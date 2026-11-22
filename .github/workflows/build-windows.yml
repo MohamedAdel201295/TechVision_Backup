@@ -38,7 +38,7 @@ jobs:
 
       - name: Build Windows installer
 # Do not let electron-builder publish: it fails with "GitHub Personal Access Token is not set".
-        run: npm run build --win --publish never
+        run: npm run build -- --win --publish never
       - name: Upload installer as artifact
       
         uses: actions/upload-artifact@v4
