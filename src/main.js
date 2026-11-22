@@ -153,8 +153,10 @@ function createMainWindow() {
 
 function createJobWizardWindow() {
   jobWizardWindow = new BrowserWindow({
-    width: 600,
-    height: 500,
+    width: 780,
+    height: 760,
+    minWidth: 700,
+    minHeight: 620,
     icon: APP_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -172,8 +174,10 @@ function createJobWizardWindow() {
 
 function createRestoreWindow() {
   restoreWindow = new BrowserWindow({
-    width: 600,
-    height: 500,
+    width: 780,
+    height: 760,
+    minWidth: 700,
+    minHeight: 620,
     icon: APP_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -495,6 +499,10 @@ ipcMain.handle('window-show-job-wizard', async () => {
   if (!jobWizardWindow) {
     createJobWizardWindow();
   } else {
+    // Reload so the wizard always starts fresh: current saved theme,
+    // empty fields, and freshly wired buttons (a re-shown window kept
+    // the old page, old theme and stale state).
+    jobWizardWindow.loadFile(path.join(__dirname, 'job-wizard.html'));
     jobWizardWindow.show();
   }
   return { success: true };
@@ -504,6 +512,7 @@ ipcMain.handle('window-show-restore-wizard', async () => {
   if (!restoreWindow) {
     createRestoreWindow();
   } else {
+    restoreWindow.loadFile(path.join(__dirname, 'restore-wizard.html'));
     restoreWindow.show();
   }
   return { success: true };
@@ -589,7 +598,7 @@ ipcMain.handle('settings-get', async () => {
     }
   } catch (e) {}
   return {
-    theme: 'light',
+    theme: 'dark',
     language: 'en',
     defaultBackupLocation: app.getPath('documents')
   };
