@@ -68,17 +68,17 @@
 
     let settings = {};
 
+    function applyTheme(theme) {
+      var t = theme === 'light' ? 'light' : 'dark';
+      document.body.setAttribute('data-theme', t);
+      if (elements.themeToggle) {
+        elements.themeToggle.checked = (t === 'dark');
+      }
+    }
+
     async function loadSettings() {
       settings = await window.electronAPI.getSettings();
-      if (settings.theme === 'dark') {
-        elements.themeToggle.checked = true;
-        document.body.classList.remove('light-theme');
-        document.body.classList.add('dark-theme');
-      } else {
-        elements.themeToggle.checked = false;
-        document.body.classList.remove('dark-theme');
-        document.body.classList.add('light-theme');
-      }
+      applyTheme(settings.theme || 'dark');
       elements.compression.checked = settings.compression ?? true;
       elements.verify.checked = settings.verify ?? true;
       elements.defaultLocation.value = settings.defaultBackupLocation || '';
@@ -102,7 +102,7 @@
       const result = await window.electronAPI.saveSettings(settings);
       if (result.success) {
         alert('Settings saved successfully!');
-        window.electronAPI.closeJobWizard();
+        window.electronAPI.closeSettings();
       } else {
         alert('Failed to save settings: ' + result.error);
       }
@@ -113,6 +113,7 @@
     });
 
     elements.themeToggle.addEventListener('change', async () => {
+      applyTheme(elements.themeToggle.checked ? 'dark' : 'light');
       settings.theme = elements.themeToggle.checked ? 'dark' : 'light';
       await window.electronAPI.saveSettings(settings);
     });

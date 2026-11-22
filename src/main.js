@@ -715,6 +715,17 @@ ipcMain.handle('job-restore', async (event, jobId) => {
 ipcMain.handle('job-delete', async (event, jobId) => {
   const idx = jobHistory.findIndex(j => j.id === jobId);
   if (idx >= 0) {
+    const job = jobHistory[idx];
+    // Delete the job config file if it exists
+    const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
+    try {
+      if (fs.existsSync(jobPath)) {
+        fs.unlinkSync(jobPath);
+        console.log(`[Main] Deleted job config file: ${jobPath}`);
+      }
+    } catch (e) {
+      console.error(`[Main] Failed to delete job config file:`, e.message);
+    }
     jobHistory.splice(idx, 1);
     saveJobHistory();
     return { success: true };

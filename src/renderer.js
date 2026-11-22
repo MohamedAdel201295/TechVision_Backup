@@ -404,8 +404,18 @@
     $('drawerEdit').addEventListener('click', function () { if (currentJob) { closeDrawer(); openJobWizard(currentJob); } });
     $('drawerDelete').addEventListener('click', async function () {
       if (!currentJob) return;
-      toast('Delete', 'Delete is handled by the main process job store. Use Edit to change a job, or Clear History in Settings.', 'warning');
-      closeDrawer();
+      try {
+        const result = await api.deleteJob(currentJob.id);
+        if (result.success) {
+          toast('Job deleted', currentJob.name + ' has been deleted.', 'success');
+          closeDrawer();
+          await window.electronAPI.refreshJobs([]);
+        } else {
+          toast('Delete failed', result.error || 'Could not delete job.', 'error');
+        }
+      } catch (e) {
+        toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error');
+      }
     });
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); } });
 
