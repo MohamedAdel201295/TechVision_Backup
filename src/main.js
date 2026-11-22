@@ -32,6 +32,16 @@ function getHistoryPath() {
   return path.join(app.getPath('userData'), '.techvision', 'jobs', 'history.json');
 }
 
+// Job paths are stored as plain strings by the wizard
+// (source: "C:\\...", destination: "D:\\..."). Keep them as strings
+// here too — the renderer displays them directly, so an object
+// { path } would render as "[object Object]".
+function jobPathValue(value) {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object' && typeof value.path === 'string') return value.path;
+  return '';
+}
+
 // Helper function to normalize job objects with uniform defaults
 function normalizeJobObject(job, defaultType = 'full') {
   if (!job || typeof job !== 'object') return null;
@@ -40,8 +50,8 @@ function normalizeJobObject(job, defaultType = 'full') {
     name: job.name || 'Unnamed Job',
     status: job.status || 'pending',
     type: job.type || defaultType,
-    source: job.source || (job.sourcePath ? { path: job.sourcePath } : { path: '' }),
-    destination: job.destination || (job.destPath ? { path: job.destPath } : { path: '' }),
+    source: jobPathValue(job.source || job.sourcePath || job.sourceDirectory),
+    destination: jobPathValue(job.destination || job.destPath || job.destinationDirectory || job.dest),
     timestamp: job.timestamp || new Date().toISOString(),
     files: job.files ?? 0,
     size: job.size ?? 0,
@@ -237,17 +247,19 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     name: jobName,
     type: 'full',
     status: result.success ? 'completed' : 'failed',
+    source: jobPathValue(jobConfig.source),
+    destination: jobPathValue(jobConfig.destination),
     timestamp: new Date().toISOString(),
     files: result.files_backed_up,
     size: result.total_bytes,
     duration: result.duration_seconds,
     result: result
   };
-  
+
   jobHistory.push(jobRecord);
   saveJobHistory();
   activeJobs.delete(jobId);
-  
+
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
   return jobRecord;
 });
@@ -268,6 +280,8 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     name: jobName,
     type: 'incremental',
     status: result.success ? 'completed' : 'failed',
+    source: jobPathValue(jobConfig.source),
+    destination: jobPathValue(jobConfig.destination),
     timestamp: new Date().toISOString(),
     files: result.files_backed_up,
     size: result.total_bytes,
@@ -301,14 +315,35 @@ ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath) => 
 });
 
 // File operations
+// Use the window that actually called the dialog as its parent.
+// Using mainWindow here made the picker open behind the job/restore
+// wizard, which looked like "Browse does nothing".
+function dialogParentWindow(event) {
+  try {
+    return (event && event.sender && BrowserWindow.fromWebContents(event.sender)) || mainWindow;
+  } catch (e) {
+    return mainWindow;
+  }
+}
+
 ipcMain.handle('dialog-showOpenDialog', async (event, options) => {
-  const result = await dialog.showOpenDialog(mainWindow, options);
-  return result;
+  try {
+    const result = await dialog.showOpenDialog(dialogParentWindow(event), options);
+    return result;
+  } catch (e) {
+    console.error('[Main] showOpenDialog failed:', e.message);
+    return { canceled: true, filePaths: [], error: e.message };
+  }
 });
 
 ipcMain.handle('dialog-showSaveDialog', async (event, options) => {
-  const result = await dialog.showSaveDialog(mainWindow, options);
-  return result;
+  try {
+    const result = await dialog.showSaveDialog(dialogParentWindow(event), options);
+    return result;
+  } catch (e) {
+    console.error('[Main] showSaveDialog failed:', e.message);
+    return { canceled: true, filePath: '', error: e.message };
+  }
 });
 
 ipcMain.handle('fs-readdir', async (event, dirPath) => {

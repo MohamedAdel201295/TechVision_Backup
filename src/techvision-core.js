@@ -12,11 +12,29 @@ const { EventEmitter } = require('events');
 /**
  * Job Configuration Class
  */
+function normalizePathValue(value) {
+  // Accept a plain string ("C:\\..."), an object { path: "C:\\..." },
+  // or nothing. The job wizard saves flat strings, the engine used to
+  // expect { path } objects — normalize both shapes here so a string
+  // source/destination can never silently become undefined.
+  if (typeof value === 'string') return { path: value };
+  if (value && typeof value === 'object') return value;
+  return { path: '' };
+}
+
 class JobConfig {
   constructor(data = {}) {
     this.name = data.name || 'DefaultJob';
-    this.source = data.source || {};
-    this.destination = data.destination || {};
+    this.source = normalizePathValue(data.source || data.sourcePath || data.sourceDirectory);
+    this.destination = normalizePathValue(data.destination || data.destPath || data.destinationDirectory || data.dest);
+    // The job wizard saves include patterns at the top level
+    // (includePatterns: ["*.txt"]), not under source.include.
+    if (Array.isArray(data.includePatterns) && data.includePatterns.length && !this.source.include) {
+      this.source.include = data.includePatterns;
+    }
+    if (Array.isArray(data.excludePatterns) && data.excludePatterns.length && !this.source.exclude) {
+      this.source.exclude = data.excludePatterns;
+    }
     this.schedule = data.schedule || { enabled: false };
     this.options = data.options || {};
   }
@@ -41,10 +59,11 @@ class JobConfig {
    * Get include patterns (minimum 1 char)
    */
   getIncludePatterns() {
-    if (!this.source.include || this.source.include.length === 0) {
+    const patterns = this.source && this.source.include;
+    if (!Array.isArray(patterns) || patterns.length === 0) {
       return ['*.*'];
     }
-    return this.source.include;
+    return patterns.filter((p) => typeof p === 'string' && p.length > 0);
   }
 
   /**
@@ -65,6 +84,7 @@ class JobConfig {
     const patterns = this.getIncludePatterns();
     
     for (const pattern of patterns) {
+      if (typeof pattern !== 'string') continue;
       // Handle *.txt, *.pdf patterns - and *.* for all files
       if (pattern === '*' || pattern === '*.*') {
         return true;
@@ -171,10 +191,14 @@ class BackupState {
  */
 class BackupEngine {
   constructor(jobConfig, logger = null) {
-    this.jobConfig = jobConfig;
+    // main.js passes the raw job object from the renderer, not a
+    // JobConfig instance — normalize it here so shouldInclude /
+    // shouldExclude and source.path / destination.path always exist.
+    this.jobConfig = jobConfig instanceof JobConfig ? jobConfig : new JobConfig(jobConfig || {});
     this.logger = logger;
-    this.logsDir = jobConfig.destination.path || './logs';
-    this.backupDir = jobConfig.destination.path || './backup';
+    const destPath = (this.jobConfig.destination && this.jobConfig.destination.path) || '';
+    this.logsDir = destPath ? path.join(destPath, 'logs') : './logs';
+    this.backupDir = destPath || './backup';
     
     // Ensure directories exist
     if (!fs.existsSync(this.logsDir)) {
@@ -227,7 +251,17 @@ class BackupEngine {
 
     const sourceDir = this.jobConfig.source.path;
     const backupName = path.basename(this.jobConfig.name);
-    
+
+    // Never record a 0-file backup as COMPLETED when the source is
+    // missing — that was the old bug (source.path was undefined).
+    if (!sourceDir || !fs.existsSync(sourceDir)) {
+      result.success = false;
+      result.error_messages.push(`Source folder does not exist: ${sourceDir || '(empty)'}`);
+      this.log('error', `Full backup failed: source folder does not exist: ${sourceDir}`);
+      this._writeLog(logFile, result);
+      return result;
+    }
+
     // Create backup directory
     const backupSubDir = path.join(this.backupDir, backupName);
     if (!fs.existsSync(backupSubDir)) {
@@ -235,7 +269,7 @@ class BackupEngine {
     }
 
     const zipPath = path.join(backupSubDir, `${backupName}_full_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`);
-    
+
     this.log('info', `Starting FULL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
     this.log('info', `Destination: ${zipPath}`);
@@ -354,7 +388,15 @@ class BackupEngine {
 
     const sourceDir = this.jobConfig.source.path;
     const backupName = path.basename(this.jobConfig.name);
-    
+
+    if (!sourceDir || !fs.existsSync(sourceDir)) {
+      result.success = false;
+      result.error_messages.push(`Source folder does not exist: ${sourceDir || '(empty)'}`);
+      this.log('error', `Incremental backup failed: source folder does not exist: ${sourceDir}`);
+      this._writeLog(logFile, result);
+      return result;
+    }
+
     // Create backup directory
     const backupSubDir = path.join(this.backupDir, backupName);
     if (!fs.existsSync(backupSubDir)) {
