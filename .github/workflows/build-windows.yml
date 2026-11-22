@@ -37,9 +37,10 @@ jobs:
         run: npm ci
 
       - name: Build Windows installer
-        run: npm run build -- --win
-
+# Do not let electron-builder publish: it fails with "GitHub Personal Access Token is not set".
+        run: npm run build --win --publish never
       - name: Upload installer as artifact
+      
         uses: actions/upload-artifact@v4
         with:
           name: TechVision-Backup-Windows
