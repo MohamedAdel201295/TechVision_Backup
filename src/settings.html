@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Settings - TechVision Backup</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="window">
+    <header class="window-header">
+      <h2>Settings</h2>
+    </header>
+
+    <main class="window-content">
+      <section class="form-section">
+        <h3>Appearance</h3>
+        <div class="form-group">
+          <label for="theme-toggle">Theme</label>
+          <div class="toggle-switch">
+            <label class="theme-switch">
+              <input type="checkbox" id="theme-toggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="form-section">
+        <h3>Backup Options</h3>
+        <div class="form-group">
+          <label for="compression">Enable compression</label>
+          <input type="checkbox" id="compression" checked>
+        </div>
+        <div class="form-group">
+          <label for="verify">Verify files after backup</label>
+          <input type="checkbox" id="verify" checked>
+        </div>
+      </section>
+
+      <section class="form-section">
+        <h3>Default Location</h3>
+        <div class="form-group">
+          <div class="path-input">
+            <input type="text" id="default-location" readonly>
+            <button id="select-default" class="btn btn-secondary">Browse</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="window-footer">
+      <button id="save-settings" class="btn btn-primary">Save</button>
+      <button id="cancel-settings" class="btn btn-secondary">Cancel</button>
+    </footer>
+  </div>
+
+  <script>
+    const elements = {
+      themeToggle: document.getElementById('theme-toggle'),
+      compression: document.getElementById('compression'),
+      verify: document.getElementById('verify'),
+      defaultLocation: document.getElementById('default-location'),
+      selectDefault: document.getElementById('select-default'),
+      saveSettings: document.getElementById('save-settings'),
+      cancelSettings: document.getElementById('cancel-settings')
+    };
+
+    let settings = {};
+
+    async function loadSettings() {
+      settings = await window.electronAPI.getSettings();
+      if (settings.theme === 'dark') {
+        elements.themeToggle.checked = true;
+        document.body.classList.remove('light-theme');
+        document.body.classList.add('dark-theme');
+      } else {
+        elements.themeToggle.checked = false;
+        document.body.classList.remove('dark-theme');
+        document.body.classList.add('light-theme');
+      }
+      elements.compression.checked = settings.compression ?? true;
+      elements.verify.checked = settings.verify ?? true;
+      elements.defaultLocation.value = settings.defaultBackupLocation || '';
+    }
+
+    elements.selectDefault.addEventListener('click', async () => {
+      const result = await window.electronAPI.showOpenDialog({
+        properties: ['openDirectory']
+      });
+      if (!result.cancelled) {
+        elements.defaultLocation.value = result.filePaths[0];
+      }
+    });
+
+    elements.saveSettings.addEventListener('click', async () => {
+      settings.theme = elements.themeToggle.checked ? 'dark' : 'light';
+      settings.compression = elements.compression.checked;
+      settings.verify = elements.verify.checked;
+      settings.defaultBackupLocation = elements.defaultLocation.value;
+      
+      const result = await window.electronAPI.saveSettings(settings);
+      if (result.success) {
+        alert('Settings saved successfully!');
+        window.electronAPI.closeJobWizard();
+      } else {
+        alert('Failed to save settings: ' + result.error);
+      }
+    });
+
+    elements.cancelSettings.addEventListener('click', () => {
+      window.electronAPI.closeSettings();
+    });
+
+    elements.themeToggle.addEventListener('change', async () => {
+      settings.theme = elements.themeToggle.checked ? 'dark' : 'light';
+      await window.electronAPI.saveSettings(settings);
+    });
+
+    // Initialize
+    loadSettings();
+  </script>
+</body>
+</html>

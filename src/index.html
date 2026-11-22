@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+<title>TechVision Backup</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body data-theme="dark">
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="assets/TechVision_Logo.png" alt="TechVision logo" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+      <div style="display:none; width:38px; height:38px; border-radius:9px; background:linear-gradient(135deg,#0ea5e9,#22c55e); color:#fff; align-items:center; justify-content:center; font-weight:800; font-size:20px;">V</div>
+      <div>
+        <div class="brand-name"><span>Tech</span>Vision</div>
+        <div class="brand-sub">Backup</div>
+      </div>
+    </div>
+    <div class="nav-label">Menu</div>
+    <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
+    <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
+    <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
+    <button class="nav-item" type="button" data-nav="logs"><span class="ico">≡</span> Logs</button>
+    <button class="nav-item" type="button" data-nav="settings"><span class="ico">⚙</span> Settings</button>
+    <div class="sidebar-foot">
+      <div>TechVision Backup</div>
+      <div>Electron · Node.js</div>
+      <div id="sidebarVersion">Version 1.0.0</div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1>TechVision Backup</h1>
+        <p>Your data, protected — full and incremental backups, fast streaming restore.</p>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" type="button" id="themeToggle" title="Toggle dark / light theme" aria-label="Toggle theme">🌙</button>
+        <button class="icon-btn" type="button" id="settingsBtn" title="Settings" aria-label="Settings">⚙</button>
+      </div>
+    </header>
+    <section class="stats" aria-label="Backup statistics">
+      <div class="stat-card">
+        <div class="stat-label">Total Backups</div>
+        <div class="stat-value" id="statTotal">0</div>
+        <div class="stat-sub" id="statTotalSub">No backups yet</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Data</div>
+        <div class="stat-value" id="statData">0 <small>MB</small></div>
+        <div class="stat-sub" id="statDataSub">Across all backups</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Last Backup</div>
+        <div class="stat-value" id="statLast" style="font-size:22px; padding-top:4px;">—</div>
+        <div class="stat-sub" id="statLastSub">Never</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Success Rate</div>
+        <div class="stat-value" id="statSuccess">—</div>
+        <div class="stat-sub" id="statSuccessSub">No runs yet</div>
+      </div>
+    </section>
+    <div class="actions-row">
+      <button class="btn btn-primary" type="button" id="newJobBtn">＋ New Job</button>
+      <button class="btn" type="button" id="restoreBtn">↺ Restore</button>
+      <button class="btn btn-ghost" type="button" id="refreshBtn">⟳ Refresh</button>
+    </div>
+    <section class="progress-card" id="progressCard" aria-live="polite">
+      <div class="progress-head">
+        <span><span class="spinner" id="progressSpinner"></span> <span id="progressTitle">Backing up…</span></span>
+        <span class="progress-pct" id="progressPct">0%</span>
+      </div>
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-sub">
+        <span id="progressCount">0 files</span>
+        <span id="progressSize">0 B</span>
+        <span class="file" id="progressFile"></span>
+      </div>
+    </section>
+    <div class="toolbar">
+      <label class="search-box">
+        <span aria-hidden="true">🔍</span>
+        <input type="text" id="searchInput" placeholder="Search backups…" autocomplete="off">
+      </label>
+      <select class="filter" id="statusFilter" aria-label="Filter by status">
+        <option value="all">All statuses</option>
+        <option value="COMPLETED">Completed</option>
+        <option value="RUNNING">Running</option>
+        <option value="PENDING">Pending</option>
+        <option value="FAILED">Failed</option>
+        <option value="TEMPLATE">Template</option>
+      </select>
+      <select class="filter" id="typeFilter" aria-label="Filter by type">
+        <option value="all">All types</option>
+        <option value="FULL">Full</option>
+        <option value="INCREMENTAL">Incremental</option>
+        <option value="TEMPLATE">Template</option>
+      </select>
+    </div>
+    <h2 class="section-title">Backup History</h2>
+    <div class="job-list" id="jobList"></div>
+    <div class="empty-state" id="emptyState" style="display:none;">
+      <div class="big">🛡️</div>
+      <h3>No backups yet</h3>
+      <p>Create your first backup job and protect your files.</p>
+      <button class="btn btn-primary" type="button" id="emptyNewJobBtn">＋ Create your first backup</button>
+    </div>
+  </main>
+</div>
+<div class="backdrop" id="drawerBackdrop"></div>
+<aside class="drawer" id="jobDrawer" aria-label="Job details">
+  <button class="icon-btn close-x" type="button" id="drawerClose" aria-label="Close details">✕</button>
+  <h2 id="drawerName">Job details</h2>
+  <div id="drawerPills" style="display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;"></div>
+  <dl class="kv">
+    <dt>Source</dt><dd id="drawerSource">—</dd>
+    <dt>Destination</dt><dd id="drawerDest">—</dd>
+    <dt>Type</dt><dd id="drawerType">—</dd>
+    <dt>Status</dt><dd id="drawerStatus">—</dd>
+    <dt>Files</dt><dd id="drawerFiles">—</dd>
+    <dt>Total size</dt><dd id="drawerSize">—</dd>
+    <dt>Duration</dt><dd id="drawerDuration">—</dd>
+    <dt>Last run</dt><dd id="drawerLastRun">—</dd>
+  </dl>
+  <div class="drawer-actions">
+    <button class="btn btn-primary btn-sm" type="button" id="drawerRun">▶ Run Backup</button>
+    <button class="btn btn-sm" type="button" id="drawerRestore">↺ Restore</button>
+    <button class="btn btn-sm" type="button" id="drawerEdit">✎ Edit</button>
+    <button class="btn btn-danger btn-sm" type="button" id="drawerDelete">🗑 Delete</button>
+  </div>
+</aside>
+<div class="backdrop" id="settingsBackdrop"></div>
+<aside class="drawer" id="settingsDrawer" aria-label="Settings">
+  <button class="icon-btn close-x" type="button" id="settingsClose" aria-label="Close settings">✕</button>
+  <h2>Settings</h2>
+  <p style="color:var(--muted); margin:4px 0 0;">Saved with <code>window.electronAPI.saveSettings()</code>.</p>
+  <div style="margin-top:14px;">
+    <div class="toggle-row">
+      <div><div class="t-label">Light theme</div><div class="t-sub">Switch between dark and light.</div></div>
+      <label class="switch"><input type="checkbox" id="settingLightTheme"><span class="slider"></span></label>
+    </div>
+    <div class="toggle-row">
+      <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Default for new jobs.</div></div>
+      <label class="switch"><input type="checkbox" id="settingCompress" checked><span class="slider"></span></label>
+    </div>
+    <div class="toggle-row">
+      <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after each backup.</div></div>
+      <label class="switch"><input type="checkbox" id="settingVerify" checked><span class="slider"></span></label>
+    </div>
+    <div class="toggle-row">
+      <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Default for new jobs.</div></div>
+      <label class="switch"><input type="checkbox" id="settingIncremental" checked><span class="slider"></span></label>
+    </div>
+  </div>
+  <div class="drawer-actions">
+    <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
+    <button class="btn btn-danger" type="button" id="clearHistoryBtn">Clear History</button>
+  </div>
+</aside>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script src="renderer.js"></script>
+</body>
+</html>

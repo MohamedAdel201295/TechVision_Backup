@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+<title>Logs - TechVision Backup</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body data-theme="dark">
+<div class="modal-wrap" style="max-width:900px;">
+  <div class="modal-head">
+    <div>
+      <h1>Logs</h1>
+      <p>Recent backup and restore activity. Auto-refreshes every 5 seconds.</p>
+    </div>
+  </div>
+  <div class="modal-body">
+    <div class="log-toolbar">
+      <select class="filter" id="levelFilter" aria-label="Filter by level">
+        <option value="all">All levels</option>
+        <option value="INFO">Info</option>
+        <option value="SUCCESS">Success</option>
+        <option value="WARN">Warning</option>
+        <option value="ERROR">Error</option>
+      </select>
+      <label class="search-box" style="flex:1; min-width:180px;">
+        <span aria-hidden="true">🔍</span>
+        <input type="text" id="logSearch" placeholder="Filter log lines…" autocomplete="off">
+      </label>
+      <label class="check" style="padding:0;"><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label>
+      <button class="btn btn-sm" type="button" id="refreshBtn">⟳ Refresh</button>
+      <button class="btn btn-sm" type="button" id="copyBtn">Copy</button>
+    </div>
+    <div class="log-box" id="logBox" aria-live="polite">Loading logs…</div>
+    <p style="color:var(--muted); font-size:12px; margin-top:10px;" id="logMeta"></p>
+  </div>
+</div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script>
+/* Log viewer — plain JavaScript, Electron renderer only.
+   No require(). Loads lines through window.electronAPI.getRecentLog(). */
+(function () {
+  'use strict';
+  var api = window.electronAPI || null;
+  var lines = [];
+  var timer = null;
+  function $(id) { return document.getElementById(id); }
+  function toast(title, message, kind) {
+    var box = $('toasts'); if (!box) return;
+    var el = document.createElement('div');
+    el.className = 'toast ' + (kind || '');
+    el.innerHTML = '<div><b></b><span></span></div>';
+    el.querySelector('b').textContent = title;
+    el.querySelector('span').textContent = message || '';
+    box.appendChild(el);
+    setTimeout(function () { el.classList.add('leaving'); setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 260); }, 4200);
+  }
+  function levelOf(text) {
+    var t = String(text || '').toUpperCase();
+    if (t.indexOf('ERROR') !== -1 || t.indexOf('FAIL') !== -1) return 'ERROR';
+    if (t.indexOf('WARN') !== -1 || t.indexOf('SKIPPED') !== -1) return 'WARN';
+    if (t.indexOf('SUCCESS') !== -1 || t.indexOf('COMPLETED') !== -1) return 'SUCCESS';
+    return 'INFO';
+  }
+  function render() {
+    var box = $('logBox');
+    var level = $('levelFilter').value;
+    var q = $('logSearch').value.trim().toLowerCase();
+    var visible = lines.filter(function (l) {
+      if (level !== 'all' && levelOf(l) !== level) return false;
+      if (q && String(l).toLowerCase().indexOf(q) === -1) return false;
+      return true;
+    });
+    box.innerHTML = '';
+    if (!visible.length) {
+      box.textContent = lines.length ? 'No log lines match this filter.' : 'No log lines yet. Run a backup or a restore to see activity here.';
+      $('logMeta').textContent = lines.length + ' line' + (lines.length === 1 ? '' : 's') + ' loaded.';
+      return;
+    }
+    visible.forEach(function (l) {
+      var div = document.createElement('div');
+      div.className = 'log-line log-' + levelOf(l).toLowerCase();
+      div.textContent = String(l);
+      box.appendChild(div);
+    });
+    box.scrollTop = box.scrollHeight;
+    $('logMeta').textContent = visible.length + ' of ' + lines.length + ' line' + (lines.length === 1 ? '' : 's') + ' shown.';
+  }
+  async function loadLogs() {
+    if (!api || typeof api.getRecentLog !== 'function') {
+      lines = ['[INFO] Log API is not available in this window.'];
+      render();
+      return;
+    }
+    try {
+      var data = await api.getRecentLog();
+      if (typeof data === 'string') lines = data.split(/\r?\n/).filter(function (l) { return l.trim().length > 0; });
+      else if (Array.isArray(data)) lines = data.map(function (l) { return String(l); });
+      else if (data && Array.isArray(data.lines)) lines = data.lines.map(function (l) { return String(l); });
+      else if (data && typeof data.log === 'string') lines = data.log.split(/\r?\n/).filter(function (l) { return l.trim().length > 0; });
+      else lines = [];
+    } catch (e) {
+      lines = ['[ERROR] Could not load logs: ' + (e && e.message ? e.message : 'unknown error')];
+    }
+    render();
+  }
+  function startAuto() {
+    clearInterval(timer);
+    if ($('autoRefresh').checked) timer = setInterval(loadLogs, 5000);
+  }
+  document.addEventListener('DOMContentLoaded', function () {
+    $('levelFilter').addEventListener('change', render);
+    $('logSearch').addEventListener('input', render);
+    $('refreshBtn').addEventListener('click', loadLogs);
+    $('autoRefresh').addEventListener('change', startAuto);
+    $('copyBtn').addEventListener('click', function () {
+      var text = lines.join('\n');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { toast('Copied', 'Log lines copied to the clipboard.', 'success'); }).catch(function () { toast('Copy failed', 'Could not copy the logs.', 'error'); });
+      } else { toast('Copy failed', 'Clipboard is not available.', 'error'); }
+    });
+    if (api && typeof api.getSettings === 'function') {
+      api.getSettings().then(function (s) { if (s && s.theme) document.body.setAttribute('data-theme', s.theme); }).catch(function () {});
+    }
+    loadLogs();
+    startAuto();
+  });
+})();
+</script>
+</body>
+</html>

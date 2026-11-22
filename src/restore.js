@@ -1,0 +1,248 @@
+/**
+ * TechVision Restore Engine
+ * Restore from ZIP with hash verification
+ * Uses yauzl for streaming extraction (memory efficient)
+ */
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const yauzl = require('yauzl');
+const EventEmitter = require('events');
+
+/**
+ * Restore Result Class
+ */
+class RestoreResult extends EventEmitter {
+  constructor() {
+    super();
+    this.success = false;
+    this.files_restored = 0;
+    this.files_verified = 0;
+    this.files_mismatched = 0;
+    this.total_bytes = 0;
+    this.duration_seconds = 0;
+    this.errors = [];
+  }
+}
+
+/**
+ * Restore Engine Class
+ * Uses streaming extraction with yauzl for memory efficiency
+ */
+class RestoreEngine {
+  constructor() {
+    this.errors = [];
+  }
+
+  /**
+   * Calculate SHA-256 hash of content
+   */
+  calculateHash(content) {
+    if (Buffer.isBuffer(content)) {
+      return crypto.createHash('sha256').update(content).digest('hex');
+    } else if (typeof content === 'string') {
+      return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+    }
+    return null;
+  }
+
+  /**
+   * Restore all files from ZIP using streaming (yauzl)
+   */
+  async restore_all(zipPath, restoreDir) {
+    const result = new RestoreResult();
+    const startTime = Date.now();
+    const zipFiles = [];
+    const zipData = new Map();
+    const restoredSizes = [];
+    
+    return new Promise((resolve, reject) => {
+      let pendingEntries = 0;
+      
+      // Ensure restore directory exists
+      if (!fs.existsSync(restoreDir)) {
+        fs.mkdirSync(restoreDir, { recursive: true });
+      }
+
+      yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+        if (err) {
+          result.success = false;
+          result.errors.push(err.message);
+          result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+          return resolve(result);
+        }
+
+        zipfile.readEntry();
+
+        zipfile.on('entry', (entry) => {
+          zipfile.readEntry();
+          
+          if (entry.externalAttributes >> 16 === 0x10) { // Directory entry
+            return;
+          }
+          
+          // File entry
+          const entryPath = path.join(restoreDir, entry.fileName.replace(/\//g, path.sep));
+          const dirName = path.dirname(entryPath);
+          const fileSize = entry.uncompressedSize;
+          
+          zipFiles.push({
+            path: entryPath,
+            name: entry.fileName,
+            size: fileSize
+          });
+          
+          pendingEntries++;
+          
+          // Create directories
+          if (!fs.existsSync(dirName)) {
+            fs.mkdirSync(dirName, { recursive: true });
+          }
+          
+          // Read entry
+          zipfile.openReadStream(entry, (err, ReadStream) => {
+            if (err) {
+              result.errors.push(`Failed to open ${entry.fileName}: ${err.message}`);
+              pendingEntries--;
+              if (pendingEntries === 0) finish();
+              return;
+            }
+            
+            const chunks = [];
+            
+            ReadStream.on('data', (chunk) => {
+              chunks.push(chunk);
+            });
+            
+            ReadStream.on('end', () => {
+              const content = Buffer.concat(chunks);
+              const size = content.length;
+              restoredSizes.push(size);
+              zipData.set(entry.fileName, content);
+              
+              try {
+                fs.writeFileSync(entryPath, content);
+                result.files_restored++;
+              } catch (e) {
+                result.errors.push(`Failed to write ${entry.fileName}: ${e.message}`);
+              }
+              
+              pendingEntries--;
+              if (pendingEntries === 0) finish();
+            });
+            
+            ReadStream.on('error', (err) => {
+              result.errors.push(`Read error for ${entry.fileName}: ${err.message}`);
+              pendingEntries--;
+              if (pendingEntries === 0) finish();
+            });
+          });
+        });
+
+        const finish = () => {
+          result.errors = [...new Set(result.errors)];
+          result.total_bytes = restoredSizes.reduce((a, b) => a + b, 0);
+          result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+          console.log(`    Found ${zipFiles.length} files in ZIP`);
+          
+          // Verify hashes
+          for (const file of zipFiles) {
+            const restoredPath = file.path;
+            const originalContent = zipData.get(file.name);
+            
+            if (fs.existsSync(restoredPath) && originalContent) {
+              try {
+                const restoredContent = fs.readFileSync(restoredPath);
+                const restoredHash = this.calculateHash(restoredContent);
+                const originalHash = this.calculateHash(originalContent);
+                
+                if (restoredHash === originalHash) {
+                  result.files_verified++;
+                } else {
+                  result.files_mismatched++;
+                  result.errors.push(`Hash mismatch: ${file.name}`);
+                }
+              } catch (e) {
+                result.errors.push(`Verification error: ${file.name}: ${e.message}`);
+              }
+            }
+          }
+
+          result.success = result.files_mismatched === 0;
+          resolve(result);
+        };
+      });
+    });
+  }
+
+  /**
+   * Get ZIP file info (streaming)
+   */
+  async getZipInfo(zipPath) {
+    return new Promise((resolve, reject) => {
+      yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+        if (err) return reject(err);
+        
+        const entries = [];
+        
+        zipfile.readEntry();
+        
+        zipfile.on('entry', (entry) => {
+          zipfile.readEntry();
+          
+          if (entry.externalAttributes >> 16 !== 0x10) { // Not a directory
+            entries.push({
+              path: entry.fileName.replace(/\//g, path.sep),
+              size: entry.uncompressedSize,
+              isDir: false
+            });
+          }
+        });
+        
+        zipfile.on('end', () => {
+          resolve(entries);
+        });
+      });
+    });
+  }
+
+  /**
+   * Restore single file to specific location
+   */
+  async restoreFile(zipPath, entryName, destPath) {
+    return new Promise((resolve, reject) => {
+      yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+        if (err) return reject(err);
+        
+        zipfile.readEntry();
+        
+        zipfile.on('entry', (entry) => {
+          zipfile.readEntry();
+          
+          if (entry.fileName === entryName.replace(/\\/g, '/')) {
+            zipfile.openReadStream(entry, (err, ReadStream) => {
+              if (err) return reject(err);
+              
+              const dir = path.dirname(destPath);
+              if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+              }
+              
+              const file = fs.createWriteStream(destPath);
+              ReadStream.pipe(file);
+              
+              file.on('finish', resolve);
+              file.on('error', reject);
+            });
+          }
+        });
+      });
+    });
+  }
+}
+
+module.exports = {
+  RestoreEngine,
+  RestoreResult
+};

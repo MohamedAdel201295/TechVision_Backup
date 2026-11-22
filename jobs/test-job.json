@@ -1,0 +1,29 @@
+{
+  "name": "TechVision_Core_Test_NodeJS",
+  "source": {
+    "type": "local",
+    "path": "C:\\Users\\Mohamed Adel\\Documents\\hermes_sessions\\techvision-electron\\test-data",
+    "include": [
+      "*.txt",
+      "*.pdf",
+      "*.bin"
+    ],
+    "exclude": [
+      "*.tmp",
+      "*.log",
+      "*.bak"
+    ]
+  },
+  "destination": {
+    "type": "local",
+    "path": "C:\\Users\\Mohamed Adel\\Documents\\hermes_sessions\\techvision-electron\\test-output",
+    "compression": "standard"
+  },
+  "schedule": {
+    "enabled": false
+  },
+  "options": {
+    "use_vss": false,
+    "handle_long_paths": true
+  }
+}

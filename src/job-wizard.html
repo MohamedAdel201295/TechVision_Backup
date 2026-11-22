@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+<title>New Backup Job - TechVision</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body data-theme="dark">
+<div class="modal-wrap">
+  <div class="wizard-card">
+    <div class="modal-head">
+      <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
+      <div>
+        <h1 id="wizardTitle">New Backup Job</h1>
+        <p>Four quick steps — the wizard stays open while you pick folders.</p>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="steps" id="steps">
+        <div class="step active" data-n="1" data-step="1">Source</div>
+        <div class="step" data-n="2" data-step="2">Destination</div>
+        <div class="step" data-n="3" data-step="3">Options</div>
+        <div class="step" data-n="4" data-step="4">Review</div>
+      </div>
+
+      <!-- Step 1: Source -->
+      <section class="step-panel active" data-panel="1">
+        <div class="field">
+          <label for="jobName">Job Name</label>
+          <input type="text" id="jobName" value="My Backup" placeholder="My Backup">
+          <div class="field-error" id="jobNameError">Please enter a job name.</div>
+        </div>
+        <div class="field">
+          <label for="sourceDir">Source Directory</label>
+          <div class="input-row">
+            <input type="text" id="sourceDir" placeholder="Select a source folder" readonly>
+            <button class="btn" type="button" id="browseSource">Browse</button>
+          </div>
+          <div class="hint">Pick the folder to back up. The wizard stays open after you click OK.</div>
+          <div class="field-error" id="sourceError">Please choose a source folder.</div>
+        </div>
+        <div class="field">
+          <label for="patternInput">Include Patterns <span class="optional">(optional)</span></label>
+          <div class="input-row">
+            <input type="text" id="patternInput" placeholder='Add pattern (*.txt, *.docx)'>
+            <button class="btn" type="button" id="addPatternBtn">＋ Add</button>
+          </div>
+          <div class="chips" id="patternChips"></div>
+          <div class="hint">Empty means: back up everything in the source folder.</div>
+        </div>
+      </section>
+
+      <!-- Step 2: Destination -->
+      <section class="step-panel" data-panel="2">
+        <div class="field">
+          <label for="destDir">Destination Directory</label>
+          <div class="input-row">
+            <input type="text" id="destDir" placeholder="Select a destination folder" readonly>
+            <button class="btn" type="button" id="browseDest">Browse</button>
+          </div>
+          <div class="hint">The .zip backup file is created in this folder. The wizard stays open after you click OK.</div>
+          <div class="field-error" id="destError">Please choose a destination folder.</div>
+        </div>
+        <div class="note info"><strong>Tip:</strong> use a different drive or an external drive for the destination, so a disk failure does not take the backup with it.</div>
+      </section>
+
+      <!-- Step 3: Options & Schedule -->
+      <section class="step-panel" data-panel="3">
+        <h3 style="margin:0 0 6px;">Backup Options</h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Back up only files that changed since the last backup.</div></div>
+          <label class="switch"><input type="checkbox" id="optIncremental" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Store the backup as a compressed .zip file.</div></div>
+          <label class="switch"><input type="checkbox" id="optCompress" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
+          <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
+        </div>
+        <h3 style="margin:18px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Run on schedule</div><div class="t-sub">Run this job automatically.</div></div>
+          <label class="switch"><input type="checkbox" id="optSchedule"><span class="slider"></span></label>
+        </div>
+        <div id="scheduleFields" style="display:none; margin-top:12px;">
+          <div class="field">
+            <label>Frequency</label>
+            <div class="radio-row">
+              <label><input type="radio" name="frequency" value="Daily" checked> Daily</label>
+              <label><input type="radio" name="frequency" value="Weekly"> Weekly</label>
+              <label><input type="radio" name="frequency" value="Monthly"> Monthly</label>
+            </div>
+          </div>
+          <div class="field">
+            <label for="scheduleTime">Time</label>
+            <input type="time" id="scheduleTime" value="02:00">
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 4: Review -->
+      <section class="step-panel" data-panel="4">
+        <h3 style="margin:0 0 10px;">Review your job</h3>
+        <div class="review" id="reviewBox"></div>
+        <div class="note info" style="margin-top:14px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
+      </section>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" type="button" id="cancelBtn">Cancel</button>
+      <span class="spacer"></span>
+      <button class="btn" type="button" id="backBtn" style="display:none;">← Back</button>
+      <button class="btn btn-primary" type="button" id="nextBtn">Next →</button>
+      <button class="btn btn-primary" type="button" id="createBtn" style="display:none;">Create Job</button>
+    </div>
+  </div>
+</div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script>
+/* New Backup Job wizard — plain JavaScript, Electron renderer only.
+   No require(). All native calls go through window.electronAPI.
+   Browse buttons call showOpenDialog and fill the field WITHOUT
+   closing this window — that was the old bug. */
+(function () {
+  'use strict';
+  var api = window.electronAPI || null;
+  var step = 1;
+  var patterns = [];
+  var editing = null;
+
+  function $(id) { return document.getElementById(id); }
+  function toast(title, message, kind) {
+    var box = $('toasts'); if (!box) return;
+    var el = document.createElement('div');
+    el.className = 'toast ' + (kind || '');
+    el.innerHTML = '<div><b></b><span></span></div>';
+    el.querySelector('b').textContent = title;
+    el.querySelector('span').textContent = message || '';
+    box.appendChild(el);
+    setTimeout(function () { el.classList.add('leaving'); setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 260); }, 4200);
+  }
+  function applyTheme(theme) { document.body.setAttribute('data-theme', theme === 'light' ? 'light' : 'dark'); }
+  function showStep(n) {
+    step = n;
+    document.querySelectorAll('.step').forEach(function (s) {
+      var sn = Number(s.getAttribute('data-step'));
+      s.classList.toggle('active', sn === n);
+      s.classList.toggle('done', sn < n);
+    });
+    document.querySelectorAll('.step-panel').forEach(function (p) {
+      p.classList.toggle('active', Number(p.getAttribute('data-panel')) === n);
+    });
+    $('backBtn').style.display = n > 1 ? '' : 'none';
+    $('nextBtn').style.display = n < 4 ? '' : 'none';
+    $('createBtn').style.display = n === 4 ? '' : 'none';
+    if (n === 4) renderReview();
+  }
+  function validateStep(n) {
+    if (n === 1) {
+      var ok = true;
+      var nameOk = $('jobName').value.trim().length > 0;
+      $('jobNameError').classList.toggle('show', !nameOk);
+      var srcOk = $('sourceDir').value.trim().length > 0;
+      $('sourceError').classList.toggle('show', !srcOk);
+      ok = nameOk && srcOk;
+      if (!ok) toast('Missing information', 'Please enter a job name and choose a source folder.', 'warning');
+      return ok;
+    }
+    if (n === 2) {
+      var destOk = $('destDir').value.trim().length > 0;
+      $('destError').classList.toggle('show', !destOk);
+      if (!destOk) toast('Missing information', 'Please choose a destination folder.', 'warning');
+      return destOk;
+    }
+    return true;
+  }
+  function renderChips() {
+    var box = $('patternChips');
+    box.innerHTML = '';
+    patterns.forEach(function (p, i) {
+      var chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.textContent = p;
+      var x = document.createElement('button');
+      x.type = 'button'; x.textContent = '✕'; x.setAttribute('aria-label', 'Remove pattern ' + p);
+      x.addEventListener('click', function () { patterns.splice(i, 1); renderChips(); });
+      chip.appendChild(x);
+      box.appendChild(chip);
+    });
+  }
+  function addPattern() {
+    var v = $('patternInput').value.trim();
+    if (!v) return;
+    if (patterns.indexOf(v) === -1) patterns.push(v);
+    $('patternInput').value = '';
+    renderChips();
+  }
+  function collectJob() {
+    var freq = 'Daily';
+    var checked = document.querySelector('input[name="frequency"]:checked');
+    if (checked) freq = checked.value;
+    return {
+      name: $('jobName').value.trim(),
+      source: $('sourceDir').value.trim(),
+      sourceDirectory: $('sourceDir').value.trim(),
+      destination: $('destDir').value.trim(),
+      destinationDirectory: $('destDir').value.trim(),
+      includePatterns: patterns.slice(),
+      allowIncremental: $('optIncremental').checked,
+      compress: $('optCompress').checked,
+      verify: $('optVerify').checked,
+      use_vss: false,
+      schedule: $('optSchedule').checked ? { enabled: true, frequency: freq, time: $('scheduleTime').value || '02:00' } : { enabled: false, frequency: freq, time: $('scheduleTime').value || '02:00' },
+      type: 'TEMPLATE',
+      status: 'PENDING'
+    };
+  }
+  function renderReview() {
+    var j = collectJob();
+    var rows = [
+      ['Job name', j.name || '—'],
+      ['Source', j.source || '—'],
+      ['Destination', j.destination || '—'],
+      ['Include patterns', j.includePatterns.length ? j.includePatterns.join(', ') : 'All files'],
+      ['Incremental', j.allowIncremental ? 'Yes' : 'No'],
+      ['Compress with ZIP', j.compress ? 'Yes' : 'No'],
+      ['Verify after backup', j.verify ? 'Yes' : 'No'],
+      ['Schedule', j.schedule.enabled ? j.schedule.frequency + ' at ' + j.schedule.time : 'Manual only']
+    ];
+    $('reviewBox').innerHTML = rows.map(function (r) {
+      var div = document.createElement('div');
+      div.className = 'review-row';
+      var k = document.createElement('div'); k.className = 'k'; k.textContent = r[0];
+      var v = document.createElement('div'); v.className = 'v'; v.textContent = r[1];
+      div.appendChild(k); div.appendChild(v);
+      return div.outerHTML;
+    }).join('');
+  }
+  async function pickFolder(targetId) {
+    if (!api || typeof api.showOpenDialog !== 'function') { toast('Browse unavailable', 'Folder picker API is not available.', 'error'); return; }
+    try {
+      var result = await api.showOpenDialog({ properties: ['openDirectory'] });
+      var path = null;
+      if (typeof result === 'string') path = result;
+      else if (result && Array.isArray(result.filePaths) && result.filePaths.length) path = result.filePaths[0];
+      else if (result && result.filePath) path = result.filePath;
+      else if (Array.isArray(result) && result.length) path = result[0];
+      if (path) { $(targetId).value = path; }
+      /* Cancelled dialog = do nothing, wizard stays open. */
+    } catch (e) {
+      toast('Browse failed', e && e.message ? e.message : 'Could not open the folder picker.', 'error');
+    }
+  }
+  async function createJob() {
+    var job = collectJob();
+    if (!job.name || !job.source || !job.destination) { toast('Missing information', 'Job name, source and destination are all required.', 'error'); return; }
+    if (!api || typeof api.saveJobConfig !== 'function') { toast('Save unavailable', 'Save API is not available.', 'error'); return; }
+    $('createBtn').disabled = true;
+    $('createBtn').textContent = 'Creating…';
+    try {
+      await api.saveJobConfig(job);
+      if (typeof api.refreshJobs === 'function') { try { await api.refreshJobs(); } catch (e) {} }
+      toast('Job created', job.name + ' has been saved.', 'success');
+      setTimeout(function () { closeWizard(); }, 500);
+    } catch (e) {
+      toast('Create failed', e && e.message ? e.message : 'Could not save the job.', 'error');
+      $('createBtn').disabled = false;
+      $('createBtn').textContent = 'Create Job';
+    }
+  }
+  function closeWizard() {
+    if (api && typeof api.closeJobWizard === 'function') { api.closeJobWizard(); }
+  }
+  async function loadExisting() {
+    if (!api) return;
+    try {
+      if (typeof api.getSettings === 'function') {
+        var s = await api.getSettings();
+        if (s && typeof s === 'object') {
+          applyTheme(s.theme || 'dark');
+          if (s.compress === false) $('optCompress').checked = false;
+          if (s.verify === false) $('optVerify').checked = false;
+          if (s.allowIncremental === false) $('optIncremental').checked = false;
+        }
+      }
+      if (typeof api.getJobConfig === 'function') {
+        var cfg = await api.getJobConfig();
+        if (cfg && typeof cfg === 'object' && (cfg.name || cfg.source)) {
+          editing = cfg;
+          $('wizardTitle').textContent = 'Edit Backup Job';
+          $('jobName').value = cfg.name || cfg.jobName || '';
+          $('sourceDir').value = cfg.source || cfg.sourceDirectory || '';
+          $('destDir').value = cfg.destination || cfg.destinationDirectory || '';
+          if (Array.isArray(cfg.includePatterns)) { patterns = cfg.includePatterns.slice(); renderChips(); }
+          if (cfg.allowIncremental === false) $('optIncremental').checked = false;
+          if (cfg.compress === false) $('optCompress').checked = false;
+          if (cfg.verify === false) $('optVerify').checked = false;
+        }
+      }
+    } catch (e) { /* start with a blank job */ }
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    $('browseSource').addEventListener('click', function () { pickFolder('sourceDir'); });
+    $('browseDest').addEventListener('click', function () { pickFolder('destDir'); });
+    $('addPatternBtn').addEventListener('click', addPattern);
+    $('patternInput').addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
+    $('optSchedule').addEventListener('change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });
+    $('nextBtn').addEventListener('click', function () { if (validateStep(step)) showStep(Math.min(4, step + 1)); });
+    $('backBtn').addEventListener('click', function () { showStep(Math.max(1, step - 1)); });
+    $('createBtn').addEventListener('click', createJob);
+    $('cancelBtn').addEventListener('click', closeWizard);
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeWizard(); });
+    loadExisting();
+  });
+})();
+</script>
+</body>
+</html>
