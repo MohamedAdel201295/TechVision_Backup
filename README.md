@@ -102,3 +102,11 @@ VSS will be implemented via:
 - File staging before backup
 
 Current MVP: Locked files skipped with logging.
+
+## 📦 GitHub Repository
+
+🔗 https://github.com/MohamedAdel201295/TechVision_Backup
+
+## License
+
+MIT License
