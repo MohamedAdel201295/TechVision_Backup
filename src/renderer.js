@@ -409,7 +409,7 @@
         if (result.success) {
           toast('Job deleted', currentJob.name + ' has been deleted.', 'success');
           closeDrawer();
-          await window.electronAPI.refreshJobs([]);
+          await refreshJobs();
         } else {
           toast('Delete failed', result.error || 'Could not delete job.', 'error');
         }
