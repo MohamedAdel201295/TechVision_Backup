@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Test data with problematic long paths
+test-data/long_paths_test/
+
 # Build outputs
 dist/
 release/
