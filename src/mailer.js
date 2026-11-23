@@ -50,10 +50,13 @@ async function sendMail(userDataDir, subject, text) {
     return { sent: false, reason: 'nodemailer is not installed yet — run npm install in the project folder.' };
   }
   try {
+    const port = Number(email.smtpPort) || 465;
+    // Port decides the encryption: 465 = implicit SSL, 587 = STARTTLS.
+    // Company mail servers usually run on one of these two.
     const transporter = nodemailer.createTransport({
       host: email.smtpHost || 'smtp.gmail.com',
-      port: Number(email.smtpPort) || 465,
-      secure: email.smtpSecure !== false,
+      port: port,
+      secure: port === 465,
       auth: { user: email.smtpUser, pass: email.smtpPass }
     });
     await transporter.sendMail({
