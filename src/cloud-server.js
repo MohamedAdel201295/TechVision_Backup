@@ -15,7 +15,11 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const https = require('https');
-const selfsigned = require('selfsigned');
+// Lazy: the app must still open when this package is missing (e.g. a
+// source checkout where `npm install` was not run yet). The server
+// refuses to start with a clear message instead of crashing the app.
+let selfsigned = null;
+try { selfsigned = require('selfsigned'); } catch (e) { selfsigned = null; }
 
 // Same scrypt parameters as the vault (vault.js).
 const SCRYPT_OPTS = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
@@ -52,6 +56,9 @@ function defaultServerConfig() {
 
 function ensureCert(cfg) {
   if (cfg.cert && cfg.cert.cert && cfg.cert.key && cfg.cert.fingerprint) return cfg.cert;
+  if (!selfsigned) {
+    throw new Error('The "selfsigned" package is not installed. Run "npm install" in the project folder, then start the server again.');
+  }
   const attrs = [{ name: 'commonName', value: os.hostname() || 'TechVision-Cloud' }];
   const pems = selfsigned.generate(attrs, { days: 3650, keySize: 2048, algorithm: 'sha256' });
   cfg.cert = {
