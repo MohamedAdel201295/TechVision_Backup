@@ -783,6 +783,11 @@ ipcMain.handle('job-get-active', async () => {
 
 ipcMain.handle('job-clear-history', async () => {
   jobHistory.length = 0;
+  // Persist the clear: before this, the in-memory list was emptied but
+  // history.json was never rewritten, so all the history came back
+  // after a restart. Job definition files (<id>.json) are untouched,
+  // so the jobs themselves survive — only their run history is gone.
+  saveJobHistory();
   return { success: true };
 });
 
