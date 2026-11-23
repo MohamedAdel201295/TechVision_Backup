@@ -65,6 +65,7 @@ function normalizeJobObject(job, defaultType = 'full') {
     size: job.size ?? 0,
     duration: job.duration ?? 0,
     result: job.result || null,
+    jobId: job.jobId || null,
     // Settings must survive load/save: the wizard saves compress,
     // compression and schedule, but normalize used to drop them, so
     // a Run from History always ran with the defaults (compressed,
@@ -104,8 +105,10 @@ function mergeJobEntries(entries) {
   }
   for (const entry of entries) {
     if (!entry) continue;
-    const key = (entry.name || 'Unnamed Job').toLowerCase();
     const isRunRecord = (entry.type === 'full' || entry.type === 'incremental') && !entry.loaded;
+    // Key by id, not by name: two jobs may share a name and must stay
+    // two separate tasks. Run records carry jobId; templates carry id.
+    const key = (isRunRecord ? (entry.jobId || entry.name) : (entry.id || entry.name) || 'Unnamed Job').toLowerCase();
     let job = byName.get(key);
     if (!job) {
       job = normalizeJobObject(entry, isRunRecord ? 'full' : 'template');
@@ -153,7 +156,8 @@ function mergeJobEntries(entries) {
 
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
-  let job = jobHistory.find(j => (j.name || '').toLowerCase() === key);
+  let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
+  if (!job) job = jobHistory.find(j => (j.name || '').toLowerCase() === key);
   if (!job) {
     job = normalizeJobObject({ name: jobName, type: 'full', status: 'pending' });
     job.runs = [];
@@ -561,6 +565,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   
   const jobRecord = {
     id: jobId,
+    jobId: jobConfig.id || null,
     name: jobName,
     type: 'full',
     success: result.success,
@@ -595,6 +600,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   
   const jobRecord = {
     id: jobId,
+    jobId: jobConfig.id || null,
     name: jobName,
     type: 'incremental',
     success: result.success,
@@ -780,11 +786,17 @@ ipcMain.handle('job-get-config', async (event, jobId) => {
     pendingRestoreJob = null;
     if (pending) return pending;
   }
-  const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
+  const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
+  const jobPath = path.join(jobsDir, `${jobId}.json`);
   try {
     if (fs.existsSync(jobPath)) {
       const content = fs.readFileSync(jobPath, 'utf-8');
       return JSON.parse(content);
+    }
+    // Old configs were saved by name (<name>.json), not by id.
+    if (typeof jobId === 'string' && jobId.startsWith('job-')) {
+      const byName = path.join(jobsDir, `${jobId.slice(4)}.json`);
+      if (fs.existsSync(byName)) return JSON.parse(fs.readFileSync(byName, 'utf-8'));
     }
     return null;
   } catch (e) {
@@ -797,9 +809,17 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
   if (!fs.existsSync(jobsDir)) {
     fs.mkdirSync(jobsDir, { recursive: true });
   }
-  const jobPath = path.join(jobsDir, `${jobConfig.name}.json`);
+  const fileId = jobConfig.id || ('job-' + jobConfig.name);
+  jobConfig.id = fileId;
+  const jobPath = path.join(jobsDir, `${fileId}.json`);
   try {
     fs.writeFileSync(jobPath, JSON.stringify(jobConfig, null, 2));
+    // Migration: old configs were saved by name (<name>.json). If one
+    // exists for this job, remove it so it is not loaded as a second job.
+    const oldNamePath = path.join(jobsDir, `${jobConfig.name}.json`);
+    if (oldNamePath !== jobPath && fs.existsSync(oldNamePath)) {
+      try { fs.unlinkSync(oldNamePath); } catch (e) {}
+    }
     console.log(`[Main] Job saved to: ${jobPath}`);
     // The template only entered the list on the next startup before:
     // add it to the in-memory history now so Create Job shows it at once.
@@ -808,7 +828,8 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
       type: 'TEMPLATE', status: 'PENDING', loaded: true
     }));
     if (tpl) {
-      const existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
+      let existing = jobHistory.findIndex(j => j.id === tpl.id);
+      if (existing < 0) existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
       if (existing >= 0) {
         // Keep the job's run history: a re-save must not wipe its runs.
         tpl.runs = jobHistory[existing].runs || [];
