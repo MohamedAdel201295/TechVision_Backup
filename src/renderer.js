@@ -389,6 +389,8 @@
     $('drawerSource').textContent = job.source || '—';
     $('drawerDest').textContent = job.destination || '—';
     $('drawerType').textContent = job.type;
+    var enc = job.encryptionEnabled === true || (job.raw && job.raw.encryptionEnabled === true);
+    if ($('drawerEncryption')) $('drawerEncryption').textContent = enc ? 'AES-256 🔒' : 'Off';
     $('drawerStatus').textContent = job.status;
     $('drawerFiles').textContent = String(job.files);
     $('drawerSize').textContent = formatBytes(job.size);
@@ -477,22 +479,60 @@
   }
 
   /* ---------- backup / restore actions ---------- */
+  // Ask for a job password in a modal. Resolves to the password, or
+  // null when the user cancels.
+  function askJobPassword(jobName) {
+    return new Promise(function (resolve) {
+      var modal = $('jobPwModal'); var back = $('jobPwBackdrop');
+      var input = $('jobPwInput');
+      $('jobPwText').textContent = 'Job "' + jobName + '" is encrypted and its password is not saved in the vault. Enter the backup password to run it.';
+      input.value = '';
+      modal.style.display = 'block'; back.classList.add('show');
+      setTimeout(function () { input.focus(); }, 50);
+      function done(value) {
+        modal.style.display = 'none'; back.classList.remove('show');
+        $('jobPwRun').onclick = null; $('jobPwCancel').onclick = null; input.onkeydown = null;
+        resolve(value);
+      }
+      $('jobPwRun').onclick = function () { done(input.value || null); };
+      $('jobPwCancel').onclick = function () { done(null); };
+      input.onkeydown = function (ev) { if (ev.key === 'Enter') done(input.value || null); };
+    });
+  }
   async function runBackup(job, incremental) {
     if (!job) return;
     if (!api || typeof api.runFullBackup !== 'function') { toast('Backup unavailable', 'Backup API is not available.', 'error'); return; }
+    var cfg = job.raw || job;
+    // Encrypted job whose password is not in the vault: ask now, and
+    // pass it for this run only (main.js stores it if the vault is open).
+    if (cfg.encryptionEnabled === true) {
+      var hasPw = false;
+      if (api && typeof api.vaultHasJobPassword === 'function') {
+        try { var hr = await api.vaultHasJobPassword(cfg.id); hasPw = !!(hr && hr.has); } catch (e) {}
+      }
+      if (!hasPw) {
+        var pw = await askJobPassword(job.name || cfg.name || 'backup job');
+        if (!pw) return; // cancelled
+        cfg = Object.assign({}, cfg, { encryptionPassword: pw });
+      }
+    }
     closeDrawer();
     showProgress(incremental ? 'Running incremental backup…' : 'Running full backup…');
     var stop = simulateProgress();
     try {
       var result = incremental && typeof api.runIncrementalBackup === 'function'
-        ? await api.runIncrementalBackup(job.raw || job)
-        : await api.runFullBackup(job.raw || job);
+        ? await api.runIncrementalBackup(cfg)
+        : await api.runFullBackup(cfg);
       stop();
       setProgress(100, result && result.files, result && result.size);
       var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
       setTimeout(function () { hideProgress(); }, 900);
       if (result && (result.success === false || result.status === 'failed')) {
-        toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
+        if (result.error === 'ENCRYPTION_PASSWORD_REQUIRED') {
+          toast('Password required', 'This job is encrypted and no password is saved. Unlock the vault in Settings, or run it and enter the password when asked.', 'error');
+        } else {
+          toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
+        }
       } else {
         toast('Backup completed', job.name + ' — ' + files + ' file' + (files === 1 ? '' : 's') + ' backed up.', 'success');
       }
@@ -544,6 +584,36 @@
     await loadJobs();
   }
 
+  /* ---------- master-password vault ---------- */
+  async function refreshVaultStatus() {
+    var txt = $('vaultStatusText'); if (!txt) return;
+    if (!api || typeof api.vaultStatus !== 'function') { txt.textContent = 'Vault API is not available.'; return; }
+    try {
+      var st = await api.vaultStatus();
+      txt.textContent = !st.exists
+        ? 'No master password set up yet.'
+        : (st.locked ? 'Vault is set up and locked.' : 'Vault is unlocked for this session.');
+      if ($('vaultSetupBox')) $('vaultSetupBox').style.display = st.exists ? 'none' : 'block';
+      if ($('vaultChangeBox')) $('vaultChangeBox').style.display = st.exists ? 'block' : 'none';
+    } catch (e) { txt.textContent = 'Could not read the vault status.'; }
+  }
+  async function checkVaultOnStartup() {
+    if (!api || typeof api.vaultStatus !== 'function') return;
+    try {
+      var st = await api.vaultStatus();
+      if (st.exists && st.locked) {
+        $('vaultModal').style.display = 'block';
+        $('vaultBackdrop').classList.add('show');
+        setTimeout(function () { var i = $('vaultUnlockPass'); if (i) i.focus(); }, 50);
+      }
+    } catch (e) { /* vault stays locked; encrypted runs will ask instead */ }
+  }
+  function hideVaultModal() {
+    $('vaultModal').style.display = 'none';
+    $('vaultBackdrop').classList.remove('show');
+    var e = $('vaultUnlockError'); if (e) e.classList.remove('show');
+  }
+
   /* ---------- wiring ---------- */
   document.addEventListener('DOMContentLoaded', function () {
     var nnj = $('navNewJob'); if (nnj) nnj.addEventListener('click', function () { openJobWizard(null); });
@@ -563,7 +633,49 @@
         try { await api.saveSettings(Object.assign({}, settings, { theme: next })); settings.theme = next; } catch (e) { /* theme already applied visually */ }
       }
     });
-    $('settingsBtn').addEventListener('click', openSettings);
+    $('settingsBtn').addEventListener('click', function () { openSettings(); refreshVaultStatus(); });
+    var vsb = $('vaultSetupBtn');
+    if (vsb) vsb.addEventListener('click', async function () {
+      var p1 = $('vaultNewPass').value, p2 = $('vaultNewPassConfirm').value;
+      if (p1.length < 8) { toast('Password too short', 'The master password must be at least 8 characters.', 'warning'); return; }
+      if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same master password.', 'warning'); return; }
+      try {
+        var r = await api.vaultSetup(p1);
+        if (r && r.success) { $('vaultNewPass').value = ''; $('vaultNewPassConfirm').value = ''; toast('Vault set up', 'Master password saved. The vault is unlocked for this session.', 'success'); }
+        else toast('Setup failed', (r && r.error) || 'Could not set up the vault.', 'error');
+      } catch (e) { toast('Setup failed', e && e.message ? e.message : 'Could not set up the vault.', 'error'); }
+      refreshVaultStatus();
+    });
+    var vcb = $('vaultChangeBtn');
+    if (vcb) vcb.addEventListener('click', async function () {
+      var oldP = $('vaultOldPass').value, p1 = $('vaultChangeNew').value, p2 = $('vaultChangeConfirm').value;
+      if (p1.length < 8) { toast('Password too short', 'The new master password must be at least 8 characters.', 'warning'); return; }
+      if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same new master password.', 'warning'); return; }
+      try {
+        var r = await api.vaultChangePassword(oldP, p1);
+        if (r && r.success) { $('vaultOldPass').value = ''; $('vaultChangeNew').value = ''; $('vaultChangeConfirm').value = ''; toast('Master password changed', 'The vault was re-encrypted with the new master password.', 'success'); }
+        else toast('Change failed', (r && r.error) || 'Could not change the master password.', 'error');
+      } catch (e) { toast('Change failed', e && e.message ? e.message : 'Could not change the master password.', 'error'); }
+      refreshVaultStatus();
+    });
+    var vlb = $('vaultLockBtn');
+    if (vlb) vlb.addEventListener('click', async function () {
+      try { await api.vaultLock(); toast('Vault locked', 'Job passwords are locked until you unlock the vault again.', ''); } catch (e) {}
+      refreshVaultStatus();
+    });
+    var vub = $('vaultUnlockBtn');
+    if (vub) vub.addEventListener('click', async function () {
+      var pw = $('vaultUnlockPass').value;
+      try {
+        var r = await api.vaultUnlock(pw);
+        if (r && r.success) { $('vaultUnlockPass').value = ''; hideVaultModal(); toast('Vault unlocked', 'Scheduled encrypted backups can run again.', 'success'); }
+        else { $('vaultUnlockError').classList.add('show'); }
+      } catch (e) { $('vaultUnlockError').classList.add('show'); }
+    });
+    var vus = $('vaultUnlockSkip');
+    if (vus) vus.addEventListener('click', hideVaultModal);
+    var vup = $('vaultUnlockPass');
+    if (vup) vup.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); $('vaultUnlockBtn').click(); } });
     $('settingsClose').addEventListener('click', closeSettings);
     $('settingsBackdrop').addEventListener('click', closeSettings);
     $('settingsSave').addEventListener('click', async function () { await saveSettings(); closeSettings(); });
@@ -630,6 +742,6 @@
     });
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); } });
 
-    loadSettings().then(loadJobs);
+    loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
   });
 })();
