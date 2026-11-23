@@ -125,10 +125,13 @@
       return div.outerHTML;
     }).join('');
   }
-  async function pickFolder(targetId) {
+  async function pickFolder(targetId, allowFile) {
     if (!api || typeof api.showOpenDialog !== 'function') { toast('Browse unavailable', 'Folder picker API is not available.', 'error'); return; }
     try {
-      var result = await api.showOpenDialog({ properties: ['openDirectory'] });
+      // Source may be a folder OR a single file — whichever the user
+      // picks. Destination stays folder-only.
+      var props = allowFile ? ['openFile', 'openDirectory'] : ['openDirectory'];
+      var result = await api.showOpenDialog({ properties: props });
       var path = null;
       if (typeof result === 'string') path = result;
       else if (result && Array.isArray(result.filePaths) && result.filePaths.length) path = result.filePaths[0];
@@ -197,7 +200,7 @@
   function wireWizard() {
     if (wireWizard.done) return; wireWizard.done = true;
     function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
-    on('browseSource', 'click', function () { pickFolder('sourceDir'); });
+    on('browseSource', 'click', function () { pickFolder('sourceDir', true); });
     on('browseDest', 'click', function () { pickFolder('destDir'); });
     on('addPatternBtn', 'click', addPattern);
     on('patternInput', 'keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
