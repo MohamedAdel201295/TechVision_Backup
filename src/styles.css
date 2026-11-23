@@ -465,3 +465,26 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .settings-guide ul { margin:0 0 4px; padding-left:18px; }
 .settings-guide li { margin:3px 0; color:var(--muted); }
 .settings-guide li b { color:var(--text); font-weight:600; }
+
+/* ---------- TechVision Cloud ---------- */
+.cloud-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.cloud-mode-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 18px; text-align: left; cursor: pointer; color: var(--text); font: inherit;
+  transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+}
+.cloud-mode-card:hover { transform: translateY(-3px); box-shadow: var(--shadow); border-color: rgba(14, 165, 233, .4); }
+.cloud-mode-ico { font-size: 26px; }
+.cloud-mode-title { font-weight: 700; font-size: 15px; margin-top: 8px; }
+.cloud-mode-sub { color: var(--muted); font-size: 12.5px; margin-top: 4px; line-height: 1.5; }
+.cloud-mode-status { margin-top: 10px; font-size: 12px; font-weight: 600; color: var(--accent); }
+.cloud-muted { color: var(--muted); font-size: 12.5px; }
+.cloud-status-row { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+.cloud-browser-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.cloud-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; font-size: 13px; }
+.cloud-crumb { background: none; border: none; color: var(--accent); font: inherit; font-weight: 600; cursor: pointer; padding: 2px 4px; border-radius: 6px; }
+.cloud-crumb:hover { background: var(--hover); }
+.cloud-crumb-sep { color: var(--muted-2); }
+.cloud-browser-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.cloud-transfer { margin: 4px 0 12px; }
+.cloud-transfer .progress-track { margin: 0 0 6px; }

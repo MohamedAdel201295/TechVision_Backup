@@ -11,6 +11,8 @@ const { RestoreEngine } = require('./restore.js');
 const mailer = require('./mailer.js');
 const vault = require('./vault.js');
 const driveResolver = require('./drive-resolver.js');
+const cloudServerMod = require('./cloud-server.js');
+const cloudClient = require('./cloud-client.js');
 // How long a due scheduled job waits for a missing removable drive
 // before it is recorded as failed (and emailed about): 2 hours.
 const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
@@ -18,6 +20,49 @@ const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
 // the vault is unlocked. Nothing about the master password or any job
 // password is ever written to disk in the clear.
 let vaultKey = null;
+
+// ---------- TechVision Cloud ----------
+// Config file: <userData>/.techvision/cloud.json — { server, clients }.
+// The server instance holds a reference to this object, so user edits
+// apply without a restart (except port changes, which restart it).
+let cloudConfig = null;
+function cloudConfigPath() {
+  return path.join(app.getPath('userData'), '.techvision', 'cloud.json');
+}
+function getCloudConfig() {
+  if (cloudConfig) return cloudConfig;
+  try {
+    const p = cloudConfigPath();
+    if (fs.existsSync(p)) cloudConfig = JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch (e) { cloudConfig = null; }
+  if (!cloudConfig || typeof cloudConfig !== 'object') cloudConfig = {};
+  if (!cloudConfig.server || typeof cloudConfig.server !== 'object') cloudConfig.server = cloudServerMod.defaultServerConfig();
+  if (!Array.isArray(cloudConfig.clients)) cloudConfig.clients = [];
+  return cloudConfig;
+}
+function saveCloudConfig() {
+  try {
+    const dir = path.join(app.getPath('userData'), '.techvision');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmp = cloudConfigPath() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(getCloudConfig(), null, 2));
+    fs.renameSync(tmp, cloudConfigPath());
+  } catch (e) { console.error('[Main] Could not save cloud config:', e.message); }
+}
+let cloudServer = null;
+function getCloudServer() {
+  if (!cloudServer) {
+    cloudServer = new cloudServerMod.CloudServer({
+      config: getCloudConfig(),
+      onConfigChange: () => saveCloudConfig(),
+      log: (level, message) => appendAppLog(level, message),
+    });
+  }
+  return cloudServer;
+}
+// Client sessions live in main only (tokens never reach the renderer):
+// serverId -> { host, port, certPem, token, user, root, canWrite }
+const cloudSessions = new Map();
 
 const isDevelopment = !app.isPackaged;
 
@@ -563,6 +608,13 @@ app.whenReady().then(() => {
   applyAutoStart(); // Start with Windows, installed or portable
   createMainWindow();
   createTray(); // Keep running in the tray after the window closes
+  // Cloud server: start it if it was left enabled — it must keep
+  // serving while the app lives in the tray.
+  try {
+    if (getCloudConfig().server && getCloudConfig().server.enabled) {
+      getCloudServer().start().catch((e) => appendAppLog('error', '[Cloud] Auto-start failed: ' + (e && e.message ? e.message : e)));
+    }
+  } catch (e) {}
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -1390,6 +1442,229 @@ ipcMain.handle('vault-unlock', async (event, masterPassword) => {
 ipcMain.handle('vault-lock', async () => {
   vaultKey = null;
   return { success: true };
+});
+
+// ---------- TechVision Cloud ----------
+// Config + server status. Passwords and the server private key never
+// leave main; the renderer only sees public config and user names.
+ipcMain.handle('cloud-get-config', async () => {
+  const cfg = getCloudConfig();
+  const srv = getCloudServer();
+  return {
+    server: {
+      enabled: !!cfg.server.enabled,
+      port: cfg.server.port || 8443,
+      running: srv.isRunning(),
+      users: srv.listUsers(),
+      fingerprint: cfg.server.cert ? cfg.server.cert.fingerprint : null,
+    },
+    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null })),
+  };
+});
+
+ipcMain.handle('cloud-detect-ip', async () => {
+  const [publicIP, lanIPs] = await Promise.all([
+    cloudServerMod.detectPublicIP(),
+    Promise.resolve(cloudServerMod.lanIPs()),
+  ]);
+  return { publicIP, lanIPs };
+});
+
+ipcMain.handle('cloud-server-save', async (event, opts) => {
+  const cfg = getCloudConfig();
+  const port = parseInt(opts && opts.port, 10);
+  if (!port || port < 1 || port > 65535) return { success: false, error: 'Port must be between 1 and 65535.' };
+  const wasRunning = getCloudServer().isRunning();
+  const portChanged = cfg.server.port !== port;
+  cfg.server.enabled = !!(opts && opts.enabled);
+  cfg.server.port = port;
+  saveCloudConfig();
+  try {
+    if (wasRunning && portChanged) {
+      await getCloudServer().stop();
+      if (cfg.server.enabled) await getCloudServer().start();
+    } else if (cfg.server.enabled && !wasRunning) {
+      await getCloudServer().start();
+    } else if (!cfg.server.enabled && wasRunning) {
+      await getCloudServer().stop();
+    }
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+  return { success: true, status: getCloudServer().status() };
+});
+
+ipcMain.handle('cloud-server-start', async () => {
+  try {
+    const cfg = getCloudConfig();
+    cfg.server.enabled = true;
+    saveCloudConfig();
+    return { success: true, status: await getCloudServer().start() };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-server-stop', async () => {
+  try {
+    const cfg = getCloudConfig();
+    cfg.server.enabled = false;
+    saveCloudConfig();
+    return { success: true, status: await getCloudServer().stop() };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-user-add', async (event, u) => {
+  try {
+    const user = getCloudServer().addUser(u.name, u.password, u.root, u.canWrite);
+    return { success: true, user };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-user-remove', async (event, name) => {
+  try {
+    getCloudServer().removeUser(name);
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-user-set-password', async (event, name, password) => {
+  try {
+    getCloudServer().setUserPassword(name, password);
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Saved servers (client side). Passwords are never stored here.
+ipcMain.handle('cloud-client-save', async (event, s) => {
+  try {
+    const cfg = getCloudConfig();
+    const host = String(s.host || '').trim();
+    const port = parseInt(s.port, 10);
+    if (!host) return { success: false, error: 'Server address is required.' };
+    if (!port || port < 1 || port > 65535) return { success: false, error: 'Port must be between 1 and 65535.' };
+    const id = s.id || ('srv-' + Date.now());
+    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null };
+    // Same host + port + user is the same server: update it in place
+    // instead of adding a duplicate row every time it is saved again.
+    let i = cfg.clients.findIndex((c) => c.id === id);
+    if (i < 0) i = cfg.clients.findIndex((c) => c.host === host && c.port === port && c.user === rec.user);
+    if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
+    else cfg.clients.push(rec);
+    saveCloudConfig();
+    return { success: true, id };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-client-remove', async (event, id) => {
+  const cfg = getCloudConfig();
+  cfg.clients = cfg.clients.filter((c) => c.id !== id);
+  cloudSessions.delete(id);
+  saveCloudConfig();
+  return { success: true };
+});
+
+// First contact: read the presented certificate (nothing sensitive sent).
+ipcMain.handle('cloud-client-probe', async (event, host, port) => {
+  try {
+    const p = await cloudClient.probeServer(String(host), parseInt(port, 10));
+    return { success: true, fingerprint: p.fingerprint, certPem: p.certPem };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-client-connect', async (event, opts) => {
+  try {
+    const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, opts.password);
+    const info = await cloudClient.info(conn);
+    cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
+    return { success: true, info };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
+  cloudSessions.delete(serverId);
+  return { success: true };
+});
+
+ipcMain.handle('cloud-client-list', async (event, serverId, relPath) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try {
+    const r = await cloudClient.list(conn, relPath || '');
+    return { success: true, path: r.path, entries: r.entries };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-client-download', async (event, serverId, relPath, destDir) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  const dest = path.join(destDir, path.basename(relPath));
+  try {
+    const r = await cloudClient.download(conn, relPath, dest, (done, total) => {
+      try {
+        if (event.sender && !event.sender.isDestroyed()) {
+          event.sender.send('cloud-progress', { kind: 'download', pct: total ? Math.min(99, 99 * done / total) : 0, done, total, name: path.basename(relPath) });
+        }
+      } catch (e) {}
+    });
+    return { success: true, dest, size: r.size };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-client-upload', async (event, serverId, localPath, remoteDir) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try {
+    const r = await cloudClient.upload(conn, localPath, remoteDir || '', (sent, total) => {
+      try {
+        if (event.sender && !event.sender.isDestroyed()) {
+          event.sender.send('cloud-progress', { kind: 'upload', pct: total ? Math.min(99, 99 * sent / total) : 0, done: sent, total, name: path.basename(localPath) });
+        }
+      } catch (e) {}
+    });
+    return { success: true, name: r.name };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-client-mkdir', async (event, serverId, relPath) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try { await cloudClient.mkdir(conn, relPath); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
+});
+
+ipcMain.handle('cloud-client-delete', async (event, serverId, relPath) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try { await cloudClient.remove(conn, relPath); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
+});
+
+ipcMain.handle('cloud-client-rename', async (event, serverId, from, to) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try { await cloudClient.rename(conn, from, to); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {

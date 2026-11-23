@@ -11,12 +11,13 @@
   },
   "dependencies": {
     "archiver": "^7.0.1",
+    "archiver-zip-encrypted": "^2.0.0",
+    "bytenode": "^2.1.0",
     "crypto-js": "^4.2.0",
     "date-fns": "^3.6.0",
     "nodemailer": "^6.9.14",
-    "yauzl": "^3.4.0",
-    "archiver-zip-encrypted": "^2.0.0",
-    "bytenode": "^2.1.0"
+    "selfsigned": "^3.0.1",
+    "yauzl": "^3.4.0"
   },
   "devDependencies": {
     "electron": "^32.0.0",

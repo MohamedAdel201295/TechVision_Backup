@@ -270,16 +270,18 @@
 
   /* ---------- views: Dashboard / Jobs ---------- */
   function showView(name) {
-    var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs');
+    var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
     if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
+    if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
     if (btn) btn.classList.add('active');
     if (name === 'jobs') renderJobsView();
     if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
     else stopLogsAutoRefresh();
+    if (name === 'cloud') loadCloud();
   }
   function startLogsAutoRefresh() {
     stopLogsAutoRefresh();
@@ -502,6 +504,422 @@
       });
       list.appendChild(card);
     });
+  }
+
+  /* ---------- TechVision Cloud ---------- */
+  var cloudCfg = null;           // last cloud-get-config result
+  var cloudPanel = 'home';       // 'home' | 'server' | 'client'
+  var cloudSelected = null;      // saved server record being connected to
+  var cloudPendingProbe = null;  // { fingerprint, certPem } awaiting trust
+  var cloudConn = null;          // { serverId, info } while connected
+  var cloudPath = '';            // current remote path, '' = root, '/' separators
+  var cloudTransferTimer = null;
+
+  function cloudMissing() {
+    toast('Cloud unavailable', 'Cloud API is not available in this build.', 'error');
+    return true;
+  }
+
+  async function loadCloud() {
+    if (!api || typeof api.cloudGetConfig !== 'function') return;
+    try {
+      cloudCfg = await api.cloudGetConfig();
+      renderCloudHome();
+      if (cloudPanel === 'server') renderCloudServer();
+      if (cloudPanel === 'client') renderCloudClientList();
+    } catch (e) {
+      toast('Cloud', e && e.message ? e.message : 'Could not load Cloud settings.', 'error');
+    }
+  }
+
+  function showCloudPanel(panel) {
+    cloudPanel = panel;
+    var modes = $('cloudModes'); if (modes) modes.style.display = panel === 'home' ? '' : 'none';
+    var sp = $('cloudServerPanel'); if (sp) sp.style.display = panel === 'server' ? '' : 'none';
+    var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
+    if (panel === 'server') renderCloudServer();
+    if (panel === 'client') renderCloudClientList();
+  }
+
+  function renderCloudHome() {
+    if (!cloudCfg) return;
+    var s = cloudCfg.server || {};
+    var ss = $('cloudServerModeStatus');
+    if (ss) ss.textContent = s.running ? ('Running — port ' + (s.port || 8443)) : 'Stopped';
+    var cs = $('cloudClientModeStatus');
+    if (cs) cs.textContent = cloudConn ? ('Connected as ' + (cloudConn.info.user || '') + ' @ ' + (cloudSelected ? cloudSelected.name : '')) : 'Not connected';
+  }
+
+  function renderCloudServer() {
+    if (!cloudCfg) return;
+    var s = cloudCfg.server || {};
+    var pill = $('cloudServerPill');
+    if (pill) {
+      pill.textContent = s.running ? 'Running' : 'Stopped';
+      pill.className = 'pill ' + (s.running ? 'pill-completed' : 'pill-pending');
+    }
+    var info = $('cloudServerInfo');
+    if (info) {
+      info.textContent = s.running
+        ? ('Listening on port ' + (s.port || 8443) + ' — ' + (s.users || []).length + ' user(s)' + (s.fingerprint ? ' — fingerprint ' + s.fingerprint.slice(0, 16) + '…' : ''))
+        : 'Not running';
+    }
+    var en = $('cloudServerEnabled'); if (en) en.checked = !!s.enabled;
+    var port = $('cloudServerPort'); if (port) port.value = String(s.port || 8443);
+    var gp = $('cloudGuidePort'); if (gp) gp.textContent = String(s.port || 8443);
+    var startBtn = $('cloudServerStartBtn');
+    if (startBtn) startBtn.textContent = s.running ? '■ Stop server' : '▶ Start server';
+    var list = $('cloudUsersList');
+    if (list) {
+      list.innerHTML = '';
+      var users = s.users || [];
+      if (!users.length) {
+        var empty = document.createElement('div');
+        empty.className = 'empty-state'; empty.style.display = '';
+        empty.innerHTML = '<div class="big">👤</div><h3>No users yet</h3><p>Add at least one user before anyone can connect.</p>';
+        list.appendChild(empty);
+      }
+      users.forEach(function (u) {
+        var card = document.createElement('div');
+        card.className = 'job-card';
+        var body = document.createElement('div'); body.className = 'job-body';
+        var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = u.name;
+        var meta = document.createElement('div'); meta.className = 'job-meta';
+        meta.textContent = (u.canWrite ? 'Read + write' : 'Read-only') + ' — ' + u.root;
+        var acts = document.createElement('div'); acts.className = 'drawer-actions';
+        var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete user';
+        del.addEventListener('click', function () {
+          askConfirm('Delete user "' + u.name + '"? They will no longer be able to connect.', async function () {
+            if (!api || typeof api.cloudUserRemove !== 'function') return cloudMissing();
+            try {
+              var r = await api.cloudUserRemove(u.name);
+              if (r && r.success) { toast('User deleted', u.name + ' was removed.', 'success'); await loadCloud(); }
+              else toast('Delete failed', (r && r.error) || 'Could not delete user.', 'error');
+            } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete user.', 'error'); }
+          });
+        });
+        acts.appendChild(del);
+        body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
+        card.appendChild(body);
+        list.appendChild(card);
+      });
+    }
+  }
+
+  function renderCloudClientList() {
+    if (!cloudCfg) return;
+    var list = $('cloudServersList');
+    if (!list) return;
+    list.innerHTML = '';
+    var servers = cloudCfg.clients || [];
+    if (!servers.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty-state'; empty.style.display = '';
+      empty.innerHTML = '<div class="big">☁️</div><h3>No servers yet</h3><p>Add the server you want to open below.</p>';
+      list.appendChild(empty);
+    }
+    servers.forEach(function (srv) {
+      var card = document.createElement('div');
+      card.className = 'job-card';
+      var body = document.createElement('div'); body.className = 'job-body';
+      var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = srv.name;
+      var meta = document.createElement('div'); meta.className = 'job-meta';
+      meta.textContent = srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet');
+      var acts = document.createElement('div'); acts.className = 'drawer-actions';
+      var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open';
+      open.addEventListener('click', function () { openCloudConnect(srv); });
+      var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Remove';
+      del.addEventListener('click', function () {
+        askConfirm('Remove server "' + srv.name + '" from the list?', async function () {
+          if (!api || typeof api.cloudClientRemove !== 'function') return cloudMissing();
+          try { await api.cloudClientRemove(srv.id); await loadCloud(); }
+          catch (e) { toast('Remove error', e && e.message ? e.message : 'Could not remove server.', 'error'); }
+        });
+      });
+      acts.appendChild(open); acts.appendChild(del);
+      body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
+      card.appendChild(body);
+      list.appendChild(card);
+    });
+  }
+
+  function openCloudConnect(srv) {
+    cloudSelected = srv;
+    cloudPendingProbe = null;
+    var box = $('cloudConnectBox'); if (box) box.style.display = '';
+    var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name;
+    var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
+    var pass = $('cloudConnectPass'); if (pass) pass.value = '';
+    var btn = $('cloudConnectBtn'); if (btn) btn.textContent = 'Connect';
+    if (box) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function closeCloudConnect() {
+    var box = $('cloudConnectBox'); if (box) box.style.display = 'none';
+    cloudSelected = null;
+    cloudPendingProbe = null;
+  }
+
+  async function cloudConnectFlow() {
+    if (!cloudSelected) return;
+    if (!api || typeof api.cloudClientProbe !== 'function' || typeof api.cloudClientConnect !== 'function') return cloudMissing();
+    var btn = $('cloudConnectBtn');
+    var pass = $('cloudConnectPass');
+    var password = pass ? pass.value : '';
+    // No trusted certificate yet: probe the server and ask the user to
+    // trust its fingerprint first (nothing sensitive is sent to probe).
+    if (!cloudSelected.fingerprint) {
+      if (cloudPendingProbe) {
+        // User already saw the fingerprint and pressed Trust & connect.
+        try {
+          if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+          var saved = await api.cloudClientSave({
+            id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
+            port: cloudSelected.port, user: cloudSelected.user,
+            fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
+          });
+          if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
+          cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
+          cloudSelected.certPem = cloudPendingProbe.certPem;
+          var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
+          await loadCloud();
+        } catch (e) {
+          toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error');
+          return;
+        } finally {
+          if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+        }
+      } else {
+        try {
+          if (btn) { btn.disabled = true; btn.textContent = 'Checking server…'; }
+          var probe = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
+          if (!probe || !probe.success) { toast('Cannot reach server', (probe && probe.error) || 'Check the address and port.', 'error'); return; }
+          cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
+          var ft = $('cloudFingerprintText'); if (ft) ft.textContent = probe.fingerprint;
+          var fbox = $('cloudFingerprintBox'); if (fbox) fbox.style.display = '';
+          if (btn) btn.textContent = 'Trust & connect';
+          toast('Check the fingerprint', 'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
+        } catch (e) {
+          toast('Cannot reach server', e && e.message ? e.message : 'Check the address and port.', 'error');
+        } finally {
+          // A failed probe must leave the button usable again, with its
+          // normal label — otherwise it stays stuck on "Checking server…".
+          if (btn) { btn.disabled = false; if (btn.textContent === 'Checking server…') btn.textContent = 'Connect'; }
+        }
+        return;
+      }
+    }
+    // Trusted certificate: connect with the password.
+    if (!password) { toast('Password needed', 'Enter the password for user ' + (cloudSelected.user || '') + '.', 'error'); return; }
+    try {
+      if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
+      var certPem = cloudSelected.certPem;
+      if (!certPem) {
+        // Fingerprint known but the PEM was saved before this build:
+        // re-probe once to get it (the fingerprint must match).
+        var p2 = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
+        if (!p2 || !p2.success || p2.fingerprint !== cloudSelected.fingerprint) {
+          toast('Certificate changed', 'The server certificate does not match the trusted fingerprint. Remove the server and add it again.', 'error');
+          return;
+        }
+        certPem = p2.certPem;
+      }
+      var r = await api.cloudClientConnect({
+        serverId: cloudSelected.id, host: cloudSelected.host, port: cloudSelected.port,
+        certPem: certPem, user: cloudSelected.user, password: password,
+      });
+      if (!r || !r.success) { toast('Connection failed', (r && r.error) || 'Wrong user name or password.', 'error'); return; }
+      cloudConn = { serverId: cloudSelected.id, info: r.info };
+      if (pass) pass.value = '';
+      closeCloudConnect();
+      cloudPath = '';
+      var browser = $('cloudBrowser'); if (browser) browser.style.display = '';
+      toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).'), 'success');
+      renderCloudHome();
+      await cloudBrowse('');
+    } catch (e) {
+      toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+    }
+  }
+
+  async function cloudDisconnect() {
+    if (cloudConn && api && typeof api.cloudClientDisconnect === 'function') {
+      try { await api.cloudClientDisconnect(cloudConn.serverId); } catch (e) {}
+    }
+    cloudConn = null;
+    cloudPath = '';
+    var browser = $('cloudBrowser'); if (browser) browser.style.display = 'none';
+    renderCloudHome();
+  }
+
+  function cloudJoin(base, name) { return base ? base + '/' + name : name; }
+  function cloudParent(p) {
+    var i = p.lastIndexOf('/');
+    return i < 0 ? '' : p.slice(0, i);
+  }
+
+  async function cloudBrowse(relPath) {
+    if (!cloudConn) return;
+    if (!api || typeof api.cloudClientList !== 'function') return cloudMissing();
+    try {
+      var r = await api.cloudClientList(cloudConn.serverId, relPath || '');
+      if (!r || !r.success) { toast('Cannot list folder', (r && r.error) || 'The server refused the request.', 'error'); return; }
+      cloudPath = r.path || '';
+      renderCloudBrowser(r.entries || []);
+    } catch (e) {
+      toast('Cannot list folder', e && e.message ? e.message : 'The server refused the request.', 'error');
+    }
+  }
+
+  function renderCloudBrowser(entries) {
+    var crumbs = $('cloudCrumbs');
+    if (crumbs) {
+      crumbs.innerHTML = '';
+      var rootBtn = document.createElement('button');
+      rootBtn.className = 'cloud-crumb'; rootBtn.type = 'button'; rootBtn.textContent = (cloudSelected ? cloudSelected.name : 'Server') + ' /';
+      rootBtn.addEventListener('click', function () { cloudBrowse(''); });
+      crumbs.appendChild(rootBtn);
+      var parts = cloudPath ? cloudPath.split('/') : [];
+      var acc = '';
+      parts.forEach(function (part, i) {
+        var sep = document.createElement('span'); sep.className = 'cloud-crumb-sep'; sep.textContent = ' › ';
+        crumbs.appendChild(sep);
+        acc = cloudJoin(acc, part);
+        var b = document.createElement('button');
+        b.className = 'cloud-crumb'; b.type = 'button'; b.textContent = part;
+        (function (target) { b.addEventListener('click', function () { cloudBrowse(target); }); })(acc);
+        crumbs.appendChild(b);
+      });
+    }
+    var info = $('cloudBrowserInfo');
+    if (info) info.textContent = (cloudConn && cloudConn.info ? 'Signed in as ' + cloudConn.info.user + (cloudConn.info.canWrite ? ' (read + write)' : ' (read-only)') : '');
+    var list = $('cloudFileList');
+    var empty = $('cloudEmptyState');
+    if (!list) return;
+    list.innerHTML = '';
+    if (!entries.length) { if (empty) empty.style.display = ''; return; }
+    if (empty) empty.style.display = 'none';
+    entries.forEach(function (e) {
+      var card = document.createElement('div');
+      card.className = 'job-card';
+      var body = document.createElement('div'); body.className = 'job-body';
+      var h = document.createElement('h3'); h.className = 'job-name';
+      h.textContent = (e.isDir ? '📁 ' : '📄 ') + e.name;
+      var meta = document.createElement('div'); meta.className = 'job-meta';
+      meta.textContent = e.isDir ? 'Folder' : (formatBytes(e.size) + (e.mtime ? ' — ' + formatDate(e.mtime) : ''));
+      var acts = document.createElement('div'); acts.className = 'drawer-actions';
+      var rel = cloudJoin(cloudPath, e.name);
+      if (e.isDir) {
+        var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open';
+        open.addEventListener('click', function () { cloudBrowse(rel); });
+        acts.appendChild(open);
+        h.style.cursor = 'pointer';
+        h.addEventListener('click', function () { cloudBrowse(rel); });
+      } else {
+        var dl = document.createElement('button'); dl.className = 'btn btn-sm'; dl.type = 'button'; dl.textContent = '⬇ Download';
+        dl.addEventListener('click', function () { cloudDownload(rel); });
+        acts.appendChild(dl);
+      }
+      if (cloudConn && cloudConn.info && cloudConn.info.canWrite) {
+        var ren = document.createElement('button'); ren.className = 'btn btn-sm'; ren.type = 'button'; ren.textContent = '✎ Rename';
+        ren.addEventListener('click', function () {
+          askCloudInput('Rename', 'New name', e.name, async function (val) {
+            if (!val || val === e.name) return;
+            if (!api || typeof api.cloudClientRename !== 'function') return cloudMissing();
+            try {
+              var r = await api.cloudClientRename(cloudConn.serverId, rel, cloudJoin(cloudPath, val));
+              if (r && r.success) { toast('Renamed', e.name + ' → ' + val, 'success'); await cloudBrowse(cloudPath); }
+              else toast('Rename failed', (r && r.error) || 'Could not rename.', 'error');
+            } catch (err) { toast('Rename error', err && err.message ? err.message : 'Could not rename.', 'error'); }
+          });
+        });
+        acts.appendChild(ren);
+        var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete';
+        del.addEventListener('click', function () {
+          askConfirm('Delete "' + e.name + '" from the server? This cannot be undone.', async function () {
+            if (!api || typeof api.cloudClientDelete !== 'function') return cloudMissing();
+            try {
+              var r = await api.cloudClientDelete(cloudConn.serverId, rel);
+              if (r && r.success) { toast('Deleted', e.name + ' was deleted.', 'success'); await cloudBrowse(cloudPath); }
+              else toast('Delete failed', (r && r.error) || 'Could not delete.', 'error');
+            } catch (err) { toast('Delete error', err && err.message ? err.message : 'Could not delete.', 'error'); }
+          });
+        });
+        acts.appendChild(del);
+      }
+      body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
+      card.appendChild(body);
+      list.appendChild(card);
+    });
+  }
+
+  async function cloudDownload(relPath) {
+    if (!cloudConn) return;
+    if (!api || typeof api.showOpenDialog !== 'function' || typeof api.cloudClientDownload !== 'function') return cloudMissing();
+    try {
+      var pick = await api.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
+      if (!pick || pick.canceled || !pick.filePaths || !pick.filePaths.length) return;
+      showCloudTransfer('Downloading…', 0);
+      var r = await api.cloudClientDownload(cloudConn.serverId, relPath, pick.filePaths[0]);
+      hideCloudTransfer();
+      if (r && r.success) toast('Downloaded', relPath.split('/').pop() + ' saved.', 'success');
+      else toast('Download failed', (r && r.error) || 'Could not download.', 'error');
+    } catch (e) {
+      hideCloudTransfer();
+      toast('Download error', e && e.message ? e.message : 'Could not download.', 'error');
+    }
+  }
+
+  async function cloudUpload() {
+    if (!cloudConn) return;
+    if (!api || typeof api.showOpenDialog !== 'function' || typeof api.cloudClientUpload !== 'function') return cloudMissing();
+    try {
+      var pick = await api.showOpenDialog({ properties: ['openFile'] });
+      if (!pick || pick.canceled || !pick.filePaths || !pick.filePaths.length) return;
+      showCloudTransfer('Uploading…', 0);
+      var r = await api.cloudClientUpload(cloudConn.serverId, pick.filePaths[0], cloudPath);
+      hideCloudTransfer();
+      if (r && r.success) { toast('Uploaded', (r.name || 'File') + ' uploaded.', 'success'); await cloudBrowse(cloudPath); }
+      else toast('Upload failed', (r && r.error) || 'Could not upload.', 'error');
+    } catch (e) {
+      hideCloudTransfer();
+      toast('Upload error', e && e.message ? e.message : 'Could not upload.', 'error');
+    }
+  }
+
+  function showCloudTransfer(text, pct) {
+    var box = $('cloudTransfer'); if (box) box.style.display = '';
+    var fill = $('cloudTransferFill'); if (fill) fill.style.width = Math.round(pct || 0) + '%';
+    var t = $('cloudTransferText'); if (t) t.textContent = text;
+    if (cloudTransferTimer) { clearTimeout(cloudTransferTimer); cloudTransferTimer = null; }
+  }
+
+  function hideCloudTransfer() {
+    var box = $('cloudTransfer'); if (box) box.style.display = 'none';
+    var fill = $('cloudTransferFill'); if (fill) fill.style.width = '0%';
+  }
+
+  /* ---------- small input dialog (same pattern as askConfirm) ---------- */
+  var cloudPromptCallback = null;
+  function askCloudInput(title, label, defaultValue, onOk) {
+    var modal = $('cloudPromptModal'); var back = $('cloudPromptBackdrop');
+    if (!modal) { var v = window.prompt(label, defaultValue); if (v !== null) onOk(v); return; }
+    $('cloudPromptTitle').textContent = title;
+    $('cloudPromptText').textContent = '';
+    $('cloudPromptLabel').textContent = label;
+    var input = $('cloudPromptInput'); input.value = defaultValue || '';
+    cloudPromptCallback = onOk;
+    modal.style.display = 'block';
+    if (back) back.classList.add('show');
+    setTimeout(function () { input.focus(); input.select(); }, 30);
+  }
+  function closeCloudPrompt() {
+    var modal = $('cloudPromptModal'); var back = $('cloudPromptBackdrop');
+    if (modal) modal.style.display = 'none';
+    if (back) back.classList.remove('show');
+    cloudPromptCallback = null;
   }
 
   /* ---------- schedule display ---------- */
@@ -884,6 +1302,7 @@
         if (nav === 'jobs') showView('jobs');
         if (nav === 'dashboard') showView('dashboard');
         if (nav === 'logs') showView('logs');
+        if (nav === 'cloud') showView('cloud');
       });
     });
     $('drawerClose').addEventListener('click', closeDrawer);
@@ -917,6 +1336,161 @@
     if (llf) llf.addEventListener('change', renderFullLog);
     var ls = $('logsSearch');
     if (ls) ls.addEventListener('input', renderFullLog);
+
+    /* ---------- TechVision Cloud wiring ---------- */
+    var crb = $('cloudRefreshBtn');
+    if (crb) crb.addEventListener('click', function () { loadCloud(); });
+    var cms = $('cloudModeServer');
+    if (cms) cms.addEventListener('click', function () { showCloudPanel('server'); });
+    var cmc = $('cloudModeClient');
+    if (cmc) cmc.addEventListener('click', function () { showCloudPanel('client'); });
+    var csb = $('cloudServerBack');
+    if (csb) csb.addEventListener('click', function () { showCloudPanel('home'); });
+    var ccb = $('cloudClientBack');
+    if (ccb) ccb.addEventListener('click', function () { showCloudPanel('home'); });
+    var css = $('cloudServerStartBtn');
+    if (css) css.addEventListener('click', async function () {
+      if (!api || typeof api.cloudServerStart !== 'function' || typeof api.cloudServerStop !== 'function') return cloudMissing();
+      try {
+        var running = cloudCfg && cloudCfg.server && cloudCfg.server.running;
+        if (running) {
+          var rs = await api.cloudServerStop();
+          if (rs && rs.success) { toast('Server stopped', 'The Cloud server is stopped.', 'success'); await loadCloud(); }
+          else toast('Server error', (rs && rs.error) || 'Could not stop the server.', 'error');
+          return;
+        }
+        // Starting applies the port shown in the field first — changing
+        // the port and pressing Start must not silently start the old one.
+        var port = parseInt(($('cloudServerPort') || {}).value, 10);
+        var saved = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : true, port: port });
+        if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save Cloud settings.', 'error'); return; }
+        var r = await api.cloudServerStart();
+        if (r && r.success) { toast('Server started', 'The Cloud server is running.', 'success'); await loadCloud(); }
+        else toast('Server error', (r && r.error) || 'Could not start the server.', 'error');
+      } catch (e) { toast('Server error', e && e.message ? e.message : 'Could not change the server state.', 'error'); }
+    });
+    var csv = $('cloudServerSaveBtn');
+    if (csv) csv.addEventListener('click', async function () {
+      if (!api || typeof api.cloudServerSave !== 'function') return cloudMissing();
+      try {
+        var port = parseInt(($('cloudServerPort') || {}).value, 10);
+        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port });
+        if (r && r.success) { toast('Cloud settings saved', 'Server settings saved.', 'success'); await loadCloud(); }
+        else toast('Save failed', (r && r.error) || 'Could not save Cloud settings.', 'error');
+      } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save Cloud settings.', 'error'); }
+    });
+    var cdi = $('cloudDetectIpBtn');
+    if (cdi) cdi.addEventListener('click', async function () {
+      if (!api || typeof api.cloudDetectIP !== 'function') return cloudMissing();
+      try {
+        cdi.disabled = true; cdi.textContent = 'Detecting…';
+        var r = await api.cloudDetectIP();
+        var addrs = $('cloudServerAddrs');
+        if (addrs) {
+          var lines = [];
+          if (r.publicIP) lines.push('Public (from outside): ' + r.publicIP);
+          else lines.push('Public: unknown (no internet or detection failed)');
+          if (r.lanIPs && r.lanIPs.length) lines.push('LAN (same network): ' + r.lanIPs.join(', '));
+          addrs.textContent = lines.join(' — ');
+        }
+      } catch (e) { toast('Detect error', e && e.message ? e.message : 'Could not detect addresses.', 'error'); }
+      finally { cdi.disabled = false; cdi.textContent = 'Detect my addresses'; }
+    });
+    var cub = $('cloudUserBrowseBtn');
+    if (cub) cub.addEventListener('click', async function () {
+      if (!api || typeof api.showOpenDialog !== 'function') return cloudMissing();
+      try {
+        var pick = await api.showOpenDialog({ properties: ['openDirectory'] });
+        if (pick && !pick.canceled && pick.filePaths && pick.filePaths.length) {
+          var f = $('cloudUserRoot'); if (f) f.value = pick.filePaths[0];
+        }
+      } catch (e) { toast('Browse error', e && e.message ? e.message : 'Could not open the folder picker.', 'error'); }
+    });
+    var cua = $('cloudUserAddBtn');
+    if (cua) cua.addEventListener('click', async function () {
+      if (!api || typeof api.cloudUserAdd !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudUserAdd({
+          name: ($('cloudUserName') || {}).value || '',
+          password: ($('cloudUserPass') || {}).value || '',
+          root: ($('cloudUserRoot') || {}).value || '',
+          canWrite: $('cloudUserCanWrite') ? $('cloudUserCanWrite').checked : false,
+        });
+        if (r && r.success) {
+          toast('User added', r.user.name + ' can now connect.', 'success');
+          var n = $('cloudUserName'); if (n) n.value = '';
+          var p = $('cloudUserPass'); if (p) p.value = '';
+          var rt = $('cloudUserRoot'); if (rt) rt.value = '';
+          await loadCloud();
+        } else toast('Add user failed', (r && r.error) || 'Could not add user.', 'error');
+      } catch (e) { toast('Add user error', e && e.message ? e.message : 'Could not add user.', 'error'); }
+    });
+    var cca = $('cloudClientAddBtn');
+    if (cca) cca.addEventListener('click', async function () {
+      if (!api || typeof api.cloudClientSave !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudClientSave({
+          name: ($('cloudClientName') || {}).value || '',
+          host: ($('cloudClientHost') || {}).value || '',
+          port: parseInt(($('cloudClientPort') || {}).value, 10),
+          user: ($('cloudClientUser') || {}).value || '',
+        });
+        if (r && r.success) {
+          toast('Server saved', 'Server added to the list.', 'success');
+          var n2 = $('cloudClientName'); if (n2) n2.value = '';
+          var h2 = $('cloudClientHost'); if (h2) h2.value = '';
+          var u2 = $('cloudClientUser'); if (u2) u2.value = '';
+          await loadCloud();
+        } else toast('Save failed', (r && r.error) || 'Could not save server.', 'error');
+      } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error'); }
+    });
+    var ccb2 = $('cloudConnectBtn');
+    if (ccb2) ccb2.addEventListener('click', function () { cloudConnectFlow(); });
+    var ccc = $('cloudConnectCancelBtn');
+    if (ccc) ccc.addEventListener('click', function () { closeCloudConnect(); });
+    var ccp = $('cloudConnectPass');
+    if (ccp) ccp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') cloudConnectFlow(); });
+    var cdb = $('cloudDisconnectBtn');
+    if (cdb) cdb.addEventListener('click', function () { cloudDisconnect(); });
+    var cub2 = $('cloudUploadBtn');
+    if (cub2) cub2.addEventListener('click', function () { cloudUpload(); });
+    var cmb = $('cloudMkdirBtn');
+    if (cmb) cmb.addEventListener('click', function () {
+      askCloudInput('New folder', 'Folder name', '', async function (val) {
+        if (!val) return;
+        if (!api || typeof api.cloudClientMkdir !== 'function') return cloudMissing();
+        try {
+          var r = await api.cloudClientMkdir(cloudConn.serverId, cloudJoin(cloudPath, val));
+          if (r && r.success) { toast('Folder created', val, 'success'); await cloudBrowse(cloudPath); }
+          else toast('Create failed', (r && r.error) || 'Could not create folder.', 'error');
+        } catch (e) { toast('Create error', e && e.message ? e.message : 'Could not create folder.', 'error'); }
+      });
+    });
+    var cbr = $('cloudBrowserRefreshBtn');
+    if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
+    var cpo = $('cloudPromptOk');
+    if (cpo) cpo.addEventListener('click', function () {
+      var cb = cloudPromptCallback;
+      var v = ($('cloudPromptInput') || {}).value || '';
+      closeCloudPrompt();
+      if (cb) cb(v);
+    });
+    var cpc = $('cloudPromptCancel');
+    if (cpc) cpc.addEventListener('click', function () { closeCloudPrompt(); });
+    var cpb = $('cloudPromptBackdrop');
+    if (cpb) cpb.addEventListener('click', function () { closeCloudPrompt(); });
+    var cpi = $('cloudPromptInput');
+    if (cpi) cpi.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { var cb = cloudPromptCallback; var v = cpi.value || ''; closeCloudPrompt(); if (cb) cb(v); }
+      if (ev.key === 'Escape') closeCloudPrompt();
+    });
+    if (api && typeof api.onCloudProgress === 'function') {
+      api.onCloudProgress(function (p) {
+        if (!p) return;
+        var kind = p.kind === 'upload' ? 'Uploading' : 'Downloading';
+        showCloudTransfer(kind + ' ' + (p.name || '') + ' — ' + Math.round(p.pct || 0) + '%', p.pct || 0);
+      });
+    }
 
     loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
   });
