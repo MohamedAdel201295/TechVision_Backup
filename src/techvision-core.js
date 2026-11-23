@@ -360,7 +360,10 @@ class BackupEngine {
       }
       backupState.save();
       
-      result.success = true;
+      // A full backup that archived 0 files (empty source, everything
+      // excluded, or all files locked) must not be reported COMPLETED.
+      result.success = result.files_backed_up > 0;
+      if (!result.success) result.error_messages.push('No files were backed up (source empty, everything excluded, or all files locked).');
       const duration = (Date.now() - startTime) / 1000;
       result.duration_seconds = duration;
       const mbSize = (result.total_bytes / 1024 / 1024).toFixed(2);
