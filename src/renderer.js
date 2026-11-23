@@ -130,6 +130,7 @@
       if ($('settingEmailPort')) $('settingEmailPort').value = String(em.smtpPort || 465);
       if ($('settingVerify')) $('settingVerify').checked = settings.verify !== false;
       if ($('settingIncremental')) $('settingIncremental').checked = settings.allowIncremental !== false;
+      refreshEmailMenuStatus();
     } catch (e) { /* settings are optional; keep defaults */ }
   }
   async function saveSettings() {
@@ -155,6 +156,7 @@
     try {
       await api.saveSettings(next);
       settings = next;
+      refreshEmailMenuStatus();
       toast('Settings saved', 'Your preferences have been saved.', 'success');
     } catch (e) {
       toast('Settings failed', e && e.message ? e.message : 'Could not save settings.', 'error');
@@ -575,7 +577,20 @@
     $('drawerBackdrop').classList.remove('show');
     currentJob = null;
   }
+  function showSettingsView(view) {
+    var home = $('settingsHomeView'), email = $('settingsEmailView');
+    if (!home || !email) return;
+    home.style.display = view === 'email' ? 'none' : '';
+    email.style.display = view === 'email' ? '' : 'none';
+  }
+  function refreshEmailMenuStatus() {
+    var el = $('emailMenuStatus'); if (!el) return;
+    var enabled = $('settingEmailEnabled') ? $('settingEmailEnabled').checked : false;
+    var to = $('settingEmailTo') ? $('settingEmailTo').value.trim() : '';
+    el.textContent = enabled ? ('On' + (to ? ' — ' + to : '')) : 'Off — tap to set up';
+  }
   function openSettings() {
+    showSettingsView('home');
     $('settingsDrawer').classList.add('show');
     $('settingsBackdrop').classList.add('show');
   }
@@ -828,6 +843,10 @@
     if (vup) vup.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); $('vaultUnlockBtn').click(); } });
     $('settingsClose').addEventListener('click', closeSettings);
     $('settingsBackdrop').addEventListener('click', closeSettings);
+    var emr = $('emailMenuRow');
+    if (emr) emr.addEventListener('click', function () { showSettingsView('email'); });
+    var ebb = $('emailBackBtn');
+    if (ebb) ebb.addEventListener('click', function () { showSettingsView('home'); });
     $('settingsSave').addEventListener('click', async function () { await saveSettings(); closeSettings(); });
     var etb = $('emailTestBtn');
     if (etb) etb.addEventListener('click', async function () {
