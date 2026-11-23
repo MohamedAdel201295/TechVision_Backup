@@ -18,13 +18,20 @@
         <div class="brand-sub">Backup</div>
       </div>
     </div>
-    <div class="nav-label">Menu</div>
-    <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
-    <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
-    <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
-    <button class="nav-item" type="button" data-nav="cloud"><span class="ico">☁</span> Cloud</button>
-    <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> New Job</button>
-    <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
+    <div class="nav-label">Modules</div>
+    <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
+    <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
+    <div class="nav-group" id="navGroupBackup">
+      <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
+      <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
+      <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
+      <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> New Job</button>
+      <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
+    </div>
+    <div class="nav-group" id="navGroupCloud" style="display:none;">
+      <button class="nav-item" type="button" data-nav="cloud-server"><span class="ico">🖥️</span> Server</button>
+      <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
+    </div>
     <div class="sidebar-foot">
       <div>TechVision Backup</div>
       <div>Powered by TechVision</div>
@@ -262,7 +269,12 @@
         <label for="cloudClientUser">User name</label>
         <input type="text" id="cloudClientUser" placeholder="admin" autocomplete="off">
       </div>
-      <button class="btn" type="button" id="cloudClientAddBtn">＋ Save server</button>
+      <div class="field">
+        <label for="cloudClientPass">Password</label>
+        <input type="password" id="cloudClientPass" placeholder="Password for this server" autocomplete="off">
+        <div class="hint">Asked once when you connect — it is never stored on this computer.</div>
+      </div>
+      <button class="btn" type="button" id="cloudClientAddBtn">＋ Save &amp; connect</button>
       <div id="cloudConnectBox" style="display:none; margin-top:16px;">
         <h3 style="margin:0 0 4px;font-size:14px;" id="cloudConnectTitle">Connect</h3>
         <div id="cloudFingerprintBox" class="settings-guide" style="display:none;">

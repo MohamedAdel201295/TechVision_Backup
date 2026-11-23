@@ -269,6 +269,35 @@
   }
 
   /* ---------- views: Dashboard / Jobs ---------- */
+  /* ---------- modules: Backup / Cloud ----------
+     The sidebar has two top-level modules. Backup owns Dashboard, Jobs,
+     Logs, New Job and Restore; Cloud owns Server and Client. Switching
+     modules swaps the visible nav group; going back to Backup returns
+     to the last backup view instead of always resetting to Dashboard. */
+  var currentModule = 'backup';
+  var lastBackupView = 'dashboard';
+
+  function applyModuleUI(mod) {
+    currentModule = mod;
+    var gb = $('navGroupBackup'); if (gb) gb.style.display = mod === 'backup' ? '' : 'none';
+    var gc = $('navGroupCloud'); if (gc) gc.style.display = mod === 'cloud' ? '' : 'none';
+    document.querySelectorAll('.module-item').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-module') === mod); });
+  }
+
+  function setModule(mod) {
+    applyModuleUI(mod);
+    if (mod === 'backup') showView(lastBackupView || 'dashboard');
+    else showView('cloud');
+  }
+
+  function syncCloudNav() {
+    document.querySelectorAll('[data-nav="cloud-server"], [data-nav="cloud-client"]').forEach(function (b) { b.classList.remove('active'); });
+    if (cloudPanel === 'server' || cloudPanel === 'client') {
+      var btn = document.querySelector('[data-nav="cloud-' + cloudPanel + '"]');
+      if (btn) btn.classList.add('active');
+    }
+  }
+
   function showView(name) {
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
@@ -281,7 +310,8 @@
     if (name === 'jobs') renderJobsView();
     if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
     else stopLogsAutoRefresh();
-    if (name === 'cloud') loadCloud();
+    if (name === 'dashboard' || name === 'jobs' || name === 'logs') { lastBackupView = name; applyModuleUI('backup'); }
+    if (name === 'cloud') { applyModuleUI('cloud'); syncCloudNav(); loadCloud(); }
   }
   function startLogsAutoRefresh() {
     stopLogsAutoRefresh();
@@ -539,6 +569,7 @@
     var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
     if (panel === 'server') renderCloudServer();
     if (panel === 'client') renderCloudClientList();
+    syncCloudNav();
   }
 
   function renderCloudHome() {
@@ -643,13 +674,13 @@
     });
   }
 
-  function openCloudConnect(srv) {
+  function openCloudConnect(srv, presetPassword) {
     cloudSelected = srv;
     cloudPendingProbe = null;
     var box = $('cloudConnectBox'); if (box) box.style.display = '';
     var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name;
     var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
-    var pass = $('cloudConnectPass'); if (pass) pass.value = '';
+    var pass = $('cloudConnectPass'); if (pass) pass.value = presetPassword || '';
     var btn = $('cloudConnectBtn'); if (btn) btn.textContent = 'Connect';
     if (box) box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -1303,7 +1334,12 @@
         if (nav === 'dashboard') showView('dashboard');
         if (nav === 'logs') showView('logs');
         if (nav === 'cloud') showView('cloud');
+        if (nav === 'cloud-server') { setModule('cloud'); showCloudPanel('server'); }
+        if (nav === 'cloud-client') { setModule('cloud'); showCloudPanel('client'); }
       });
+    });
+    document.querySelectorAll('[data-module]').forEach(function (btn) {
+      btn.addEventListener('click', function () { setModule(btn.getAttribute('data-module')); });
     });
     $('drawerClose').addEventListener('click', closeDrawer);
     $('drawerBackdrop').addEventListener('click', closeDrawer);
@@ -1429,6 +1465,7 @@
     if (cca) cca.addEventListener('click', async function () {
       if (!api || typeof api.cloudClientSave !== 'function') return cloudMissing();
       try {
+        var password = ($('cloudClientPass') || {}).value || '';
         var r = await api.cloudClientSave({
           name: ($('cloudClientName') || {}).value || '',
           host: ($('cloudClientHost') || {}).value || '',
@@ -1440,7 +1477,16 @@
           var n2 = $('cloudClientName'); if (n2) n2.value = '';
           var h2 = $('cloudClientHost'); if (h2) h2.value = '';
           var u2 = $('cloudClientUser'); if (u2) u2.value = '';
+          var p2 = $('cloudClientPass'); if (p2) p2.value = '';
           await loadCloud();
+          // Save & connect: open the connect box with the password the
+          // user just typed (it is never stored), and connect at once
+          // when this server is already trusted.
+          var rec = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === r.id; });
+          if (rec) {
+            openCloudConnect(rec, password);
+            if (rec.fingerprint && password) cloudConnectFlow();
+          }
         } else toast('Save failed', (r && r.error) || 'Could not save server.', 'error');
       } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error'); }
     });

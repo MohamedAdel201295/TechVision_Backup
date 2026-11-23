@@ -488,3 +488,16 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .cloud-browser-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .cloud-transfer { margin: 4px 0 12px; }
 .cloud-transfer .progress-track { margin: 0 0 6px; }
+
+/* ---------- modules: Backup / Cloud ---------- */
+.module-item {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 11px 12px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text);
+  font-size: 14.5px; font-weight: 700; font-family: inherit; text-align: left;
+  cursor: pointer; margin-bottom: 8px;
+  transition: transform .15s ease, border-color .15s ease, background .15s ease, color .15s ease;
+}
+.module-item:hover { border-color: rgba(14, 165, 233, .4); transform: translateX(2px); }
+.module-item.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.nav-group { display: flex; flex-direction: column; }
