@@ -52,8 +52,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   deleteJob: (jobId) => ipcRenderer.invoke('job-delete', jobId),
 
   // Window management
-    showJobWizard: () => ipcRenderer.invoke('window-show-job-wizard'),
-    showRestoreWizard: () => ipcRenderer.invoke('window-show-restore-wizard'),
+    showJobWizard: (job) => ipcRenderer.invoke('window-show-job-wizard', job || null),
+    showRestoreWizard: (job) => ipcRenderer.invoke('window-show-restore-wizard', job || null),
     showLogViewer: () => ipcRenderer.invoke('window-show-log-viewer'),
     closeLogViewer: () => ipcRenderer.invoke('window-close-log-viewer'),
     closeJobWizard: () => ipcRenderer.invoke('window-close-job-wizard'),

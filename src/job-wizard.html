@@ -166,7 +166,10 @@
       var srcOk = $('sourceDir').value.trim().length > 0;
       $('sourceError').classList.toggle('show', !srcOk);
       ok = nameOk && srcOk;
-      if (!ok) toast('Missing information', 'Please enter a job name and choose a source folder.', 'warning');
+      if (!ok) {
+        toast('Missing information', 'Please enter a job name and choose a source folder.', 'warning');
+        if (!nameOk) $('jobName').focus(); else if (!srcOk) $('sourceDir').focus();
+      }
       return ok;
     }
     if (n === 2) {
@@ -287,7 +290,7 @@
         }
       }
       if (typeof api.getJobConfig === 'function') {
-        var cfg = await api.getJobConfig();
+        var cfg = await api.getJobConfig(editing && editing.id);
         if (cfg && typeof cfg === 'object' && (cfg.name || cfg.source)) {
           editing = cfg;
           $('wizardTitle').textContent = 'Edit Backup Job';
@@ -303,19 +306,26 @@
     } catch (e) { /* start with a blank job */ }
   }
 
-  document.addEventListener('DOMContentLoaded', function () {
-    $('browseSource').addEventListener('click', function () { pickFolder('sourceDir'); });
-    $('browseDest').addEventListener('click', function () { pickFolder('destDir'); });
-    $('addPatternBtn').addEventListener('click', addPattern);
-    $('patternInput').addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
-    $('optSchedule').addEventListener('change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });
-    $('nextBtn').addEventListener('click', function () { if (validateStep(step)) showStep(Math.min(4, step + 1)); });
-    $('backBtn').addEventListener('click', function () { showStep(Math.max(1, step - 1)); });
-    $('createBtn').addEventListener('click', createJob);
-    $('cancelBtn').addEventListener('click', closeWizard);
+  // Wire the buttons as soon as this script runs: it sits at the end of
+  // <body>, so all buttons already exist. Relying only on DOMContentLoaded
+  // left the wizard dead when the event had already fired / was missed.
+  function wireWizard() {
+    if (wireWizard.done) return; wireWizard.done = true;
+    function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
+    on('browseSource', 'click', function () { pickFolder('sourceDir'); });
+    on('browseDest', 'click', function () { pickFolder('destDir'); });
+    on('addPatternBtn', 'click', addPattern);
+    on('patternInput', 'keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
+    on('optSchedule', 'change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });
+    on('nextBtn', 'click', function () { if (validateStep(step)) showStep(Math.min(4, step + 1)); });
+    on('backBtn', 'click', function () { showStep(Math.max(1, step - 1)); });
+    on('createBtn', 'click', createJob);
+    on('cancelBtn', 'click', closeWizard);
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeWizard(); });
-    loadExisting();
-  });
+    loadExisting().catch(function(e) { /* ignore async errors on initial load */ });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireWizard);
+  else wireWizard();
 })();
 </script>
 </body>

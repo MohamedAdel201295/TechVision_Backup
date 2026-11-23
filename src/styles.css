@@ -272,7 +272,10 @@ select.filter {
 .drawer-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
 
 /* ---------- Modal / wizard ---------- */
-.modal-wrap { max-width: 680px; margin: 0 auto; padding: 22px 24px; }
+.modal-wrap { max-width: 720px; margin: 0 auto; padding: 16px 20px; }
+.modal-wrap .wizard-card { max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
+.modal-wrap .wizard-card .modal-body { overflow-y: auto; max-height: calc(100vh - 210px); }
+.modal-wrap .wizard-card .modal-foot { flex-shrink: 0; }
 .modal-card, .wizard-card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
   box-shadow: var(--shadow); overflow: hidden; animation: fadeUp .35s ease both;
