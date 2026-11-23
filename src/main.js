@@ -9,6 +9,11 @@ const fs = require('fs');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
 const { RestoreEngine } = require('./restore.js');
 const mailer = require('./mailer.js');
+const vault = require('./vault.js');
+// Master-password vault: the derived key lives ONLY in memory while
+// the vault is unlocked. Nothing about the master password or any job
+// password is ever written to disk in the clear.
+let vaultKey = null;
 
 const isDevelopment = !app.isPackaged;
 
@@ -117,6 +122,7 @@ function normalizeJobObject(job, defaultType = 'full') {
     compress: job.compress !== undefined ? job.compress : undefined,
     compression: job.compression || (job.compress === false ? 'none' : undefined),
     allowIncremental: job.allowIncremental,
+    encryptionEnabled: job.encryptionEnabled === true,
     verify: job.verify,
     options: job.options || {},
     lastScheduledRun: job.lastScheduledRun || null,
@@ -226,6 +232,20 @@ function notifyEmail(kind, job, extra) {
       else if (r && r.sent) console.log('[Mail] Notification sent (' + kind + ')');
     }).catch(function (e) { console.log('[Mail] Notification error:', e.message); });
   } catch (e) { console.log('[Mail] Notification error:', e.message); }
+}
+
+// Resolve the password for an encrypted job, in order:
+//  1. supplied with this call (wizard / run prompt — runtime only),
+//  2. the vault, when it is unlocked (so scheduled runs work).
+// Returns null when there is no password anywhere. Never throws.
+function resolveBackupPassword(jobConfig) {
+  if (jobConfig && typeof jobConfig.encryptionPassword === 'string' && jobConfig.encryptionPassword) {
+    return jobConfig.encryptionPassword;
+  }
+  if (jobConfig && jobConfig.encryptionEnabled && vaultKey && jobConfig.id) {
+    try { return vault.getJobPassword(app.getPath('userData'), vaultKey, jobConfig.id); } catch (e) { return null; }
+  }
+  return null;
 }
 
 function recordRun(jobName, jobRecord) {
@@ -575,8 +595,20 @@ async function executeScheduledBackup(job) {
     name: job.name, source: job.source, destination: job.destination,
     compress: job.compress, compression: job.compression,
     allowIncremental: job.allowIncremental, schedule: job.schedule,
-    includePatterns: job.includePatterns, excludePatterns: job.excludePatterns
+    includePatterns: job.includePatterns, excludePatterns: job.excludePatterns,
+    encryptionEnabled: job.encryptionEnabled === true, id: job.id
   };
+  // Encrypted job, vault locked (or no password saved): the schedule
+  // cannot run without the password, so skip this run and say so in
+  // the log instead of failing silently or running unencrypted.
+  if (jobConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(jobConfig);
+    if (!pw) {
+      console.log(`[Scheduler] Skipped encrypted job ${job.name}: vault is locked or no password is saved. Unlock the vault in Settings to let scheduled encrypted backups run.`);
+      return;
+    }
+    jobConfig.encryptionPassword = pw;
+  }
   const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
   const jobId = `${job.name}-scheduled-${Date.now()}`;
   activeJobs.set(jobId, { name: job.name, status: 'running' });
@@ -657,6 +689,13 @@ function startScheduler() {
 // Backup operations
 ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   const jobName = jobConfig.name || `backup-${Date.now()}`;
+  // Encrypted job with no password anywhere: refuse up front instead
+  // of starting a backup that cannot be written.
+  if (jobConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(jobConfig);
+    if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'full' };
+    jobConfig.encryptionPassword = pw;
+  }
   const engine = new BackupEngine(jobConfig);
   
   const jobId = `${jobName}-${Date.now()}`;
@@ -689,6 +728,11 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   notifyJobsUpdated();
   activeJobs.delete(jobId);
 
+  // The run used a password the user typed: if the vault is unlocked,
+  // save it there (encrypted) so scheduled runs of this job work too.
+  if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
+    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) {}
+  }
   notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
   return jobRecord;
@@ -696,6 +740,11 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 
 ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   const jobName = jobConfig.name || `incremental-${Date.now()}`;
+  if (jobConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(jobConfig);
+    if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
+    jobConfig.encryptionPassword = pw;
+  }
   const engine = new BackupEngine(jobConfig);
   
   const jobId = `${jobName}-${Date.now()}`;
@@ -727,26 +776,29 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   notifyJobsUpdated();
   activeJobs.delete(jobId);
 
+  if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
+    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) {}
+  }
   notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Incremental backup completed: ${jobName}`);
   return jobRecord;
 });
 
 // Restore operations
-ipcMain.handle('restore-all', async (event, zipPath, restoreDir) => {
+ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restore_all(zipPath, restoreDir);
+    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null);
     return { success: true, files: result.files || 0, size: result.size || 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
   }
 });
 
-ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath) => {
+ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, password) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath);
+    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath, password || null);
     return { success: true, files: result && result.files ? result.files : 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
@@ -921,6 +973,13 @@ ipcMain.handle('job-get-config', async (event, jobId) => {
 });
 
 ipcMain.handle('job-save-config', async (event, jobConfig) => {
+  // A job password must never reach disk in a job file: strip every
+  // password field before writing, whatever the caller sent.
+  if (jobConfig) {
+    delete jobConfig.encryptionPassword;
+    if (jobConfig.encryption && typeof jobConfig.encryption === 'object') delete jobConfig.encryption.password;
+    delete jobConfig.password;
+  }
   const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
   if (!fs.existsSync(jobsDir)) {
     fs.mkdirSync(jobsDir, { recursive: true });
@@ -1117,6 +1176,45 @@ ipcMain.handle('email-test', async () => {
   return { success: r.sent, error: r.sent ? undefined : r.reason };
 });
 
+// Master-password vault: the key lives in memory only while unlocked.
+ipcMain.handle('vault-status', async () => {
+  return { exists: vault.vaultExists(app.getPath('userData')), locked: vaultKey === null };
+});
+ipcMain.handle('vault-setup', async (event, masterPassword) => {
+  try {
+    vaultKey = vault.setupVault(app.getPath('userData'), masterPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+ipcMain.handle('vault-unlock', async (event, masterPassword) => {
+  try {
+    vaultKey = vault.unlockVault(app.getPath('userData'), masterPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+ipcMain.handle('vault-lock', async () => {
+  vaultKey = null;
+  return { success: true };
+});
+ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
+  try {
+    vaultKey = vault.changeMasterPassword(app.getPath('userData'), oldPassword, newPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+ipcMain.handle('vault-has-job-password', async (event, jobId) => {
+  if (!vaultKey || !jobId) return { has: false };
+  try { return { has: vault.hasJobPassword(app.getPath('userData'), vaultKey, jobId) }; }
+  catch (e) { return { has: false }; }
+});
+ipcMain.handle('vault-store-job-password', async (event, jobId, jobPassword) => {
+  if (!vaultKey) return { success: false, error: 'Vault is locked.' };
+  try {
+    vault.storeJobPassword(app.getPath('userData'), vaultKey, jobId, jobPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
 // Settings window
 ipcMain.handle('window-show-settings', async () => {
   if (!settingsWindow) {
@@ -1169,8 +1267,16 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     name: job.name,
     source: job.source,
     destination: job.destination,
+    compression: job.compression,
+    encryptionEnabled: job.encryptionEnabled === true,
+    id: job.id,
     options: job.options || { incremental: false, compress: true, verify: true }
   };
+  if (backupConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(backupConfig);
+    if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED' };
+    backupConfig.encryptionPassword = pw;
+  }
   
   const engine = new BackupEngine(backupConfig);
   engine.logger = true;
