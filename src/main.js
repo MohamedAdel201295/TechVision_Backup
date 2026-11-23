@@ -22,6 +22,8 @@ let logViewerWindow;
 let jobWizardWindow;
 let settingsWindow;
 let jobDetailsWindow;
+let pendingWizardJob = null;
+let pendingRestoreJob = null;
 
 // Active jobs tracking (Map for tracking in-progress operations)
 const activeJobs = new Map();
@@ -252,6 +254,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     id: jobId,
     name: jobName,
     type: 'full',
+    success: result.success,
     status: result.success ? 'completed' : 'failed',
     source: jobPathValue(jobConfig.source),
     destination: jobPathValue(jobConfig.destination),
@@ -285,6 +288,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     id: jobId,
     name: jobName,
     type: 'incremental',
+    success: result.success,
     status: result.success ? 'completed' : 'failed',
     source: jobPathValue(jobConfig.source),
     destination: jobPathValue(jobConfig.destination),
@@ -315,9 +319,13 @@ ipcMain.handle('restore-all', async (event, zipPath, restoreDir) => {
 });
 
 ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath) => {
-  const restoreEngine = new RestoreEngine();
-  const result = await restoreEngine.restoreFile(zipPath, entryName, destPath);
-  return { success: true };
+  try {
+    const restoreEngine = new RestoreEngine();
+    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath);
+    return { success: true, files: result && result.files ? result.files : 0 };
+  } catch (err) {
+    return { success: false, error: err && err.message ? err.message : String(err) };
+  }
 });
 
 // File operations
@@ -455,6 +463,14 @@ ipcMain.handle('job-clear-history', async () => {
 });
 
 ipcMain.handle('job-get-config', async (event, jobId) => {
+  if (!jobId || jobId === 'null' || jobId === 'undefined') {
+    // Edit opened the wizard with a job object: the wizard asks for the
+    // config with no id, so hand it the pending job instead of null.
+    const pending = pendingRestoreJob || pendingWizardJob;
+    pendingWizardJob = null;
+    pendingRestoreJob = null;
+    if (pending) return pending;
+  }
   const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
   try {
     if (fs.existsSync(jobPath)) {
@@ -476,6 +492,16 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
   try {
     fs.writeFileSync(jobPath, JSON.stringify(jobConfig, null, 2));
     console.log(`[Main] Job saved to: ${jobPath}`);
+    // The template only entered the list on the next startup before:
+    // add it to the in-memory history now so Create Job shows it at once.
+    const tpl = normalizeJobObject(Object.assign({}, jobConfig, {
+      id: jobConfig.id || ('job-' + jobConfig.name),
+      type: 'TEMPLATE', status: 'PENDING', loaded: true
+    }));
+    if (tpl) {
+      const existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
+      if (existing >= 0) jobHistory[existing] = tpl; else jobHistory.push(tpl);
+    }
     return { success: true, path: jobPath };
   } catch (e) {
     console.error(`[Main] Failed to save job config:`, e.message);
@@ -498,7 +524,8 @@ ipcMain.handle('job-list-stored', async () => {
 });
 
 // Window management
-ipcMain.handle('window-show-job-wizard', async () => {
+ipcMain.handle('window-show-job-wizard', async (event, job) => {
+  if (job && typeof job === 'object') pendingWizardJob = job;
   if (!jobWizardWindow) {
     createJobWizardWindow();
   } else {
@@ -511,7 +538,8 @@ ipcMain.handle('window-show-job-wizard', async () => {
   return { success: true };
 });
 
-ipcMain.handle('window-show-restore-wizard', async () => {
+ipcMain.handle('window-show-restore-wizard', async (event, job) => {
+  if (job && typeof job === 'object') pendingRestoreJob = job;
   if (!restoreWindow) {
     createRestoreWindow();
   } else {
@@ -716,23 +744,27 @@ ipcMain.handle('job-restore', async (event, jobId) => {
 });
 
 ipcMain.handle('job-delete', async (event, jobId) => {
-  const idx = jobHistory.findIndex(j => j.id === jobId);
+  // Templates are saved by NAME (<name>.json) but their in-memory id is
+  // generated, so deleting by id alone never removed the file. Try id,
+  // then name, then a config file named after the id.
+  let idx = jobHistory.findIndex(j => j.id === jobId);
+  if (idx < 0) idx = jobHistory.findIndex(j => j.name === jobId);
   if (idx >= 0) {
     const job = jobHistory[idx];
-    // Delete the job config file if it exists
-    const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
-    try {
-      if (fs.existsSync(jobPath)) {
-        fs.unlinkSync(jobPath);
-        console.log(`[Main] Deleted job config file: ${jobPath}`);
-      }
-    } catch (e) {
-      console.error(`[Main] Failed to delete job config file:`, e.message);
+    for (const fileName of [`${jobId}.json`, `${job.name}.json`]) {
+      try {
+        const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', fileName);
+        if (fs.existsSync(jobPath)) { fs.unlinkSync(jobPath); console.log(`[Main] Deleted job config file: ${jobPath}`); }
+      } catch (e) { console.error(`[Main] Failed to delete job config file:`, e.message); }
     }
     jobHistory.splice(idx, 1);
     saveJobHistory();
     return { success: true };
   }
+  const orphanPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
+  try {
+    if (jobId && fs.existsSync(orphanPath)) { fs.unlinkSync(orphanPath); return { success: true }; }
+  } catch (e) { /* fall through to not found */ }
   return { success: false, error: 'Job not found' };
 });
 
