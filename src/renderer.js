@@ -146,8 +146,7 @@
         smtpUser: $('settingEmailUser') ? $('settingEmailUser').value.trim() : '',
         smtpPass: $('settingEmailPass') ? $('settingEmailPass').value : '',
         smtpHost: $('settingEmailHost') ? $('settingEmailHost').value.trim() || 'smtp.gmail.com' : 'smtp.gmail.com',
-        smtpPort: $('settingEmailPort') ? parseInt($('settingEmailPort').value, 10) || 465 : 465,
-        smtpSecure: true
+        smtpPort: $('settingEmailPort') ? parseInt($('settingEmailPort').value, 10) || 465 : 465
       }
     });
     try {
