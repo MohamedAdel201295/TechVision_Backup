@@ -163,6 +163,17 @@ function mergeJobEntries(entries) {
   return merged;
 }
 
+// Tell the main window to reload its jobs/history. Called after every
+// change (create, edit, delete, run, clear, scheduled run) so the
+// Dashboard refreshes automatically — no manual Refresh needed.
+function notifyJobsUpdated() {
+  try {
+    if (typeof mainWindow !== 'undefined' && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('jobs-updated');
+    }
+  } catch (e) { /* window not ready yet */ }
+}
+
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
   let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
@@ -590,6 +601,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 
   recordRun(jobName, jobRecord);
   saveJobHistory();
+  notifyJobsUpdated();
   activeJobs.delete(jobId);
 
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
@@ -625,8 +637,9 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   
   recordRun(jobName, jobRecord);
   saveJobHistory();
+  notifyJobsUpdated();
   activeJobs.delete(jobId);
-  
+
   console.log(`[Main] Incremental backup completed: ${jobName}`);
   return jobRecord;
 });
@@ -788,6 +801,7 @@ ipcMain.handle('job-clear-history', async () => {
   // after a restart. Job definition files (<id>.json) are untouched,
   // so the jobs themselves survive — only their run history is gone.
   saveJobHistory();
+  notifyJobsUpdated();
   return { success: true };
 });
 
@@ -860,6 +874,7 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
         jobHistory[existing] = tpl;
       } else jobHistory.push(tpl);
     }
+    notifyJobsUpdated();
     return { success: true, path: jobPath };
   } catch (e) {
     console.error(`[Main] Failed to save job config:`, e.message);
@@ -1120,6 +1135,7 @@ ipcMain.handle('job-delete', async (event, jobId) => {
     }
     jobHistory.splice(idx, 1);
     saveJobHistory();
+    notifyJobsUpdated();
     return { success: true };
   }
   const orphanPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
