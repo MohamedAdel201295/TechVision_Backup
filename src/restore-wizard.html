@@ -143,7 +143,7 @@
     var pct = 0;
     timer = setInterval(function () { pct = Math.min(92, pct + Math.random() * 9 + 3); setProgress(pct); }, 350);
     try {
-      var result = await api.restoreAll({ zipPath: zipPath, destination: dest, overwrite: $('optOverwrite').checked, verify: $('optVerify').checked });
+      var result = await api.restoreAll(zipPath, dest);
       clearInterval(timer);
       var files = result ? Number(result.files ?? result.restoredFiles ?? result.fileCount ?? 0) : 0;
       setProgress(100, files, '');
@@ -170,16 +170,30 @@
   function closeWizard() {
     if (api && typeof api.closeRestoreWizard === 'function') { api.closeRestoreWizard(); }
   }
-  document.addEventListener('DOMContentLoaded', function () {
-    $('browseFile').addEventListener('click', pickFile);
-    $('browseDest').addEventListener('click', pickFolder);
-    $('startBtn').addEventListener('click', startRestore);
-    $('cancelBtn').addEventListener('click', closeWizard);
+  // Wire immediately like the job wizard: this script sits at the end of
+  // <body>, so the buttons already exist. DOMContentLoaded-only wiring was
+  // the pattern that left wizard buttons dead.
+  function wireRestore() {
+    if (wireRestore.done) return; wireRestore.done = true;
+    function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
+    on('browseFile', 'click', pickFile);
+    on('browseDest', 'click', pickFolder);
+    on('startBtn', 'click', startRestore);
+    on('cancelBtn', 'click', closeWizard);
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeWizard(); });
     if (api && typeof api.getSettings === 'function') {
       api.getSettings().then(function (s) { if (s && s.theme) applyTheme(s.theme); }).catch(function () {});
     }
-  });
+    // Edit/restore from History: pre-fill the backup file from the job
+    // passed to the wizard (its result.backup_path).
+    if (api && typeof api.getJobConfig === 'function') {
+      api.getJobConfig(null).then(function (cfg) {
+        if (cfg && cfg.result && cfg.result.backup_path) $('backupFile').value = cfg.result.backup_path;
+      }).catch(function () {});
+    }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireRestore);
+  else wireRestore();
 })();
 </script>
 </body>
