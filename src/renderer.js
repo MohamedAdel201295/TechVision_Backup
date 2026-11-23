@@ -137,6 +137,23 @@
     }
   }
 
+  /* ---------- Yes/No confirm dialog ---------- */
+  var confirmCallback = null;
+  function askConfirm(message, onYes) {
+    var modal = $('confirmModal'); var back = $('confirmBackdrop');
+    if (!modal) { if (window.confirm(message)) onYes(); return; }
+    $('confirmText').textContent = message;
+    confirmCallback = onYes;
+    modal.style.display = 'block';
+    if (back) back.classList.add('show');
+  }
+  function closeConfirm() {
+    var modal = $('confirmModal'); var back = $('confirmBackdrop');
+    if (modal) modal.style.display = 'none';
+    if (back) back.classList.remove('show');
+    confirmCallback = null;
+  }
+
   /* ---------- stats from REAL history ---------- */
   function renderStats() {
     var runs = jobs.filter(function (j) { return j.type !== 'TEMPLATE'; });
@@ -540,11 +557,16 @@
         try { await api.saveSettings(Object.assign({}, settings, { theme: next })); settings.theme = next; } catch (e) { /* theme already applied visually */ }
       }
     });
-    $('clearHistoryBtn').addEventListener('click', async function () {
+    $('clearHistoryBtn').addEventListener('click', function () {
       if (!api || typeof api.clearJobHistory !== 'function') return;
-      try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
-      catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
+      askConfirm('Do you want to delete ALL backup history? This cannot be undone.', async function () {
+        try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
+        catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
+      });
     });
+    var cy = $('confirmYes'); if (cy) cy.addEventListener('click', function () { var cb = confirmCallback; closeConfirm(); if (cb) cb(); });
+    var cn = $('confirmNo'); if (cn) cn.addEventListener('click', closeConfirm);
+    var cb2 = $('confirmBackdrop'); if (cb2) cb2.addEventListener('click', closeConfirm);
     document.querySelectorAll('[data-nav]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var nav = btn.getAttribute('data-nav');
