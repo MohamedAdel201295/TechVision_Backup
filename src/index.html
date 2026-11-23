@@ -22,8 +22,6 @@
     <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
     <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
     <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
-    <button class="nav-item" type="button" data-nav="logs"><span class="ico">≡</span> Logs</button>
-    <button class="nav-item" type="button" data-nav="settings"><span class="ico">⚙</span> Settings</button>
     <div class="sidebar-foot">
       <div>TechVision Backup</div>
       <div>Powered by TechVision</div>
@@ -41,6 +39,7 @@
         <button class="icon-btn" type="button" id="settingsBtn" title="Settings" aria-label="Settings">⚙</button>
       </div>
     </header>
+  <div id="view-dashboard">
     <section class="stats" aria-label="Backup statistics">
       <div class="stat-card">
         <div class="stat-label">Total Backups</div>
@@ -108,6 +107,23 @@
       <p>Create your first backup job and protect your files.</p>
       <button class="btn btn-primary" type="button" id="emptyNewJobBtn">＋ Create your first backup</button>
     </div>
+  </div>
+  <div id="view-jobs" style="display:none;">
+    <div class="view-head">
+      <div>
+        <h2 class="section-title" style="margin:0;">Jobs — up next</h2>
+        <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">The jobs waiting for their turn to run: never run yet, or scheduled. Finished jobs live in the Dashboard history.</p>
+      </div>
+      <button class="btn btn-primary" type="button" id="jobsNewJobBtn">＋ New Job</button>
+    </div>
+    <div class="job-list" id="jobsList"></div>
+    <div class="empty-state" id="jobsEmptyState" style="display:none;">
+      <div class="big">✅</div>
+      <h3>Nothing waiting</h3>
+      <p>No job is waiting to run — create one, or set a schedule on an existing job.</p>
+      <button class="btn btn-primary" type="button" id="jobsEmptyNewJobBtn">＋ Create a job</button>
+    </div>
+  </div>
   </main>
 </div>
 <div class="backdrop" id="drawerBackdrop"></div>
