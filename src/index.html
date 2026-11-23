@@ -202,21 +202,23 @@
       <input type="text" id="settingEmailTo" placeholder="you@example.com" autocomplete="off">
     </div>
     <div class="field">
-      <label for="settingEmailUser">Gmail address (sender)</label>
-      <input type="text" id="settingEmailUser" placeholder="you@gmail.com" autocomplete="off">
+      <label for="settingEmailUser">Sender email address</label>
+      <input type="text" id="settingEmailUser" placeholder="you@gmail.com or you@company.com" autocomplete="off">
     </div>
     <div class="field">
-      <label for="settingEmailPass">Gmail App Password</label>
-      <input type="password" id="settingEmailPass" placeholder="16-character app password" autocomplete="off">
-      <div class="hint">Google Account &rarr; Security &rarr; 2-Step Verification &rarr; App passwords. Use the app password, not your normal Gmail password.</div>
+      <label for="settingEmailPass">Email password</label>
+      <input type="password" id="settingEmailPass" placeholder="account password" autocomplete="off">
+      <div class="hint">Company mail: use the normal account password. Gmail: use an App Password (Google Account &rarr; Security &rarr; 2-Step Verification &rarr; App passwords), not your normal Gmail password.</div>
     </div>
     <div class="field">
       <label for="settingEmailHost">SMTP host</label>
       <input type="text" id="settingEmailHost" value="smtp.gmail.com" autocomplete="off">
+      <div class="hint">Gmail: smtp.gmail.com. Company domain: your mail server, e.g. mail.company.com (ask your mail admin if unsure).</div>
     </div>
     <div class="field">
       <label for="settingEmailPort">SMTP port</label>
       <input type="text" id="settingEmailPort" value="465" autocomplete="off">
+      <div class="hint">465 = SSL, 587 = STARTTLS. Most company servers use one of these two.</div>
     </div>
     <button class="btn" type="button" id="emailTestBtn" style="margin-top:8px;">✉ Send test email</button>
   </div>
