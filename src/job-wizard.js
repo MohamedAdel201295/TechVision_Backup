@@ -84,6 +84,10 @@
     var checked = document.querySelector('input[name="frequency"]:checked');
     if (checked) freq = checked.value;
     return {
+      // Every job gets a unique id. Two jobs may share a name, but they
+      // must stay two separate tasks — the old code keyed everything by
+      // name, so a second job with the same name overwrote the first.
+      id: (editing && editing.id) || ('job-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4)),
       name: $('jobName').value.trim(),
       source: $('sourceDir').value.trim(),
       sourceDirectory: $('sourceDir').value.trim(),
@@ -171,7 +175,9 @@
       if (typeof api.getJobConfig === 'function') {
         var cfg = await api.getJobConfig(editing && editing.id);
         if (cfg && typeof cfg === 'object' && (cfg.name || cfg.source)) {
+          var keepId = editing && editing.id;
           editing = cfg;
+          if (keepId) editing.id = keepId;
           $('wizardTitle').textContent = 'Edit Backup Job';
           $('jobName').value = cfg.name || cfg.jobName || '';
           $('sourceDir').value = cfg.source || cfg.sourceDirectory || '';
