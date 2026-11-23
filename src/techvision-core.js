@@ -160,7 +160,8 @@ class BackupResult extends EventEmitter {
     this.locked_files_skipped = 0;  // Files skipped due to being locked (EACCES)
     this.total_bytes = 0;
     this.duration_seconds = 0;
-    this.backup_path = '';  // Path to the created ZIP file
+    this.backup_path = '';  // Path to the created ZIP file or plain-copy folder
+    this.backup_format = 'zip'; // 'zip' or 'folder' (plain copy, same files)
     this.log_file = '';
     this.error_messages = [];
     this.timestamp = new Date().toISOString();
@@ -266,6 +267,19 @@ class BackupEngine {
   }
 
   /**
+   * Copy one file into a plain-copy backup folder, keeping the same
+   * relative path it had in the source. Used when compression is 'none':
+   * the user wants the backup to be the same files, not a ZIP.
+   */
+  _copyPlainFile(file, sourceDir, destRoot) {
+    const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+    const dest = path.join(destRoot, relativePath);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(file, dest);
+    return dest;
+  }
+
+  /**
    * Run full backup
    */
   async run_full_backup() {
@@ -293,30 +307,33 @@ class BackupEngine {
       fs.mkdirSync(backupSubDir, { recursive: true });
     }
 
-    const zipPath = path.join(backupSubDir, `${backupName}_full_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const zipPath = path.join(backupSubDir, `${backupName}_full_${stamp}.zip`);
+    // No compression at all means: no ZIP. The backup is a plain folder
+    // with the same files, same names, same folder structure.
+    const plainCopy = this.jobConfig.compression === 'none';
+    const copyDir = path.join(backupSubDir, `${backupName}_full_${stamp}`);
+    if (plainCopy) fs.mkdirSync(copyDir, { recursive: true });
 
     this.log('info', `Starting FULL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
-    this.log('info', `Destination: ${zipPath}`);
+    this.log('info', `Destination: ${plainCopy ? copyDir + ' (plain files, no ZIP)' : zipPath}`);
 
     try {
-      // Create ZIP archive
-      const output = fs.createWriteStream(zipPath);
-      const archive = archiver('zip', this.jobConfig.getArchiveOptions());
-
-      archive.on('error', err => {
-        throw err;
-      });
-
-      archive.on('progress', prog => {
-        this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
-      });
-
-      output.on('close', () => {
-        this.log('info', `Archive created: ${archive.pointer()} bytes`);
-      });
-
-      archive.pipe(output);
+      // Create ZIP archive (skipped for plain-copy backups)
+      let archive = null;
+      if (!plainCopy) {
+        const output = fs.createWriteStream(zipPath);
+        archive = archiver('zip', this.jobConfig.getArchiveOptions());
+        archive.on('error', err => { throw err; });
+        archive.on('progress', prog => {
+          this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
+        });
+        output.on('close', () => {
+          this.log('info', `Archive created: ${archive.pointer()} bytes`);
+        });
+        archive.pipe(output);
+      }
 
       // Collect all files
       const files = this._collectFiles(sourceDir);
@@ -348,8 +365,12 @@ class BackupEngine {
               }
             }
             
-            // File is readable, add to archive
-            archive.file(file, { name: relativePath });
+            // File is readable: copy it as-is, or add it to the ZIP
+            if (plainCopy) {
+              this._copyPlainFile(file, sourceDir, copyDir);
+            } else {
+              archive.file(file, { name: relativePath });
+            }
             result.files_backed_up++;
             result.total_bytes += fs.statSync(file).size;
             this.log('info', `Backed up: ${relativePath}`);
@@ -361,10 +382,11 @@ class BackupEngine {
         }
       }
 
-      await archive.finalize();
+      if (!plainCopy) await archive.finalize();
 
       // Set the backup path on result
-      result.backup_path = zipPath;
+      result.backup_path = plainCopy ? copyDir : zipPath;
+      result.backup_format = plainCopy ? 'folder' : 'zip';
 
       // Save state for incremental backups
       const stateFile = path.join(backupSubDir, '.backup_state.json');
@@ -436,33 +458,34 @@ class BackupEngine {
     const backupState = new BackupState(stateFile);
     backupState.state['__base_dir__'] = sourceDir;
 
-    const zipPath = path.join(backupSubDir, `${backupName}_incremental_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`);
+    const stampInc = new Date().toISOString().replace(/[:.]/g, '-');
+    const zipPath = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.zip`);
+    const plainCopyInc = this.jobConfig.compression === 'none';
+    const copyDirInc = path.join(backupSubDir, `${backupName}_incremental_${stampInc}`);
+    if (plainCopyInc) fs.mkdirSync(copyDirInc, { recursive: true });
 
     this.log('info', `Starting INCREMENTAL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
-    this.log('info', `Destination: ${zipPath}`);
+    this.log('info', `Destination: ${plainCopyInc ? copyDirInc + ' (plain files, no ZIP)' : zipPath}`);
 
     try {
       // Get previous state
       const prevState = backupState.state;
 
-      // Create ZIP archive
-      const output = fs.createWriteStream(zipPath);
-      const archive = archiver('zip', this.jobConfig.getArchiveOptions());
-
-      archive.on('error', err => {
-        throw err;
-      });
-
-      archive.on('progress', prog => {
-        this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
-      });
-
-      output.on('close', () => {
-        this.log('info', `Archive created: ${archive.pointer()} bytes`);
-      });
-
-      archive.pipe(output);
+      // Create ZIP archive (skipped for plain-copy backups)
+      let archive = null;
+      if (!plainCopyInc) {
+        const output = fs.createWriteStream(zipPath);
+        archive = archiver('zip', this.jobConfig.getArchiveOptions());
+        archive.on('error', err => { throw err; });
+        archive.on('progress', prog => {
+          this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
+        });
+        output.on('close', () => {
+          this.log('info', `Archive created: ${archive.pointer()} bytes`);
+        });
+        archive.pipe(output);
+      }
 
       // Collect current files
       const currentFiles = this._collectFiles(sourceDir);
@@ -502,7 +525,11 @@ class BackupEngine {
           const needsBackup = this._needsBackup(file, prevInfo, currentInfo);
 
           if (needsBackup) {
-            archive.file(file, { name: relativePath });
+            if (plainCopyInc) {
+              this._copyPlainFile(file, sourceDir, copyDirInc);
+            } else {
+              archive.file(file, { name: relativePath });
+            }
             result.files_backed_up++;
             result.total_bytes += currentInfo.size;
             filesNeedingBackup++;
@@ -521,10 +548,11 @@ class BackupEngine {
         }
       }
 
-      await archive.finalize();
+      if (!plainCopyInc) await archive.finalize();
 
       // Set the backup path on result
-      result.backup_path = zipPath;
+      result.backup_path = plainCopyInc ? copyDirInc : zipPath;
+      result.backup_format = plainCopyInc ? 'folder' : 'zip';
 
       // Save updated state
       backupState.save();
