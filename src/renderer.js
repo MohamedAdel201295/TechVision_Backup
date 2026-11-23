@@ -82,6 +82,9 @@
   var currentJob = null;
   var settings = {};
   var progressTimer = null;
+  var currentLogTab = 'today';
+  var logsTimer = null;
+  var fullLogLines = [];
 
   /* ---------- toasts (never alert()) ---------- */
   function toast(title, message, kind) {
@@ -266,13 +269,153 @@
 
   /* ---------- views: Dashboard / Jobs ---------- */
   function showView(name) {
-    var dash = $('view-dashboard'); var jobsView = $('view-jobs');
-    if (dash) dash.style.display = name === 'jobs' ? 'none' : '';
+    var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs');
+    if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
+    if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
     if (btn) btn.classList.add('active');
     if (name === 'jobs') renderJobsView();
+    if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
+    else stopLogsAutoRefresh();
+  }
+  function startLogsAutoRefresh() {
+    stopLogsAutoRefresh();
+    logsTimer = setInterval(function () { renderLogs(currentLogTab); }, 10000);
+  }
+  function stopLogsAutoRefresh() {
+    if (logsTimer) { clearInterval(logsTimer); logsTimer = null; }
+  }
+
+  /* ---------- Logs view: Today / Completed / Failed / Full log ---------- */
+  function collectRuns() {
+    var out = [];
+    jobs.forEach(function (job) {
+      (job.runs || []).forEach(function (run) {
+        out.push({ job: job, run: run });
+      });
+    });
+    out.sort(function (a, b) {
+      return new Date(b.run.timestamp || 0) - new Date(a.run.timestamp || 0);
+    });
+    return out;
+  }
+  function isToday(ts) {
+    var d = new Date(ts); if (isNaN(d.getTime())) return false;
+    var n = new Date();
+    return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+  }
+  function waitingOf(job) { return job.waitingForDrive || (job.raw && job.raw.waitingForDrive) || null; }
+  function logLevelOf(text) {
+    var s = String(text || '').toUpperCase();
+    if (s.indexOf('ERROR') !== -1 || s.indexOf('FAIL') !== -1) return 'ERROR';
+    if (s.indexOf('WARN') !== -1 || s.indexOf('SKIPPED') !== -1) return 'WARN';
+    if (s.indexOf('SUCCESS') !== -1 || s.indexOf('COMPLETED') !== -1) return 'SUCCESS';
+    return 'INFO';
+  }
+  function runRow(item, extraStatus) {
+    var job = item.job, run = item.run;
+    var div = document.createElement('article');
+    div.className = 'job-card';
+    var status = extraStatus || String((run.status || (run.success ? 'COMPLETED' : 'FAILED'))).toUpperCase();
+    var body = document.createElement('div'); body.className = 'job-body';
+    var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = job.name;
+    var meta = document.createElement('div'); meta.className = 'job-meta';
+    var pill = document.createElement('span'); pill.className = 'pill ' + pillClass(status, run.type || 'full'); pill.textContent = status;
+    var when = document.createElement('span'); when.textContent = ' ' + formatDate(run.timestamp);
+    var files = document.createElement('span'); files.textContent = ' ' + safeNum(run.files, 0) + ' files · ' + formatBytes(run.size);
+    meta.appendChild(pill); meta.appendChild(when); meta.appendChild(files);
+    body.appendChild(h); body.appendChild(meta);
+    var pathLine = document.createElement('div'); pathLine.className = 'job-path';
+    pathLine.textContent = (job.source || '—') + '  →  ' + (job.destination || '—');
+    body.appendChild(pathLine);
+    if (run.error) {
+      var err = document.createElement('div'); err.className = 'log-run-error'; err.textContent = run.error;
+      body.appendChild(err);
+    }
+    if (extraStatus === 'WAITING' && item.waiting) {
+      var w = item.waiting;
+      var wdiv = document.createElement('div'); wdiv.className = 'job-waiting';
+      wdiv.textContent = '⏳ Waiting for the ' + (w.which || 'source') + ' drive since ' + formatDate(w.since) + ' — ' + (w.path || '') + (w.label ? ' (volume "' + w.label + '")' : '') + '. The job runs as soon as the disk is back.';
+      body.appendChild(wdiv);
+    }
+    div.appendChild(body);
+    return div;
+  }
+  function renderLogs(tab) {
+    currentLogTab = tab || currentLogTab;
+    var list = $('logsList'); var fullBox = $('logsFullBox'); var toolbar = $('logsToolbar');
+    var empty = $('logsEmptyState'); var emptyText = $('logsEmptyText');
+    if (!list) return;
+    document.querySelectorAll('#logsTabs .log-tab').forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-logtab') === currentLogTab);
+    });
+    var isFull = currentLogTab === 'full';
+    if (toolbar) toolbar.style.display = isFull ? '' : 'none';
+    if (fullBox) fullBox.style.display = isFull ? '' : 'none';
+    list.style.display = isFull ? 'none' : '';
+    if (isFull) { loadFullLog(); if (empty) empty.style.display = 'none'; return; }
+    var runs = collectRuns();
+    var items = [];
+    if (currentLogTab === 'today') {
+      items = runs.filter(function (it) { return isToday(it.run.timestamp); });
+      if (emptyText) emptyText.textContent = 'No tasks ran today yet.';
+    } else if (currentLogTab === 'completed') {
+      items = runs.filter(function (it) { return it.run.success === true || String(it.run.status || '').toUpperCase() === 'COMPLETED'; });
+      if (emptyText) emptyText.textContent = 'No completed backups yet.';
+    } else if (currentLogTab === 'failed') {
+      items = runs.filter(function (it) { return it.run.success === false || String(it.run.status || '').toUpperCase() === 'FAILED'; });
+      // Jobs still waiting for their drive belong here too — they have
+      // not run, and the user asked to see what did not happen.
+      jobs.forEach(function (job) {
+        var w = waitingOf(job);
+        if (w) items.push({ job: job, run: { status: 'WAITING', timestamp: w.since, files: 0, size: 0 }, waiting: w });
+      });
+      items.sort(function (a, b) { return new Date(b.run.timestamp || 0) - new Date(a.run.timestamp || 0); });
+      if (emptyText) emptyText.textContent = 'No failed or waiting tasks. Everything ran fine.';
+    }
+    list.innerHTML = '';
+    if (!items.length) { if (empty) empty.style.display = 'block'; return; }
+    if (empty) empty.style.display = 'none';
+    items.forEach(function (it) {
+      var status = it.waiting ? 'WAITING' : null;
+      list.appendChild(runRow(it, status));
+    });
+  }
+  async function loadFullLog() {
+    var box = $('logsFullBox'); if (!box) return;
+    if (!api || typeof api.getAppLog !== 'function') {
+      box.textContent = 'Log API is not available.';
+      return;
+    }
+    try {
+      var res = await api.getAppLog();
+      fullLogLines = (res && Array.isArray(res.lines)) ? res.lines : [];
+    } catch (e) { fullLogLines = ['[ERROR] Could not load the log: ' + (e && e.message ? e.message : 'unknown error')]; }
+    renderFullLog();
+  }
+  function renderFullLog() {
+    var box = $('logsFullBox'); if (!box) return;
+    var level = $('logsLevelFilter') ? $('logsLevelFilter').value : 'all';
+    var q = $('logsSearch') ? $('logsSearch').value.trim().toLowerCase() : '';
+    var visible = fullLogLines.filter(function (l) {
+      if (level !== 'all' && logLevelOf(l) !== level) return false;
+      if (q && String(l).toLowerCase().indexOf(q) === -1) return false;
+      return true;
+    });
+    box.innerHTML = '';
+    if (!visible.length) {
+      box.textContent = fullLogLines.length ? 'No log lines match this filter.' : 'No log lines yet. Run a backup or wait for a scheduled one to see activity here.';
+      return;
+    }
+    visible.forEach(function (l) {
+      var div = document.createElement('div');
+      div.className = 'log-line log-' + logLevelOf(l).toLowerCase();
+      div.textContent = String(l);
+      box.appendChild(div);
+    });
+    box.scrollTop = box.scrollHeight;
   }
   function compressionLabel(job) {
     var c = (job.compression || (job.raw && job.raw.compression) || 'standard').toLowerCase();
@@ -326,6 +469,13 @@
       card.querySelector('.last-run').textContent = job.runs && job.runs.length ? formatDate(job.timestamp) : 'Never run';
       card.querySelector('.run-count').textContent = String(job.runCount || 0);
       card.querySelector('.job-path').textContent = job.source ? job.source + '  →  ' + (job.destination || '—') : (job.destination || '—');
+      var w = waitingOf(job);
+      if (w) {
+        var wdiv = document.createElement('div');
+        wdiv.className = 'job-waiting';
+        wdiv.textContent = '⏳ Waiting for the ' + (w.which || 'source') + ' drive since ' + formatDate(w.since) + ' — ' + (w.path || '') + (w.label ? ' (volume "' + w.label + '")' : '');
+        card.querySelector('.job-body').appendChild(wdiv);
+      }
       var sched = job.schedule || (job.raw && job.raw.schedule) || null;
       card.querySelector('.d-schedule').textContent = sched && sched.enabled ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00') : 'Manual only';
       card.querySelector('.d-next').textContent = nextRunText(job);
@@ -718,6 +868,7 @@
         if (nav === 'logs') toast('Logs', 'Open the Log Viewer from the Logs window.', '');
         if (nav === 'jobs') showView('jobs');
         if (nav === 'dashboard') showView('dashboard');
+        if (nav === 'logs') showView('logs');
       });
     });
     $('drawerClose').addEventListener('click', closeDrawer);
@@ -741,6 +892,16 @@
       }
     });
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); } });
+
+    document.querySelectorAll('#logsTabs .log-tab').forEach(function (btn) {
+      btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
+    });
+    var lrb = $('logsRefreshBtn');
+    if (lrb) lrb.addEventListener('click', function () { loadJobs().then(function () { renderLogs(currentLogTab); }); });
+    var llf = $('logsLevelFilter');
+    if (llf) llf.addEventListener('change', renderFullLog);
+    var ls = $('logsSearch');
+    if (ls) ls.addEventListener('input', renderFullLog);
 
     loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
   });

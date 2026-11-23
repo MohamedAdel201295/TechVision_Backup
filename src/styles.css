@@ -370,6 +370,15 @@ select.filter {
 .review-row .k { flex: 0 0 150px; color: var(--muted); font-weight: 500; }
 .review-row .v { font-weight: 500; word-break: break-all; }
 
+/* Logs view tabs (in-page, next to Dashboard / Jobs) */
+.log-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.log-tab { border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+  border-radius: 999px; padding: 7px 14px; font: inherit; font-size: 13px; cursor: pointer; }
+.log-tab.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.job-waiting { margin-top: 8px; padding: 8px 10px; border-radius: 8px; font-size: 13px;
+  background: var(--warning-bg); color: var(--warning); }
+.log-run-error { color: var(--danger); font-size: 12px; margin-top: 4px; }
+
 /* ---------- Log viewer ---------- */
 .log-toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
 .log-box {

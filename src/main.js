@@ -10,6 +10,10 @@ const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js'
 const { RestoreEngine } = require('./restore.js');
 const mailer = require('./mailer.js');
 const vault = require('./vault.js');
+const driveResolver = require('./drive-resolver.js');
+// How long a due scheduled job waits for a missing removable drive
+// before it is recorded as failed (and emailed about): 2 hours.
+const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
 // Master-password vault: the derived key lives ONLY in memory while
 // the vault is unlocked. Nothing about the master password or any job
 // password is ever written to disk in the clear.
@@ -122,6 +126,9 @@ function normalizeJobObject(job, defaultType = 'full') {
     compress: job.compress !== undefined ? job.compress : undefined,
     compression: job.compression || (job.compress === false ? 'none' : undefined),
     allowIncremental: job.allowIncremental,
+    sourceVolumeLabel: job.sourceVolumeLabel || null,
+    destinationVolumeLabel: job.destinationVolumeLabel || null,
+    waitingForDrive: job.waitingForDrive || null,
     encryptionEnabled: job.encryptionEnabled === true,
     verify: job.verify,
     options: job.options || {},
@@ -158,6 +165,7 @@ function mergeJobEntries(entries) {
       files: rec.files ?? 0,
       size: rec.size ?? 0,
       duration: rec.duration ?? 0,
+      error: rec.error || null,
       result: rec.result || null
     };
   }
@@ -248,6 +256,25 @@ function resolveBackupPassword(jobConfig) {
   return null;
 }
 
+// Central app log: one file for everything the scheduler, the drive
+// watcher and the backup runs do, so the Logs view has a full story
+// instead of only per-backup files in the destination folder.
+function appendAppLog(level, message) {
+  try {
+    const dir = path.join(app.getPath('userData'), '.techvision');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const logPath = path.join(dir, 'app.log');
+    // Keep the file bounded: over 1 MB, keep only the last ~1000 lines.
+    try {
+      if (fs.existsSync(logPath) && fs.statSync(logPath).size > 1024 * 1024) {
+        const lines = fs.readFileSync(logPath, 'utf-8').split(/\r?\n/);
+        fs.writeFileSync(logPath, lines.slice(-1000).join('\n') + '\n');
+      }
+    } catch (e) {}
+    fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${String(level).toUpperCase()}: ${message}\n`);
+  } catch (e) { /* logging must never break a backup */ }
+}
+
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
   let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
@@ -266,6 +293,7 @@ function recordRun(jobName, jobRecord) {
     files: jobRecord.files,
     size: jobRecord.size,
     duration: jobRecord.duration,
+    error: jobRecord.error || null,
     result: jobRecord.result || null
   };
   job.runs.push(run);
@@ -358,7 +386,7 @@ function saveJobHistory() {
           id: r.id, name: j.name, type: r.type, status: r.status,
           success: r.success, source: j.source, destination: j.destination,
           timestamp: r.timestamp, files: r.files, size: r.size,
-          duration: r.duration, result: r.result || null
+          duration: r.duration, error: r.error || null, result: r.result || null
         });
       }
     }
@@ -577,22 +605,40 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
     target.setDate(target.getDate() + 7);
     return target;
   }
+  // A run time that already passed TODAY is due, not tomorrow — but
+  // only if we have not already run for it (lastRun at/after target).
+  // This is what makes a daily/monthly job actually fire, and what
+  // lets a missed job (app was closed) fire on the next tick.
+  const lastDate = lastRun ? new Date(lastRun) : null;
+  const alreadyRanForTarget = lastDate && !isNaN(lastDate) && lastDate >= target;
   if (freq === 'monthly') {
     if (target > fromDate) return target;
+    if (!alreadyRanForTarget) return target; // due already; caller fires once then records lastScheduledRun
     target.setMonth(target.getMonth() + 1);
     return target;
   }
   // Daily (default)
   if (target > fromDate) return target;
+  if (!alreadyRanForTarget) return target; // due already
   target.setDate(target.getDate() + 1);
   return target;
 }
 
-async function executeScheduledBackup(job) {
+async function executeScheduledBackup(job, resolved) {
   if (!job || !job.source || !job.destination) return;
+  // Resolved paths from the drive watcher: the source may have moved
+  // to another letter (same volume label), or the destination too.
+  const sourcePath = (resolved && resolved.source && resolved.source.path) || job.source;
+  const destPath = (resolved && resolved.destination && resolved.destination.path) || job.destination;
+  if (resolved && resolved.source && resolved.source.remapped) {
+    appendAppLog('info', `Job "${job.name}": source drive moved — ${job.source} is now ${sourcePath} (volume "${resolved.source.label}").`);
+  }
+  if (resolved && resolved.destination && resolved.destination.remapped) {
+    appendAppLog('info', `Job "${job.name}": destination drive moved — ${job.destination} is now ${destPath} (volume "${resolved.destination.label}").`);
+  }
   if (Array.from(activeJobs.values()).some(a => a.name === job.name && a.status === 'running')) return;
   const jobConfig = {
-    name: job.name, source: job.source, destination: job.destination,
+    name: job.name, source: sourcePath, destination: destPath,
     compress: job.compress, compression: job.compression,
     allowIncremental: job.allowIncremental, schedule: job.schedule,
     includePatterns: job.includePatterns, excludePatterns: job.excludePatterns,
@@ -632,13 +678,25 @@ async function executeScheduledBackup(job) {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } catch (e) {
     console.error(`[Scheduler] Scheduled backup failed for ${job.name}:`, e.message);
-    notifyEmail('failed', { name: job.name, type: useIncremental ? 'incremental' : 'full', files: 0, size: 0, duration: 0 });
+    const errText = e && e.message ? e.message : 'Unknown error';
+    recordRun(job.name, {
+      id: jobId, jobId: job.id || null, name: job.name,
+      type: useIncremental ? 'incremental' : 'full', success: false, status: 'failed',
+      source: jobPathValue(job.source), destination: jobPathValue(job.destination),
+      timestamp: new Date().toISOString(), files: 0, size: 0, duration: 0,
+      error: errText, result: null
+    });
+    job.lastScheduledRun = new Date().toISOString();
+    saveJobHistory();
+    appendAppLog('error', `Job "${job.name}" FAILED (scheduled): ${errText}`);
+    notifyEmail('failed', { name: job.name, type: useIncremental ? 'incremental' : 'full', files: 0, size: 0, duration: 0, error: errText });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } finally {
     activeJobs.delete(jobId);
   }
 }
 
-function checkSchedules() {
+async function checkSchedules() {
   const now = new Date();
   for (const job of jobHistory) {
     if (!job.schedule || !job.schedule.enabled) continue;
@@ -647,10 +705,68 @@ function checkSchedules() {
     const last = job.lastScheduledRun ? new Date(job.lastScheduledRun) : null;
     // Due when the next run time has passed and we have not already
     // fired for it (lastScheduledRun is before that run time).
-    if (next <= now && (!last || last < next)) {
-      executeScheduledBackup(job);
+    // A job already waiting for its drive stays due: the due minute
+    // passes while it waits, and it must still run (or time out)
+    // instead of being silently dropped until tomorrow.
+    const isWaiting = !!job.waitingForDrive;
+    if (!isWaiting && !(next <= now && (!last || last < next))) continue;
+    // A scheduled run can take longer than the 30s tick: never start
+    // the same job again while its scheduled run is still going.
+    if ([...activeJobs.values()].some(function (a) { return a.name === job.name; })) continue;
+
+    // Removable drive? Resolve source + destination: the volume may
+    // have come back on another letter, or be unplugged right now.
+    const resolved = await resolveJobPaths(job);
+    if (resolved.source.found && resolved.destination.found) {
+      if (job.waitingForDrive) { delete job.waitingForDrive; notifyJobsUpdated(); }
+      executeScheduledBackup(job, resolved);
+      continue;
+    }
+    const missing = !resolved.source.found ? 'source' : 'destination';
+    const missingPath = !resolved.source.found ? resolved.source.path : resolved.destination.path;
+    if (!job.waitingForDrive) {
+      // First tick without the drive: wait for it instead of failing.
+      // The scheduler retries every 30s; as soon as the disk is back
+      // (any letter), the job runs.
+      job.waitingForDrive = {
+        since: now.toISOString(), due: next.toISOString(),
+        which: missing, path: missingPath,
+        label: missing === 'source' ? (job.sourceVolumeLabel || null) : (job.destinationVolumeLabel || null)
+      };
+      appendAppLog('warn', `Job "${job.name}" is due but the ${missing} drive is missing (${missingPath}). Waiting for the drive — the job will run as soon as it appears.`);
+      console.log(`[Scheduler] Job ${job.name} waiting for ${missing} drive: ${missingPath}`);
+      notifyJobsUpdated();
+      continue;
+    }
+    // Still waiting: give up after DRIVE_WAIT_MS, record the failure
+    // and email about it — the user asked for an error, not silence.
+    if (now - new Date(job.waitingForDrive.since) >= DRIVE_WAIT_MS) {
+      const errText = `Source drive not found: ${job.waitingForDrive.path} (volume "${job.waitingForDrive.label || 'unknown'}") was not available within 2 hours of the scheduled time.`;
+      const jobRecord = {
+        id: `${job.name}-scheduled-${Date.now()}`, jobId: job.id || null, name: job.name,
+        type: 'full', success: false, status: 'failed',
+        source: jobPathValue(job.source), destination: jobPathValue(job.destination),
+        timestamp: now.toISOString(), files: 0, size: 0, duration: 0,
+        error: errText, result: null
+      };
+      recordRun(job.name, jobRecord);
+      job.lastScheduledRun = now.toISOString();
+      delete job.waitingForDrive;
+      saveJobHistory();
+      notifyJobsUpdated();
+      notifyEmail('failed', Object.assign({}, jobRecord, { error: errText }));
+      appendAppLog('error', `Job "${job.name}" FAILED: ${errText}`);
+      console.log(`[Scheduler] Job ${job.name} failed: drive never appeared.`);
     }
   }
+}
+
+// Resolve a job's source + destination through the drive watcher.
+// Returns { source: {...}, destination: {...} } per drive-resolver.
+async function resolveJobPaths(job) {
+  const source = await driveResolver.resolvePathAsync(jobPathValue(job.source), job.sourceVolumeLabel || null);
+  const destination = await driveResolver.resolvePathAsync(jobPathValue(job.destination), job.destinationVolumeLabel || null);
+  return { source: source, destination: destination };
 }
 
 // The app was closed, so scheduled backups could not run: on startup,
@@ -679,8 +795,10 @@ function checkMissedSchedules() {
 
 function startScheduler() {
   if (global._schedulerTimer) return;
-  checkSchedules();
-  global._schedulerTimer = setInterval(checkSchedules, 30000);
+  checkSchedules().catch(function (e) { console.error('[Scheduler] check failed:', e.message); });
+  global._schedulerTimer = setInterval(function () {
+    checkSchedules().catch(function (e) { console.error('[Scheduler] check failed:', e.message); });
+  }, 30000);
   console.log('[Scheduler] Started (checks every 30s while the app is open)');
 }
 
@@ -689,6 +807,22 @@ function startScheduler() {
 // Backup operations
 ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   const jobName = jobConfig.name || `backup-${Date.now()}`;
+  // Removable drive missing? Fail with a clear error (and an email)
+  // instead of letting the engine fail on a path that does not exist.
+  {
+    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceVolumeLabel || null);
+    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationVolumeLabel || null);
+    const missing = !src.found ? { which: 'source', res: src } : (!dst.found ? { which: 'destination', res: dst } : null);
+    if (missing) {
+      const errText = `${missing.which === 'source' ? 'Source' : 'Destination'} drive not found: ${missing.res.path}` +
+        (missing.res.label ? ` (volume "${missing.res.label}")` : '') + ' — plug the disk back in and run again.';
+      appendAppLog('error', `Manual backup "${jobName}" FAILED: ${errText}`);
+      notifyEmail('failed', { name: jobName, type: 'full', files: 0, size: 0, duration: 0, error: errText });
+      return { success: false, error: 'SOURCE_DRIVE_NOT_FOUND', message: errText, name: jobName, status: 'failed', type: 'full' };
+    }
+    if (src.remapped) jobConfig.source = src.path;
+    if (dst.remapped) jobConfig.destination = dst.path;
+  }
   // Encrypted job with no password anywhere: refuse up front instead
   // of starting a backup that cannot be written.
   if (jobConfig.encryptionEnabled) {
@@ -740,6 +874,20 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 
 ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   const jobName = jobConfig.name || `incremental-${Date.now()}`;
+  {
+    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceVolumeLabel || null);
+    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationVolumeLabel || null);
+    const missing = !src.found ? { which: 'source', res: src } : (!dst.found ? { which: 'destination', res: dst } : null);
+    if (missing) {
+      const errText = `${missing.which === 'source' ? 'Source' : 'Destination'} drive not found: ${missing.res.path}` +
+        (missing.res.label ? ` (volume "${missing.res.label}")` : '') + ' — plug the disk back in and run again.';
+      appendAppLog('error', `Manual incremental backup "${jobName}" FAILED: ${errText}`);
+      notifyEmail('failed', { name: jobName, type: 'incremental', files: 0, size: 0, duration: 0, error: errText });
+      return { success: false, error: 'SOURCE_DRIVE_NOT_FOUND', message: errText, name: jobName, status: 'failed', type: 'incremental' };
+    }
+    if (src.remapped) jobConfig.source = src.path;
+    if (dst.remapped) jobConfig.destination = dst.path;
+  }
   if (jobConfig.encryptionEnabled) {
     const pw = resolveBackupPassword(jobConfig);
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
@@ -980,6 +1128,21 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     if (jobConfig.encryption && typeof jobConfig.encryption === 'object') delete jobConfig.encryption.password;
     delete jobConfig.password;
   }
+  // Removable drives: remember the volume label (e.g. "Nile view") of
+  // the source/destination drive, so a later run can find the same
+  // disk when Windows gives it another letter. Only set when the
+  // drive is actually present right now.
+  try {
+    const drives = await driveResolver.listDrives();
+    if (jobConfig) {
+      const sLetter = driveResolver.driveLetterOf(jobPathValue(jobConfig.source));
+      const sLabel = driveResolver.labelForLetter(drives, sLetter);
+      if (sLabel) jobConfig.sourceVolumeLabel = sLabel;
+      const dLetter = driveResolver.driveLetterOf(jobPathValue(jobConfig.destination));
+      const dLabel = driveResolver.labelForLetter(drives, dLetter);
+      if (dLabel) jobConfig.destinationVolumeLabel = dLabel;
+    }
+  } catch (e) { /* labels stay as they were; literal paths still work */ }
   const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
   if (!fs.existsSync(jobsDir)) {
     fs.mkdirSync(jobsDir, { recursive: true });
@@ -1124,6 +1287,19 @@ ipcMain.handle('log-get-recent', async () => {
   } catch (e) {
     console.error('[Main] log-get-recent error:', e);
     return [];
+  }
+});
+
+// Full app log for the Logs view: the central app.log, newest last.
+ipcMain.handle('logs-get', async () => {
+  try {
+    const logPath = path.join(app.getPath('userData'), '.techvision', 'app.log');
+    if (!fs.existsSync(logPath)) return { success: true, lines: [] };
+    const content = fs.readFileSync(logPath, 'utf-8');
+    const lines = content.split(/\r?\n/).filter(function (l) { return l.trim().length > 0; });
+    return { success: true, lines: lines.slice(-500) };
+  } catch (e) {
+    return { success: false, error: e.message, lines: [] };
   }
 });
 

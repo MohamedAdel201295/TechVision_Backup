@@ -91,7 +91,7 @@ function eventText(kind, job, extra) {
     return 'Backup ' + (ok ? 'finished' : 'FAILED') + ': ' + name + ' (' + ((job && job.type) || 'full') + ')' +
       '\nTime: ' + when + '\nFiles: ' + ((job && job.files) || 0) +
       '\nSize: ' + formatBytes(job && job.size) + '\nDuration: ' + ((job && job.duration) || 0) + 's' +
-      (ok ? '' : '\nCheck the app log for the error.');
+      (ok ? '' : ('\nError: ' + ((job && job.error) || 'check the app log for details.')));
   }
   if (kind === 'missed') {
     const list = (extra || []).map(function (m) {

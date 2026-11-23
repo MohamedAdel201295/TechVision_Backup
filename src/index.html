@@ -21,6 +21,7 @@
     <div class="nav-label">Menu</div>
     <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
     <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
+    <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
     <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> New Job</button>
     <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
     <div class="sidebar-foot">
@@ -124,6 +125,41 @@
       <h3>Nothing waiting</h3>
       <p>No job is waiting to run — create one, or set a schedule on an existing job.</p>
       <button class="btn btn-primary" type="button" id="jobsEmptyNewJobBtn">＋ Create a job</button>
+    </div>
+  </div>
+  <div id="view-logs" style="display:none;">
+    <div class="view-head">
+      <div>
+        <h2 class="section-title" style="margin:0;">Logs</h2>
+        <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Today's tasks, what finished, what failed or is still waiting for its drive — and the full log.</p>
+      </div>
+      <button class="btn btn-ghost" type="button" id="logsRefreshBtn">⟳ Refresh</button>
+    </div>
+    <div class="log-tabs" id="logsTabs" role="tablist">
+      <button class="log-tab active" type="button" data-logtab="today">Today</button>
+      <button class="log-tab" type="button" data-logtab="completed">Completed</button>
+      <button class="log-tab" type="button" data-logtab="failed">Failed / waiting</button>
+      <button class="log-tab" type="button" data-logtab="full">Full log</button>
+    </div>
+    <div class="log-toolbar" id="logsToolbar" style="display:none; margin-top:12px;">
+      <select class="filter" id="logsLevelFilter" aria-label="Filter by level">
+        <option value="all">All levels</option>
+        <option value="INFO">Info</option>
+        <option value="SUCCESS">Success</option>
+        <option value="WARN">Warning</option>
+        <option value="ERROR">Error</option>
+      </select>
+      <label class="search-box" style="flex:1; min-width:180px;">
+        <span aria-hidden="true">🔍</span>
+        <input type="text" id="logsSearch" placeholder="Filter log lines…" autocomplete="off">
+      </label>
+    </div>
+    <div class="job-list" id="logsList" style="margin-top:12px;"></div>
+    <div class="log-box" id="logsFullBox" style="display:none; margin-top:12px;" aria-live="polite"></div>
+    <div class="empty-state" id="logsEmptyState" style="display:none;">
+      <div class="big">📋</div>
+      <h3>Nothing here yet</h3>
+      <p id="logsEmptyText">No runs match this tab.</p>
     </div>
   </div>
   </main>
