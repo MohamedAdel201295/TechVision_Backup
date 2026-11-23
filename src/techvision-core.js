@@ -36,6 +36,19 @@ class JobConfig {
       this.source.exclude = data.excludePatterns;
     }
     this.schedule = data.schedule || { enabled: false };
+    // Compression: the wizard saves `compress` (boolean) and/or
+    // `compression` ('none' | 'standard' | 'advanced'). The engine used
+    // to ignore both and always used zlib level 9, so "no compression"
+    // still produced a compressed ZIP. Honour the setting here.
+    if (typeof data.compression === 'string') {
+      this.compression = data.compression;
+    } else if (data.options && typeof data.options.compression === 'string') {
+      this.compression = data.options.compression;
+    } else if (data.compress === false) {
+      this.compression = 'none';
+    } else {
+      this.compression = 'standard';
+    }
     this.options = data.options || {};
   }
 
@@ -51,8 +64,20 @@ class JobConfig {
       source: this.source,
       destination: this.destination,
       schedule: this.schedule,
+      compression: this.compression,
       options: this.options
     }, null, 2);
+  }
+
+  /**
+   * archiver options for the configured compression.
+   * 'none' = store entries uncompressed (zlib level 0),
+   * 'standard' = deflate level 6, 'advanced' = deflate level 9.
+   */
+  getArchiveOptions() {
+    if (this.compression === 'none') return { zlib: { level: 0 } };
+    if (this.compression === 'advanced') return { zlib: { level: 9 } };
+    return { zlib: { level: 6 } };
   }
 
   /**
@@ -277,7 +302,7 @@ class BackupEngine {
     try {
       // Create ZIP archive
       const output = fs.createWriteStream(zipPath);
-      const archive = archiver('zip', { zlib: { level: 9 } });
+      const archive = archiver('zip', this.jobConfig.getArchiveOptions());
 
       archive.on('error', err => {
         throw err;
@@ -423,7 +448,7 @@ class BackupEngine {
 
       // Create ZIP archive
       const output = fs.createWriteStream(zipPath);
-      const archive = archiver('zip', { zlib: { level: 9 } });
+      const archive = archiver('zip', this.jobConfig.getArchiveOptions());
 
       archive.on('error', err => {
         throw err;
