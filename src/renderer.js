@@ -225,6 +225,26 @@
     });
   }
 
+  /* ---------- schedule display ---------- */
+  function nextRunText(job) {
+    var s = job.schedule || (job.raw && job.raw.schedule) || null;
+    if (!s || !s.enabled) return 'No schedule — manual only';
+    var freq = s.frequency || 'Daily';
+    var time = s.time || '02:00';
+    var m = /^(\d{1,2}):(\d{2})$/.exec(time);
+    if (!m) return freq + ' at ' + time;
+    var next = new Date();
+    next.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+    if (freq.toLowerCase() === 'weekly') {
+      if (next <= new Date()) next.setDate(next.getDate() + 7);
+    } else if (freq.toLowerCase() === 'monthly') {
+      if (next <= new Date()) next.setMonth(next.getMonth() + 1);
+    } else if (next <= new Date()) {
+      next.setDate(next.getDate() + 1);
+    }
+    return freq + ' at ' + time + ' — next: ' + formatDate(next.toISOString());
+  }
+
   /* ---------- job details drawer ---------- */
   function openDrawer(job) {
     currentJob = job;
@@ -246,6 +266,11 @@
     $('drawerSize').textContent = formatBytes(job.size);
     $('drawerDuration').textContent = formatDuration(job.duration);
     $('drawerLastRun').textContent = formatDate(job.timestamp);
+    var sched = job.schedule || (job.raw && job.raw.schedule) || null;
+    $('drawerSchedule').textContent = sched && sched.enabled
+      ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00')
+      : 'Manual only — no schedule set';
+    $('drawerNextRun').textContent = nextRunText(job);
     var runsBox = $('drawerRuns');
     if (runsBox) {
       if (job.runs && job.runs.length) {
@@ -379,6 +404,9 @@
     }
     renderStats();
     renderJobs();
+  }
+  if (api && typeof api.onJobsUpdated === 'function') {
+    api.onJobsUpdated(function () { loadJobs(); });
   }
   async function refreshJobs() {
     if (api && typeof api.refreshJobs === 'function') {
