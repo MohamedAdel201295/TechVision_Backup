@@ -322,7 +322,7 @@
     on('createBtn', 'click', createJob);
     on('cancelBtn', 'click', closeWizard);
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeWizard(); });
-    loadExisting();
+    loadExisting().catch(function(e) { /* ignore async errors on initial load */ });
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireWizard);
   else wireWizard();

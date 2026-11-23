@@ -166,6 +166,7 @@ function createJobWizardWindow() {
   });
 
   jobWizardWindow.loadFile(path.join(__dirname, 'job-wizard.html'));
+  jobWizardWindow.show();
 
   jobWizardWindow.on('closed', () => {
     jobWizardWindow = null;
@@ -187,6 +188,7 @@ function createRestoreWindow() {
   });
 
   restoreWindow.loadFile(path.join(__dirname, 'restore-wizard.html'));
+  restoreWindow.show();
 
   restoreWindow.on('closed', () => {
     restoreWindow = null;
@@ -320,13 +322,14 @@ ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath) => 
 
 // File operations
 // Use the window that actually called the dialog as its parent.
-// Using mainWindow here made the picker open behind the job/restore
-// wizard, which looked like "Browse does nothing".
+// Also check for active wizard windows which might be the callers.
 function dialogParentWindow(event) {
   try {
-    return (event && event.sender && BrowserWindow.fromWebContents(event.sender)) || mainWindow;
+    const callerWindow = event && event.sender && BrowserWindow.fromWebContents(event.sender);
+    // Return the calling window if found, otherwise try wizard windows, finally mainWindow
+    return callerWindow || jobWizardWindow || restoreWindow || mainWindow;
   } catch (e) {
-    return mainWindow;
+    return jobWizardWindow || mainWindow;
   }
 }
 
