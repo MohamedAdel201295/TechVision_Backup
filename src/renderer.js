@@ -217,7 +217,6 @@
         '<div class="job-actions"><span class="pill"></span><div class="job-actions-row">' +
           '<button class="btn btn-sm" type="button" data-act="details">Details</button>' +
           '<button class="btn btn-sm" type="button" data-act="run">▶ Run</button>' +
-          '<button class="btn btn-sm" type="button" data-act="restore">↺ Restore</button>' +
         '</div></div>';
       card.querySelector('.job-name').textContent = job.name;
       var meta = card.querySelectorAll('.job-meta b');
