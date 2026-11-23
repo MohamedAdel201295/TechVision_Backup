@@ -290,7 +290,7 @@
         }
       }
       if (typeof api.getJobConfig === 'function') {
-        var cfg = await api.getJobConfig();
+        var cfg = await api.getJobConfig(editing && editing.id);
         if (cfg && typeof cfg === 'object' && (cfg.name || cfg.source)) {
           editing = cfg;
           $('wizardTitle').textContent = 'Edit Backup Job';
