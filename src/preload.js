@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Settings
     getSettings: () => ipcRenderer.invoke('settings-get'),
     saveSettings: (settings) => ipcRenderer.invoke('settings-save', settings),
+    sendTestEmail: () => ipcRenderer.invoke('email-test'),
     showSettingsWindow: () => ipcRenderer.invoke('window-show-settings'),
     closeSettings: () => ipcRenderer.invoke('window-close-settings'),
 
