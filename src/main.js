@@ -59,6 +59,17 @@ function normalizeJobObject(job, defaultType = 'full') {
     size: job.size ?? 0,
     duration: job.duration ?? 0,
     result: job.result || null,
+    // Settings must survive load/save: the wizard saves compress,
+    // compression and schedule, but normalize used to drop them, so
+    // a Run from History always ran with the defaults (compressed,
+    // no schedule) no matter what the job was created with.
+    schedule: job.schedule || { enabled: false },
+    compress: job.compress !== undefined ? job.compress : undefined,
+    compression: job.compression || (job.compress === false ? 'none' : undefined),
+    allowIncremental: job.allowIncremental,
+    verify: job.verify,
+    options: job.options || {},
+    lastScheduledRun: job.lastScheduledRun || null,
     runs: Array.isArray(job.runs) ? job.runs : [],
     runCount: job.runCount ?? (Array.isArray(job.runs) ? job.runs.length : 0),
     loaded: job.loaded || false
@@ -118,6 +129,13 @@ function mergeJobEntries(entries) {
       job.loaded = true;
       if (entry.source) job.source = entry.source;
       if (entry.destination) job.destination = entry.destination;
+      if (entry.schedule) job.schedule = entry.schedule;
+      if (entry.compress !== undefined) job.compress = entry.compress;
+      if (entry.compression) job.compression = entry.compression;
+      if (entry.allowIncremental !== undefined) job.allowIncremental = entry.allowIncremental;
+      if (entry.verify !== undefined) job.verify = entry.verify;
+      if (entry.options) job.options = entry.options;
+      if (entry.lastScheduledRun) job.lastScheduledRun = entry.lastScheduledRun;
       if (!job.runs.length) {
         job.status = entry.status || 'pending';
         job.type = 'template';
@@ -334,6 +352,7 @@ function createLogViewerWindow() {
 // App lifecycle
 app.whenReady().then(() => {
   loadStoredJobs(); // Load stored jobs on startup
+  startScheduler(); // Run scheduled jobs while the app is open
   createMainWindow();
 
   app.on('activate', () => {
@@ -348,6 +367,97 @@ app.on('window-all-closed', () => {
     app.quit();
   }
 });
+
+// ---------- Scheduler ----------
+// The schedule a job is created with was saved but never executed:
+// nothing in the app ever checked it. This timer runs while the app
+// is open and fires each enabled job at its scheduled time.
+function nextScheduledRun(schedule, fromDate, lastRun) {
+  if (!schedule || !schedule.enabled) return null;
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(schedule.time || '02:00');
+  if (!m) return null;
+  const target = new Date(fromDate);
+  target.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+  const freq = (schedule.frequency || 'Daily').toLowerCase();
+  if (freq === 'weekly') {
+    const base = lastRun ? new Date(lastRun) : null;
+    if (base && !isNaN(base)) {
+      const next = new Date(base); next.setDate(next.getDate() + 7);
+      next.setHours(target.getHours(), target.getMinutes(), 0, 0);
+      if (next > fromDate) return next;
+      return next; // due already; caller fires once then records lastScheduledRun
+    }
+    if (target > fromDate) return target;
+    target.setDate(target.getDate() + 7);
+    return target;
+  }
+  if (freq === 'monthly') {
+    if (target > fromDate) return target;
+    target.setMonth(target.getMonth() + 1);
+    return target;
+  }
+  // Daily (default)
+  if (target > fromDate) return target;
+  target.setDate(target.getDate() + 1);
+  return target;
+}
+
+async function executeScheduledBackup(job) {
+  if (!job || !job.source || !job.destination) return;
+  if (Array.from(activeJobs.values()).some(a => a.name === job.name && a.status === 'running')) return;
+  const jobConfig = {
+    name: job.name, source: job.source, destination: job.destination,
+    compress: job.compress, compression: job.compression,
+    allowIncremental: job.allowIncremental, schedule: job.schedule,
+    includePatterns: job.includePatterns, excludePatterns: job.excludePatterns
+  };
+  const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
+  const jobId = `${job.name}-scheduled-${Date.now()}`;
+  activeJobs.set(jobId, { name: job.name, status: 'running' });
+  try {
+    const engine = new BackupEngine(jobConfig);
+    engine.logger = true;
+    const result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
+    const jobRecord = {
+      id: jobId, name: job.name, type: useIncremental ? 'incremental' : 'full',
+      success: result.success, status: result.success ? 'completed' : 'failed',
+      source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination),
+      timestamp: new Date().toISOString(), files: result.files_backed_up,
+      size: result.total_bytes, duration: result.duration_seconds, result
+    };
+    recordRun(job.name, jobRecord);
+    job.lastScheduledRun = new Date().toISOString();
+    saveJobHistory();
+    console.log(`[Scheduler] Scheduled backup ${useIncremental ? 'incremental' : 'full'} for ${job.name}: ${jobRecord.status}`);
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
+  } catch (e) {
+    console.error(`[Scheduler] Scheduled backup failed for ${job.name}:`, e.message);
+  } finally {
+    activeJobs.delete(jobId);
+  }
+}
+
+function checkSchedules() {
+  const now = new Date();
+  for (const job of jobHistory) {
+    if (!job.schedule || !job.schedule.enabled) continue;
+    const next = nextScheduledRun(job.schedule, now, job.lastScheduledRun);
+    if (!next) continue;
+    const last = job.lastScheduledRun ? new Date(job.lastScheduledRun) : null;
+    // Due when the next run time has passed and we have not already
+    // fired for it (lastScheduledRun is before that run time).
+    if (next <= now && (!last || last < next)) {
+      executeScheduledBackup(job);
+    }
+  }
+}
+
+function startScheduler() {
+  if (global._schedulerTimer) return;
+  checkSchedules();
+  global._schedulerTimer = setInterval(checkSchedules, 30000);
+  console.log('[Scheduler] Started (checks every 30s while the app is open)');
+}
 
 // IPC Handlers
 
