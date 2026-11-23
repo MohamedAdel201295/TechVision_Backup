@@ -49,7 +49,7 @@
     if (type !== 'FULL' && type !== 'INCREMENTAL' && type !== 'TEMPLATE') type = 'FULL';
     var status = safeStr(raw.status, 'PENDING').toUpperCase();
     if (['COMPLETED', 'RUNNING', 'PENDING', 'FAILED', 'TEMPLATE'].indexOf(status) === -1) status = 'PENDING';
-    return {
+    var job = {
       id: raw.id || raw.jobId || '',
       name: name,
       type: type,
@@ -61,8 +61,19 @@
       duration: safeNum(raw.duration ?? raw.durationSeconds ?? raw.elapsed, 0),
       timestamp: raw.timestamp || raw.lastRun || raw.date || raw.createdAt || '',
       schedule: raw.schedule || null,
+      runs: Array.isArray(raw.runs) ? raw.runs : [],
+      runCount: raw.runCount ?? (Array.isArray(raw.runs) ? raw.runs.length : 0),
       raw: raw
     };
+    if (job.runs && job.runs.length) {
+      var last = job.runs[job.runs.length - 1];
+      job.status = (last.status || job.status || 'PENDING').toUpperCase();
+      job.files = safeNum(last.files, job.files);
+      job.size = safeNum(last.size, job.size);
+      job.duration = safeNum(last.duration, job.duration);
+      job.timestamp = last.timestamp || job.timestamp;
+    }
+    return job;
   }
 
   /* ---------- state ---------- */
@@ -235,6 +246,22 @@
     $('drawerSize').textContent = formatBytes(job.size);
     $('drawerDuration').textContent = formatDuration(job.duration);
     $('drawerLastRun').textContent = formatDate(job.timestamp);
+    var runsBox = $('drawerRuns');
+    if (runsBox) {
+      if (job.runs && job.runs.length) {
+        var html = '<h3 style="margin:14px 0 6px;font-size:13px;">Run history (' + job.runs.length + ')</h3>';
+        job.runs.slice().reverse().forEach(function (r) {
+          html += '<div class="run-row" style="display:flex;gap:8px;justify-content:space-between;padding:6px 0;border-top:1px solid var(--hatch-widget-border, #ddd);font-size:12px;">' +
+            '<span>' + escapeHtml(formatDate(r.timestamp)) + '</span>' +
+            '<span>' + escapeHtml((r.type || '').toUpperCase()) + '</span>' +
+            '<span>' + escapeHtml((r.status || '').toUpperCase()) + '</span>' +
+            '<span>' + r.files + ' files · ' + escapeHtml(formatBytes(r.size)) + '</span></div>';
+        });
+        runsBox.innerHTML = html;
+      } else {
+        runsBox.innerHTML = '<p style="margin:12px 0 0;font-size:12px;opacity:.7;">No runs yet — this job has never run.</p>';
+      }
+    }
     $('jobDrawer').classList.add('show');
     $('drawerBackdrop').classList.add('show');
   }
