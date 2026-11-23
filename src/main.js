@@ -11,6 +11,48 @@ const { RestoreEngine } = require('./restore.js');
 
 const isDevelopment = !app.isPackaged;
 
+// ONE userData folder for every way of running the app. This was the
+// settings bug: Electron picks userData from the app name, which is
+// "techvision-backup" when run from source (`electron .`) but
+// "TechVision Backup" (productName) once packaged — so settings (and
+// jobs) saved in one mode were invisible in the other, and it looked
+// like nothing had been saved at all. Pinning the path unifies them.
+const USER_DATA_DIR = path.join(app.getPath('appData'), 'TechVision Backup');
+try {
+  app.setPath('userData', USER_DATA_DIR);
+} catch (e) {
+  console.error('[Main] Could not pin userData path:', e.message);
+}
+
+// Bring over settings/jobs saved under the old per-mode folders
+// (techvision-backup or TechVision Backup) into the pinned folder,
+// copying only files that are missing there.
+function migrateLegacyUserData() {
+  try {
+    const newBase = path.join(USER_DATA_DIR, '.techvision');
+    for (const name of ['techvision-backup', 'TechVision Backup']) {
+      const oldBase = path.join(app.getPath('appData'), name, '.techvision');
+      if (oldBase === newBase || !fs.existsSync(oldBase)) continue;
+      const copyMissing = (srcDir, destDir) => {
+        if (!fs.existsSync(srcDir)) return;
+        if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+        for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+          const src = path.join(srcDir, entry.name);
+          const dest = path.join(destDir, entry.name);
+          if (entry.isDirectory()) copyMissing(src, dest);
+          else if (!fs.existsSync(dest)) {
+            fs.copyFileSync(src, dest);
+            console.log(`[Main] Migrated user data file: ${dest}`);
+          }
+        }
+      };
+      copyMissing(oldBase, newBase);
+    }
+  } catch (e) {
+    console.error('[Main] User data migration failed:', e.message);
+  }
+}
+
 // Assets path for icons
 const ASSETS_PATH = path.join(__dirname, 'assets');
 const APP_ICON = path.join(ASSETS_PATH, 'TechVision_Logo.png');
@@ -453,6 +495,7 @@ function createLogViewerWindow() {
 
 // App lifecycle
 app.whenReady().then(() => {
+  migrateLegacyUserData(); // Bring old settings/jobs into the pinned folder
   loadStoredJobs(); // Load stored jobs on startup
   startScheduler(); // Run scheduled jobs while the app is open
   try { app.setAppUserModelId('com.techvision.backup'); } catch (e) {}
