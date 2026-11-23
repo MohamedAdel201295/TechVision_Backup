@@ -8,6 +8,7 @@
   var step = 1;
   var patterns = [];
   var editing = null;
+  var hasSavedPassword = false; // vault already holds a password for this job
 
   function $(id) { return document.getElementById(id); }
   function toast(title, message, kind) {
@@ -32,9 +33,9 @@
       p.classList.toggle('active', Number(p.getAttribute('data-panel')) === n);
     });
     $('backBtn').style.display = n > 1 ? '' : 'none';
-    $('nextBtn').style.display = n < 4 ? '' : 'none';
-    $('createBtn').style.display = n === 4 ? '' : 'none';
-    if (n === 4) renderReview();
+    $('nextBtn').style.display = n < 5 ? '' : 'none';
+    $('createBtn').style.display = n === 5 ? '' : 'none';
+    if (n === 5) renderReview();
   }
   function validateStep(n) {
     if (n === 1) {
@@ -55,6 +56,19 @@
       $('destError').classList.toggle('show', !destOk);
       if (!destOk) toast('Missing information', 'Please choose a destination folder.', 'warning');
       return destOk;
+    }
+    if (n === 4) {
+      if (!$('optEncrypt').checked) return true;
+      // A saved vault password counts: blank fields keep it.
+      if (hasSavedPassword && !$('encPassword').value && !$('encPasswordConfirm').value) return true;
+      var pw = $('encPassword').value;
+      var pwOk = pw.length >= 8;
+      $('encPasswordError').classList.toggle('show', !pwOk);
+      var matchOk = pwOk && $('encPasswordConfirm').value === pw;
+      $('encPasswordConfirmError').classList.toggle('show', pwOk && !matchOk);
+      if (!pwOk) { toast('Password too short', 'The backup password must be at least 8 characters.', 'warning'); $('encPassword').focus(); return false; }
+      if (!matchOk) { toast('Passwords do not match', 'Please repeat the same password.', 'warning'); $('encPasswordConfirm').focus(); return false; }
+      return true;
     }
     return true;
   }
@@ -97,6 +111,7 @@
       allowIncremental: $('optIncremental').checked,
       compress: $('optCompress').checked,
       compression: $('optCompress').checked ? 'standard' : 'none',
+      encryptionEnabled: $('optEncrypt').checked,
       verify: $('optVerify').checked,
       use_vss: false,
       schedule: $('optSchedule').checked ? { enabled: true, frequency: freq, time: $('scheduleTime').value || '02:00' } : { enabled: false, frequency: freq, time: $('scheduleTime').value || '02:00' },
@@ -113,6 +128,7 @@
       ['Include patterns', j.includePatterns.length ? j.includePatterns.join(', ') : 'All files'],
       ['Incremental', j.allowIncremental ? 'Yes' : 'No'],
       ['Compress with ZIP', j.compress ? 'Yes' : 'No'],
+      ['Encryption', j.encryptionEnabled ? 'AES-256' + (j.compress ? ' (compression + encryption)' : ' (encryption only, files stored uncompressed)') : 'Off'],
       ['Verify after backup', j.verify ? 'Yes' : 'No'],
       ['Schedule', j.schedule.enabled ? j.schedule.frequency + ' at ' + j.schedule.time : 'Manual only']
     ];
@@ -151,6 +167,19 @@
     $('createBtn').textContent = 'Creating…';
     try {
       await api.saveJobConfig(job);
+      if (job.encryptionEnabled) {
+        var pw = $('encPassword').value;
+        if (pw && typeof api.vaultStoreJobPassword === 'function') {
+          try {
+            var stored = await api.vaultStoreJobPassword(job.id, pw);
+            if (!stored || stored.success === false) {
+              toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+            }
+          } catch (e) {}
+        } else if (!pw && !hasSavedPassword) {
+          toast('No password saved', 'Job saved, but no password was stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+        }
+      }
       if (typeof api.refreshJobs === 'function') { try { await api.refreshJobs(); } catch (e) {} }
       toast('Job created', job.name + ' has been saved.', 'success');
       setTimeout(function () { closeWizard(); }, 500);
@@ -189,6 +218,17 @@
           if (cfg.allowIncremental === false) $('optIncremental').checked = false;
           if (cfg.compress === false) $('optCompress').checked = false;
           if (cfg.verify === false) $('optVerify').checked = false;
+          if (cfg.encryptionEnabled === true) {
+            $('optEncrypt').checked = true;
+            $('encFields').style.display = 'block';
+            updateEncNote();
+            if (typeof api.vaultHasJobPassword === 'function') {
+              try {
+                var hp = await api.vaultHasJobPassword(editing.id);
+                if (hp && hp.has) { hasSavedPassword = true; $('encVaultNote').style.display = 'block'; }
+              } catch (e) {}
+            }
+          }
         }
       }
     } catch (e) { /* start with a blank job */ }
@@ -197,6 +237,17 @@
   // Wire the buttons as soon as this script runs: it sits at the end of
   // <body>, so all buttons already exist. Relying only on DOMContentLoaded
   // left the wizard dead when the event had already fired / was missed.
+  function updateEncNote() {
+    var note = $('encModeNote'); if (!note) return;
+    note.innerHTML = '';
+    var b = document.createElement('strong');
+    b.textContent = $('optCompress').checked ? 'Compression + encryption: ' : 'Encryption only: ';
+    var s = document.createElement('span');
+    s.textContent = $('optCompress').checked
+      ? 'files are compressed and then encrypted (AES-256).'
+      : 'files are stored uncompressed inside the encrypted ZIP (AES-256) — same files, just protected.';
+    note.appendChild(b); note.appendChild(s);
+  }
   function wireWizard() {
     if (wireWizard.done) return; wireWizard.done = true;
     function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
@@ -205,7 +256,9 @@
     on('addPatternBtn', 'click', addPattern);
     on('patternInput', 'keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
     on('optSchedule', 'change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });
-    on('nextBtn', 'click', function () { if (validateStep(step)) showStep(Math.min(4, step + 1)); });
+    on('optEncrypt', 'change', function (ev) { $('encFields').style.display = ev.target.checked ? 'block' : 'none'; if (ev.target.checked) updateEncNote(); });
+    on('optCompress', 'change', function () { if ($('optEncrypt').checked) updateEncNote(); });
+    on('nextBtn', 'click', function () { if (validateStep(step)) showStep(Math.min(5, step + 1)); });
     on('backBtn', 'click', function () { showStep(Math.max(1, step - 1)); });
     on('createBtn', 'click', createJob);
     on('cancelBtn', 'click', closeWizard);
