@@ -3,7 +3,7 @@
  * Electron main process for backup application
  */
 
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
@@ -14,6 +14,12 @@ const isDevelopment = !app.isPackaged;
 // Assets path for icons
 const ASSETS_PATH = path.join(__dirname, 'assets');
 const APP_ICON = path.join(ASSETS_PATH, 'TechVision_Logo.png');
+
+// System tray + auto-start: the app must keep running (and keep its
+// scheduler alive) until the user explicitly quits from the tray.
+// Closing the main window only hides it to the tray.
+let tray = null;
+let isQuitting = false;
 
 // Main window
 let mainWindow;
@@ -265,6 +271,69 @@ function saveJobHistory() {
   }
 }
 
+function getAutoStartSetting() {
+  try {
+    const settingsPath = path.join(app.getPath('userData'), '.techvision', 'settings.json');
+    if (fs.existsSync(settingsPath)) {
+      const s = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      if (s && typeof s.autoStart === 'boolean') return s.autoStart;
+    }
+  } catch (e) {}
+  return true; // default: start with Windows
+}
+
+function saveAutoStartSetting(value) {
+  try {
+    const dir = path.join(app.getPath('userData'), '.techvision');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const settingsPath = path.join(dir, 'settings.json');
+    let s = {};
+    try { s = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')); } catch (e) {}
+    s.autoStart = value;
+    fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2));
+  } catch (e) {}
+}
+
+function applyAutoStart() {
+  // Works for the installed app AND the portable exe: Electron
+  // registers the current exe path in the Windows Run key, so the
+  // app starts at login even when it was never installed.
+  try {
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      app.setLoginItemSettings({ openAtLogin: getAutoStartSetting(), path: process.execPath });
+    }
+  } catch (e) {
+    console.error('[Tray] Could not set auto-start:', e.message);
+  }
+}
+
+function createTray() {
+  try {
+    let icon = nativeImage.createEmpty();
+    if (fs.existsSync(APP_ICON)) icon = nativeImage.createFromPath(APP_ICON);
+    tray = new Tray(icon);
+    tray.setToolTip('TechVision Backup — running in the tray');
+    const buildMenu = () => Menu.buildFromTemplate([
+      { label: 'Show TechVision Backup', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } else createMainWindow(); } },
+      { type: 'separator' },
+      { label: 'Start with Windows', type: 'checkbox', checked: getAutoStartSetting(), click: (item) => { saveAutoStartSetting(item.checked); applyAutoStart(); } },
+      { type: 'separator' },
+      { label: 'Exit', click: () => { isQuitting = true; app.quit(); } }
+    ]);
+    tray.setContextMenu(buildMenu());
+    tray.on('click', () => {
+      if (!mainWindow) { createMainWindow(); return; }
+      if (mainWindow.isVisible()) mainWindow.hide(); else { mainWindow.show(); mainWindow.focus(); }
+    });
+    // Rebuild the menu when it opens so the checkbox reflects the setting.
+    tray.on('right-click', () => tray.setContextMenu(buildMenu()));
+    console.log('[Tray] System tray icon created');
+  } catch (e) {
+    console.error('[Tray] Could not create tray icon:', e.message);
+    tray = null;
+  }
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -278,6 +347,15 @@ function createMainWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
+
+  // The X button hides the window to the tray instead of quitting:
+  // the app (and its scheduler) keeps running until Exit from the tray.
+  mainWindow.on('close', (e) => {
+    if (!isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -353,7 +431,10 @@ function createLogViewerWindow() {
 app.whenReady().then(() => {
   loadStoredJobs(); // Load stored jobs on startup
   startScheduler(); // Run scheduled jobs while the app is open
+  try { app.setAppUserModelId('com.techvision.backup'); } catch (e) {}
+  applyAutoStart(); // Start with Windows, installed or portable
   createMainWindow();
+  createTray(); // Keep running in the tray after the window closes
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -363,10 +444,15 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  // Do NOT quit when the window closes: the app lives in the tray
+  // (and keeps running scheduled backups) until Exit from the tray.
+  // Only quit if the tray could not be created at all.
+  if (!tray && process.platform !== 'darwin') {
     app.quit();
   }
 });
+
+app.on('before-quit', () => { isQuitting = true; });
 
 // ---------- Scheduler ----------
 // The schedule a job is created with was saved but never executed:
