@@ -59,8 +59,105 @@ function normalizeJobObject(job, defaultType = 'full') {
     size: job.size ?? 0,
     duration: job.duration ?? 0,
     result: job.result || null,
+    runs: Array.isArray(job.runs) ? job.runs : [],
+    runCount: job.runCount ?? (Array.isArray(job.runs) ? job.runs.length : 0),
     loaded: job.loaded || false
   };
+}
+
+// One entry per job in jobHistory: a job template (loaded from its
+// <name>.json) plus the runs that belong to it. A run must NEVER create
+// a second history entry: recordRun() appends the run to the job's own
+// `runs` list and updates the job's latest-run stats in place.
+function mergeJobEntries(entries) {
+  const byName = new Map();
+  const merged = [];
+  function runFromRecord(rec) {
+    return {
+      id: rec.id || `run-${Date.now()}`,
+      type: rec.type || 'full',
+      status: rec.status || (rec.success ? 'completed' : 'failed'),
+      success: rec.success,
+      timestamp: rec.timestamp || new Date().toISOString(),
+      files: rec.files ?? 0,
+      size: rec.size ?? 0,
+      duration: rec.duration ?? 0,
+      result: rec.result || null
+    };
+  }
+  for (const entry of entries) {
+    if (!entry) continue;
+    const key = (entry.name || 'Unnamed Job').toLowerCase();
+    const isRunRecord = (entry.type === 'full' || entry.type === 'incremental') && !entry.loaded;
+    let job = byName.get(key);
+    if (!job) {
+      job = normalizeJobObject(entry, isRunRecord ? 'full' : 'template');
+      job.runs = [];
+      job.runCount = 0;
+      if (isRunRecord) {
+        job.type = 'full';
+        job.status = 'pending';
+      }
+      byName.set(key, job);
+      merged.push(job);
+    }
+    if (isRunRecord) {
+      const run = runFromRecord(entry);
+      job.runs.push(run);
+      job.runCount = job.runs.length;
+      job.status = run.status;
+      job.files = run.files;
+      job.size = run.size;
+      job.duration = run.duration;
+      job.timestamp = run.timestamp;
+      job.result = run.result;
+      job.type = run.type === 'incremental' ? 'incremental' : 'full';
+    } else {
+      // Template: keep the job's identity/paths, preserve any runs
+      // already merged from history records.
+      job.loaded = true;
+      if (entry.source) job.source = entry.source;
+      if (entry.destination) job.destination = entry.destination;
+      if (!job.runs.length) {
+        job.status = entry.status || 'pending';
+        job.type = 'template';
+      }
+    }
+  }
+  return merged;
+}
+
+function recordRun(jobName, jobRecord) {
+  const key = (jobName || 'Unnamed Job').toLowerCase();
+  let job = jobHistory.find(j => (j.name || '').toLowerCase() === key);
+  if (!job) {
+    job = normalizeJobObject({ name: jobName, type: 'full', status: 'pending' });
+    job.runs = [];
+    jobHistory.push(job);
+  }
+  const run = {
+    id: jobRecord.id,
+    type: jobRecord.type || 'full',
+    status: jobRecord.status,
+    success: jobRecord.success,
+    timestamp: jobRecord.timestamp,
+    files: jobRecord.files,
+    size: jobRecord.size,
+    duration: jobRecord.duration,
+    result: jobRecord.result || null
+  };
+  job.runs.push(run);
+  job.runCount = job.runs.length;
+  job.status = run.status;
+  job.files = run.files;
+  job.size = run.size;
+  job.duration = run.duration;
+  job.timestamp = run.timestamp;
+  job.result = run.result;
+  job.type = run.type === 'incremental' ? 'incremental' : 'full';
+  if (jobRecord.source) job.source = jobRecord.source;
+  if (jobRecord.destination) job.destination = jobRecord.destination;
+  return job;
 }
 
 // Load stored jobs from disk on app start
@@ -115,6 +212,10 @@ async function loadStoredJobs() {
   } catch (e) {
     console.error('[Main] Failed to load stored jobs:', e.message);
   }
+  // Merge templates + run records so History shows one entry per job,
+  // with the job's runs attached, instead of a PENDING template row
+  // plus a separate row per run.
+  jobHistory = mergeJobEntries(jobHistory);
 }
 
 // Save job history to disk
@@ -125,8 +226,20 @@ function saveJobHistory() {
     if (!fs.existsSync(jobsDir)) {
       fs.mkdirSync(jobsDir, { recursive: true });
     }
-    // Filter out loaded templates and keep only actual job records
-    const recordsToSave = jobHistory.filter(j => !j.loaded);
+    // Persist runs as flat records (the on-disk history.json format),
+    // one per run, so they survive a restart and merge back into their
+    // job on load. Templates with no runs save nothing.
+    const recordsToSave = [];
+    for (const j of jobHistory) {
+      for (const r of (j.runs || [])) {
+        recordsToSave.push({
+          id: r.id, name: j.name, type: r.type, status: r.status,
+          success: r.success, source: j.source, destination: j.destination,
+          timestamp: r.timestamp, files: r.files, size: r.size,
+          duration: r.duration, result: r.result || null
+        });
+      }
+    }
     fs.writeFileSync(historyPath, JSON.stringify(recordsToSave, null, 2));
     console.log(`[Main] Saved ${recordsToSave.length} job history records`);
   } catch (e) {
@@ -265,7 +378,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     result: result
   };
 
-  jobHistory.push(jobRecord);
+  recordRun(jobName, jobRecord);
   saveJobHistory();
   activeJobs.delete(jobId);
 
@@ -299,7 +412,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     result: result
   };
   
-  jobHistory.push(jobRecord);
+  recordRun(jobName, jobRecord);
   saveJobHistory();
   activeJobs.delete(jobId);
   
@@ -500,7 +613,17 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     }));
     if (tpl) {
       const existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
-      if (existing >= 0) jobHistory[existing] = tpl; else jobHistory.push(tpl);
+      if (existing >= 0) {
+        // Keep the job's run history: a re-save must not wipe its runs.
+        tpl.runs = jobHistory[existing].runs || [];
+        tpl.runCount = tpl.runs.length;
+        if (tpl.runs.length) {
+          const last = tpl.runs[tpl.runs.length - 1];
+          tpl.status = last.status; tpl.files = last.files; tpl.size = last.size;
+          tpl.duration = last.duration; tpl.timestamp = last.timestamp; tpl.result = last.result;
+        }
+        jobHistory[existing] = tpl;
+      } else jobHistory.push(tpl);
     }
     return { success: true, path: jobPath };
   } catch (e) {
