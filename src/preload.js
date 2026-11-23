@@ -75,7 +75,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   refreshJobs: (jobs) => ipcRenderer.invoke('jobs-refresh', jobs),
 
   // Event listeners for real-time updates
-  onBackupProgress: (callback) => ipcRenderer.on('backup-progress', (event, ...args) => callback(...args)),
+  // onBackupProgress returns an unsubscribe function so a run can stop
+  // listening when it finishes (no duplicate listeners on repeat runs).
+  onBackupProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('backup-progress', h); return () => ipcRenderer.removeListener('backup-progress', h); },
   onBackupComplete: (callback) => ipcRenderer.on('backup-complete', (event, ...args) => callback(...args)),
   onJobsUpdated: (callback) => ipcRenderer.on('jobs-updated', () => callback()),
 

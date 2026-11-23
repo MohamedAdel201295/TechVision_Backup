@@ -81,7 +81,6 @@
   var jobs = [];
   var currentJob = null;
   var settings = {};
-  var progressTimer = null;
   var currentLogTab = 'today';
   var logsTimer = null;
   var fullLogLines = [];
@@ -630,19 +629,6 @@
     var dr = $('drawerRun');
     if (dr) dr.disabled = disabled;
   }
-  /* Simulated in-page progress while the main process works.
-     The real result still comes from the IPC reply; this only keeps
-     the user informed that the operation is running. */
-  function simulateProgress(label, done) {
-    var pct = 0;
-    clearInterval(progressTimer);
-    progressTimer = setInterval(function () {
-      pct = Math.min(92, pct + Math.random() * 9 + 3);
-      setProgress(pct);
-    }, 350);
-    return function stop() { clearInterval(progressTimer); };
-  }
-
   /* ---------- backup / restore actions ---------- */
   // Ask for a job password in a modal. Resolves to the password, or
   // null when the user cancels.
@@ -683,12 +669,22 @@
     }
     closeDrawer();
     showProgress(incremental ? 'Running incremental backup…' : 'Running full backup…');
-    var stop = simulateProgress();
+    // Real progress from the engine: main forwards 'backup-progress'
+    // events as bytes are actually processed. This replaces the old
+    // simulated bar that raced to 92% and froze there.
+    var stopProgress = null;
+    if (api && typeof api.onBackupProgress === 'function') {
+      stopProgress = api.onBackupProgress(function (p) {
+        setProgress(p.pct, p.filesDone, p.bytesDone, p.currentFile);
+        var t = $('progressTitle');
+        if (t) t.textContent = p.phase === 'writing' ? 'Writing archive…' : (p.phase === 'copying' ? 'Copying files…' : (incremental ? 'Running incremental backup…' : 'Running full backup…'));
+      });
+    }
     try {
       var result = incremental && typeof api.runIncrementalBackup === 'function'
         ? await api.runIncrementalBackup(cfg)
         : await api.runFullBackup(cfg);
-      stop();
+      if (stopProgress) stopProgress();
       setProgress(100, result && result.files, result && result.size);
       var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
       setTimeout(function () { hideProgress(); }, 900);
@@ -703,7 +699,7 @@
       }
       await loadJobs();
     } catch (e) {
-      stop();
+      if (stopProgress) stopProgress();
       hideProgress();
       toast('Backup failed', e && e.message ? e.message : 'The backup did not complete.', 'error');
     }

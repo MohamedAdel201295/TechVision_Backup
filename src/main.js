@@ -831,10 +831,17 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     jobConfig.encryptionPassword = pw;
   }
   const engine = new BackupEngine(jobConfig);
-  
+
+  // Real progress for the window that started the run: the renderer
+  // used to fake the bar (raced to 92% and froze). The engine now
+  // reports real bytes; forward them as they arrive.
+  engine.onProgress = (p) => {
+    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', p); } catch (e) {}
+  };
+
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, status: 'running' });
-  
+
   notifyEmail('started', { name: jobName, type: 'full', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
 
   engine.logger = true; // Enable logging
@@ -894,7 +901,12 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     jobConfig.encryptionPassword = pw;
   }
   const engine = new BackupEngine(jobConfig);
-  
+
+  // Real progress for the window that started the run (see full backup).
+  engine.onProgress = (p) => {
+    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', p); } catch (e) {}
+  };
+
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, status: 'running' });
   notifyEmail('started', { name: jobName, type: 'incremental', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
@@ -937,7 +949,14 @@ ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password) => {
   try {
     const restoreEngine = new RestoreEngine();
     const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null);
-    return { success: true, files: result.files || 0, size: result.size || 0 };
+    // restore_all reports failures in its result object instead of
+    // throwing (wrong password, hash mismatch) — honour it, or a
+    // failed restore would be reported as success. Its counters are
+    // files_restored/total_bytes, not files/size.
+    if (result && result.success === false) {
+      return { success: false, error: (result.errors && result.errors[0]) || 'Restore failed.' };
+    }
+    return { success: true, files: (result && result.files_restored) || 0, size: (result && result.total_bytes) || 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
   }
