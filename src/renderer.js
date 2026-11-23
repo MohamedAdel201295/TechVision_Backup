@@ -114,7 +114,7 @@
       var s = await api.getSettings();
       settings = (s && typeof s === 'object') ? s : {};
       applyTheme(settings.theme || settings.appearance || 'dark');
-      if ($('settingCompress')) $('settingCompress').checked = settings.compress !== false;
+      if ($('settingAutoStart')) $('settingAutoStart').checked = settings.autoStart !== false;
       if ($('settingVerify')) $('settingVerify').checked = settings.verify !== false;
       if ($('settingIncremental')) $('settingIncremental').checked = settings.allowIncremental !== false;
     } catch (e) { /* settings are optional; keep defaults */ }
@@ -125,7 +125,8 @@
       theme: document.body.getAttribute('data-theme') || 'dark',
       compress: $('settingCompress') ? $('settingCompress').checked : true,
       verify: $('settingVerify') ? $('settingVerify').checked : true,
-      allowIncremental: $('settingIncremental') ? $('settingIncremental').checked : true
+      allowIncremental: $('settingIncremental') ? $('settingIncremental').checked : true,
+      autoStart: $('settingAutoStart') ? $('settingAutoStart').checked : true
     });
     try {
       await api.saveSettings(next);
