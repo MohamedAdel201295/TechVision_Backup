@@ -99,7 +99,10 @@
         <option value="TEMPLATE">Template</option>
       </select>
     </div>
-    <h2 class="section-title">Backup History</h2>
+    <div class="history-head">
+      <h2 class="section-title" style="margin:0;">Backup History</h2>
+      <button class="btn btn-danger btn-sm" type="button" id="clearHistoryBtn">🗑 Clear History</button>
+    </div>
     <div class="job-list" id="jobList"></div>
     <div class="empty-state" id="emptyState" style="display:none;">
       <div class="big">🛡️</div>
@@ -180,9 +183,17 @@
   </div>
   <div class="drawer-actions">
     <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
-    <button class="btn btn-danger" type="button" id="clearHistoryBtn">Clear History</button>
   </div>
 </aside>
+<div class="backdrop" id="confirmBackdrop"></div>
+<div class="confirm-modal" id="confirmModal" role="alertdialog" aria-labelledby="confirmTitle" aria-describedby="confirmText" style="display:none;">
+  <h3 id="confirmTitle">Are you sure?</h3>
+  <p id="confirmText">Do you want to delete all backup history? This cannot be undone.</p>
+  <div class="confirm-actions">
+    <button class="btn btn-danger" type="button" id="confirmYes">Yes, delete all</button>
+    <button class="btn" type="button" id="confirmNo">No, keep it</button>
+  </div>
+</div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <script src="renderer.js"></script>
 </body>
