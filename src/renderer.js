@@ -50,6 +50,7 @@
     var status = safeStr(raw.status, 'PENDING').toUpperCase();
     if (['COMPLETED', 'RUNNING', 'PENDING', 'FAILED', 'TEMPLATE'].indexOf(status) === -1) status = 'PENDING';
     return {
+      id: raw.id || raw.jobId || '',
       name: name,
       type: type,
       status: status,
@@ -310,7 +311,7 @@
       setProgress(100, result && result.files, result && result.size);
       var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
       setTimeout(function () { hideProgress(); }, 900);
-      if (result && result.success === false) {
+      if (result && (result.success === false || result.status === 'failed')) {
         toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
       } else {
         toast('Backup completed', job.name + ' — ' + files + ' file' + (files === 1 ? '' : 's') + ' backed up.', 'success');
@@ -380,7 +381,16 @@
     $('settingsClose').addEventListener('click', closeSettings);
     $('settingsBackdrop').addEventListener('click', closeSettings);
     $('settingsSave').addEventListener('click', async function () { await saveSettings(); closeSettings(); });
-    $('settingLightTheme').addEventListener('change', function (ev) { applyTheme(ev.target.checked ? 'light' : 'dark'); });
+    $('settingLightTheme').addEventListener('change', async function (ev) {
+      var next = ev.target.checked ? 'light' : 'dark';
+      applyTheme(next);
+      /* Persist on change: before this, toggling Light only changed the
+         main window visually, settings.json still said dark, and the next
+         New Job wizard opened black. Save immediately, like themeToggle. */
+      if (api && typeof api.saveSettings === 'function') {
+        try { await api.saveSettings(Object.assign({}, settings, { theme: next })); settings.theme = next; } catch (e) { /* theme already applied visually */ }
+      }
+    });
     $('clearHistoryBtn').addEventListener('click', async function () {
       if (!api || typeof api.clearJobHistory !== 'function') return;
       try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
