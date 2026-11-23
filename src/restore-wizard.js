@@ -45,8 +45,23 @@
       else if (result && Array.isArray(result.filePaths) && result.filePaths.length) path = result.filePaths[0];
       else if (result && result.filePath) path = result.filePath;
       else if (Array.isArray(result) && result.length) path = result[0];
-      if (path) { $('backupFile').value = path; $('fileError').classList.remove('show'); }
+      if (path) { $('backupFile').value = path; $('fileError').classList.remove('show'); checkEncrypted(path); }
     } catch (e) { toast('Browse failed', e && e.message ? e.message : 'Could not open the file picker.', 'error'); }
+  }
+  // Encrypted backup? Ask for its password before restoring.
+  var isEncryptedBackup = false;
+  async function checkEncrypted(zipPath) {
+    isEncryptedBackup = false;
+    $('restorePasswordField').style.display = 'none';
+    if (!api || typeof api.getZipInfo !== 'function') return;
+    try {
+      var info = await api.getZipInfo(zipPath);
+      if (info && info.success && Array.isArray(info.entries) &&
+          info.entries.some(function (e) { return e.encrypted; })) {
+        isEncryptedBackup = true;
+        $('restorePasswordField').style.display = 'block';
+      }
+    } catch (e) { /* unknown: restore will report the real error */ }
   }
   async function pickFolder() {
     if (!api || typeof api.showOpenDialog !== 'function') { toast('Browse unavailable', 'Folder picker API is not available.', 'error'); return; }
@@ -66,6 +81,9 @@
     var ok = true;
     if (!zipPath) { $('fileError').classList.add('show'); ok = false; }
     if (!dest) { $('destError').classList.add('show'); ok = false; }
+    var pw = $('restorePassword').value;
+    if (isEncryptedBackup && !pw) { $('restorePasswordError').classList.add('show'); ok = false; }
+    else $('restorePasswordError').classList.remove('show');
     if (!ok) { toast('Missing information', 'Please choose a backup file and a destination folder.', 'warning'); return; }
     if (!api || typeof api.restoreAll !== 'function') { toast('Restore unavailable', 'Restore API is not available.', 'error'); return; }
     $('startBtn').disabled = true;
@@ -77,7 +95,7 @@
     var pct = 0;
     timer = setInterval(function () { pct = Math.min(92, pct + Math.random() * 9 + 3); setProgress(pct); }, 350);
     try {
-      var result = await api.restoreAll(zipPath, dest);
+      var result = await api.restoreAll(zipPath, dest, isEncryptedBackup ? $('restorePassword').value : null);
       clearInterval(timer);
       var files = result ? Number(result.files ?? result.restoredFiles ?? result.fileCount ?? 0) : 0;
       setProgress(100, files, '');
@@ -122,7 +140,7 @@
     // passed to the wizard (its result.backup_path).
     if (api && typeof api.getJobConfig === 'function') {
       api.getJobConfig(null).then(function (cfg) {
-        if (cfg && cfg.result && cfg.result.backup_path) $('backupFile').value = cfg.result.backup_path;
+        if (cfg && cfg.result && cfg.result.backup_path) { $('backupFile').value = cfg.result.backup_path; checkEncrypted(cfg.result.backup_path); }
       }).catch(function () {});
     }
   }
