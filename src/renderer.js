@@ -115,6 +115,16 @@
       settings = (s && typeof s === 'object') ? s : {};
       applyTheme(settings.theme || settings.appearance || 'dark');
       if ($('settingAutoStart')) $('settingAutoStart').checked = settings.autoStart !== false;
+      var em = (settings.email && typeof settings.email === 'object') ? settings.email : {};
+      if ($('settingEmailEnabled')) $('settingEmailEnabled').checked = em.enabled === true;
+      if ($('settingEmailStart')) $('settingEmailStart').checked = em.notifyOnStart !== false;
+      if ($('settingEmailFinish')) $('settingEmailFinish').checked = em.notifyOnFinish !== false;
+      if ($('settingEmailMissed')) $('settingEmailMissed').checked = em.notifyOnMissed !== false;
+      if ($('settingEmailTo')) $('settingEmailTo').value = em.to || '';
+      if ($('settingEmailUser')) $('settingEmailUser').value = em.smtpUser || '';
+      if ($('settingEmailPass')) $('settingEmailPass').value = em.smtpPass || '';
+      if ($('settingEmailHost')) $('settingEmailHost').value = em.smtpHost || 'smtp.gmail.com';
+      if ($('settingEmailPort')) $('settingEmailPort').value = String(em.smtpPort || 465);
       if ($('settingVerify')) $('settingVerify').checked = settings.verify !== false;
       if ($('settingIncremental')) $('settingIncremental').checked = settings.allowIncremental !== false;
     } catch (e) { /* settings are optional; keep defaults */ }
@@ -126,7 +136,19 @@
       compress: $('settingCompress') ? $('settingCompress').checked : true,
       verify: $('settingVerify') ? $('settingVerify').checked : true,
       allowIncremental: $('settingIncremental') ? $('settingIncremental').checked : true,
-      autoStart: $('settingAutoStart') ? $('settingAutoStart').checked : true
+      autoStart: $('settingAutoStart') ? $('settingAutoStart').checked : true,
+      email: {
+        enabled: $('settingEmailEnabled') ? $('settingEmailEnabled').checked : false,
+        notifyOnStart: $('settingEmailStart') ? $('settingEmailStart').checked : true,
+        notifyOnFinish: $('settingEmailFinish') ? $('settingEmailFinish').checked : true,
+        notifyOnMissed: $('settingEmailMissed') ? $('settingEmailMissed').checked : true,
+        to: $('settingEmailTo') ? $('settingEmailTo').value.trim() : '',
+        smtpUser: $('settingEmailUser') ? $('settingEmailUser').value.trim() : '',
+        smtpPass: $('settingEmailPass') ? $('settingEmailPass').value : '',
+        smtpHost: $('settingEmailHost') ? $('settingEmailHost').value.trim() || 'smtp.gmail.com' : 'smtp.gmail.com',
+        smtpPort: $('settingEmailPort') ? parseInt($('settingEmailPort').value, 10) || 465 : 465,
+        smtpSecure: true
+      }
     });
     try {
       await api.saveSettings(next);
@@ -546,6 +568,16 @@
     $('settingsClose').addEventListener('click', closeSettings);
     $('settingsBackdrop').addEventListener('click', closeSettings);
     $('settingsSave').addEventListener('click', async function () { await saveSettings(); closeSettings(); });
+    var etb = $('emailTestBtn');
+    if (etb) etb.addEventListener('click', async function () {
+      await saveSettings();
+      if (!api || typeof api.sendTestEmail !== 'function') { toast('Test unavailable', 'Test email API is not available.', 'error'); return; }
+      try {
+        var res = await api.sendTestEmail();
+        if (res && res.success) toast('Test email sent', 'Check your inbox for the TechVision test email.', 'success');
+        else toast('Test email failed', (res && res.error) || 'Could not send the test email.', 'error');
+      } catch (e) { toast('Test email failed', e && e.message ? e.message : 'Could not send the test email.', 'error'); }
+    });
     $('settingLightTheme').addEventListener('change', async function (ev) {
       var next = ev.target.checked ? 'light' : 'dark';
       applyTheme(next);
