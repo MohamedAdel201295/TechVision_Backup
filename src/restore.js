@@ -53,6 +53,30 @@ class RestoreEngine {
   async restore_all(zipPath, restoreDir) {
     const result = new RestoreResult();
     const startTime = Date.now();
+    // Plain-copy backup: backup_path is a folder with the same files,
+    // not a ZIP. Restore is a straight copy back, same structure.
+    try {
+      if (zipPath && fs.existsSync(zipPath) && fs.statSync(zipPath).isDirectory()) {
+        if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
+        const walk = (dir) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const src = path.join(dir, entry.name);
+            const dest = path.join(restoreDir, path.relative(zipPath, src));
+            if (entry.isDirectory()) { fs.mkdirSync(dest, { recursive: true }); walk(src); }
+            else { fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.copyFileSync(src, dest); result.files_restored++; result.total_size += fs.statSync(src).size; }
+          }
+        };
+        walk(zipPath);
+        result.success = result.files_restored > 0;
+        result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+        return result;
+      }
+    } catch (e) {
+      result.success = false;
+      result.errors.push(e.message);
+      result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+      return result;
+    }
     const zipFiles = [];
     const zipData = new Map();
     const restoredSizes = [];
@@ -180,6 +204,19 @@ class RestoreEngine {
    * Get ZIP file info (streaming)
    */
   async getZipInfo(zipPath) {
+    // Plain-copy backup folder: list its files instead of opening a ZIP.
+    if (zipPath && fs.existsSync(zipPath) && fs.statSync(zipPath).isDirectory()) {
+      const entries = [];
+      const walk = (dir) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else entries.push({ path: path.relative(zipPath, full), size: fs.statSync(full).size, isDir: false });
+        }
+      };
+      walk(zipPath);
+      return entries;
+    }
     return new Promise((resolve, reject) => {
       yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
         if (err) return reject(err);

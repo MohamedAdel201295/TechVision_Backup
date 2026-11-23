@@ -21,12 +21,11 @@
     <div class="nav-label">Menu</div>
     <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
     <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
+    <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> New Job</button>
     <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
-    <button class="nav-item" type="button" data-nav="logs"><span class="ico">≡</span> Logs</button>
-    <button class="nav-item" type="button" data-nav="settings"><span class="ico">⚙</span> Settings</button>
     <div class="sidebar-foot">
       <div>TechVision Backup</div>
-      <div>Electron · Node.js</div>
+      <div>Powered by TechVision</div>
       <div id="sidebarVersion">Version 1.0.0</div>
     </div>
   </aside>
@@ -41,6 +40,7 @@
         <button class="icon-btn" type="button" id="settingsBtn" title="Settings" aria-label="Settings">⚙</button>
       </div>
     </header>
+  <div id="view-dashboard">
     <section class="stats" aria-label="Backup statistics">
       <div class="stat-card">
         <div class="stat-label">Total Backups</div>
@@ -64,8 +64,6 @@
       </div>
     </section>
     <div class="actions-row">
-      <button class="btn btn-primary" type="button" id="newJobBtn">＋ New Job</button>
-      <button class="btn" type="button" id="restoreBtn">↺ Restore</button>
       <button class="btn btn-ghost" type="button" id="refreshBtn">⟳ Refresh</button>
     </div>
     <section class="progress-card" id="progressCard" aria-live="polite">
@@ -100,7 +98,10 @@
         <option value="TEMPLATE">Template</option>
       </select>
     </div>
-    <h2 class="section-title">Backup History</h2>
+    <div class="history-head">
+      <h2 class="section-title" style="margin:0;">Backup History</h2>
+      <button class="btn btn-danger btn-sm" type="button" id="clearHistoryBtn">🗑 Clear History</button>
+    </div>
     <div class="job-list" id="jobList"></div>
     <div class="empty-state" id="emptyState" style="display:none;">
       <div class="big">🛡️</div>
@@ -108,6 +109,23 @@
       <p>Create your first backup job and protect your files.</p>
       <button class="btn btn-primary" type="button" id="emptyNewJobBtn">＋ Create your first backup</button>
     </div>
+  </div>
+  <div id="view-jobs" style="display:none;">
+    <div class="view-head">
+      <div>
+        <h2 class="section-title" style="margin:0;">Jobs — up next</h2>
+        <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">The jobs waiting for their turn to run: never run yet, or scheduled. Finished jobs live in the Dashboard history.</p>
+      </div>
+      <button class="btn btn-primary" type="button" id="jobsNewJobBtn">＋ New Job</button>
+    </div>
+    <div class="job-list" id="jobsList"></div>
+    <div class="empty-state" id="jobsEmptyState" style="display:none;">
+      <div class="big">✅</div>
+      <h3>Nothing waiting</h3>
+      <p>No job is waiting to run — create one, or set a schedule on an existing job.</p>
+      <button class="btn btn-primary" type="button" id="jobsEmptyNewJobBtn">＋ Create a job</button>
+    </div>
+  </div>
   </main>
 </div>
 <div class="backdrop" id="drawerBackdrop"></div>
@@ -124,7 +142,10 @@
     <dt>Total size</dt><dd id="drawerSize">—</dd>
     <dt>Duration</dt><dd id="drawerDuration">—</dd>
     <dt>Last run</dt><dd id="drawerLastRun">—</dd>
+    <dt>Schedule</dt><dd id="drawerSchedule">—</dd>
+    <dt>Next run</dt><dd id="drawerNextRun">—</dd>
   </dl>
+  <div id="drawerRuns"></div>
   <div class="drawer-actions">
     <button class="btn btn-primary btn-sm" type="button" id="drawerRun">▶ Run Backup</button>
     <button class="btn btn-sm" type="button" id="drawerRestore">↺ Restore</button>
@@ -143,6 +164,10 @@
       <label class="switch"><input type="checkbox" id="settingLightTheme"><span class="slider"></span></label>
     </div>
     <div class="toggle-row">
+      <div><div class="t-label">Start with Windows</div><div class="t-sub">Launch TechVision Backup automatically when Windows starts.</div></div>
+      <label class="switch"><input type="checkbox" id="settingAutoStart" checked><span class="slider"></span></label>
+    </div>
+    <div class="toggle-row">
       <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Default for new jobs.</div></div>
       <label class="switch"><input type="checkbox" id="settingCompress" checked><span class="slider"></span></label>
     </div>
@@ -157,9 +182,17 @@
   </div>
   <div class="drawer-actions">
     <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
-    <button class="btn btn-danger" type="button" id="clearHistoryBtn">Clear History</button>
   </div>
 </aside>
+<div class="backdrop" id="confirmBackdrop"></div>
+<div class="confirm-modal" id="confirmModal" role="alertdialog" aria-labelledby="confirmTitle" aria-describedby="confirmText" style="display:none;">
+  <h3 id="confirmTitle">Are you sure?</h3>
+  <p id="confirmText">Do you want to delete all backup history? This cannot be undone.</p>
+  <div class="confirm-actions">
+    <button class="btn btn-danger" type="button" id="confirmYes">Yes, delete all</button>
+    <button class="btn" type="button" id="confirmNo">No, keep it</button>
+  </div>
+</div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <script src="renderer.js"></script>
 </body>

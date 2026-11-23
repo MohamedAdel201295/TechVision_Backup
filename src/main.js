@@ -3,7 +3,7 @@
  * Electron main process for backup application
  */
 
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
@@ -14,6 +14,12 @@ const isDevelopment = !app.isPackaged;
 // Assets path for icons
 const ASSETS_PATH = path.join(__dirname, 'assets');
 const APP_ICON = path.join(ASSETS_PATH, 'TechVision_Logo.png');
+
+// System tray + auto-start: the app must keep running (and keep its
+// scheduler alive) until the user explicitly quits from the tray.
+// Closing the main window only hides it to the tray.
+let tray = null;
+let isQuitting = false;
 
 // Main window
 let mainWindow;
@@ -47,7 +53,7 @@ function jobPathValue(value) {
 // Helper function to normalize job objects with uniform defaults
 function normalizeJobObject(job, defaultType = 'full') {
   if (!job || typeof job !== 'object') return null;
-  return {
+  const normalized = {
     id: job.id || `job-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
     name: job.name || 'Unnamed Job',
     status: job.status || 'pending',
@@ -59,8 +65,147 @@ function normalizeJobObject(job, defaultType = 'full') {
     size: job.size ?? 0,
     duration: job.duration ?? 0,
     result: job.result || null,
+    jobId: job.jobId || null,
+    // Settings must survive load/save: the wizard saves compress,
+    // compression and schedule, but normalize used to drop them, so
+    // a Run from History always ran with the defaults (compressed,
+    // no schedule) no matter what the job was created with.
+    schedule: job.schedule || { enabled: false },
+    compress: job.compress !== undefined ? job.compress : undefined,
+    compression: job.compression || (job.compress === false ? 'none' : undefined),
+    allowIncremental: job.allowIncremental,
+    verify: job.verify,
+    options: job.options || {},
+    lastScheduledRun: job.lastScheduledRun || null,
+    runs: Array.isArray(job.runs) ? job.runs : [],
+    runCount: job.runCount ?? (Array.isArray(job.runs) ? job.runs.length : 0),
     loaded: job.loaded || false
   };
+  // A job with runs is a real job, not a template: showing
+  // "TEMPLATE / COMPLETED" is contradictory. Only a job that never
+  // ran keeps type TEMPLATE.
+  if (normalized.runs.length) {
+    const lastRun = normalized.runs[normalized.runs.length - 1];
+    normalized.type = lastRun.type === 'incremental' ? 'incremental' : 'full';
+    normalized.status = lastRun.status || normalized.status;
+  }
+  return normalized;
+}
+
+// One entry per job in jobHistory: a job template (loaded from its
+// <name>.json) plus the runs that belong to it. A run must NEVER create
+// a second history entry: recordRun() appends the run to the job's own
+// `runs` list and updates the job's latest-run stats in place.
+function mergeJobEntries(entries) {
+  const byName = new Map();
+  const merged = [];
+  function runFromRecord(rec) {
+    return {
+      id: rec.id || `run-${Date.now()}`,
+      type: rec.type || 'full',
+      status: rec.status || (rec.success ? 'completed' : 'failed'),
+      success: rec.success,
+      timestamp: rec.timestamp || new Date().toISOString(),
+      files: rec.files ?? 0,
+      size: rec.size ?? 0,
+      duration: rec.duration ?? 0,
+      result: rec.result || null
+    };
+  }
+  for (const entry of entries) {
+    if (!entry) continue;
+    const isRunRecord = (entry.type === 'full' || entry.type === 'incremental') && !entry.loaded;
+    // Key by id, not by name: two jobs may share a name and must stay
+    // two separate tasks. Run records carry jobId; templates carry id.
+    const key = (isRunRecord ? (entry.jobId || entry.name) : (entry.id || entry.name) || 'Unnamed Job').toLowerCase();
+    let job = byName.get(key);
+    if (!job) {
+      job = normalizeJobObject(entry, isRunRecord ? 'full' : 'template');
+      job.runs = [];
+      job.runCount = 0;
+      if (isRunRecord) {
+        job.type = 'full';
+        job.status = 'pending';
+      }
+      byName.set(key, job);
+      merged.push(job);
+    }
+    if (isRunRecord) {
+      const run = runFromRecord(entry);
+      job.runs.push(run);
+      job.runCount = job.runs.length;
+      job.status = run.status;
+      job.files = run.files;
+      job.size = run.size;
+      job.duration = run.duration;
+      job.timestamp = run.timestamp;
+      job.result = run.result;
+      job.type = run.type === 'incremental' ? 'incremental' : 'full';
+    } else {
+      // Template: keep the job's identity/paths, preserve any runs
+      // already merged from history records.
+      job.loaded = true;
+      if (entry.source) job.source = entry.source;
+      if (entry.destination) job.destination = entry.destination;
+      if (entry.schedule) job.schedule = entry.schedule;
+      if (entry.compress !== undefined) job.compress = entry.compress;
+      if (entry.compression) job.compression = entry.compression;
+      if (entry.allowIncremental !== undefined) job.allowIncremental = entry.allowIncremental;
+      if (entry.verify !== undefined) job.verify = entry.verify;
+      if (entry.options) job.options = entry.options;
+      if (entry.lastScheduledRun) job.lastScheduledRun = entry.lastScheduledRun;
+      if (!job.runs.length) {
+        job.status = entry.status || 'pending';
+        job.type = 'template';
+      }
+    }
+  }
+  return merged;
+}
+
+// Tell the main window to reload its jobs/history. Called after every
+// change (create, edit, delete, run, clear, scheduled run) so the
+// Dashboard refreshes automatically — no manual Refresh needed.
+function notifyJobsUpdated() {
+  try {
+    if (typeof mainWindow !== 'undefined' && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('jobs-updated');
+    }
+  } catch (e) { /* window not ready yet */ }
+}
+
+function recordRun(jobName, jobRecord) {
+  const key = (jobName || 'Unnamed Job').toLowerCase();
+  let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
+  if (!job) job = jobHistory.find(j => (j.name || '').toLowerCase() === key);
+  if (!job) {
+    job = normalizeJobObject({ name: jobName, type: 'full', status: 'pending' });
+    job.runs = [];
+    jobHistory.push(job);
+  }
+  const run = {
+    id: jobRecord.id,
+    type: jobRecord.type || 'full',
+    status: jobRecord.status,
+    success: jobRecord.success,
+    timestamp: jobRecord.timestamp,
+    files: jobRecord.files,
+    size: jobRecord.size,
+    duration: jobRecord.duration,
+    result: jobRecord.result || null
+  };
+  job.runs.push(run);
+  job.runCount = job.runs.length;
+  job.status = run.status;
+  job.files = run.files;
+  job.size = run.size;
+  job.duration = run.duration;
+  job.timestamp = run.timestamp;
+  job.result = run.result;
+  job.type = run.type === 'incremental' ? 'incremental' : 'full';
+  if (jobRecord.source) job.source = jobRecord.source;
+  if (jobRecord.destination) job.destination = jobRecord.destination;
+  return job;
 }
 
 // Load stored jobs from disk on app start
@@ -115,6 +260,10 @@ async function loadStoredJobs() {
   } catch (e) {
     console.error('[Main] Failed to load stored jobs:', e.message);
   }
+  // Merge templates + run records so History shows one entry per job,
+  // with the job's runs attached, instead of a PENDING template row
+  // plus a separate row per run.
+  jobHistory = mergeJobEntries(jobHistory);
 }
 
 // Save job history to disk
@@ -125,12 +274,87 @@ function saveJobHistory() {
     if (!fs.existsSync(jobsDir)) {
       fs.mkdirSync(jobsDir, { recursive: true });
     }
-    // Filter out loaded templates and keep only actual job records
-    const recordsToSave = jobHistory.filter(j => !j.loaded);
+    // Persist runs as flat records (the on-disk history.json format),
+    // one per run, so they survive a restart and merge back into their
+    // job on load. Templates with no runs save nothing.
+    const recordsToSave = [];
+    for (const j of jobHistory) {
+      for (const r of (j.runs || [])) {
+        recordsToSave.push({
+          id: r.id, name: j.name, type: r.type, status: r.status,
+          success: r.success, source: j.source, destination: j.destination,
+          timestamp: r.timestamp, files: r.files, size: r.size,
+          duration: r.duration, result: r.result || null
+        });
+      }
+    }
     fs.writeFileSync(historyPath, JSON.stringify(recordsToSave, null, 2));
     console.log(`[Main] Saved ${recordsToSave.length} job history records`);
   } catch (e) {
     console.error('[Main] Failed to save job history:', e.message);
+  }
+}
+
+function getAutoStartSetting() {
+  try {
+    const settingsPath = path.join(app.getPath('userData'), '.techvision', 'settings.json');
+    if (fs.existsSync(settingsPath)) {
+      const s = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      if (s && typeof s.autoStart === 'boolean') return s.autoStart;
+    }
+  } catch (e) {}
+  return true; // default: start with Windows
+}
+
+function saveAutoStartSetting(value) {
+  try {
+    const dir = path.join(app.getPath('userData'), '.techvision');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const settingsPath = path.join(dir, 'settings.json');
+    let s = {};
+    try { s = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')); } catch (e) {}
+    s.autoStart = value;
+    fs.writeFileSync(settingsPath, JSON.stringify(s, null, 2));
+  } catch (e) {}
+}
+
+function applyAutoStart() {
+  // Works for the installed app AND the portable exe: Electron
+  // registers the current exe path in the Windows Run key, so the
+  // app starts at login even when it was never installed.
+  try {
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+      app.setLoginItemSettings({ openAtLogin: getAutoStartSetting(), path: process.execPath });
+    }
+  } catch (e) {
+    console.error('[Tray] Could not set auto-start:', e.message);
+  }
+}
+
+function createTray() {
+  try {
+    let icon = nativeImage.createEmpty();
+    if (fs.existsSync(APP_ICON)) icon = nativeImage.createFromPath(APP_ICON);
+    tray = new Tray(icon);
+    tray.setToolTip('TechVision Backup — running in the tray');
+    const buildMenu = () => Menu.buildFromTemplate([
+      { label: 'Show TechVision Backup', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } else createMainWindow(); } },
+      { type: 'separator' },
+      { label: 'Start with Windows', type: 'checkbox', checked: getAutoStartSetting(), click: (item) => { saveAutoStartSetting(item.checked); applyAutoStart(); } },
+      { type: 'separator' },
+      { label: 'Exit', click: () => { isQuitting = true; app.quit(); } }
+    ]);
+    tray.setContextMenu(buildMenu());
+    tray.on('click', () => {
+      if (!mainWindow) { createMainWindow(); return; }
+      if (mainWindow.isVisible()) mainWindow.hide(); else { mainWindow.show(); mainWindow.focus(); }
+    });
+    // Rebuild the menu when it opens so the checkbox reflects the setting.
+    tray.on('right-click', () => tray.setContextMenu(buildMenu()));
+    console.log('[Tray] System tray icon created');
+  } catch (e) {
+    console.error('[Tray] Could not create tray icon:', e.message);
+    tray = null;
   }
 }
 
@@ -147,6 +371,15 @@ function createMainWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
+
+  // The X button hides the window to the tray instead of quitting:
+  // the app (and its scheduler) keeps running until Exit from the tray.
+  mainWindow.on('close', (e) => {
+    if (!isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -221,7 +454,11 @@ function createLogViewerWindow() {
 // App lifecycle
 app.whenReady().then(() => {
   loadStoredJobs(); // Load stored jobs on startup
+  startScheduler(); // Run scheduled jobs while the app is open
+  try { app.setAppUserModelId('com.techvision.backup'); } catch (e) {}
+  applyAutoStart(); // Start with Windows, installed or portable
   createMainWindow();
+  createTray(); // Keep running in the tray after the window closes
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -231,10 +468,106 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  // Do NOT quit when the window closes: the app lives in the tray
+  // (and keeps running scheduled backups) until Exit from the tray.
+  // Only quit if the tray could not be created at all.
+  if (!tray && process.platform !== 'darwin') {
     app.quit();
   }
 });
+
+app.on('before-quit', () => { isQuitting = true; });
+
+// ---------- Scheduler ----------
+// The schedule a job is created with was saved but never executed:
+// nothing in the app ever checked it. This timer runs while the app
+// is open and fires each enabled job at its scheduled time.
+function nextScheduledRun(schedule, fromDate, lastRun) {
+  if (!schedule || !schedule.enabled) return null;
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(schedule.time || '02:00');
+  if (!m) return null;
+  const target = new Date(fromDate);
+  target.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+  const freq = (schedule.frequency || 'Daily').toLowerCase();
+  if (freq === 'weekly') {
+    const base = lastRun ? new Date(lastRun) : null;
+    if (base && !isNaN(base)) {
+      const next = new Date(base); next.setDate(next.getDate() + 7);
+      next.setHours(target.getHours(), target.getMinutes(), 0, 0);
+      if (next > fromDate) return next;
+      return next; // due already; caller fires once then records lastScheduledRun
+    }
+    if (target > fromDate) return target;
+    target.setDate(target.getDate() + 7);
+    return target;
+  }
+  if (freq === 'monthly') {
+    if (target > fromDate) return target;
+    target.setMonth(target.getMonth() + 1);
+    return target;
+  }
+  // Daily (default)
+  if (target > fromDate) return target;
+  target.setDate(target.getDate() + 1);
+  return target;
+}
+
+async function executeScheduledBackup(job) {
+  if (!job || !job.source || !job.destination) return;
+  if (Array.from(activeJobs.values()).some(a => a.name === job.name && a.status === 'running')) return;
+  const jobConfig = {
+    name: job.name, source: job.source, destination: job.destination,
+    compress: job.compress, compression: job.compression,
+    allowIncremental: job.allowIncremental, schedule: job.schedule,
+    includePatterns: job.includePatterns, excludePatterns: job.excludePatterns
+  };
+  const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
+  const jobId = `${job.name}-scheduled-${Date.now()}`;
+  activeJobs.set(jobId, { name: job.name, status: 'running' });
+  try {
+    const engine = new BackupEngine(jobConfig);
+    engine.logger = true;
+    const result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
+    const jobRecord = {
+      id: jobId, name: job.name, type: useIncremental ? 'incremental' : 'full',
+      success: result.success, status: result.success ? 'completed' : 'failed',
+      source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination),
+      timestamp: new Date().toISOString(), files: result.files_backed_up,
+      size: result.total_bytes, duration: result.duration_seconds, result
+    };
+    recordRun(job.name, jobRecord);
+    job.lastScheduledRun = new Date().toISOString();
+    saveJobHistory();
+    console.log(`[Scheduler] Scheduled backup ${useIncremental ? 'incremental' : 'full'} for ${job.name}: ${jobRecord.status}`);
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
+  } catch (e) {
+    console.error(`[Scheduler] Scheduled backup failed for ${job.name}:`, e.message);
+  } finally {
+    activeJobs.delete(jobId);
+  }
+}
+
+function checkSchedules() {
+  const now = new Date();
+  for (const job of jobHistory) {
+    if (!job.schedule || !job.schedule.enabled) continue;
+    const next = nextScheduledRun(job.schedule, now, job.lastScheduledRun);
+    if (!next) continue;
+    const last = job.lastScheduledRun ? new Date(job.lastScheduledRun) : null;
+    // Due when the next run time has passed and we have not already
+    // fired for it (lastScheduledRun is before that run time).
+    if (next <= now && (!last || last < next)) {
+      executeScheduledBackup(job);
+    }
+  }
+}
+
+function startScheduler() {
+  if (global._schedulerTimer) return;
+  checkSchedules();
+  global._schedulerTimer = setInterval(checkSchedules, 30000);
+  console.log('[Scheduler] Started (checks every 30s while the app is open)');
+}
 
 // IPC Handlers
 
@@ -252,6 +585,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   
   const jobRecord = {
     id: jobId,
+    jobId: jobConfig.id || null,
     name: jobName,
     type: 'full',
     success: result.success,
@@ -265,8 +599,9 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     result: result
   };
 
-  jobHistory.push(jobRecord);
+  recordRun(jobName, jobRecord);
   saveJobHistory();
+  notifyJobsUpdated();
   activeJobs.delete(jobId);
 
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
@@ -286,6 +621,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   
   const jobRecord = {
     id: jobId,
+    jobId: jobConfig.id || null,
     name: jobName,
     type: 'incremental',
     success: result.success,
@@ -299,10 +635,11 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     result: result
   };
   
-  jobHistory.push(jobRecord);
+  recordRun(jobName, jobRecord);
   saveJobHistory();
+  notifyJobsUpdated();
   activeJobs.delete(jobId);
-  
+
   console.log(`[Main] Incremental backup completed: ${jobName}`);
   return jobRecord;
 });
@@ -459,6 +796,12 @@ ipcMain.handle('job-get-active', async () => {
 
 ipcMain.handle('job-clear-history', async () => {
   jobHistory.length = 0;
+  // Persist the clear: before this, the in-memory list was emptied but
+  // history.json was never rewritten, so all the history came back
+  // after a restart. Job definition files (<id>.json) are untouched,
+  // so the jobs themselves survive — only their run history is gone.
+  saveJobHistory();
+  notifyJobsUpdated();
   return { success: true };
 });
 
@@ -471,11 +814,17 @@ ipcMain.handle('job-get-config', async (event, jobId) => {
     pendingRestoreJob = null;
     if (pending) return pending;
   }
-  const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
+  const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
+  const jobPath = path.join(jobsDir, `${jobId}.json`);
   try {
     if (fs.existsSync(jobPath)) {
       const content = fs.readFileSync(jobPath, 'utf-8');
       return JSON.parse(content);
+    }
+    // Old configs were saved by name (<name>.json), not by id.
+    if (typeof jobId === 'string' && jobId.startsWith('job-')) {
+      const byName = path.join(jobsDir, `${jobId.slice(4)}.json`);
+      if (fs.existsSync(byName)) return JSON.parse(fs.readFileSync(byName, 'utf-8'));
     }
     return null;
   } catch (e) {
@@ -488,9 +837,17 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
   if (!fs.existsSync(jobsDir)) {
     fs.mkdirSync(jobsDir, { recursive: true });
   }
-  const jobPath = path.join(jobsDir, `${jobConfig.name}.json`);
+  const fileId = jobConfig.id || ('job-' + jobConfig.name);
+  jobConfig.id = fileId;
+  const jobPath = path.join(jobsDir, `${fileId}.json`);
   try {
     fs.writeFileSync(jobPath, JSON.stringify(jobConfig, null, 2));
+    // Migration: old configs were saved by name (<name>.json). If one
+    // exists for this job, remove it so it is not loaded as a second job.
+    const oldNamePath = path.join(jobsDir, `${jobConfig.name}.json`);
+    if (oldNamePath !== jobPath && fs.existsSync(oldNamePath)) {
+      try { fs.unlinkSync(oldNamePath); } catch (e) {}
+    }
     console.log(`[Main] Job saved to: ${jobPath}`);
     // The template only entered the list on the next startup before:
     // add it to the in-memory history now so Create Job shows it at once.
@@ -499,9 +856,25 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
       type: 'TEMPLATE', status: 'PENDING', loaded: true
     }));
     if (tpl) {
-      const existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
-      if (existing >= 0) jobHistory[existing] = tpl; else jobHistory.push(tpl);
+      let existing = jobHistory.findIndex(j => j.id === tpl.id);
+      if (existing < 0) existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
+      if (existing >= 0) {
+        // Keep the job's run history: a re-save must not wipe its runs.
+        tpl.runs = jobHistory[existing].runs || [];
+        tpl.runCount = tpl.runs.length;
+        if (tpl.runs.length) {
+          const last = tpl.runs[tpl.runs.length - 1];
+          // The job already ran: it is a FULL/INCREMENTAL job with a
+          // COMPLETED status, not a TEMPLATE. Leaving type TEMPLATE
+          // here showed the contradictory "TEMPLATE / COMPLETED".
+          tpl.type = last.type === 'incremental' ? 'incremental' : 'full';
+          tpl.status = last.status; tpl.files = last.files; tpl.size = last.size;
+          tpl.duration = last.duration; tpl.timestamp = last.timestamp; tpl.result = last.result;
+        }
+        jobHistory[existing] = tpl;
+      } else jobHistory.push(tpl);
     }
+    notifyJobsUpdated();
     return { success: true, path: jobPath };
   } catch (e) {
     console.error(`[Main] Failed to save job config:`, e.message);
@@ -642,6 +1015,9 @@ ipcMain.handle('settings-save', async (event, settings) => {
   }
   const settingsPath = path.join(settingsDir, 'settings.json');
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  // Apply Start-with-Windows right away: saving the setting must
+  // register/unregister the app at login without needing a restart.
+  applyAutoStart();
   return { success: true };
 });
 
@@ -759,6 +1135,7 @@ ipcMain.handle('job-delete', async (event, jobId) => {
     }
     jobHistory.splice(idx, 1);
     saveJobHistory();
+    notifyJobsUpdated();
     return { success: true };
   }
   const orphanPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
