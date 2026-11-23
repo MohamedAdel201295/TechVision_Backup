@@ -179,6 +179,46 @@
       <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Default for new jobs.</div></div>
       <label class="switch"><input type="checkbox" id="settingIncremental" checked><span class="slider"></span></label>
     </div>
+    <h3 style="margin:18px 0 4px;font-size:14px;">Email notifications</h3>
+    <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">Get an email when a backup starts or finishes, or when the app was closed and a scheduled backup was missed.</p>
+    <div class="toggle-row">
+      <div><div class="t-label">Email notifications</div><div class="t-sub">Send mail for backup events.</div></div>
+      <label class="switch"><input type="checkbox" id="settingEmailEnabled"><span class="slider"></span></label>
+    </div>
+    <div class="toggle-row">
+      <div><div class="t-label">Notify on start</div><div class="t-sub">Email when a backup starts.</div></div>
+      <label class="switch"><input type="checkbox" id="settingEmailStart" checked><span class="slider"></span></label>
+    </div>
+    <div class="toggle-row">
+      <div><div class="t-label">Notify on finish</div><div class="t-sub">Email when a backup finishes or fails.</div></div>
+      <label class="switch"><input type="checkbox" id="settingEmailFinish" checked><span class="slider"></span></label>
+    </div>
+    <div class="toggle-row">
+      <div><div class="t-label">Notify if service was down</div><div class="t-sub">Email when a scheduled backup was missed because the app was closed.</div></div>
+      <label class="switch"><input type="checkbox" id="settingEmailMissed" checked><span class="slider"></span></label>
+    </div>
+    <div class="field">
+      <label for="settingEmailTo">Send notifications to (email)</label>
+      <input type="text" id="settingEmailTo" placeholder="you@example.com" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="settingEmailUser">Gmail address (sender)</label>
+      <input type="text" id="settingEmailUser" placeholder="you@gmail.com" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="settingEmailPass">Gmail App Password</label>
+      <input type="password" id="settingEmailPass" placeholder="16-character app password" autocomplete="off">
+      <div class="hint">Google Account &rarr; Security &rarr; 2-Step Verification &rarr; App passwords. Use the app password, not your normal Gmail password.</div>
+    </div>
+    <div class="field">
+      <label for="settingEmailHost">SMTP host</label>
+      <input type="text" id="settingEmailHost" value="smtp.gmail.com" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="settingEmailPort">SMTP port</label>
+      <input type="text" id="settingEmailPort" value="465" autocomplete="off">
+    </div>
+    <button class="btn" type="button" id="emailTestBtn" style="margin-top:8px;">✉ Send test email</button>
   </div>
   <div class="drawer-actions">
     <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
