@@ -301,6 +301,10 @@ class BackupEngine {
       return result;
     }
 
+    // Single-file source: relative paths are computed from the file's
+    // parent folder, so the backed-up file keeps its own name.
+    const sourceBase = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
+
     // Create backup directory
     const backupSubDir = path.join(this.backupDir, backupName);
     if (!fs.existsSync(backupSubDir)) {
@@ -341,7 +345,7 @@ class BackupEngine {
 
       for (const file of files) {
         try {
-          const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+          const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
           
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
@@ -367,7 +371,7 @@ class BackupEngine {
             
             // File is readable: copy it as-is, or add it to the ZIP
             if (plainCopy) {
-              this._copyPlainFile(file, sourceDir, copyDir);
+              this._copyPlainFile(file, sourceBase, copyDir);
             } else {
               archive.file(file, { name: relativePath });
             }
@@ -391,13 +395,13 @@ class BackupEngine {
       // Save state for incremental backups
       const stateFile = path.join(backupSubDir, '.backup_state.json');
       const backupState = new BackupState(stateFile);
-      backupState.state['__base_dir__'] = sourceDir;
+      backupState.state['__base_dir__'] = sourceBase;
       
       // Save file states
       for (const file of files) {
         try {
           if (this.jobConfig.shouldInclude(file)) {
-            const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+            const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
             const fileInfo = await this.getFileInfo(file);
             backupState.set(file, fileInfo);
           }
@@ -456,7 +460,8 @@ class BackupEngine {
     // Initialize backup state
     const stateFile = path.join(backupSubDir, '.backup_state.json');
     const backupState = new BackupState(stateFile);
-    backupState.state['__base_dir__'] = sourceDir;
+    const sourceBaseInc = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
+    backupState.state['__base_dir__'] = sourceBaseInc;
 
     const stampInc = new Date().toISOString().replace(/[:.]/g, '-');
     const zipPath = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.zip`);
@@ -493,7 +498,7 @@ class BackupEngine {
 
       for (const file of currentFiles) {
         try {
-          const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+          const relativePath = path.relative(sourceBaseInc, file).replace(/\\/g, '/');
           
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
@@ -526,7 +531,7 @@ class BackupEngine {
 
           if (needsBackup) {
             if (plainCopyInc) {
-              this._copyPlainFile(file, sourceDir, copyDirInc);
+              this._copyPlainFile(file, sourceBaseInc, copyDirInc);
             } else {
               archive.file(file, { name: relativePath });
             }
@@ -603,6 +608,12 @@ class BackupEngine {
     const files = [];
     
     if (!fs.existsSync(dir)) {
+      return files;
+    }
+    // Single-file source: the backup is just that one file.
+    try {
+      if (fs.statSync(dir).isFile()) return [dir];
+    } catch (e) {
       return files;
     }
 
