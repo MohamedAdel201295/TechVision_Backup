@@ -435,7 +435,7 @@
     setProgressButtons(false);
   }
   function setProgressButtons(disabled) {
-    ['newJobBtn', 'restoreBtn', 'refreshBtn'].forEach(function (id) {
+    ['refreshBtn'].forEach(function (id) {
       var b = $(id);
       if (b) b.disabled = disabled;
     });
@@ -525,11 +525,11 @@
 
   /* ---------- wiring ---------- */
   document.addEventListener('DOMContentLoaded', function () {
-    $('newJobBtn').addEventListener('click', function () { openJobWizard(null); });
+    var nnj = $('navNewJob'); if (nnj) nnj.addEventListener('click', function () { openJobWizard(null); });
     var jnb = $('jobsNewJobBtn'); if (jnb) jnb.addEventListener('click', function () { openJobWizard(null); });
     var jenb = $('jobsEmptyNewJobBtn'); if (jenb) jenb.addEventListener('click', function () { openJobWizard(null); });
     $('emptyNewJobBtn').addEventListener('click', function () { openJobWizard(null); });
-    $('restoreBtn').addEventListener('click', function () { openRestore(null); });
+
     $('navRestore').addEventListener('click', function () { openRestore(null); });
     $('refreshBtn').addEventListener('click', refreshJobs);
     $('searchInput').addEventListener('input', renderJobs);
