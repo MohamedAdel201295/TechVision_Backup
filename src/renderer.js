@@ -82,6 +82,9 @@
   var currentJob = null;
   var settings = {};
   var progressTimer = null;
+  var currentLogTab = 'today';
+  var logsTimer = null;
+  var fullLogLines = [];
 
   /* ---------- toasts (never alert()) ---------- */
   function toast(title, message, kind) {
@@ -115,6 +118,16 @@
       settings = (s && typeof s === 'object') ? s : {};
       applyTheme(settings.theme || settings.appearance || 'dark');
       if ($('settingAutoStart')) $('settingAutoStart').checked = settings.autoStart !== false;
+      var em = (settings.email && typeof settings.email === 'object') ? settings.email : {};
+      if ($('settingEmailEnabled')) $('settingEmailEnabled').checked = em.enabled === true;
+      if ($('settingEmailStart')) $('settingEmailStart').checked = em.notifyOnStart !== false;
+      if ($('settingEmailFinish')) $('settingEmailFinish').checked = em.notifyOnFinish !== false;
+      if ($('settingEmailMissed')) $('settingEmailMissed').checked = em.notifyOnMissed !== false;
+      if ($('settingEmailTo')) $('settingEmailTo').value = em.to || '';
+      if ($('settingEmailUser')) $('settingEmailUser').value = em.smtpUser || '';
+      if ($('settingEmailPass')) $('settingEmailPass').value = em.smtpPass || '';
+      if ($('settingEmailHost')) $('settingEmailHost').value = em.smtpHost || 'smtp.gmail.com';
+      if ($('settingEmailPort')) $('settingEmailPort').value = String(em.smtpPort || 465);
       if ($('settingVerify')) $('settingVerify').checked = settings.verify !== false;
       if ($('settingIncremental')) $('settingIncremental').checked = settings.allowIncremental !== false;
     } catch (e) { /* settings are optional; keep defaults */ }
@@ -126,7 +139,18 @@
       compress: $('settingCompress') ? $('settingCompress').checked : true,
       verify: $('settingVerify') ? $('settingVerify').checked : true,
       allowIncremental: $('settingIncremental') ? $('settingIncremental').checked : true,
-      autoStart: $('settingAutoStart') ? $('settingAutoStart').checked : true
+      autoStart: $('settingAutoStart') ? $('settingAutoStart').checked : true,
+      email: {
+        enabled: $('settingEmailEnabled') ? $('settingEmailEnabled').checked : false,
+        notifyOnStart: $('settingEmailStart') ? $('settingEmailStart').checked : true,
+        notifyOnFinish: $('settingEmailFinish') ? $('settingEmailFinish').checked : true,
+        notifyOnMissed: $('settingEmailMissed') ? $('settingEmailMissed').checked : true,
+        to: $('settingEmailTo') ? $('settingEmailTo').value.trim() : '',
+        smtpUser: $('settingEmailUser') ? $('settingEmailUser').value.trim() : '',
+        smtpPass: $('settingEmailPass') ? $('settingEmailPass').value : '',
+        smtpHost: $('settingEmailHost') ? $('settingEmailHost').value.trim() || 'smtp.gmail.com' : 'smtp.gmail.com',
+        smtpPort: $('settingEmailPort') ? parseInt($('settingEmailPort').value, 10) || 465 : 465
+      }
     });
     try {
       await api.saveSettings(next);
@@ -245,13 +269,153 @@
 
   /* ---------- views: Dashboard / Jobs ---------- */
   function showView(name) {
-    var dash = $('view-dashboard'); var jobsView = $('view-jobs');
-    if (dash) dash.style.display = name === 'jobs' ? 'none' : '';
+    var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs');
+    if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
+    if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
     if (btn) btn.classList.add('active');
     if (name === 'jobs') renderJobsView();
+    if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
+    else stopLogsAutoRefresh();
+  }
+  function startLogsAutoRefresh() {
+    stopLogsAutoRefresh();
+    logsTimer = setInterval(function () { renderLogs(currentLogTab); }, 10000);
+  }
+  function stopLogsAutoRefresh() {
+    if (logsTimer) { clearInterval(logsTimer); logsTimer = null; }
+  }
+
+  /* ---------- Logs view: Today / Completed / Failed / Full log ---------- */
+  function collectRuns() {
+    var out = [];
+    jobs.forEach(function (job) {
+      (job.runs || []).forEach(function (run) {
+        out.push({ job: job, run: run });
+      });
+    });
+    out.sort(function (a, b) {
+      return new Date(b.run.timestamp || 0) - new Date(a.run.timestamp || 0);
+    });
+    return out;
+  }
+  function isToday(ts) {
+    var d = new Date(ts); if (isNaN(d.getTime())) return false;
+    var n = new Date();
+    return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+  }
+  function waitingOf(job) { return job.waitingForDrive || (job.raw && job.raw.waitingForDrive) || null; }
+  function logLevelOf(text) {
+    var s = String(text || '').toUpperCase();
+    if (s.indexOf('ERROR') !== -1 || s.indexOf('FAIL') !== -1) return 'ERROR';
+    if (s.indexOf('WARN') !== -1 || s.indexOf('SKIPPED') !== -1) return 'WARN';
+    if (s.indexOf('SUCCESS') !== -1 || s.indexOf('COMPLETED') !== -1) return 'SUCCESS';
+    return 'INFO';
+  }
+  function runRow(item, extraStatus) {
+    var job = item.job, run = item.run;
+    var div = document.createElement('article');
+    div.className = 'job-card';
+    var status = extraStatus || String((run.status || (run.success ? 'COMPLETED' : 'FAILED'))).toUpperCase();
+    var body = document.createElement('div'); body.className = 'job-body';
+    var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = job.name;
+    var meta = document.createElement('div'); meta.className = 'job-meta';
+    var pill = document.createElement('span'); pill.className = 'pill ' + pillClass(status, run.type || 'full'); pill.textContent = status;
+    var when = document.createElement('span'); when.textContent = ' ' + formatDate(run.timestamp);
+    var files = document.createElement('span'); files.textContent = ' ' + safeNum(run.files, 0) + ' files · ' + formatBytes(run.size);
+    meta.appendChild(pill); meta.appendChild(when); meta.appendChild(files);
+    body.appendChild(h); body.appendChild(meta);
+    var pathLine = document.createElement('div'); pathLine.className = 'job-path';
+    pathLine.textContent = (job.source || '—') + '  →  ' + (job.destination || '—');
+    body.appendChild(pathLine);
+    if (run.error) {
+      var err = document.createElement('div'); err.className = 'log-run-error'; err.textContent = run.error;
+      body.appendChild(err);
+    }
+    if (extraStatus === 'WAITING' && item.waiting) {
+      var w = item.waiting;
+      var wdiv = document.createElement('div'); wdiv.className = 'job-waiting';
+      wdiv.textContent = '⏳ Waiting for the ' + (w.which || 'source') + ' drive since ' + formatDate(w.since) + ' — ' + (w.path || '') + (w.label ? ' (volume "' + w.label + '")' : '') + '. The job runs as soon as the disk is back.';
+      body.appendChild(wdiv);
+    }
+    div.appendChild(body);
+    return div;
+  }
+  function renderLogs(tab) {
+    currentLogTab = tab || currentLogTab;
+    var list = $('logsList'); var fullBox = $('logsFullBox'); var toolbar = $('logsToolbar');
+    var empty = $('logsEmptyState'); var emptyText = $('logsEmptyText');
+    if (!list) return;
+    document.querySelectorAll('#logsTabs .log-tab').forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-logtab') === currentLogTab);
+    });
+    var isFull = currentLogTab === 'full';
+    if (toolbar) toolbar.style.display = isFull ? '' : 'none';
+    if (fullBox) fullBox.style.display = isFull ? '' : 'none';
+    list.style.display = isFull ? 'none' : '';
+    if (isFull) { loadFullLog(); if (empty) empty.style.display = 'none'; return; }
+    var runs = collectRuns();
+    var items = [];
+    if (currentLogTab === 'today') {
+      items = runs.filter(function (it) { return isToday(it.run.timestamp); });
+      if (emptyText) emptyText.textContent = 'No tasks ran today yet.';
+    } else if (currentLogTab === 'completed') {
+      items = runs.filter(function (it) { return it.run.success === true || String(it.run.status || '').toUpperCase() === 'COMPLETED'; });
+      if (emptyText) emptyText.textContent = 'No completed backups yet.';
+    } else if (currentLogTab === 'failed') {
+      items = runs.filter(function (it) { return it.run.success === false || String(it.run.status || '').toUpperCase() === 'FAILED'; });
+      // Jobs still waiting for their drive belong here too — they have
+      // not run, and the user asked to see what did not happen.
+      jobs.forEach(function (job) {
+        var w = waitingOf(job);
+        if (w) items.push({ job: job, run: { status: 'WAITING', timestamp: w.since, files: 0, size: 0 }, waiting: w });
+      });
+      items.sort(function (a, b) { return new Date(b.run.timestamp || 0) - new Date(a.run.timestamp || 0); });
+      if (emptyText) emptyText.textContent = 'No failed or waiting tasks. Everything ran fine.';
+    }
+    list.innerHTML = '';
+    if (!items.length) { if (empty) empty.style.display = 'block'; return; }
+    if (empty) empty.style.display = 'none';
+    items.forEach(function (it) {
+      var status = it.waiting ? 'WAITING' : null;
+      list.appendChild(runRow(it, status));
+    });
+  }
+  async function loadFullLog() {
+    var box = $('logsFullBox'); if (!box) return;
+    if (!api || typeof api.getAppLog !== 'function') {
+      box.textContent = 'Log API is not available.';
+      return;
+    }
+    try {
+      var res = await api.getAppLog();
+      fullLogLines = (res && Array.isArray(res.lines)) ? res.lines : [];
+    } catch (e) { fullLogLines = ['[ERROR] Could not load the log: ' + (e && e.message ? e.message : 'unknown error')]; }
+    renderFullLog();
+  }
+  function renderFullLog() {
+    var box = $('logsFullBox'); if (!box) return;
+    var level = $('logsLevelFilter') ? $('logsLevelFilter').value : 'all';
+    var q = $('logsSearch') ? $('logsSearch').value.trim().toLowerCase() : '';
+    var visible = fullLogLines.filter(function (l) {
+      if (level !== 'all' && logLevelOf(l) !== level) return false;
+      if (q && String(l).toLowerCase().indexOf(q) === -1) return false;
+      return true;
+    });
+    box.innerHTML = '';
+    if (!visible.length) {
+      box.textContent = fullLogLines.length ? 'No log lines match this filter.' : 'No log lines yet. Run a backup or wait for a scheduled one to see activity here.';
+      return;
+    }
+    visible.forEach(function (l) {
+      var div = document.createElement('div');
+      div.className = 'log-line log-' + logLevelOf(l).toLowerCase();
+      div.textContent = String(l);
+      box.appendChild(div);
+    });
+    box.scrollTop = box.scrollHeight;
   }
   function compressionLabel(job) {
     var c = (job.compression || (job.raw && job.raw.compression) || 'standard').toLowerCase();
@@ -305,6 +469,13 @@
       card.querySelector('.last-run').textContent = job.runs && job.runs.length ? formatDate(job.timestamp) : 'Never run';
       card.querySelector('.run-count').textContent = String(job.runCount || 0);
       card.querySelector('.job-path').textContent = job.source ? job.source + '  →  ' + (job.destination || '—') : (job.destination || '—');
+      var w = waitingOf(job);
+      if (w) {
+        var wdiv = document.createElement('div');
+        wdiv.className = 'job-waiting';
+        wdiv.textContent = '⏳ Waiting for the ' + (w.which || 'source') + ' drive since ' + formatDate(w.since) + ' — ' + (w.path || '') + (w.label ? ' (volume "' + w.label + '")' : '');
+        card.querySelector('.job-body').appendChild(wdiv);
+      }
       var sched = job.schedule || (job.raw && job.raw.schedule) || null;
       card.querySelector('.d-schedule').textContent = sched && sched.enabled ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00') : 'Manual only';
       card.querySelector('.d-next').textContent = nextRunText(job);
@@ -368,6 +539,8 @@
     $('drawerSource').textContent = job.source || '—';
     $('drawerDest').textContent = job.destination || '—';
     $('drawerType').textContent = job.type;
+    var enc = job.encryptionEnabled === true || (job.raw && job.raw.encryptionEnabled === true);
+    if ($('drawerEncryption')) $('drawerEncryption').textContent = enc ? 'AES-256 🔒' : 'Off';
     $('drawerStatus').textContent = job.status;
     $('drawerFiles').textContent = String(job.files);
     $('drawerSize').textContent = formatBytes(job.size);
@@ -456,22 +629,60 @@
   }
 
   /* ---------- backup / restore actions ---------- */
+  // Ask for a job password in a modal. Resolves to the password, or
+  // null when the user cancels.
+  function askJobPassword(jobName) {
+    return new Promise(function (resolve) {
+      var modal = $('jobPwModal'); var back = $('jobPwBackdrop');
+      var input = $('jobPwInput');
+      $('jobPwText').textContent = 'Job "' + jobName + '" is encrypted and its password is not saved in the vault. Enter the backup password to run it.';
+      input.value = '';
+      modal.style.display = 'block'; back.classList.add('show');
+      setTimeout(function () { input.focus(); }, 50);
+      function done(value) {
+        modal.style.display = 'none'; back.classList.remove('show');
+        $('jobPwRun').onclick = null; $('jobPwCancel').onclick = null; input.onkeydown = null;
+        resolve(value);
+      }
+      $('jobPwRun').onclick = function () { done(input.value || null); };
+      $('jobPwCancel').onclick = function () { done(null); };
+      input.onkeydown = function (ev) { if (ev.key === 'Enter') done(input.value || null); };
+    });
+  }
   async function runBackup(job, incremental) {
     if (!job) return;
     if (!api || typeof api.runFullBackup !== 'function') { toast('Backup unavailable', 'Backup API is not available.', 'error'); return; }
+    var cfg = job.raw || job;
+    // Encrypted job whose password is not in the vault: ask now, and
+    // pass it for this run only (main.js stores it if the vault is open).
+    if (cfg.encryptionEnabled === true) {
+      var hasPw = false;
+      if (api && typeof api.vaultHasJobPassword === 'function') {
+        try { var hr = await api.vaultHasJobPassword(cfg.id); hasPw = !!(hr && hr.has); } catch (e) {}
+      }
+      if (!hasPw) {
+        var pw = await askJobPassword(job.name || cfg.name || 'backup job');
+        if (!pw) return; // cancelled
+        cfg = Object.assign({}, cfg, { encryptionPassword: pw });
+      }
+    }
     closeDrawer();
     showProgress(incremental ? 'Running incremental backup…' : 'Running full backup…');
     var stop = simulateProgress();
     try {
       var result = incremental && typeof api.runIncrementalBackup === 'function'
-        ? await api.runIncrementalBackup(job.raw || job)
-        : await api.runFullBackup(job.raw || job);
+        ? await api.runIncrementalBackup(cfg)
+        : await api.runFullBackup(cfg);
       stop();
       setProgress(100, result && result.files, result && result.size);
       var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
       setTimeout(function () { hideProgress(); }, 900);
       if (result && (result.success === false || result.status === 'failed')) {
-        toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
+        if (result.error === 'ENCRYPTION_PASSWORD_REQUIRED') {
+          toast('Password required', 'This job is encrypted and no password is saved. Unlock the vault in Settings, or run it and enter the password when asked.', 'error');
+        } else {
+          toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
+        }
       } else {
         toast('Backup completed', job.name + ' — ' + files + ' file' + (files === 1 ? '' : 's') + ' backed up.', 'success');
       }
@@ -523,6 +734,36 @@
     await loadJobs();
   }
 
+  /* ---------- master-password vault ---------- */
+  async function refreshVaultStatus() {
+    var txt = $('vaultStatusText'); if (!txt) return;
+    if (!api || typeof api.vaultStatus !== 'function') { txt.textContent = 'Vault API is not available.'; return; }
+    try {
+      var st = await api.vaultStatus();
+      txt.textContent = !st.exists
+        ? 'No master password set up yet.'
+        : (st.locked ? 'Vault is set up and locked.' : 'Vault is unlocked for this session.');
+      if ($('vaultSetupBox')) $('vaultSetupBox').style.display = st.exists ? 'none' : 'block';
+      if ($('vaultChangeBox')) $('vaultChangeBox').style.display = st.exists ? 'block' : 'none';
+    } catch (e) { txt.textContent = 'Could not read the vault status.'; }
+  }
+  async function checkVaultOnStartup() {
+    if (!api || typeof api.vaultStatus !== 'function') return;
+    try {
+      var st = await api.vaultStatus();
+      if (st.exists && st.locked) {
+        $('vaultModal').style.display = 'block';
+        $('vaultBackdrop').classList.add('show');
+        setTimeout(function () { var i = $('vaultUnlockPass'); if (i) i.focus(); }, 50);
+      }
+    } catch (e) { /* vault stays locked; encrypted runs will ask instead */ }
+  }
+  function hideVaultModal() {
+    $('vaultModal').style.display = 'none';
+    $('vaultBackdrop').classList.remove('show');
+    var e = $('vaultUnlockError'); if (e) e.classList.remove('show');
+  }
+
   /* ---------- wiring ---------- */
   document.addEventListener('DOMContentLoaded', function () {
     var nnj = $('navNewJob'); if (nnj) nnj.addEventListener('click', function () { openJobWizard(null); });
@@ -542,10 +783,62 @@
         try { await api.saveSettings(Object.assign({}, settings, { theme: next })); settings.theme = next; } catch (e) { /* theme already applied visually */ }
       }
     });
-    $('settingsBtn').addEventListener('click', openSettings);
+    $('settingsBtn').addEventListener('click', function () { openSettings(); refreshVaultStatus(); });
+    var vsb = $('vaultSetupBtn');
+    if (vsb) vsb.addEventListener('click', async function () {
+      var p1 = $('vaultNewPass').value, p2 = $('vaultNewPassConfirm').value;
+      if (p1.length < 8) { toast('Password too short', 'The master password must be at least 8 characters.', 'warning'); return; }
+      if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same master password.', 'warning'); return; }
+      try {
+        var r = await api.vaultSetup(p1);
+        if (r && r.success) { $('vaultNewPass').value = ''; $('vaultNewPassConfirm').value = ''; toast('Vault set up', 'Master password saved. The vault is unlocked for this session.', 'success'); }
+        else toast('Setup failed', (r && r.error) || 'Could not set up the vault.', 'error');
+      } catch (e) { toast('Setup failed', e && e.message ? e.message : 'Could not set up the vault.', 'error'); }
+      refreshVaultStatus();
+    });
+    var vcb = $('vaultChangeBtn');
+    if (vcb) vcb.addEventListener('click', async function () {
+      var oldP = $('vaultOldPass').value, p1 = $('vaultChangeNew').value, p2 = $('vaultChangeConfirm').value;
+      if (p1.length < 8) { toast('Password too short', 'The new master password must be at least 8 characters.', 'warning'); return; }
+      if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same new master password.', 'warning'); return; }
+      try {
+        var r = await api.vaultChangePassword(oldP, p1);
+        if (r && r.success) { $('vaultOldPass').value = ''; $('vaultChangeNew').value = ''; $('vaultChangeConfirm').value = ''; toast('Master password changed', 'The vault was re-encrypted with the new master password.', 'success'); }
+        else toast('Change failed', (r && r.error) || 'Could not change the master password.', 'error');
+      } catch (e) { toast('Change failed', e && e.message ? e.message : 'Could not change the master password.', 'error'); }
+      refreshVaultStatus();
+    });
+    var vlb = $('vaultLockBtn');
+    if (vlb) vlb.addEventListener('click', async function () {
+      try { await api.vaultLock(); toast('Vault locked', 'Job passwords are locked until you unlock the vault again.', ''); } catch (e) {}
+      refreshVaultStatus();
+    });
+    var vub = $('vaultUnlockBtn');
+    if (vub) vub.addEventListener('click', async function () {
+      var pw = $('vaultUnlockPass').value;
+      try {
+        var r = await api.vaultUnlock(pw);
+        if (r && r.success) { $('vaultUnlockPass').value = ''; hideVaultModal(); toast('Vault unlocked', 'Scheduled encrypted backups can run again.', 'success'); }
+        else { $('vaultUnlockError').classList.add('show'); }
+      } catch (e) { $('vaultUnlockError').classList.add('show'); }
+    });
+    var vus = $('vaultUnlockSkip');
+    if (vus) vus.addEventListener('click', hideVaultModal);
+    var vup = $('vaultUnlockPass');
+    if (vup) vup.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); $('vaultUnlockBtn').click(); } });
     $('settingsClose').addEventListener('click', closeSettings);
     $('settingsBackdrop').addEventListener('click', closeSettings);
     $('settingsSave').addEventListener('click', async function () { await saveSettings(); closeSettings(); });
+    var etb = $('emailTestBtn');
+    if (etb) etb.addEventListener('click', async function () {
+      await saveSettings();
+      if (!api || typeof api.sendTestEmail !== 'function') { toast('Test unavailable', 'Test email API is not available.', 'error'); return; }
+      try {
+        var res = await api.sendTestEmail();
+        if (res && res.success) toast('Test email sent', 'Check your inbox for the TechVision test email.', 'success');
+        else toast('Test email failed', (res && res.error) || 'Could not send the test email.', 'error');
+      } catch (e) { toast('Test email failed', e && e.message ? e.message : 'Could not send the test email.', 'error'); }
+    });
     $('settingLightTheme').addEventListener('change', async function (ev) {
       var next = ev.target.checked ? 'light' : 'dark';
       applyTheme(next);
@@ -575,6 +868,7 @@
         if (nav === 'logs') toast('Logs', 'Open the Log Viewer from the Logs window.', '');
         if (nav === 'jobs') showView('jobs');
         if (nav === 'dashboard') showView('dashboard');
+        if (nav === 'logs') showView('logs');
       });
     });
     $('drawerClose').addEventListener('click', closeDrawer);
@@ -599,6 +893,16 @@
     });
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); } });
 
-    loadSettings().then(loadJobs);
+    document.querySelectorAll('#logsTabs .log-tab').forEach(function (btn) {
+      btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
+    });
+    var lrb = $('logsRefreshBtn');
+    if (lrb) lrb.addEventListener('click', function () { loadJobs().then(function () { renderLogs(currentLogTab); }); });
+    var llf = $('logsLevelFilter');
+    if (llf) llf.addEventListener('change', renderFullLog);
+    var ls = $('logsSearch');
+    if (ls) ls.addEventListener('input', renderFullLog);
+
+    loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
   });
 })();

@@ -9,6 +9,9 @@ const path = require('path');
 const crypto = require('crypto');
 const yauzl = require('yauzl');
 const EventEmitter = require('events');
+// WinZip AES-256 reader (pure JS, Node crypto). yauzl cannot decrypt,
+// so encrypted backups go through this module instead.
+const zipAes = require('./zip-aes.js');
 
 /**
  * Restore Result Class
@@ -50,9 +53,43 @@ class RestoreEngine {
   /**
    * Restore all files from ZIP using streaming (yauzl)
    */
-  async restore_all(zipPath, restoreDir) {
+  async restore_all(zipPath, restoreDir, password) {
     const result = new RestoreResult();
     const startTime = Date.now();
+    // Encrypted backup (WinZip AES-256): yauzl cannot decrypt, so the
+    // AES reader handles the whole restore. Wrong password fails fast.
+    try {
+      if (zipPath && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
+        const info = zipAes.inspectZip(zipPath);
+        if (info.encrypted) {
+          if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
+          if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
+          const zipData = new Map();
+          const extracted = zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
+            result.files_restored++;
+            result.total_bytes += size;
+            zipData.set(name, fs.readFileSync(path.join(restoreDir, name.split('/').join(path.sep))));
+          });
+          result.errors = extracted.errors;
+          // Hash-verify each restored file against its decrypted content.
+          for (const [name, content] of zipData) {
+            const restoredPath = path.join(restoreDir, name.split('/').join(path.sep));
+            try {
+              if (this.calculateHash(fs.readFileSync(restoredPath)) === this.calculateHash(content)) result.files_verified++;
+              else { result.files_mismatched++; result.errors.push('Hash mismatch: ' + name); }
+            } catch (e) { result.errors.push('Verification error: ' + name + ': ' + e.message); }
+          }
+          result.success = result.files_mismatched === 0 && result.errors.length === 0 && result.files_restored > 0;
+          result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+          return result;
+        }
+      }
+    } catch (e) {
+      result.success = false;
+      result.errors.push(e.message);
+      result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+      return result;
+    }
     // Plain-copy backup: backup_path is a folder with the same files,
     // not a ZIP. Restore is a straight copy back, same structure.
     try {
@@ -211,12 +248,21 @@ class RestoreEngine {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) walk(full);
-          else entries.push({ path: path.relative(zipPath, full), size: fs.statSync(full).size, isDir: false });
+          else entries.push({ path: path.relative(zipPath, full), size: fs.statSync(full).size, isDir: false, encrypted: false });
         }
       };
       walk(zipPath);
       return entries;
     }
+    // ZIP: the AES inspector lists entries AND flags encrypted ones, so
+    // the restore wizard knows when to ask for a password. If its
+    // parser cannot read the file, fall back to yauzl (no flag).
+    try {
+      const info = zipAes.inspectZip(zipPath);
+      return info.entries.filter(function (e) { return !e.isDir; }).map(function (e) {
+        return { path: e.name.replace(/\//g, path.sep), size: e.size, isDir: false, encrypted: e.encrypted };
+      });
+    } catch (e) { /* fall through to yauzl below */ }
     return new Promise((resolve, reject) => {
       yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
         if (err) return reject(err);
@@ -232,7 +278,8 @@ class RestoreEngine {
             entries.push({
               path: entry.fileName.replace(/\//g, path.sep),
               size: entry.uncompressedSize,
-              isDir: false
+              isDir: false,
+              encrypted: false
             });
           }
         });
@@ -247,7 +294,31 @@ class RestoreEngine {
   /**
    * Restore single file to specific location
    */
-  async restoreFile(zipPath, entryName, destPath) {
+  async restoreFile(zipPath, entryName, destPath, password) {
+    // Encrypted entry: decrypt it directly with the AES reader.
+    // (If the inspector cannot read this ZIP at all — e.g. Zip64 — we
+    // fall through to the yauzl path below instead of failing here.)
+    try {
+      if (zipPath && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
+        const info = zipAes.inspectZip(zipPath);
+        const wanted = entryName.replace(/\\/g, '/');
+        const hit = info.entries.find(function (e) { return e.name === wanted; });
+        if (hit && hit.encrypted) {
+          if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
+          const all = zipAes.parseCentralDirectory(fs.readFileSync(zipPath));
+          const full = all.find(function (e) { return e.name === wanted; });
+          const content = zipAes.decryptEntry(zipPath, full, password);
+          const dir = path.dirname(destPath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(destPath, content);
+          return { files: 1 };
+        }
+      }
+    } catch (e) {
+      if (e.message && e.message.indexOf('Wrong password') === 0) throw e;
+      if (e.message && e.message.indexOf('password is required') !== -1) throw e;
+      // Inspector could not read the file: fall through to yauzl.
+    }
     return new Promise((resolve, reject) => {
       yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
         if (err) return reject(err);

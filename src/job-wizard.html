@@ -14,7 +14,7 @@
       <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
       <div>
         <h1 id="wizardTitle">New Backup Job</h1>
-        <p>Four quick steps — the wizard stays open while you pick folders.</p>
+        <p>Five quick steps — the wizard stays open while you pick folders.</p>
       </div>
     </div>
     <div class="modal-body">
@@ -22,7 +22,8 @@
         <div class="step active" data-n="1" data-step="1">Source</div>
         <div class="step" data-n="2" data-step="2">Destination</div>
         <div class="step" data-n="3" data-step="3">Options</div>
-        <div class="step" data-n="4" data-step="4">Review</div>
+        <div class="step" data-n="4" data-step="4">Encryption</div>
+        <div class="step" data-n="5" data-step="5">Review</div>
       </div>
 
       <!-- Step 1: Source -->
@@ -33,13 +34,13 @@
           <div class="field-error" id="jobNameError">Please enter a job name.</div>
         </div>
         <div class="field">
-          <label for="sourceDir">Source Directory</label>
+          <label for="sourceDir">Source — folder or file</label>
           <div class="input-row">
-            <input type="text" id="sourceDir" placeholder="Select a source folder" readonly>
+            <input type="text" id="sourceDir" placeholder="Select a folder or a single file" readonly>
             <button class="btn" type="button" id="browseSource">Browse</button>
           </div>
-          <div class="hint">Pick the folder to back up. The wizard stays open after you click OK.</div>
-          <div class="field-error" id="sourceError">Please choose a source folder.</div>
+          <div class="hint">Pick a folder to back up, or a single file. The wizard stays open after you click OK.</div>
+          <div class="field-error" id="sourceError">Please choose a source folder or file.</div>
         </div>
         <div class="field">
           <label for="patternInput">Include Patterns <span class="optional">(optional)</span></label>
@@ -102,8 +103,32 @@
         </div>
       </section>
 
-      <!-- Step 4: Review -->
+      <!-- Step 4: Encryption (independent of compression) -->
       <section class="step-panel" data-panel="4">
+        <h3 style="margin:0 0 6px;">Encryption</h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Encrypt backup (AES-256)</div><div class="t-sub">Protect the backup with a password. Standard WinZip AES — 7-Zip and WinRAR can open it too.</div></div>
+          <label class="switch"><input type="checkbox" id="optEncrypt"><span class="slider"></span></label>
+        </div>
+        <div id="encFields" style="display:none; margin-top:12px;">
+          <div class="field">
+            <label for="encPassword">Backup password</label>
+            <input type="password" id="encPassword" placeholder="At least 8 characters" autocomplete="new-password">
+            <div class="field-error" id="encPasswordError">Please enter a password of at least 8 characters.</div>
+          </div>
+          <div class="field">
+            <label for="encPasswordConfirm">Confirm password</label>
+            <input type="password" id="encPasswordConfirm" placeholder="Repeat the password" autocomplete="new-password">
+            <div class="field-error" id="encPasswordConfirmError">Passwords do not match.</div>
+          </div>
+          <div class="note info" id="encModeNote"></div>
+          <div class="note" id="encVaultNote" style="display:none;"><strong>Password saved:</strong> this job already has a password in the vault — leave the fields blank to keep it.</div>
+          <div class="hint">The password is never written into the job file. If the vault is unlocked it is stored encrypted there so scheduled backups can run; otherwise you will be asked for it at run time. If you forget it, the backup cannot be opened — anywhere.</div>
+        </div>
+      </section>
+
+      <!-- Step 5: Review -->
+      <section class="step-panel" data-panel="5">
         <h3 style="margin:0 0 10px;">Review your job</h3>
         <div class="review" id="reviewBox"></div>
         <div class="note info" style="margin-top:14px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>

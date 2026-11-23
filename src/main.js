@@ -8,8 +8,60 @@ const path = require('path');
 const fs = require('fs');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
 const { RestoreEngine } = require('./restore.js');
+const mailer = require('./mailer.js');
+const vault = require('./vault.js');
+const driveResolver = require('./drive-resolver.js');
+// How long a due scheduled job waits for a missing removable drive
+// before it is recorded as failed (and emailed about): 2 hours.
+const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
+// Master-password vault: the derived key lives ONLY in memory while
+// the vault is unlocked. Nothing about the master password or any job
+// password is ever written to disk in the clear.
+let vaultKey = null;
 
 const isDevelopment = !app.isPackaged;
+
+// ONE userData folder for every way of running the app. This was the
+// settings bug: Electron picks userData from the app name, which is
+// "techvision-backup" when run from source (`electron .`) but
+// "TechVision Backup" (productName) once packaged — so settings (and
+// jobs) saved in one mode were invisible in the other, and it looked
+// like nothing had been saved at all. Pinning the path unifies them.
+const USER_DATA_DIR = path.join(app.getPath('appData'), 'TechVision Backup');
+try {
+  app.setPath('userData', USER_DATA_DIR);
+} catch (e) {
+  console.error('[Main] Could not pin userData path:', e.message);
+}
+
+// Bring over settings/jobs saved under the old per-mode folders
+// (techvision-backup or TechVision Backup) into the pinned folder,
+// copying only files that are missing there.
+function migrateLegacyUserData() {
+  try {
+    const newBase = path.join(USER_DATA_DIR, '.techvision');
+    for (const name of ['techvision-backup', 'TechVision Backup']) {
+      const oldBase = path.join(app.getPath('appData'), name, '.techvision');
+      if (oldBase === newBase || !fs.existsSync(oldBase)) continue;
+      const copyMissing = (srcDir, destDir) => {
+        if (!fs.existsSync(srcDir)) return;
+        if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+        for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+          const src = path.join(srcDir, entry.name);
+          const dest = path.join(destDir, entry.name);
+          if (entry.isDirectory()) copyMissing(src, dest);
+          else if (!fs.existsSync(dest)) {
+            fs.copyFileSync(src, dest);
+            console.log(`[Main] Migrated user data file: ${dest}`);
+          }
+        }
+      };
+      copyMissing(oldBase, newBase);
+    }
+  } catch (e) {
+    console.error('[Main] User data migration failed:', e.message);
+  }
+}
 
 // Assets path for icons
 const ASSETS_PATH = path.join(__dirname, 'assets');
@@ -74,6 +126,10 @@ function normalizeJobObject(job, defaultType = 'full') {
     compress: job.compress !== undefined ? job.compress : undefined,
     compression: job.compression || (job.compress === false ? 'none' : undefined),
     allowIncremental: job.allowIncremental,
+    sourceVolumeLabel: job.sourceVolumeLabel || null,
+    destinationVolumeLabel: job.destinationVolumeLabel || null,
+    waitingForDrive: job.waitingForDrive || null,
+    encryptionEnabled: job.encryptionEnabled === true,
     verify: job.verify,
     options: job.options || {},
     lastScheduledRun: job.lastScheduledRun || null,
@@ -109,6 +165,7 @@ function mergeJobEntries(entries) {
       files: rec.files ?? 0,
       size: rec.size ?? 0,
       duration: rec.duration ?? 0,
+      error: rec.error || null,
       result: rec.result || null
     };
   }
@@ -174,6 +231,50 @@ function notifyJobsUpdated() {
   } catch (e) { /* window not ready yet */ }
 }
 
+// Email notification, fire-and-forget: a mail failure must never
+// break or delay a backup. Logs the outcome, nothing else.
+function notifyEmail(kind, job, extra) {
+  try {
+    mailer.notify(app.getPath('userData'), kind, job, extra).then(function (r) {
+      if (r && !r.sent && r.reason !== 'off') console.log('[Mail] Notification not sent (' + kind + '): ' + r.reason);
+      else if (r && r.sent) console.log('[Mail] Notification sent (' + kind + ')');
+    }).catch(function (e) { console.log('[Mail] Notification error:', e.message); });
+  } catch (e) { console.log('[Mail] Notification error:', e.message); }
+}
+
+// Resolve the password for an encrypted job, in order:
+//  1. supplied with this call (wizard / run prompt — runtime only),
+//  2. the vault, when it is unlocked (so scheduled runs work).
+// Returns null when there is no password anywhere. Never throws.
+function resolveBackupPassword(jobConfig) {
+  if (jobConfig && typeof jobConfig.encryptionPassword === 'string' && jobConfig.encryptionPassword) {
+    return jobConfig.encryptionPassword;
+  }
+  if (jobConfig && jobConfig.encryptionEnabled && vaultKey && jobConfig.id) {
+    try { return vault.getJobPassword(app.getPath('userData'), vaultKey, jobConfig.id); } catch (e) { return null; }
+  }
+  return null;
+}
+
+// Central app log: one file for everything the scheduler, the drive
+// watcher and the backup runs do, so the Logs view has a full story
+// instead of only per-backup files in the destination folder.
+function appendAppLog(level, message) {
+  try {
+    const dir = path.join(app.getPath('userData'), '.techvision');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const logPath = path.join(dir, 'app.log');
+    // Keep the file bounded: over 1 MB, keep only the last ~1000 lines.
+    try {
+      if (fs.existsSync(logPath) && fs.statSync(logPath).size > 1024 * 1024) {
+        const lines = fs.readFileSync(logPath, 'utf-8').split(/\r?\n/);
+        fs.writeFileSync(logPath, lines.slice(-1000).join('\n') + '\n');
+      }
+    } catch (e) {}
+    fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${String(level).toUpperCase()}: ${message}\n`);
+  } catch (e) { /* logging must never break a backup */ }
+}
+
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
   let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
@@ -192,6 +293,7 @@ function recordRun(jobName, jobRecord) {
     files: jobRecord.files,
     size: jobRecord.size,
     duration: jobRecord.duration,
+    error: jobRecord.error || null,
     result: jobRecord.result || null
   };
   job.runs.push(run);
@@ -284,7 +386,7 @@ function saveJobHistory() {
           id: r.id, name: j.name, type: r.type, status: r.status,
           success: r.success, source: j.source, destination: j.destination,
           timestamp: r.timestamp, files: r.files, size: r.size,
-          duration: r.duration, result: r.result || null
+          duration: r.duration, error: r.error || null, result: r.result || null
         });
       }
     }
@@ -453,7 +555,9 @@ function createLogViewerWindow() {
 
 // App lifecycle
 app.whenReady().then(() => {
+  migrateLegacyUserData(); // Bring old settings/jobs into the pinned folder
   loadStoredJobs(); // Load stored jobs on startup
+  checkMissedSchedules(); // Email if the app was closed and a schedule was missed
   startScheduler(); // Run scheduled jobs while the app is open
   try { app.setAppUserModelId('com.techvision.backup'); } catch (e) {}
   applyAutoStart(); // Start with Windows, installed or portable
@@ -501,29 +605,60 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
     target.setDate(target.getDate() + 7);
     return target;
   }
+  // A run time that already passed TODAY is due, not tomorrow — but
+  // only if we have not already run for it (lastRun at/after target).
+  // This is what makes a daily/monthly job actually fire, and what
+  // lets a missed job (app was closed) fire on the next tick.
+  const lastDate = lastRun ? new Date(lastRun) : null;
+  const alreadyRanForTarget = lastDate && !isNaN(lastDate) && lastDate >= target;
   if (freq === 'monthly') {
     if (target > fromDate) return target;
+    if (!alreadyRanForTarget) return target; // due already; caller fires once then records lastScheduledRun
     target.setMonth(target.getMonth() + 1);
     return target;
   }
   // Daily (default)
   if (target > fromDate) return target;
+  if (!alreadyRanForTarget) return target; // due already
   target.setDate(target.getDate() + 1);
   return target;
 }
 
-async function executeScheduledBackup(job) {
+async function executeScheduledBackup(job, resolved) {
   if (!job || !job.source || !job.destination) return;
+  // Resolved paths from the drive watcher: the source may have moved
+  // to another letter (same volume label), or the destination too.
+  const sourcePath = (resolved && resolved.source && resolved.source.path) || job.source;
+  const destPath = (resolved && resolved.destination && resolved.destination.path) || job.destination;
+  if (resolved && resolved.source && resolved.source.remapped) {
+    appendAppLog('info', `Job "${job.name}": source drive moved — ${job.source} is now ${sourcePath} (volume "${resolved.source.label}").`);
+  }
+  if (resolved && resolved.destination && resolved.destination.remapped) {
+    appendAppLog('info', `Job "${job.name}": destination drive moved — ${job.destination} is now ${destPath} (volume "${resolved.destination.label}").`);
+  }
   if (Array.from(activeJobs.values()).some(a => a.name === job.name && a.status === 'running')) return;
   const jobConfig = {
-    name: job.name, source: job.source, destination: job.destination,
+    name: job.name, source: sourcePath, destination: destPath,
     compress: job.compress, compression: job.compression,
     allowIncremental: job.allowIncremental, schedule: job.schedule,
-    includePatterns: job.includePatterns, excludePatterns: job.excludePatterns
+    includePatterns: job.includePatterns, excludePatterns: job.excludePatterns,
+    encryptionEnabled: job.encryptionEnabled === true, id: job.id
   };
+  // Encrypted job, vault locked (or no password saved): the schedule
+  // cannot run without the password, so skip this run and say so in
+  // the log instead of failing silently or running unencrypted.
+  if (jobConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(jobConfig);
+    if (!pw) {
+      console.log(`[Scheduler] Skipped encrypted job ${job.name}: vault is locked or no password is saved. Unlock the vault in Settings to let scheduled encrypted backups run.`);
+      return;
+    }
+    jobConfig.encryptionPassword = pw;
+  }
   const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
   const jobId = `${job.name}-scheduled-${Date.now()}`;
   activeJobs.set(jobId, { name: job.name, status: 'running' });
+  notifyEmail('started', { name: job.name, type: useIncremental ? 'incremental' : 'full', source: job.source, destination: job.destination });
   try {
     const engine = new BackupEngine(jobConfig);
     engine.logger = true;
@@ -538,16 +673,30 @@ async function executeScheduledBackup(job) {
     recordRun(job.name, jobRecord);
     job.lastScheduledRun = new Date().toISOString();
     saveJobHistory();
+    notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
     console.log(`[Scheduler] Scheduled backup ${useIncremental ? 'incremental' : 'full'} for ${job.name}: ${jobRecord.status}`);
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } catch (e) {
     console.error(`[Scheduler] Scheduled backup failed for ${job.name}:`, e.message);
+    const errText = e && e.message ? e.message : 'Unknown error';
+    recordRun(job.name, {
+      id: jobId, jobId: job.id || null, name: job.name,
+      type: useIncremental ? 'incremental' : 'full', success: false, status: 'failed',
+      source: jobPathValue(job.source), destination: jobPathValue(job.destination),
+      timestamp: new Date().toISOString(), files: 0, size: 0, duration: 0,
+      error: errText, result: null
+    });
+    job.lastScheduledRun = new Date().toISOString();
+    saveJobHistory();
+    appendAppLog('error', `Job "${job.name}" FAILED (scheduled): ${errText}`);
+    notifyEmail('failed', { name: job.name, type: useIncremental ? 'incremental' : 'full', files: 0, size: 0, duration: 0, error: errText });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } finally {
     activeJobs.delete(jobId);
   }
 }
 
-function checkSchedules() {
+async function checkSchedules() {
   const now = new Date();
   for (const job of jobHistory) {
     if (!job.schedule || !job.schedule.enabled) continue;
@@ -556,16 +705,100 @@ function checkSchedules() {
     const last = job.lastScheduledRun ? new Date(job.lastScheduledRun) : null;
     // Due when the next run time has passed and we have not already
     // fired for it (lastScheduledRun is before that run time).
-    if (next <= now && (!last || last < next)) {
-      executeScheduledBackup(job);
+    // A job already waiting for its drive stays due: the due minute
+    // passes while it waits, and it must still run (or time out)
+    // instead of being silently dropped until tomorrow.
+    const isWaiting = !!job.waitingForDrive;
+    if (!isWaiting && !(next <= now && (!last || last < next))) continue;
+    // A scheduled run can take longer than the 30s tick: never start
+    // the same job again while its scheduled run is still going.
+    if ([...activeJobs.values()].some(function (a) { return a.name === job.name; })) continue;
+
+    // Removable drive? Resolve source + destination: the volume may
+    // have come back on another letter, or be unplugged right now.
+    const resolved = await resolveJobPaths(job);
+    if (resolved.source.found && resolved.destination.found) {
+      if (job.waitingForDrive) { delete job.waitingForDrive; notifyJobsUpdated(); }
+      executeScheduledBackup(job, resolved);
+      continue;
+    }
+    const missing = !resolved.source.found ? 'source' : 'destination';
+    const missingPath = !resolved.source.found ? resolved.source.path : resolved.destination.path;
+    if (!job.waitingForDrive) {
+      // First tick without the drive: wait for it instead of failing.
+      // The scheduler retries every 30s; as soon as the disk is back
+      // (any letter), the job runs.
+      job.waitingForDrive = {
+        since: now.toISOString(), due: next.toISOString(),
+        which: missing, path: missingPath,
+        label: missing === 'source' ? (job.sourceVolumeLabel || null) : (job.destinationVolumeLabel || null)
+      };
+      appendAppLog('warn', `Job "${job.name}" is due but the ${missing} drive is missing (${missingPath}). Waiting for the drive — the job will run as soon as it appears.`);
+      console.log(`[Scheduler] Job ${job.name} waiting for ${missing} drive: ${missingPath}`);
+      notifyJobsUpdated();
+      continue;
+    }
+    // Still waiting: give up after DRIVE_WAIT_MS, record the failure
+    // and email about it — the user asked for an error, not silence.
+    if (now - new Date(job.waitingForDrive.since) >= DRIVE_WAIT_MS) {
+      const errText = `Source drive not found: ${job.waitingForDrive.path} (volume "${job.waitingForDrive.label || 'unknown'}") was not available within 2 hours of the scheduled time.`;
+      const jobRecord = {
+        id: `${job.name}-scheduled-${Date.now()}`, jobId: job.id || null, name: job.name,
+        type: 'full', success: false, status: 'failed',
+        source: jobPathValue(job.source), destination: jobPathValue(job.destination),
+        timestamp: now.toISOString(), files: 0, size: 0, duration: 0,
+        error: errText, result: null
+      };
+      recordRun(job.name, jobRecord);
+      job.lastScheduledRun = now.toISOString();
+      delete job.waitingForDrive;
+      saveJobHistory();
+      notifyJobsUpdated();
+      notifyEmail('failed', Object.assign({}, jobRecord, { error: errText }));
+      appendAppLog('error', `Job "${job.name}" FAILED: ${errText}`);
+      console.log(`[Scheduler] Job ${job.name} failed: drive never appeared.`);
     }
   }
 }
 
+// Resolve a job's source + destination through the drive watcher.
+// Returns { source: {...}, destination: {...} } per drive-resolver.
+async function resolveJobPaths(job) {
+  const source = await driveResolver.resolvePathAsync(jobPathValue(job.source), job.sourceVolumeLabel || null);
+  const destination = await driveResolver.resolvePathAsync(jobPathValue(job.destination), job.destinationVolumeLabel || null);
+  return { source: source, destination: destination };
+}
+
+// The app was closed, so scheduled backups could not run: on startup,
+// find enabled schedules whose run time already passed without a run
+// and email about them. Only established schedules count (jobs that
+// have run at least once), so a brand-new job never spams on day one.
+// The scheduler then fires the missed jobs right away.
+function checkMissedSchedules() {
+  try {
+    const now = new Date();
+    const missed = [];
+    for (const job of jobHistory) {
+      if (!job.schedule || !job.schedule.enabled) continue;
+      if (!job.lastScheduledRun && !(job.runCount > 0)) continue;
+      const next = nextScheduledRun(job.schedule, now, job.lastScheduledRun);
+      if (!next) continue;
+      const last = job.lastScheduledRun ? new Date(job.lastScheduledRun) : null;
+      if (next <= now && (!last || last < next)) missed.push({ job: job, due: next });
+    }
+    if (missed.length) {
+      console.log('[Mail] ' + missed.length + ' scheduled backup(s) missed while the app was closed');
+      notifyEmail('missed', null, missed);
+    }
+  } catch (e) { console.error('[Mail] Missed-schedule check failed:', e.message); }
+}
+
 function startScheduler() {
   if (global._schedulerTimer) return;
-  checkSchedules();
-  global._schedulerTimer = setInterval(checkSchedules, 30000);
+  checkSchedules().catch(function (e) { console.error('[Scheduler] check failed:', e.message); });
+  global._schedulerTimer = setInterval(function () {
+    checkSchedules().catch(function (e) { console.error('[Scheduler] check failed:', e.message); });
+  }, 30000);
   console.log('[Scheduler] Started (checks every 30s while the app is open)');
 }
 
@@ -574,13 +807,38 @@ function startScheduler() {
 // Backup operations
 ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   const jobName = jobConfig.name || `backup-${Date.now()}`;
+  // Removable drive missing? Fail with a clear error (and an email)
+  // instead of letting the engine fail on a path that does not exist.
+  {
+    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceVolumeLabel || null);
+    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationVolumeLabel || null);
+    const missing = !src.found ? { which: 'source', res: src } : (!dst.found ? { which: 'destination', res: dst } : null);
+    if (missing) {
+      const errText = `${missing.which === 'source' ? 'Source' : 'Destination'} drive not found: ${missing.res.path}` +
+        (missing.res.label ? ` (volume "${missing.res.label}")` : '') + ' — plug the disk back in and run again.';
+      appendAppLog('error', `Manual backup "${jobName}" FAILED: ${errText}`);
+      notifyEmail('failed', { name: jobName, type: 'full', files: 0, size: 0, duration: 0, error: errText });
+      return { success: false, error: 'SOURCE_DRIVE_NOT_FOUND', message: errText, name: jobName, status: 'failed', type: 'full' };
+    }
+    if (src.remapped) jobConfig.source = src.path;
+    if (dst.remapped) jobConfig.destination = dst.path;
+  }
+  // Encrypted job with no password anywhere: refuse up front instead
+  // of starting a backup that cannot be written.
+  if (jobConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(jobConfig);
+    if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'full' };
+    jobConfig.encryptionPassword = pw;
+  }
   const engine = new BackupEngine(jobConfig);
   
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, status: 'running' });
   
+  notifyEmail('started', { name: jobName, type: 'full', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
+
   engine.logger = true; // Enable logging
-  
+
   const result = await engine.run_full_backup();
   
   const jobRecord = {
@@ -604,19 +862,45 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   notifyJobsUpdated();
   activeJobs.delete(jobId);
 
+  // The run used a password the user typed: if the vault is unlocked,
+  // save it there (encrypted) so scheduled runs of this job work too.
+  if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
+    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) {}
+  }
+  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
   return jobRecord;
 });
 
 ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   const jobName = jobConfig.name || `incremental-${Date.now()}`;
+  {
+    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceVolumeLabel || null);
+    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationVolumeLabel || null);
+    const missing = !src.found ? { which: 'source', res: src } : (!dst.found ? { which: 'destination', res: dst } : null);
+    if (missing) {
+      const errText = `${missing.which === 'source' ? 'Source' : 'Destination'} drive not found: ${missing.res.path}` +
+        (missing.res.label ? ` (volume "${missing.res.label}")` : '') + ' — plug the disk back in and run again.';
+      appendAppLog('error', `Manual incremental backup "${jobName}" FAILED: ${errText}`);
+      notifyEmail('failed', { name: jobName, type: 'incremental', files: 0, size: 0, duration: 0, error: errText });
+      return { success: false, error: 'SOURCE_DRIVE_NOT_FOUND', message: errText, name: jobName, status: 'failed', type: 'incremental' };
+    }
+    if (src.remapped) jobConfig.source = src.path;
+    if (dst.remapped) jobConfig.destination = dst.path;
+  }
+  if (jobConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(jobConfig);
+    if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
+    jobConfig.encryptionPassword = pw;
+  }
   const engine = new BackupEngine(jobConfig);
   
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, status: 'running' });
-  
+  notifyEmail('started', { name: jobName, type: 'incremental', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
+
   engine.logger = true;
-  
+
   const result = await engine.run_incremental_backup();
   
   const jobRecord = {
@@ -640,25 +924,29 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   notifyJobsUpdated();
   activeJobs.delete(jobId);
 
+  if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
+    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) {}
+  }
+  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Incremental backup completed: ${jobName}`);
   return jobRecord;
 });
 
 // Restore operations
-ipcMain.handle('restore-all', async (event, zipPath, restoreDir) => {
+ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restore_all(zipPath, restoreDir);
+    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null);
     return { success: true, files: result.files || 0, size: result.size || 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
   }
 });
 
-ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath) => {
+ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, password) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath);
+    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath, password || null);
     return { success: true, files: result && result.files ? result.files : 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
@@ -833,6 +1121,28 @@ ipcMain.handle('job-get-config', async (event, jobId) => {
 });
 
 ipcMain.handle('job-save-config', async (event, jobConfig) => {
+  // A job password must never reach disk in a job file: strip every
+  // password field before writing, whatever the caller sent.
+  if (jobConfig) {
+    delete jobConfig.encryptionPassword;
+    if (jobConfig.encryption && typeof jobConfig.encryption === 'object') delete jobConfig.encryption.password;
+    delete jobConfig.password;
+  }
+  // Removable drives: remember the volume label (e.g. "Nile view") of
+  // the source/destination drive, so a later run can find the same
+  // disk when Windows gives it another letter. Only set when the
+  // drive is actually present right now.
+  try {
+    const drives = await driveResolver.listDrives();
+    if (jobConfig) {
+      const sLetter = driveResolver.driveLetterOf(jobPathValue(jobConfig.source));
+      const sLabel = driveResolver.labelForLetter(drives, sLetter);
+      if (sLabel) jobConfig.sourceVolumeLabel = sLabel;
+      const dLetter = driveResolver.driveLetterOf(jobPathValue(jobConfig.destination));
+      const dLabel = driveResolver.labelForLetter(drives, dLetter);
+      if (dLabel) jobConfig.destinationVolumeLabel = dLabel;
+    }
+  } catch (e) { /* labels stay as they were; literal paths still work */ }
   const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
   if (!fs.existsSync(jobsDir)) {
     fs.mkdirSync(jobsDir, { recursive: true });
@@ -980,6 +1290,19 @@ ipcMain.handle('log-get-recent', async () => {
   }
 });
 
+// Full app log for the Logs view: the central app.log, newest last.
+ipcMain.handle('logs-get', async () => {
+  try {
+    const logPath = path.join(app.getPath('userData'), '.techvision', 'app.log');
+    if (!fs.existsSync(logPath)) return { success: true, lines: [] };
+    const content = fs.readFileSync(logPath, 'utf-8');
+    const lines = content.split(/\r?\n/).filter(function (l) { return l.trim().length > 0; });
+    return { success: true, lines: lines.slice(-500) };
+  } catch (e) {
+    return { success: false, error: e.message, lines: [] };
+  }
+});
+
 // Refresh jobs
 ipcMain.handle('jobs-refresh', async (event, jobs) => {
   if (!Array.isArray(jobs)) {
@@ -1019,6 +1342,53 @@ ipcMain.handle('settings-save', async (event, settings) => {
   // register/unregister the app at login without needing a restart.
   applyAutoStart();
   return { success: true };
+});
+
+// Send a test notification with the saved email settings.
+ipcMain.handle('email-test', async () => {
+  const r = await mailer.sendMail(app.getPath('userData'),
+    'Test email from TechVision Backup',
+    'This is a test notification from TechVision Backup.\n\nIf you got this, email notifications are set up correctly.\nTime: ' + new Date().toLocaleString());
+  return { success: r.sent, error: r.sent ? undefined : r.reason };
+});
+
+// Master-password vault: the key lives in memory only while unlocked.
+ipcMain.handle('vault-status', async () => {
+  return { exists: vault.vaultExists(app.getPath('userData')), locked: vaultKey === null };
+});
+ipcMain.handle('vault-setup', async (event, masterPassword) => {
+  try {
+    vaultKey = vault.setupVault(app.getPath('userData'), masterPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+ipcMain.handle('vault-unlock', async (event, masterPassword) => {
+  try {
+    vaultKey = vault.unlockVault(app.getPath('userData'), masterPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+ipcMain.handle('vault-lock', async () => {
+  vaultKey = null;
+  return { success: true };
+});
+ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
+  try {
+    vaultKey = vault.changeMasterPassword(app.getPath('userData'), oldPassword, newPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+ipcMain.handle('vault-has-job-password', async (event, jobId) => {
+  if (!vaultKey || !jobId) return { has: false };
+  try { return { has: vault.hasJobPassword(app.getPath('userData'), vaultKey, jobId) }; }
+  catch (e) { return { has: false }; }
+});
+ipcMain.handle('vault-store-job-password', async (event, jobId, jobPassword) => {
+  if (!vaultKey) return { success: false, error: 'Vault is locked.' };
+  try {
+    vault.storeJobPassword(app.getPath('userData'), vaultKey, jobId, jobPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
 });
 
 // Settings window
@@ -1073,8 +1443,16 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     name: job.name,
     source: job.source,
     destination: job.destination,
+    compression: job.compression,
+    encryptionEnabled: job.encryptionEnabled === true,
+    id: job.id,
     options: job.options || { incremental: false, compress: true, verify: true }
   };
+  if (backupConfig.encryptionEnabled) {
+    const pw = resolveBackupPassword(backupConfig);
+    if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED' };
+    backupConfig.encryptionPassword = pw;
+  }
   
   const engine = new BackupEngine(backupConfig);
   engine.logger = true;

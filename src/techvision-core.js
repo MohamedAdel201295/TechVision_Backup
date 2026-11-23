@@ -7,6 +7,15 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const archiver = require('archiver');
+// WinZip AES-256 ZIPs, standard format (7-Zip / WinRAR can open them
+// with the same password). Guarded: if the user has not run
+// `npm install` yet, the app still starts and encryption just reports
+// a clear error instead of crashing the backup engine.
+let zipEncryptedAvailable = false;
+try {
+  archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
+  zipEncryptedAvailable = true;
+} catch (e) { /* encryption unavailable until npm install */ }
 const { EventEmitter } = require('events');
 
 /**
@@ -50,6 +59,15 @@ class JobConfig {
       this.compression = 'standard';
     }
     this.options = data.options || {};
+    // Encryption is INDEPENDENT of compression: encrypt only (stored,
+    // level 0) or compression + encryption. `encryptionEnabled` is a
+    // job setting and may be saved; `encryptionPassword` is runtime-only
+    // and must NEVER be written to a job file or history — the vault
+    // holds it encrypted, main.js strips it before any save.
+    this.encryptionEnabled = data.encryptionEnabled === true ||
+      (data.encryption && data.encryption.enabled === true);
+    this.encryptionPassword = typeof data.encryptionPassword === 'string' ? data.encryptionPassword :
+      (data.encryption && typeof data.encryption.password === 'string' ? data.encryption.password : null);
   }
 
   static fromJson(filePath) {
@@ -78,6 +96,28 @@ class JobConfig {
     if (this.compression === 'none') return { zlib: { level: 0 } };
     if (this.compression === 'advanced') return { zlib: { level: 9 } };
     return { zlib: { level: 6 } };
+  }
+
+  /**
+   * Build the archiver for this job: plain 'zip', or 'zip-encrypted'
+   * (WinZip AES-256) when encryption is on. Encryption always makes a
+   * ZIP — even with compression 'none' (stored entries + AES), because
+   * a plain folder copy cannot be encrypted.
+   */
+  createArchive() {
+    if (this.encryptionEnabled) {
+      if (!zipEncryptedAvailable) {
+        throw new Error('Encryption needs archiver-zip-encrypted — run `npm install` in the project folder first.');
+      }
+      if (!this.encryptionPassword) {
+        throw new Error('Encryption is on but no password was provided for this job.');
+      }
+      return archiver('zip-encrypted', Object.assign({}, this.getArchiveOptions(), {
+        encryptionMethod: 'aes256',
+        password: this.encryptionPassword
+      }));
+    }
+    return archiver('zip', this.getArchiveOptions());
   }
 
   /**
@@ -301,6 +341,10 @@ class BackupEngine {
       return result;
     }
 
+    // Single-file source: relative paths are computed from the file's
+    // parent folder, so the backed-up file keeps its own name.
+    const sourceBase = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
+
     // Create backup directory
     const backupSubDir = path.join(this.backupDir, backupName);
     if (!fs.existsSync(backupSubDir)) {
@@ -310,24 +354,35 @@ class BackupEngine {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const zipPath = path.join(backupSubDir, `${backupName}_full_${stamp}.zip`);
     // No compression at all means: no ZIP. The backup is a plain folder
-    // with the same files, same names, same folder structure.
-    const plainCopy = this.jobConfig.compression === 'none';
+    // with the same files, same names, same folder structure — unless
+    // encryption is on, which always needs a ZIP (stored + AES-256).
+    const plainCopy = this.jobConfig.compression === 'none' && !this.jobConfig.encryptionEnabled;
     const copyDir = path.join(backupSubDir, `${backupName}_full_${stamp}`);
     if (plainCopy) fs.mkdirSync(copyDir, { recursive: true });
 
     this.log('info', `Starting FULL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
-    this.log('info', `Destination: ${plainCopy ? copyDir + ' (plain files, no ZIP)' : zipPath}`);
+    this.log('info', `Destination: ${plainCopy ? copyDir + ' (plain files, no ZIP)' : zipPath + (this.jobConfig.encryptionEnabled ? ' (AES-256 encrypted)' : '')}`);
 
     try {
       // Create ZIP archive (skipped for plain-copy backups)
       let archive = null;
+      let outputClosed = null;
       if (!plainCopy) {
         const output = fs.createWriteStream(zipPath);
-        archive = archiver('zip', this.jobConfig.getArchiveOptions());
+        archive = this.jobConfig.createArchive();
         archive.on('error', err => { throw err; });
         archive.on('progress', prog => {
           this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
+        });
+        // finalize() resolves when archiver finishes queueing, NOT when
+        // the file is fully written — awaiting only it returned while
+        // the ZIP was still truncated (no central directory). Wait for
+        // the output stream to close before the backup is "done".
+        outputClosed = new Promise((resolve, reject) => {
+          output.on('close', resolve);
+          output.on('error', reject);
+          archive.on('error', reject);
         });
         output.on('close', () => {
           this.log('info', `Archive created: ${archive.pointer()} bytes`);
@@ -341,7 +396,7 @@ class BackupEngine {
 
       for (const file of files) {
         try {
-          const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+          const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
           
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
@@ -367,7 +422,7 @@ class BackupEngine {
             
             // File is readable: copy it as-is, or add it to the ZIP
             if (plainCopy) {
-              this._copyPlainFile(file, sourceDir, copyDir);
+              this._copyPlainFile(file, sourceBase, copyDir);
             } else {
               archive.file(file, { name: relativePath });
             }
@@ -382,22 +437,23 @@ class BackupEngine {
         }
       }
 
-      if (!plainCopy) await archive.finalize();
+      if (!plainCopy) { await archive.finalize(); await outputClosed; }
 
       // Set the backup path on result
       result.backup_path = plainCopy ? copyDir : zipPath;
-      result.backup_format = plainCopy ? 'folder' : 'zip';
+      result.backup_format = plainCopy ? 'folder' : (this.jobConfig.encryptionEnabled ? 'zip-encrypted' : 'zip');
+      result.encrypted = this.jobConfig.encryptionEnabled;
 
       // Save state for incremental backups
       const stateFile = path.join(backupSubDir, '.backup_state.json');
       const backupState = new BackupState(stateFile);
-      backupState.state['__base_dir__'] = sourceDir;
+      backupState.state['__base_dir__'] = sourceBase;
       
       // Save file states
       for (const file of files) {
         try {
           if (this.jobConfig.shouldInclude(file)) {
-            const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+            const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
             const fileInfo = await this.getFileInfo(file);
             backupState.set(file, fileInfo);
           }
@@ -456,17 +512,18 @@ class BackupEngine {
     // Initialize backup state
     const stateFile = path.join(backupSubDir, '.backup_state.json');
     const backupState = new BackupState(stateFile);
-    backupState.state['__base_dir__'] = sourceDir;
+    const sourceBaseInc = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
+    backupState.state['__base_dir__'] = sourceBaseInc;
 
     const stampInc = new Date().toISOString().replace(/[:.]/g, '-');
     const zipPath = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.zip`);
-    const plainCopyInc = this.jobConfig.compression === 'none';
+    const plainCopyInc = this.jobConfig.compression === 'none' && !this.jobConfig.encryptionEnabled;
     const copyDirInc = path.join(backupSubDir, `${backupName}_incremental_${stampInc}`);
     if (plainCopyInc) fs.mkdirSync(copyDirInc, { recursive: true });
 
     this.log('info', `Starting INCREMENTAL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
-    this.log('info', `Destination: ${plainCopyInc ? copyDirInc + ' (plain files, no ZIP)' : zipPath}`);
+    this.log('info', `Destination: ${plainCopyInc ? copyDirInc + ' (plain files, no ZIP)' : zipPath + (this.jobConfig.encryptionEnabled ? ' (AES-256 encrypted)' : '')}`);
 
     try {
       // Get previous state
@@ -474,12 +531,20 @@ class BackupEngine {
 
       // Create ZIP archive (skipped for plain-copy backups)
       let archive = null;
+      let outputClosed = null;
       if (!plainCopyInc) {
         const output = fs.createWriteStream(zipPath);
-        archive = archiver('zip', this.jobConfig.getArchiveOptions());
+        archive = this.jobConfig.createArchive();
         archive.on('error', err => { throw err; });
         archive.on('progress', prog => {
           this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
+        });
+        // Same as full backups: finalize() alone does not mean the file
+        // is fully written — wait for the output stream to close.
+        outputClosed = new Promise((resolve, reject) => {
+          output.on('close', resolve);
+          output.on('error', reject);
+          archive.on('error', reject);
         });
         output.on('close', () => {
           this.log('info', `Archive created: ${archive.pointer()} bytes`);
@@ -493,7 +558,7 @@ class BackupEngine {
 
       for (const file of currentFiles) {
         try {
-          const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
+          const relativePath = path.relative(sourceBaseInc, file).replace(/\\/g, '/');
           
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
@@ -526,7 +591,7 @@ class BackupEngine {
 
           if (needsBackup) {
             if (plainCopyInc) {
-              this._copyPlainFile(file, sourceDir, copyDirInc);
+              this._copyPlainFile(file, sourceBaseInc, copyDirInc);
             } else {
               archive.file(file, { name: relativePath });
             }
@@ -548,11 +613,12 @@ class BackupEngine {
         }
       }
 
-      if (!plainCopyInc) await archive.finalize();
+      if (!plainCopyInc) { await archive.finalize(); await outputClosed; }
 
       // Set the backup path on result
       result.backup_path = plainCopyInc ? copyDirInc : zipPath;
-      result.backup_format = plainCopyInc ? 'folder' : 'zip';
+      result.backup_format = plainCopyInc ? 'folder' : (this.jobConfig.encryptionEnabled ? 'zip-encrypted' : 'zip');
+      result.encrypted = this.jobConfig.encryptionEnabled;
 
       // Save updated state
       backupState.save();
@@ -603,6 +669,12 @@ class BackupEngine {
     const files = [];
     
     if (!fs.existsSync(dir)) {
+      return files;
+    }
+    // Single-file source: the backup is just that one file.
+    try {
+      if (fs.statSync(dir).isFile()) return [dir];
+    } catch (e) {
       return files;
     }
 

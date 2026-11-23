@@ -14,8 +14,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   runIncrementalBackup: (jobConfig) => ipcRenderer.invoke('backup-run-incremental', jobConfig),
 
   // Restore operations
-  restoreAll: (zipPath, restoreDir) => ipcRenderer.invoke('restore-all', zipPath, restoreDir),
-  restoreSingle: (zipPath, entryName, destPath) => ipcRenderer.invoke('restore-single', zipPath, entryName, destPath),
+  restoreAll: (zipPath, restoreDir, password) => ipcRenderer.invoke('restore-all', zipPath, restoreDir, password),
+  restoreSingle: (zipPath, entryName, destPath, password) => ipcRenderer.invoke('restore-single', zipPath, entryName, destPath, password),
 
   // File system operations
     readDir: (dirPath) => ipcRenderer.invoke('fs-readdir', dirPath),
@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     deleteFile: (filePath) => ipcRenderer.invoke('fs-delete', filePath),
     fileExists: (filePath) => ipcRenderer.invoke('fs-exists', filePath),
     getZipInfo: (zipPath) => ipcRenderer.invoke('zip-get-info', zipPath),
+    getAppLog: () => ipcRenderer.invoke('logs-get'),
 
     // Dialog operations
     showOpenDialog: (options) => ipcRenderer.invoke('dialog-showOpenDialog', options),
@@ -42,6 +43,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Settings
     getSettings: () => ipcRenderer.invoke('settings-get'),
     saveSettings: (settings) => ipcRenderer.invoke('settings-save', settings),
+    sendTestEmail: () => ipcRenderer.invoke('email-test'),
+
+    // Master-password vault (job passwords for encrypted backups)
+    vaultStatus: () => ipcRenderer.invoke('vault-status'),
+    vaultSetup: (masterPassword) => ipcRenderer.invoke('vault-setup', masterPassword),
+    vaultUnlock: (masterPassword) => ipcRenderer.invoke('vault-unlock', masterPassword),
+    vaultLock: () => ipcRenderer.invoke('vault-lock'),
+    vaultChangePassword: (oldPassword, newPassword) => ipcRenderer.invoke('vault-change-password', oldPassword, newPassword),
+    vaultHasJobPassword: (jobId) => ipcRenderer.invoke('vault-has-job-password', jobId),
+    vaultStoreJobPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-password', jobId, jobPassword),
     showSettingsWindow: () => ipcRenderer.invoke('window-show-settings'),
     closeSettings: () => ipcRenderer.invoke('window-close-settings'),
 
