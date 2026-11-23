@@ -53,7 +53,7 @@ function jobPathValue(value) {
 // Helper function to normalize job objects with uniform defaults
 function normalizeJobObject(job, defaultType = 'full') {
   if (!job || typeof job !== 'object') return null;
-  return {
+  const normalized = {
     id: job.id || `job-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
     name: job.name || 'Unnamed Job',
     status: job.status || 'pending',
@@ -81,6 +81,15 @@ function normalizeJobObject(job, defaultType = 'full') {
     runCount: job.runCount ?? (Array.isArray(job.runs) ? job.runs.length : 0),
     loaded: job.loaded || false
   };
+  // A job with runs is a real job, not a template: showing
+  // "TEMPLATE / COMPLETED" is contradictory. Only a job that never
+  // ran keeps type TEMPLATE.
+  if (normalized.runs.length) {
+    const lastRun = normalized.runs[normalized.runs.length - 1];
+    normalized.type = lastRun.type === 'incremental' ? 'incremental' : 'full';
+    normalized.status = lastRun.status || normalized.status;
+  }
+  return normalized;
 }
 
 // One entry per job in jobHistory: a job template (loaded from its
@@ -836,6 +845,10 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
         tpl.runCount = tpl.runs.length;
         if (tpl.runs.length) {
           const last = tpl.runs[tpl.runs.length - 1];
+          // The job already ran: it is a FULL/INCREMENTAL job with a
+          // COMPLETED status, not a TEMPLATE. Leaving type TEMPLATE
+          // here showed the contradictory "TEMPLATE / COMPLETED".
+          tpl.type = last.type === 'incremental' ? 'incremental' : 'full';
           tpl.status = last.status; tpl.files = last.files; tpl.size = last.size;
           tpl.duration = last.duration; tpl.timestamp = last.timestamp; tpl.result = last.result;
         }
