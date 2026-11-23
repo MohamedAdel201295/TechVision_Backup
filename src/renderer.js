@@ -298,20 +298,45 @@
     }
   }
 
+  function setBackTitle(t) { var b = $('backBarTitle'); if (b) b.textContent = t; }
+  function setAppTitle(t, s) { var h = $('appTitle'); if (h) h.textContent = t; var p = $('appSubtitle'); if (p) p.textContent = s; }
+
+  /* Back from the very top: from a Server/Client panel back to the
+     Cloud home, from anywhere else back to the module chooser. */
+  function goBack() {
+    var cloudView = $('view-cloud');
+    if (cloudView && cloudView.style.display !== 'none' && (cloudPanel === 'server' || cloudPanel === 'client')) { showCloudPanel('home'); return; }
+    showView('modules');
+  }
+
   function showView(name) {
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
+    var modulesView = $('view-modules');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
     if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
     if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
+    if (modulesView) modulesView.style.display = name === 'modules' ? '' : 'none';
+    document.body.classList.toggle('modules-mode', name === 'modules');
+    var bb = $('backBar'); if (bb) bb.style.display = name === 'modules' ? 'none' : '';
+    var hdr = $('appHeader'); if (hdr) hdr.style.display = name === 'modules' ? 'none' : '';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
     if (btn) btn.classList.add('active');
     if (name === 'jobs') renderJobsView();
     if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
     else stopLogsAutoRefresh();
-    if (name === 'dashboard' || name === 'jobs' || name === 'logs') { lastBackupView = name; applyModuleUI('backup'); }
-    if (name === 'cloud') { applyModuleUI('cloud'); syncCloudNav(); loadCloud(); }
+    if (name === 'dashboard' || name === 'jobs' || name === 'logs') {
+      lastBackupView = name; applyModuleUI('backup');
+      setBackTitle('Backup');
+      setAppTitle('TechVision Backup', 'Your data, protected — full and incremental backups, fast streaming restore.');
+    }
+    if (name === 'cloud') {
+      applyModuleUI('cloud'); syncCloudNav();
+      setBackTitle(cloudPanel === 'server' ? 'Cloud — Server' : cloudPanel === 'client' ? 'Cloud — Client' : 'Cloud');
+      setAppTitle('TechVision Cloud', 'Your own remote drive — share a folder or open one, encrypted.');
+      loadCloud();
+    }
   }
   function startLogsAutoRefresh() {
     stopLogsAutoRefresh();
@@ -570,6 +595,7 @@
     if (panel === 'server') renderCloudServer();
     if (panel === 'client') renderCloudClientList();
     syncCloudNav();
+    setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : 'Cloud');
   }
 
   function renderCloudHome() {
@@ -1538,6 +1564,13 @@
       });
     }
 
+    document.querySelectorAll('[data-module-enter]').forEach(function (card) {
+      card.addEventListener('click', function () { setModule(card.getAttribute('data-module-enter')); });
+    });
+    var tbb = $('topBackBtn');
+    if (tbb) tbb.addEventListener('click', goBack);
+
     loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
+    showView('modules');
   });
 })();
