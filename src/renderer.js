@@ -320,6 +320,10 @@
     document.body.classList.toggle('modules-mode', name === 'modules');
     var bb = $('backBar'); if (bb) bb.style.display = name === 'modules' ? 'none' : '';
     var hdr = $('appHeader'); if (hdr) hdr.style.display = name === 'modules' ? 'none' : '';
+    /* Inside a module only that module's things show: the module
+       switcher (Backup / Cloud buttons) is hidden, the way back out
+       is the top Back button. */
+    var ms = $('moduleSwitcher'); if (ms) ms.style.display = name === 'modules' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
     if (btn) btn.classList.add('active');
@@ -1406,10 +1410,6 @@
     if (cms) cms.addEventListener('click', function () { showCloudPanel('server'); });
     var cmc = $('cloudModeClient');
     if (cmc) cmc.addEventListener('click', function () { showCloudPanel('client'); });
-    var csb = $('cloudServerBack');
-    if (csb) csb.addEventListener('click', function () { showCloudPanel('home'); });
-    var ccb = $('cloudClientBack');
-    if (ccb) ccb.addEventListener('click', function () { showCloudPanel('home'); });
     var css = $('cloudServerStartBtn');
     if (css) css.addEventListener('click', async function () {
       if (!api || typeof api.cloudServerStart !== 'function' || typeof api.cloudServerStop !== 'function') return cloudMissing();

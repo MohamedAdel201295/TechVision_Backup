@@ -18,9 +18,11 @@
         <div class="brand-sub">Backup</div>
       </div>
     </div>
-    <div class="nav-label">Modules</div>
-    <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
-    <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
+    <div id="moduleSwitcher">
+      <div class="nav-label">Modules</div>
+      <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
+      <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
+    </div>
     <div class="nav-group" id="navGroupBackup">
       <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
       <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
@@ -215,7 +217,6 @@
       </button>
     </div>
     <div id="cloudServerPanel" style="display:none;">
-      <button class="btn btn-ghost settings-back-btn" type="button" id="cloudServerBack">‹ Cloud</button>
       <h3 style="margin:14px 0 4px;font-size:16px;">Server — share a folder</h3>
       <div class="cloud-status-row">
         <span class="pill pill-pending" id="cloudServerPill">Stopped</span>
@@ -272,7 +273,6 @@
       <button class="btn" type="button" id="cloudUserAddBtn">＋ Add user</button>
     </div>
     <div id="cloudClientPanel" style="display:none;">
-      <button class="btn btn-ghost settings-back-btn" type="button" id="cloudClientBack">‹ Cloud</button>
       <h3 style="margin:14px 0 4px;font-size:16px;">Client — open a shared folder</h3>
       <div id="cloudServersList" class="job-list"></div>
       <div class="field">
