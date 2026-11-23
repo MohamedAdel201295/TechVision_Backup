@@ -137,6 +137,7 @@
     <dt>Source</dt><dd id="drawerSource">—</dd>
     <dt>Destination</dt><dd id="drawerDest">—</dd>
     <dt>Type</dt><dd id="drawerType">—</dd>
+    <dt>Encryption</dt><dd id="drawerEncryption">—</dd>
     <dt>Status</dt><dd id="drawerStatus">—</dd>
     <dt>Files</dt><dd id="drawerFiles">—</dd>
     <dt>Total size</dt><dd id="drawerSize">—</dd>
@@ -221,6 +222,36 @@
       <div class="hint">465 = SSL, 587 = STARTTLS. Most company servers use one of these two.</div>
     </div>
     <button class="btn" type="button" id="emailTestBtn" style="margin-top:8px;">✉ Send test email</button>
+    <h3 style="margin:18px 0 4px;font-size:14px;">Master password</h3>
+    <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where job passwords for encrypted backups are stored. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
+    <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
+    <div id="vaultSetupBox">
+      <div class="field">
+        <label for="vaultNewPass">New master password</label>
+        <input type="password" id="vaultNewPass" placeholder="At least 8 characters" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="vaultNewPassConfirm">Confirm master password</label>
+        <input type="password" id="vaultNewPassConfirm" placeholder="Repeat the master password" autocomplete="new-password">
+      </div>
+      <button class="btn" type="button" id="vaultSetupBtn" style="margin-top:4px;">Set master password</button>
+    </div>
+    <div id="vaultChangeBox" style="display:none;">
+      <div class="field">
+        <label for="vaultOldPass">Current master password</label>
+        <input type="password" id="vaultOldPass" placeholder="Current master password" autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label for="vaultChangeNew">New master password</label>
+        <input type="password" id="vaultChangeNew" placeholder="At least 8 characters" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="vaultChangeConfirm">Confirm new master password</label>
+        <input type="password" id="vaultChangeConfirm" placeholder="Repeat the new master password" autocomplete="new-password">
+      </div>
+      <button class="btn" type="button" id="vaultChangeBtn" style="margin-top:4px;">Change master password</button>
+      <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
+    </div>
   </div>
   <div class="drawer-actions">
     <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
@@ -233,6 +264,34 @@
   <div class="confirm-actions">
     <button class="btn btn-danger" type="button" id="confirmYes">Yes, delete all</button>
     <button class="btn" type="button" id="confirmNo">No, keep it</button>
+  </div>
+</div>
+<div class="backdrop" id="vaultBackdrop"></div>
+<div class="confirm-modal" id="vaultModal" role="alertdialog" aria-labelledby="vaultModalTitle" style="display:none;">
+  <h3 id="vaultModalTitle">🔒 Unlock the vault</h3>
+  <p id="vaultModalText">A master password protects the saved passwords for your encrypted backups. Enter it once to unlock the vault for this session.</p>
+  <div class="field">
+    <label for="vaultUnlockPass">Master password</label>
+    <input type="password" id="vaultUnlockPass" placeholder="Master password" autocomplete="current-password">
+    <div class="field-error" id="vaultUnlockError">Wrong master password.</div>
+  </div>
+  <div class="confirm-actions">
+    <button class="btn btn-primary" type="button" id="vaultUnlockBtn">Unlock</button>
+    <button class="btn btn-ghost" type="button" id="vaultUnlockSkip">Skip for now</button>
+  </div>
+  <p style="font-size:12px; color:var(--muted); margin:10px 0 0;">Skipping leaves the vault locked: scheduled encrypted backups will not run, and manual runs will ask for the job password instead.</p>
+</div>
+<div class="backdrop" id="jobPwBackdrop"></div>
+<div class="confirm-modal" id="jobPwModal" role="alertdialog" aria-labelledby="jobPwTitle" style="display:none;">
+  <h3 id="jobPwTitle">🔒 Encrypted backup</h3>
+  <p id="jobPwText">This job is encrypted and its password is not saved in the vault. Enter the backup password to run it.</p>
+  <div class="field">
+    <label for="jobPwInput">Backup password</label>
+    <input type="password" id="jobPwInput" placeholder="Backup password" autocomplete="off">
+  </div>
+  <div class="confirm-actions">
+    <button class="btn btn-primary" type="button" id="jobPwRun">Run backup</button>
+    <button class="btn btn-ghost" type="button" id="jobPwCancel">Cancel</button>
   </div>
 </div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
