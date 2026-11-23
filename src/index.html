@@ -195,7 +195,7 @@
   <button class="icon-btn close-x" type="button" id="settingsClose" aria-label="Close settings">✕</button>
   <h2>Settings</h2>
   <p style="color:var(--muted); margin:4px 0 0;">Saved with <code>window.electronAPI.saveSettings()</code>.</p>
-  <div style="margin-top:14px;">
+  <div id="settingsHomeView" style="margin-top:14px;">
     <div class="toggle-row">
       <div><div class="t-label">Light theme</div><div class="t-sub">Switch between dark and light.</div></div>
       <label class="switch"><input type="checkbox" id="settingLightTheme"><span class="slider"></span></label>
@@ -216,8 +216,60 @@
       <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Default for new jobs.</div></div>
       <label class="switch"><input type="checkbox" id="settingIncremental" checked><span class="slider"></span></label>
     </div>
-    <h3 style="margin:18px 0 4px;font-size:14px;">Email notifications</h3>
+    <button class="settings-menu-row" type="button" id="emailMenuRow">
+      <span class="settings-menu-icon">✉</span>
+      <span class="settings-menu-text"><span class="t-label">Email notifications</span><span class="t-sub" id="emailMenuStatus">Off — tap to set up</span></span>
+      <span class="settings-menu-chevron">›</span>
+    </button>
+    <h3 style="margin:18px 0 4px;font-size:14px;">Master password</h3>
+    <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where job passwords for encrypted backups are stored. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
+    <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
+    <div id="vaultSetupBox">
+      <div class="field">
+        <label for="vaultNewPass">New master password</label>
+        <input type="password" id="vaultNewPass" placeholder="At least 8 characters" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="vaultNewPassConfirm">Confirm master password</label>
+        <input type="password" id="vaultNewPassConfirm" placeholder="Repeat the master password" autocomplete="new-password">
+      </div>
+      <button class="btn" type="button" id="vaultSetupBtn" style="margin-top:4px;">Set master password</button>
+    </div>
+    <div id="vaultChangeBox" style="display:none;">
+      <div class="field">
+        <label for="vaultOldPass">Current master password</label>
+        <input type="password" id="vaultOldPass" placeholder="Current master password" autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label for="vaultChangeNew">New master password</label>
+        <input type="password" id="vaultChangeNew" placeholder="At least 8 characters" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="vaultChangeConfirm">Confirm new master password</label>
+        <input type="password" id="vaultChangeConfirm" placeholder="Repeat the new master password" autocomplete="new-password">
+      </div>
+      <button class="btn" type="button" id="vaultChangeBtn" style="margin-top:4px;">Change master password</button>
+      <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
+    </div>
+  </div>
+  <div id="settingsEmailView" style="display:none; margin-top:14px;">
+    <button class="btn btn-ghost settings-back-btn" type="button" id="emailBackBtn">‹ Settings</button>
+    <h3 style="margin:14px 0 4px;font-size:16px;">✉ Email notifications</h3>
     <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">Get an email when a backup starts or finishes, or when the app was closed and a scheduled backup was missed.</p>
+    <div class="settings-guide">
+      <div class="settings-guide-title">What to fill in</div>
+      <ul>
+        <li><b>Send notifications to</b> — the inbox that receives the emails.</li>
+        <li><b>Sender email + password</b> — the account the app sends from.</li>
+        <li><b>SMTP host + port</b> — Gmail is prefilled (smtp.gmail.com, 465). For a company mailbox, ask your mail admin for the server and port.</li>
+      </ul>
+      <div class="settings-guide-title">What NOT to put here</div>
+      <ul>
+        <li>Your normal Gmail password — Gmail needs an <b>App Password</b> (Google Account → Security → 2-Step Verification → App passwords).</li>
+        <li>Your backup job password or the master password — those belong to encryption, not to email.</li>
+        <li>The app only ever emails the address in “Send notifications to” — nothing else.</li>
+      </ul>
+    </div>
     <div class="toggle-row">
       <div><div class="t-label">Email notifications</div><div class="t-sub">Send mail for backup events.</div></div>
       <label class="switch"><input type="checkbox" id="settingEmailEnabled"><span class="slider"></span></label>
@@ -258,36 +310,6 @@
       <div class="hint">465 = SSL, 587 = STARTTLS. Most company servers use one of these two.</div>
     </div>
     <button class="btn" type="button" id="emailTestBtn" style="margin-top:8px;">✉ Send test email</button>
-    <h3 style="margin:18px 0 4px;font-size:14px;">Master password</h3>
-    <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where job passwords for encrypted backups are stored. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
-    <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
-    <div id="vaultSetupBox">
-      <div class="field">
-        <label for="vaultNewPass">New master password</label>
-        <input type="password" id="vaultNewPass" placeholder="At least 8 characters" autocomplete="new-password">
-      </div>
-      <div class="field">
-        <label for="vaultNewPassConfirm">Confirm master password</label>
-        <input type="password" id="vaultNewPassConfirm" placeholder="Repeat the master password" autocomplete="new-password">
-      </div>
-      <button class="btn" type="button" id="vaultSetupBtn" style="margin-top:4px;">Set master password</button>
-    </div>
-    <div id="vaultChangeBox" style="display:none;">
-      <div class="field">
-        <label for="vaultOldPass">Current master password</label>
-        <input type="password" id="vaultOldPass" placeholder="Current master password" autocomplete="current-password">
-      </div>
-      <div class="field">
-        <label for="vaultChangeNew">New master password</label>
-        <input type="password" id="vaultChangeNew" placeholder="At least 8 characters" autocomplete="new-password">
-      </div>
-      <div class="field">
-        <label for="vaultChangeConfirm">Confirm new master password</label>
-        <input type="password" id="vaultChangeConfirm" placeholder="Repeat the new master password" autocomplete="new-password">
-      </div>
-      <button class="btn" type="button" id="vaultChangeBtn" style="margin-top:4px;">Change master password</button>
-      <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
-    </div>
   </div>
   <div class="drawer-actions">
     <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
