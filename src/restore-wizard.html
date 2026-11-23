@@ -35,6 +35,12 @@
         </div>
         <div class="field-error" id="destError">Please choose a destination folder.</div>
       </div>
+      <div class="field" id="restorePasswordField" style="display:none;">
+        <label for="restorePassword">Backup password</label>
+        <input type="password" id="restorePassword" placeholder="Password for this encrypted backup" autocomplete="off">
+        <div class="hint">This backup is encrypted (AES-256). Enter its backup password — the same one used when it was created. Without it, the files cannot be restored.</div>
+        <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
+      </div>
       <label class="check"><input type="checkbox" id="optOverwrite"> Overwrite existing files</label>
       <label class="check"><input type="checkbox" id="optVerify" checked> Verify restored files</label>
       <div class="note">
