@@ -8,6 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
 const { RestoreEngine } = require('./restore.js');
+const mailer = require('./mailer.js');
 
 const isDevelopment = !app.isPackaged;
 
@@ -214,6 +215,17 @@ function notifyJobsUpdated() {
       mainWindow.webContents.send('jobs-updated');
     }
   } catch (e) { /* window not ready yet */ }
+}
+
+// Email notification, fire-and-forget: a mail failure must never
+// break or delay a backup. Logs the outcome, nothing else.
+function notifyEmail(kind, job, extra) {
+  try {
+    mailer.notify(app.getPath('userData'), kind, job, extra).then(function (r) {
+      if (r && !r.sent && r.reason !== 'off') console.log('[Mail] Notification not sent (' + kind + '): ' + r.reason);
+      else if (r && r.sent) console.log('[Mail] Notification sent (' + kind + ')');
+    }).catch(function (e) { console.log('[Mail] Notification error:', e.message); });
+  } catch (e) { console.log('[Mail] Notification error:', e.message); }
 }
 
 function recordRun(jobName, jobRecord) {
@@ -497,6 +509,7 @@ function createLogViewerWindow() {
 app.whenReady().then(() => {
   migrateLegacyUserData(); // Bring old settings/jobs into the pinned folder
   loadStoredJobs(); // Load stored jobs on startup
+  checkMissedSchedules(); // Email if the app was closed and a schedule was missed
   startScheduler(); // Run scheduled jobs while the app is open
   try { app.setAppUserModelId('com.techvision.backup'); } catch (e) {}
   applyAutoStart(); // Start with Windows, installed or portable
@@ -567,6 +580,7 @@ async function executeScheduledBackup(job) {
   const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
   const jobId = `${job.name}-scheduled-${Date.now()}`;
   activeJobs.set(jobId, { name: job.name, status: 'running' });
+  notifyEmail('started', { name: job.name, type: useIncremental ? 'incremental' : 'full', source: job.source, destination: job.destination });
   try {
     const engine = new BackupEngine(jobConfig);
     engine.logger = true;
@@ -581,10 +595,12 @@ async function executeScheduledBackup(job) {
     recordRun(job.name, jobRecord);
     job.lastScheduledRun = new Date().toISOString();
     saveJobHistory();
+    notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
     console.log(`[Scheduler] Scheduled backup ${useIncremental ? 'incremental' : 'full'} for ${job.name}: ${jobRecord.status}`);
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } catch (e) {
     console.error(`[Scheduler] Scheduled backup failed for ${job.name}:`, e.message);
+    notifyEmail('failed', { name: job.name, type: useIncremental ? 'incremental' : 'full', files: 0, size: 0, duration: 0 });
   } finally {
     activeJobs.delete(jobId);
   }
@@ -605,6 +621,30 @@ function checkSchedules() {
   }
 }
 
+// The app was closed, so scheduled backups could not run: on startup,
+// find enabled schedules whose run time already passed without a run
+// and email about them. Only established schedules count (jobs that
+// have run at least once), so a brand-new job never spams on day one.
+// The scheduler then fires the missed jobs right away.
+function checkMissedSchedules() {
+  try {
+    const now = new Date();
+    const missed = [];
+    for (const job of jobHistory) {
+      if (!job.schedule || !job.schedule.enabled) continue;
+      if (!job.lastScheduledRun && !(job.runCount > 0)) continue;
+      const next = nextScheduledRun(job.schedule, now, job.lastScheduledRun);
+      if (!next) continue;
+      const last = job.lastScheduledRun ? new Date(job.lastScheduledRun) : null;
+      if (next <= now && (!last || last < next)) missed.push({ job: job, due: next });
+    }
+    if (missed.length) {
+      console.log('[Mail] ' + missed.length + ' scheduled backup(s) missed while the app was closed');
+      notifyEmail('missed', null, missed);
+    }
+  } catch (e) { console.error('[Mail] Missed-schedule check failed:', e.message); }
+}
+
 function startScheduler() {
   if (global._schedulerTimer) return;
   checkSchedules();
@@ -622,8 +662,10 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, status: 'running' });
   
+  notifyEmail('started', { name: jobName, type: 'full', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
+
   engine.logger = true; // Enable logging
-  
+
   const result = await engine.run_full_backup();
   
   const jobRecord = {
@@ -647,6 +689,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   notifyJobsUpdated();
   activeJobs.delete(jobId);
 
+  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
   return jobRecord;
 });
@@ -657,9 +700,10 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, status: 'running' });
-  
+  notifyEmail('started', { name: jobName, type: 'incremental', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
+
   engine.logger = true;
-  
+
   const result = await engine.run_incremental_backup();
   
   const jobRecord = {
@@ -683,6 +727,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   notifyJobsUpdated();
   activeJobs.delete(jobId);
 
+  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Incremental backup completed: ${jobName}`);
   return jobRecord;
 });
@@ -1062,6 +1107,14 @@ ipcMain.handle('settings-save', async (event, settings) => {
   // register/unregister the app at login without needing a restart.
   applyAutoStart();
   return { success: true };
+});
+
+// Send a test notification with the saved email settings.
+ipcMain.handle('email-test', async () => {
+  const r = await mailer.sendMail(app.getPath('userData'),
+    'Test email from TechVision Backup',
+    'This is a test notification from TechVision Backup.\n\nIf you got this, email notifications are set up correctly.\nTime: ' + new Date().toLocaleString());
+  return { success: r.sent, error: r.sent ? undefined : r.reason };
 });
 
 // Settings window
