@@ -92,6 +92,7 @@
       includePatterns: patterns.slice(),
       allowIncremental: $('optIncremental').checked,
       compress: $('optCompress').checked,
+      compression: $('optCompress').checked ? 'standard' : 'none',
       verify: $('optVerify').checked,
       use_vss: false,
       schedule: $('optSchedule').checked ? { enabled: true, frequency: freq, time: $('scheduleTime').value || '02:00' } : { enabled: false, frequency: freq, time: $('scheduleTime').value || '02:00' },
