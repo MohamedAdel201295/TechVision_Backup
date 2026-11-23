@@ -995,6 +995,9 @@ ipcMain.handle('settings-save', async (event, settings) => {
   }
   const settingsPath = path.join(settingsDir, 'settings.json');
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  // Apply Start-with-Windows right away: saving the setting must
+  // register/unregister the app at login without needing a restart.
+  applyAutoStart();
   return { success: true };
 });
 
