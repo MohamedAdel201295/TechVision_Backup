@@ -61,6 +61,7 @@
       duration: safeNum(raw.duration ?? raw.durationSeconds ?? raw.elapsed, 0),
       timestamp: raw.timestamp || raw.lastRun || raw.date || raw.createdAt || '',
       schedule: raw.schedule || null,
+      compression: raw.compression || (raw.compress === false ? 'none' : 'standard'),
       runs: Array.isArray(raw.runs) ? raw.runs : [],
       runCount: raw.runCount ?? (Array.isArray(raw.runs) ? raw.runs.length : 0),
       raw: raw
@@ -219,6 +220,95 @@
           if (act === 'details') openDrawer(job);
           if (act === 'run') runBackup(job, false);
           if (act === 'restore') openRestore(job);
+        });
+      });
+      list.appendChild(card);
+    });
+  }
+
+  /* ---------- views: Dashboard / Jobs ---------- */
+  function showView(name) {
+    var dash = $('view-dashboard'); var jobsView = $('view-jobs');
+    if (dash) dash.style.display = name === 'jobs' ? 'none' : '';
+    if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
+    document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
+    var btn = document.querySelector('[data-nav="' + name + '"]');
+    if (btn) btn.classList.add('active');
+    if (name === 'jobs') renderJobsView();
+  }
+  function compressionLabel(job) {
+    var c = (job.compression || (job.raw && job.raw.compression) || 'standard').toLowerCase();
+    if (c === 'none') return 'No compression — plain files';
+    if (c === 'advanced') return 'Advanced (max compression)';
+    return 'Standard compression';
+  }
+  function renderJobsView() {
+    var list = $('jobsList');
+    if (!list) return;
+    // Jobs page = the jobs whose turn it is to run: never run yet, or
+    // scheduled for a next run. A job that already ran and has no
+    // schedule is done — it stays in the Dashboard history only.
+    var upcoming = jobs.filter(function (j) {
+      var neverRun = !j.runs || j.runs.length === 0;
+      var sched = j.schedule && j.schedule.enabled;
+      return neverRun || sched;
+    });
+    list.innerHTML = '';
+    var empty = $('jobsEmptyState');
+    if (empty) empty.style.display = upcoming.length === 0 ? 'block' : 'none';
+    upcoming.forEach(function (job, idx) {
+      var card = document.createElement('article');
+      card.className = 'job-card';
+      card.style.animationDelay = Math.min(idx * 0.05, 0.3) + 's';
+      var initial = escapeHtml((job.name || 'T').charAt(0).toUpperCase());
+      card.innerHTML =
+        '<div class="job-icon">' + initial + '</div>' +
+        '<div class="job-body">' +
+          '<h3 class="job-name"></h3>' +
+          '<div class="job-meta"><span class="pill"></span><span>Last run: <b class="last-run"></b></span><span>Runs: <b class="run-count"></b></span></div>' +
+          '<div class="job-path"></div>' +
+          '<dl class="job-detail">' +
+            '<div><dt>Schedule</dt><dd class="d-schedule"></dd></div>' +
+            '<div><dt>Next run</dt><dd class="d-next"></dd></div>' +
+            '<div><dt>Compression</dt><dd class="d-compress"></dd></div>' +
+            '<div><dt>Last run files</dt><dd class="d-files"></dd></div>' +
+          '</dl>' +
+        '</div>' +
+        '<div class="job-actions"><div class="job-actions-row">' +
+          '<button class="btn btn-primary btn-sm" type="button" data-act="run">▶ Run now</button>' +
+          '<button class="btn btn-sm" type="button" data-act="details">Details</button>' +
+          '<button class="btn btn-sm" type="button" data-act="edit">✎ Edit</button>' +
+          '<button class="btn btn-sm" type="button" data-act="restore">↺ Restore</button>' +
+          '<button class="btn btn-danger btn-sm" type="button" data-act="delete">🗑 Delete</button>' +
+        '</div></div>';
+      card.querySelector('.job-name').textContent = job.name;
+      var pill = card.querySelector('.pill');
+      pill.className = 'pill ' + pillClass(job.status, job.type);
+      pill.textContent = job.status;
+      card.querySelector('.last-run').textContent = job.runs && job.runs.length ? formatDate(job.timestamp) : 'Never run';
+      card.querySelector('.run-count').textContent = String(job.runCount || 0);
+      card.querySelector('.job-path').textContent = job.source ? job.source + '  →  ' + (job.destination || '—') : (job.destination || '—');
+      var sched = job.schedule || (job.raw && job.raw.schedule) || null;
+      card.querySelector('.d-schedule').textContent = sched && sched.enabled ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00') : 'Manual only';
+      card.querySelector('.d-next').textContent = nextRunText(job);
+      card.querySelector('.d-compress').textContent = compressionLabel(job);
+      card.querySelector('.d-files').textContent = job.runs && job.runs.length ? job.files + ' files · ' + formatBytes(job.size) : '—';
+      card.querySelectorAll('[data-act]').forEach(function (btn) {
+        btn.addEventListener('click', async function (ev) {
+          ev.stopPropagation();
+          var act = btn.getAttribute('data-act');
+          if (act === 'details') openDrawer(job);
+          if (act === 'run') runBackup(job, false);
+          if (act === 'edit') openJobWizard(job);
+          if (act === 'restore') openRestore(job);
+          if (act === 'delete') {
+            if (!api || typeof api.deleteJob !== 'function') return;
+            try {
+              var res = await api.deleteJob(job.id);
+              if (res && res.success) { toast('Job deleted', job.name + ' has been deleted.', 'success'); await refreshJobs(); }
+              else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
+            } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
+          }
         });
       });
       list.appendChild(card);
@@ -404,6 +494,7 @@
     }
     renderStats();
     renderJobs();
+    renderJobsView();
   }
   if (api && typeof api.onJobsUpdated === 'function') {
     api.onJobsUpdated(function () { loadJobs(); });
@@ -418,6 +509,8 @@
   /* ---------- wiring ---------- */
   document.addEventListener('DOMContentLoaded', function () {
     $('newJobBtn').addEventListener('click', function () { openJobWizard(null); });
+    var jnb = $('jobsNewJobBtn'); if (jnb) jnb.addEventListener('click', function () { openJobWizard(null); });
+    var jenb = $('jobsEmptyNewJobBtn'); if (jenb) jenb.addEventListener('click', function () { openJobWizard(null); });
     $('emptyNewJobBtn').addEventListener('click', function () { openJobWizard(null); });
     $('restoreBtn').addEventListener('click', function () { openRestore(null); });
     $('navRestore').addEventListener('click', function () { openRestore(null); });
@@ -458,8 +551,8 @@
         btn.classList.add('active');
         if (nav === 'settings') openSettings();
         if (nav === 'logs') toast('Logs', 'Open the Log Viewer from the Logs window.', '');
-        if (nav === 'jobs') { var el = $('jobList'); if (el) el.scrollIntoView({ behavior: 'smooth' }); }
-        if (nav === 'dashboard') { var m = document.querySelector('.main'); if (m) m.scrollIntoView({ behavior: 'smooth' }); }
+        if (nav === 'jobs') showView('jobs');
+        if (nav === 'dashboard') showView('dashboard');
       });
     });
     $('drawerClose').addEventListener('click', closeDrawer);
