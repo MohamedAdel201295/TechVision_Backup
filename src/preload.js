@@ -120,6 +120,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wgConnect: (opts) => ipcRenderer.invoke('wg-connect', opts),
   wgDisconnect: () => ipcRenderer.invoke('wg-disconnect'),
   wgOpenDownload: () => ipcRenderer.invoke('wg-open-download'),
+  // TechVision WireGuard VPN — Cloud join (third key-exchange option)
+  wgCloudJoinList: () => ipcRenderer.invoke('wg-cloudjoin-list'),
+  wgCloudJoinApprove: (opts) => ipcRenderer.invoke('wg-cloudjoin-approve', opts),
+  wgCloudJoinReject: (opts) => ipcRenderer.invoke('wg-cloudjoin-reject', opts),
+  wgCloudJoinRequest: (opts) => ipcRenderer.invoke('wg-cloudjoin-request', opts),
+  wgCloudJoinPoll: (opts) => ipcRenderer.invoke('wg-cloudjoin-poll', opts),
+  wgCloudJoinCancel: (opts) => ipcRenderer.invoke('wg-cloudjoin-cancel', opts),
+  // TechVision WireGuard VPN — gateway NAT service (site-to-site)
+  wgNatStart: (opts) => ipcRenderer.invoke('wg-nat-start', opts || null),
+  wgNatStop: () => ipcRenderer.invoke('wg-nat-stop'),
+  wgNatStatus: () => ipcRenderer.invoke('wg-nat-status'),
+  wgNatSave: (config) => ipcRenderer.invoke('wg-nat-save', config),
+  wgInstallAmneziawg: () => ipcRenderer.invoke('wg-install-amneziawg'),
   // TechVision VPN — Tailscale client manager (no VPN of its own)
   vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
   vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
@@ -134,6 +147,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   vpnOpenKeysPage: () => ipcRenderer.invoke('vpn-open-keys-page'),
   vpnOpenOauthPage: () => ipcRenderer.invoke('vpn-open-oauth-page'),
   onVpnInstallProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('vpn-install-progress', h); return () => ipcRenderer.removeListener('vpn-install-progress', h); },
+  onWgInstallProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('wg-install-progress', h); return () => ipcRenderer.removeListener('wg-install-progress', h); },
   vpnOpenDownload: () => ipcRenderer.invoke('vpn-open-download'),
   vpnOpenAuthUrl: (url) => ipcRenderer.invoke('vpn-open-auth-url', url),
   vpnOpenAdmin: () => ipcRenderer.invoke('vpn-open-admin'),

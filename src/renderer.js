@@ -2218,6 +2218,15 @@
   var wgStatusCache = null;
   var wgBusy = false;
   var lastWgPeersSig = null;
+  // Cloud join (third key-exchange option): a request this machine
+  // sent is { requestId, serverId, deviceName } — the private key
+  // stays in main, so a restart loses the pending request and the
+  // user simply sends a fresh one. The poll timer runs every 5s
+  // while a request is outstanding and stops on any terminal state.
+  var wgJoinPending = null;
+  var wgJoinPollTimer = null;
+  var lastWgJoinReqSig = null;
+  var lastWgJoinServersSig = null;
 
   function wgMissing() { toast('WireGuard', 'The WireGuard bridge is not available in this build.', 'error'); }
 
@@ -2237,31 +2246,43 @@
     var st;
     try { st = await api.wgGetStatus(); } catch (e) { st = { installed: false, serverRunning: false, clientRunning: false, error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
     wgStatusCache = st || {};
+    renderWgNat(st || {});
     var dot = $('wgStatusDot'); if (dot) dot.className = 'vpn-dot' + ((st.serverRunning || st.clientRunning) ? ' on' : '');
     var txt = $('wgStatusText'), sub = $('wgStatusSub');
     var ni = $('wgNotInstalled');
     var sc = $('wgServerCard'), cc = $('wgClientCard');
+    var tl = $('wgTransportLine');
     if (!st.installed) {
       if (txt) txt.textContent = 'Not installed';
-      if (sub) sub.textContent = 'WireGuard is not installed on this computer.';
+      if (sub) sub.textContent = 'AmneziaWG is not installed on this computer.';
+      if (tl) tl.style.display = 'none';
       if (ni) ni.style.display = '';
       if (sc) sc.style.display = 'none';
       if (cc) cc.style.display = 'none';
+      // The early return below used to skip the button reset, so a
+      // failed Start left the button stuck on "Working…" — reset
+      // both buttons here too.
+      var sb0 = $('wgServerBtn'); if (sb0) { sb0.textContent = 'Start server'; sb0.classList.add('btn-primary'); }
+      var cb0 = $('wgClientBtn'); if (cb0) { cb0.textContent = 'Connect'; cb0.classList.add('btn-primary'); }
       renderWgPeers([]);
       return;
     }
     if (ni) ni.style.display = 'none';
     if (sc) sc.style.display = '';
     if (cc) cc.style.display = '';
+    if (tl) {
+      if (st.transport === 'amneziawg') { tl.style.display = ''; tl.textContent = st.obfuscated ? 'Transport: AmneziaWG — traffic is obfuscated, so it doesn\u2019t look like WireGuard on the network.' : 'Transport: AmneziaWG.'; }
+      else { tl.style.display = ''; tl.textContent = 'Transport: stock WireGuard (no obfuscation).'; }
+    }
     if (st.serverRunning && st.clientRunning) {
       if (txt) txt.textContent = 'Server running · Client connected';
       if (sub) sub.textContent = 'This machine is a hub and a client at the same time.';
     } else if (st.serverRunning) {
       if (txt) txt.textContent = 'Server running';
-      if (sub) sub.textContent = 'This machine is the WireGuard hub — devices connect to it.';
+      if (sub) sub.textContent = 'This machine is the AmneziaWG hub — devices connect to it.';
     } else if (st.clientRunning) {
       if (txt) txt.textContent = 'Connected';
-      if (sub) sub.textContent = 'This machine is connected to a WireGuard server.';
+      if (sub) sub.textContent = 'This machine is connected to an AmneziaWG server.';
     } else if (st.error) {
       if (txt) txt.textContent = 'Error';
       if (sub) sub.textContent = st.error;
@@ -2293,6 +2314,213 @@
       var ci = $('wgClientTunnelIp'); if (ci && !ci.value && st.client.tunnelIp) ci.value = st.client.tunnelIp;
     }
     renderWgPeers(st.peers || []);
+    loadWgJoinRequests();
+    try {
+      var ccfg = await api.cloudGetConfig();
+      renderWgJoinServers((ccfg && ccfg.clients) || []);
+    } catch (e) { /* the join server list stays as it is */ }
+  }
+
+  /* Gateway NAT service status (site-to-site): the card lives in
+     the WireGuard view next to the static-route guidance. The
+     service itself is Windows-only — on Linux the status simply
+     says stopped, and Start reports the real reason. The status
+     line also carries the saved configuration summary, and Start
+     stays disabled until a configuration has been saved. */
+  function renderWgNat(st) {
+    var ns = $('wgNatStatus'); if (!ns) return;
+    var n = (st && st.nat) || {};
+    var saved = (st && st.natConfig) || null;
+    var summary = '';
+    if (saved) {
+      summary = ' Saved: ' + (saved.mode === 'same-subnet' ? 'same-subnet' : 'different-subnet') + ', ' +
+        (saved.localSubnet || '') + ' ↔ ' + (saved.remoteSubnet || '') +
+        (saved.mode === 'same-subnet' ? (', ' + (saved.mappings ? saved.mappings.length : 0) + ' mapped device' + ((saved.mappings || []).length === 1 ? '' : 's')) : ', no mappings') + '.';
+    } else {
+      summary = ' No site-to-site configuration saved yet — fill in the form below and press Save.';
+    }
+    if (n.running) {
+      var s = n.stats || {};
+      ns.textContent = 'NAT service: running — ' + (n.mode || '') + ' mode' +
+        (n.mappings ? (', ' + n.mappings + ' mapped device' + (n.mappings === 1 ? '' : 's')) : '') +
+        (s.translated ? (', ' + s.translated + ' packet' + (s.translated === 1 ? '' : 's') + ' translated') : '') + '.' + summary;
+    } else {
+      ns.textContent = 'NAT service: stopped.' + (n.lastError ? (' ' + n.lastError) : '') + summary;
+    }
+    var startBtn = $('wgNatStartBtn'); if (startBtn) startBtn.disabled = !!n.running || !saved;
+    var stopBtn = $('wgNatStopBtn'); if (stopBtn) stopBtn.disabled = !n.running;
+    renderWgNatForm(st);
+  }
+
+  /* The NAT mapping editor: prefill from the saved config, show or
+     hide the same-subnet blocks by mode, and never clobber the
+     user's edits — the 15s poller calls loadWireGuard, so once the
+     form is dirty it is left alone, and the mappings rows rebuild
+     only when the saved config actually changes. */
+  var wgNatFormDirty = false;
+  var lastWgNatSavedSig = null;
+  var lastWgNatMappingsSig = null;
+  var lastWgNatPeersSig = null;
+  function wgNatVal(id) { var el = $(id); return el ? String(el.value || '').trim() : ''; }
+  function wgNatSetVal(id, v) { var el = $(id); if (el) el.value = (v === undefined || v === null) ? '' : String(v); }
+  function currentWgNatMode() {
+    var diff = $('wgNatModeDiff');
+    return (diff && diff.checked) ? 'different-subnet' : 'same-subnet';
+  }
+  function setWgNatMode(m) {
+    var same = $('wgNatModeSame'), diff = $('wgNatModeDiff');
+    if (same) same.checked = m !== 'different-subnet';
+    if (diff) diff.checked = m === 'different-subnet';
+    var so = $('wgNatSameOnly'); if (so) so.style.display = m === 'different-subnet' ? 'none' : '';
+    var dh = $('wgNatDiffHint'); if (dh) dh.style.display = m === 'different-subnet' ? '' : 'none';
+  }
+  function wgNatAddMappingRow(m) {
+    var box = $('wgNatMappingsRows'); if (!box) return;
+    var row = document.createElement('div');
+    row.className = 'wg-nat-map-row';
+    row.style.cssText = 'display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; align-items:center;';
+    var mk = function (cls, ph) {
+      var el = document.createElement('input');
+      el.type = 'text'; el.className = cls; el.placeholder = ph; el.autocomplete = 'off';
+      el.style.cssText = 'flex:1; min-width:130px;';
+      el.addEventListener('input', function () { wgNatFormDirty = true; });
+      return el;
+    };
+    var real = mk('wg-nat-map-real', 'Remote device, e.g. 192.168.1.3'); real.value = (m && m.real) || '';
+    var virt = mk('wg-nat-map-virt', 'Appears as, e.g. 192.168.1.203'); virt.value = (m && m.virt) || '';
+    var name = mk('wg-nat-map-name', 'Name, e.g. printer'); name.value = (m && m.name) || '';
+    var rm = document.createElement('button');
+    rm.className = 'btn btn-ghost btn-sm'; rm.type = 'button'; rm.textContent = 'Remove';
+    rm.addEventListener('click', function () {
+      var rows = box.querySelectorAll('.wg-nat-map-row');
+      if (rows.length <= 1) { real.value = ''; virt.value = ''; name.value = ''; wgNatFormDirty = true; return; }
+      row.remove(); wgNatFormDirty = true;
+    });
+    row.appendChild(real); row.appendChild(virt); row.appendChild(name); row.appendChild(rm);
+    box.appendChild(row);
+  }
+  function wgNatRebuildMappings(list) {
+    var box = $('wgNatMappingsRows'); if (!box) return;
+    box.innerHTML = '';
+    var rows = (list && list.length) ? list : [null];
+    rows.forEach(function (m) { wgNatAddMappingRow(m); });
+  }
+  function wgNatReadMappings() {
+    var out = [];
+    document.querySelectorAll('#wgNatMappingsRows .wg-nat-map-row').forEach(function (row) {
+      var real = (row.querySelector('.wg-nat-map-real') || {}).value || '';
+      var virt = (row.querySelector('.wg-nat-map-virt') || {}).value || '';
+      var name = (row.querySelector('.wg-nat-map-name') || {}).value || '';
+      if (String(real).trim() === '' && String(virt).trim() === '' && String(name).trim() === '') return;
+      out.push({ real: String(real).trim(), virt: String(virt).trim(), name: String(name).trim() });
+    });
+    return out;
+  }
+  function renderWgNatPeerPick(peers) {
+    var sel = $('wgNatRemotePeerPick'); if (!sel) return;
+    var sig = JSON.stringify((peers || []).map(function (p) { return [p.name, p.tunnelIp]; }));
+    if (sig === lastWgNatPeersSig) return;
+    lastWgNatPeersSig = sig;
+    var prev = sel.value;
+    sel.innerHTML = '';
+    var o0 = document.createElement('option'); o0.value = '';
+    o0.textContent = (peers && peers.length) ? 'Pick a peer…' : 'No peers yet — add one above first';
+    sel.appendChild(o0);
+    (peers || []).forEach(function (p) {
+      var opt = document.createElement('option'); opt.value = p.tunnelIp;
+      opt.textContent = (p.name || 'peer') + ' — ' + p.tunnelIp;
+      sel.appendChild(opt);
+    });
+    if (prev) sel.value = prev;
+  }
+  function renderWgNatForm(st) {
+    var fs = $('wgNatFieldset'); if (!fs) return;
+    var n = (st && st.nat) || {};
+    var saved = (st && st.natConfig) || null;
+    fs.disabled = !!n.running;
+    var savedSig = JSON.stringify(saved || null);
+    if (!wgNatFormDirty && savedSig !== lastWgNatSavedSig) {
+      lastWgNatSavedSig = savedSig;
+      if (saved) {
+        setWgNatMode(saved.mode === 'different-subnet' ? 'different-subnet' : 'same-subnet');
+        wgNatSetVal('wgNatLocalSubnet', saved.localSubnet);
+        wgNatSetVal('wgNatRemoteSubnet', saved.remoteSubnet);
+        wgNatSetVal('wgNatGatewayLanIp', saved.gatewayLanIp);
+        wgNatSetVal('wgNatGatewayTunnelIp', saved.gatewayTunnelIp);
+        wgNatSetVal('wgNatRemoteTunnelIp', saved.remoteTunnelIp);
+        wgNatSetVal('wgNatFarVirtIp', saved.farVirtIp);
+        wgNatSetVal('wgNatInterface', saved.interfaceName);
+      } else {
+        setWgNatMode('same-subnet');
+        wgNatSetVal('wgNatGatewayTunnelIp', (st.server && st.server.address) ? String(st.server.address).split('/')[0] : '10.0.0.1');
+      }
+    }
+    setWgNatMode(currentWgNatMode());
+    var mapSig = JSON.stringify((saved && saved.mode === 'same-subnet') ? (saved.mappings || []) : []);
+    if (!wgNatFormDirty && mapSig !== lastWgNatMappingsSig) {
+      lastWgNatMappingsSig = mapSig;
+      wgNatRebuildMappings(saved && saved.mappings ? saved.mappings : [null]);
+    }
+    renderWgNatPeerPick(st.peers || []);
+  }
+  async function wgNatSaveForm() {
+    var errEl = $('wgNatFormError');
+    var fail = function (msg) {
+      if (errEl) errEl.textContent = msg;
+      toast('NAT configuration', msg, 'error');
+      return false;
+    };
+    if (errEl) errEl.textContent = '';
+    if (!api || typeof api.wgNatSave !== 'function') return wgMissing();
+    var mode = currentWgNatMode();
+    var remoteTunnelIp = wgNatVal('wgNatRemoteTunnelIp');
+    if (!remoteTunnelIp) return fail('Pick the other gateway first — its tunnel address goes in the remote gateway field.');
+    /* The remote gateway must be a server peer — checked here for
+       instant feedback, and again in main (the authoritative
+       check, before anything is saved). */
+    var peers = (wgStatusCache && wgStatusCache.peers) || [];
+    if (!peers.some(function (p) { return p.tunnelIp === remoteTunnelIp; })) return fail('The remote gateway (' + remoteTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save.');
+    /* Virtual addresses live on the LAN, never inside the tunnel
+       subnet — the tunnel subnet is a fixed /24, so this is a
+       plain octet check; main re-checks it with the real CIDR
+       math before saving. */
+    var inTunnel = function (ip) {
+      var q = String(ip || '').split('.');
+      return q.length === 4 && q[0] === '10' && q[1] === '0' && q[2] === '0';
+    };
+    var mappings = [];
+    if (mode === 'same-subnet') {
+      var farVirt = wgNatVal('wgNatFarVirtIp');
+      if (farVirt && inTunnel(farVirt)) return fail('The gateway\'s virtual address ' + farVirt + ' is inside the tunnel subnet 10.0.0.0/24 — a virtual address must be on the LAN.');
+      mappings = wgNatReadMappings();
+      for (var i = 0; i < mappings.length; i++) {
+        if (mappings[i].virt && inTunnel(mappings[i].virt)) return fail('Mapping ' + (i + 1) + ': virtual address ' + mappings[i].virt + ' is inside the tunnel subnet 10.0.0.0/24 — a virtual address must be on the LAN.');
+      }
+    }
+    var config = {
+      mode: mode,
+      localSubnet: wgNatVal('wgNatLocalSubnet'),
+      remoteSubnet: wgNatVal('wgNatRemoteSubnet'),
+      gatewayLanIp: wgNatVal('wgNatGatewayLanIp'),
+      gatewayTunnelIp: wgNatVal('wgNatGatewayTunnelIp'),
+      remoteTunnelIp: remoteTunnelIp,
+      farVirtIp: mode === 'same-subnet' ? wgNatVal('wgNatFarVirtIp') : '',
+      interfaceName: wgNatVal('wgNatInterface'),
+      mappings: mappings,
+    };
+    var saveBtn = $('wgNatSaveBtn'); if (saveBtn) saveBtn.disabled = true;
+    try {
+      var r = await api.wgNatSave(config);
+      if (r && r.success) {
+        wgNatFormDirty = false;
+        toast('NAT configuration', 'Site-to-site configuration saved — press Start NAT service when ready.', 'success');
+        await loadWireGuard();
+      } else {
+        var msg = (r && r.errors && r.errors.length > 1) ? r.errors.join(' ') : ((r && r.error) || 'Could not save the NAT configuration.');
+        fail(msg);
+      }
+    } catch (e) { fail(e && e.message ? e.message : 'Could not save the NAT configuration.'); }
+    finally { if (saveBtn) saveBtn.disabled = false; }
   }
 
   function renderWgPeers(peers) {
@@ -2332,6 +2560,148 @@
       row.appendChild(rm);
       list.appendChild(row);
     });
+  }
+
+  /* Cloud join — server side: pending requests with Approve /
+     Reject. The list rebuilds only when it changes (sig guard), so
+     a button never disappears under the mouse on the 15s refresh. */
+  async function loadWgJoinRequests() {
+    var list = $('wgJoinList'); if (!list) return;
+    if (!api || typeof api.wgCloudJoinList !== 'function') { list.innerHTML = ''; return; }
+    var reqs = [];
+    try {
+      var r = await api.wgCloudJoinList();
+      if (r && r.success) reqs = r.requests || [];
+    } catch (e) { /* keep the previous list */ return; }
+    var sig = JSON.stringify(reqs.map(function (q) { return [q.id, q.deviceName, q.user, q.publicKey]; }));
+    if (sig === lastWgJoinReqSig) return;
+    lastWgJoinReqSig = sig;
+    list.innerHTML = '';
+    if (!reqs.length) {
+      var none = document.createElement('div');
+      none.className = 't-sub';
+      none.textContent = 'No join requests.';
+      list.appendChild(none);
+      return;
+    }
+    reqs.forEach(function (q) {
+      var row = document.createElement('div');
+      row.className = 'vpn-peer';
+      var d = document.createElement('span'); d.className = 'vpn-peer-dot';
+      var body = document.createElement('div'); body.className = 'vpn-peer-body';
+      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = q.deviceName + ' — from ' + q.user;
+      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
+      meta.textContent = 'public key ' + String(q.publicKey || '').slice(0, 12) + '… · waiting for approval';
+      body.appendChild(h); body.appendChild(meta);
+      row.appendChild(d); row.appendChild(body);
+      var ok = document.createElement('button'); ok.className = 'btn btn-primary btn-sm'; ok.type = 'button'; ok.textContent = 'Approve';
+      ok.addEventListener('click', async function () {
+        if (!api || typeof api.wgCloudJoinApprove !== 'function') return wgMissing();
+        ok.disabled = true;
+        try {
+          var ar = await api.wgCloudJoinApprove({ id: q.id });
+          if (ar && ar.success) toast('Join approved', q.deviceName + ' got tunnel address ' + (ar.approval && ar.approval.tunnelIp ? ar.approval.tunnelIp : '') + '.', 'success');
+          else toast('Approve failed', (ar && ar.error) || 'Could not approve the join request.', 'error');
+        } catch (e) { toast('Approve failed', e && e.message ? e.message : 'Could not approve the join request.', 'error'); }
+        lastWgJoinReqSig = null;
+        await loadWireGuard();
+      });
+      row.appendChild(ok);
+      var no = document.createElement('button'); no.className = 'btn btn-ghost btn-sm'; no.type = 'button'; no.textContent = 'Reject';
+      no.addEventListener('click', async function () {
+        if (!api || typeof api.wgCloudJoinReject !== 'function') return wgMissing();
+        no.disabled = true;
+        try {
+          var rr = await api.wgCloudJoinReject({ id: q.id });
+          if (rr && rr.success) toast('Join rejected', q.deviceName + ' was turned down.', 'success');
+          else toast('Reject failed', (rr && rr.error) || 'Could not reject the join request.', 'error');
+        } catch (e) { toast('Reject failed', e && e.message ? e.message : 'Could not reject the join request.', 'error'); }
+        lastWgJoinReqSig = null;
+        await loadWireGuard();
+      });
+      row.appendChild(no);
+      list.appendChild(row);
+    });
+  }
+
+  /* Cloud join — client side: the saved Cloud servers this machine
+     can send a join request through. Options rebuild only when the
+     saved list changes, so the user's pick is never clobbered. */
+  function renderWgJoinServers(clients) {
+    var sel = $('wgJoinServer'); if (!sel) return;
+    var sig = JSON.stringify((clients || []).map(function (c) { return [c.id, c.name, c.host, c.port, c.user]; }));
+    if (sig === lastWgJoinServersSig) return;
+    lastWgJoinServersSig = sig;
+    var prev = sel.value;
+    sel.innerHTML = '';
+    if (!clients || !clients.length) {
+      var o = document.createElement('option'); o.value = ''; o.textContent = 'No saved Cloud server — add one in the Cloud module first';
+      sel.appendChild(o);
+      return;
+    }
+    clients.forEach(function (c) {
+      var opt = document.createElement('option');
+      opt.value = c.id;
+      opt.textContent = (c.name || c.host) + ' — ' + (c.user || '') + ' @ ' + c.host + ':' + c.port;
+      sel.appendChild(opt);
+    });
+    if (prev) sel.value = prev;
+  }
+
+  function wgJoinSetStatus(text) {
+    var s = $('wgJoinStatus'); if (s) s.textContent = text || '';
+    var cancel = $('wgJoinCancelBtn'); if (cancel) cancel.style.display = wgJoinPending ? '' : 'none';
+    var send = $('wgJoinSendBtn'); if (send) send.disabled = !!wgJoinPending;
+  }
+
+  function wgJoinStopPolling() {
+    if (wgJoinPollTimer) { clearInterval(wgJoinPollTimer); wgJoinPollTimer = null; }
+  }
+
+  function wgJoinClearPending() {
+    wgJoinStopPolling();
+    wgJoinPending = null;
+    wgJoinSetStatus('');
+  }
+
+  // One poll of the outstanding join request. Approved hands the
+  // config straight to wg-connect (the same path as a pasted invite);
+  // rejected / expired / server-restarted are terminal — the timer
+  // stops and the user sends a fresh request.
+  async function wgJoinPollOnce() {
+    if (!wgJoinPending || !api || typeof api.wgCloudJoinPoll !== 'function') return;
+    var r;
+    try { r = await api.wgCloudJoinPoll({ requestId: wgJoinPending.requestId }); }
+    catch (e) { r = { success: false, error: e && e.message ? e.message : 'Could not check the join request.' }; }
+    if (!wgJoinPending) return;
+    if (r && r.success && r.status === 'approved') {
+      wgJoinClearPending();
+      try {
+        var c = await api.wgConnect({ confText: r.confText });
+        if (c && c.success) toast('WireGuard', 'Join approved — connected as ' + (c.tunnelIp || r.tunnelIp || 'a client') + '.', 'success');
+        else toast('Connect failed', (c && c.error) || 'The join was approved, but connecting failed.', 'error');
+      } catch (e) { toast('Connect failed', e && e.message ? e.message : 'The join was approved, but connecting failed.', 'error'); }
+      await loadWireGuard();
+      return;
+    }
+    if (r && r.success && r.status === 'pending') {
+      wgJoinSetStatus('Waiting for approval on the server — ' + wgJoinPending.deviceName + '…');
+      return;
+    }
+    if (r && r.success && r.status === 'rejected') {
+      wgJoinClearPending();
+      toast('Join rejected', 'The server turned down the join request.', 'error');
+      await loadWireGuard();
+      return;
+    }
+    wgJoinClearPending();
+    toast('Join request ended', (r && r.error) || 'The join request is no longer waiting.', 'error');
+    await loadWireGuard();
+  }
+
+  function wgJoinStartPolling() {
+    wgJoinStopPolling();
+    wgJoinPollTimer = setInterval(wgJoinPollOnce, 5000);
   }
 
   /* ---------- wiring ---------- */
@@ -2884,8 +3254,70 @@
     if (!api || typeof api.wgOpenDownload !== 'function') return wgMissing();
     await api.wgOpenDownload();
   });
+  // One-click AmneziaWG install (the transport since Phase 2): the
+  // button shows the download/verify/install phases live, mirroring
+  // the Tailscale install button. On Linux this refuses in main
+  // before fetching anything; on Windows it is one UAC prompt.
+  var wgIb = $('wgInstallBtn');
+  if (wgIb) wgIb.addEventListener('click', async function () {
+    if (!api || typeof api.wgInstallAmneziawg !== 'function' || typeof api.onWgInstallProgress !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgIb.disabled = true; wgIb.textContent = 'Installing…';
+    var stopListen = api.onWgInstallProgress(function (p) {
+      if (!p) return;
+      if (p.phase === 'downloading' && typeof p.pct === 'number') wgIb.textContent = 'Downloading… ' + p.pct + '%';
+      else if (p.phase === 'verifying') wgIb.textContent = 'Verifying…';
+      else if (p.phase === 'installing') wgIb.textContent = 'Installing…';
+    });
+    try {
+      var r = await api.wgInstallAmneziawg();
+      if (r && r.success) toast('AmneziaWG installed', 'AmneziaWG is ready — the server and client are now available.', 'success');
+      else toast('Install failed', (r && r.error) || 'Could not install AmneziaWG.', 'error');
+    } catch (e) { toast('Install failed', e && e.message ? e.message : 'Could not install AmneziaWG.', 'error'); }
+    finally { if (stopListen) stopListen(); wgBusy = false; wgIb.disabled = false; wgIb.textContent = 'Install AmneziaWG'; await loadWireGuard(); }
+  });
   var wgRc = $('wgRecheckBtn');
   if (wgRc) wgRc.addEventListener('click', function () { loadWireGuard(); });
+  /* NAT mapping editor wiring: any edit marks the form dirty so the
+     poller never overwrites it; mode radios toggle the same-subnet
+     blocks; the peer picker fills the remote gateway field. */
+  var wgNatFs = $('wgNatFieldset');
+  if (wgNatFs) {
+    wgNatFs.addEventListener('input', function () { wgNatFormDirty = true; });
+    wgNatFs.addEventListener('change', function () { wgNatFormDirty = true; setWgNatMode(currentWgNatMode()); });
+  }
+  var wgNatPick = $('wgNatRemotePeerPick');
+  if (wgNatPick) wgNatPick.addEventListener('change', function () {
+    if (wgNatPick.value) { wgNatSetVal('wgNatRemoteTunnelIp', wgNatPick.value); wgNatFormDirty = true; }
+  });
+  var wgNatAddMap = $('wgNatAddMappingBtn');
+  if (wgNatAddMap) wgNatAddMap.addEventListener('click', function () { wgNatAddMappingRow(null); wgNatFormDirty = true; });
+  var wgNatSave = $('wgNatSaveBtn');
+  if (wgNatSave) wgNatSave.addEventListener('click', function () { wgNatSaveForm(); });
+  var wgNatStart = $('wgNatStartBtn');
+  if (wgNatStart) wgNatStart.addEventListener('click', async function () {
+    if (!api || typeof api.wgNatStart !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgNatStart.disabled = true; wgNatStart.textContent = 'Starting…';
+    try {
+      var r = await api.wgNatStart();
+      if (r && r.success) toast('NAT service', 'The gateway NAT service is running.', 'success');
+      else toast('NAT service', (r && r.error) || 'Could not start the NAT service.', 'error');
+    } catch (e) { toast('NAT service', e && e.message ? e.message : 'Could not start the NAT service.', 'error'); }
+    finally { wgBusy = false; wgNatStart.disabled = false; wgNatStart.textContent = 'Start NAT service'; await loadWireGuard(); }
+  });
+  var wgNatStop = $('wgNatStopBtn');
+  if (wgNatStop) wgNatStop.addEventListener('click', async function () {
+    if (!api || typeof api.wgNatStop !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgNatStop.disabled = true;
+    try {
+      var r = await api.wgNatStop();
+      if (r && r.success) toast('NAT service', 'The gateway NAT service is stopped.', 'success');
+      else toast('NAT service', (r && r.error) || 'Could not stop the NAT service.', 'error');
+    } catch (e) { toast('NAT service', e && e.message ? e.message : 'Could not stop the NAT service.', 'error'); }
+    finally { wgBusy = false; wgNatStop.disabled = false; await loadWireGuard(); }
+  });
   var wgSb = $('wgServerBtn');
   if (wgSb) wgSb.addEventListener('click', async function () {
     if (!api || typeof api.wgStartServer !== 'function' || typeof api.wgStopServer !== 'function') return wgMissing();
@@ -3030,6 +3462,40 @@
         toast('Config imported', 'Server ' + (s.endpoint || 'unknown') + ', tunnel address ' + (s.address || 'unknown') + ' — press Connect.', 'success');
       } else toast('Import failed', (r && r.error) || 'Could not read that config file.', 'error');
     } catch (e) { toast('Import failed', e && e.message ? e.message : 'Could not read that config file.', 'error'); }
+  });
+  // Cloud join — client side: send a join request through a saved
+  // Cloud server, then poll every 5s until the server approves (the
+  // client connects by itself) or the request ends. One outstanding
+  // request at a time; the Send button is disabled while waiting.
+  var wgJs = $('wgJoinSendBtn');
+  if (wgJs) wgJs.addEventListener('click', async function () {
+    if (!api || typeof api.wgCloudJoinRequest !== 'function') return wgMissing();
+    if (wgJoinPending) return;
+    var serverId = ($('wgJoinServer') || {}).value || '';
+    var deviceName = (($('wgJoinDeviceName') || {}).value || '').trim();
+    if (!serverId) { toast('No Cloud server', 'Add a Cloud server in the Cloud module first.', 'error'); return; }
+    if (!deviceName) { toast('Device name needed', 'Give this device a name first.', 'error'); return; }
+    wgJs.disabled = true;
+    try {
+      var r = await api.wgCloudJoinRequest({ serverId: serverId, deviceName: deviceName });
+      if (r && r.success) {
+        wgJoinPending = { requestId: r.requestId, serverId: serverId, deviceName: r.deviceName };
+        wgJoinSetStatus('Waiting for approval on the server — ' + r.deviceName + '…');
+        wgJoinStartPolling();
+        toast('Join request sent', 'Waiting for approval on the server.', 'success');
+      } else toast('Join request failed', (r && r.error) || 'Could not send the join request.', 'error');
+    } catch (e) { toast('Join request failed', e && e.message ? e.message : 'Could not send the join request.', 'error'); }
+    finally { wgJs.disabled = !!wgJoinPending; }
+  });
+  var wgJc = $('wgJoinCancelBtn');
+  if (wgJc) wgJc.addEventListener('click', async function () {
+    if (!wgJoinPending) return;
+    var reqId = wgJoinPending.requestId;
+    wgJoinClearPending();
+    try {
+      if (api && typeof api.wgCloudJoinCancel === 'function') await api.wgCloudJoinCancel({ requestId: reqId });
+    } catch (e) { /* the local request is already dropped */ }
+    toast('Join request cancelled', 'No request is waiting any more.', 'success');
   });
 
     document.querySelectorAll('[data-module-enter]').forEach(function (card) {

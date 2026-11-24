@@ -16,6 +16,8 @@ const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
 const vpn = require('./vpn.js');
 const wireguard = require('./wireguard.js');
+const cloudJoin = require('./cloud-join.js');
+const natGateway = require('./nat-gateway.js');
 // How long a due scheduled job waits for a missing removable drive
 // before it is recorded as failed (and emailed about): 2 hours.
 const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
@@ -60,9 +62,32 @@ function getCloudServer() {
       onConfigChange: () => saveCloudConfig(),
       log: (level, message) => appendAppLog(level, message),
     });
+    // Cloud join (WireGuard, Phase 2): the /api/wg-join-* routes ride
+    // on this same Cloud server — same users, same TLS-pinned channel.
+    // Pending requests live in cloud.json at cfg.server.wgJoinRequests
+    // (configBackedStore), so they survive a server restart. start()
+    // dispatches through this._handle, so attaching here — before any
+    // start — is picked up; attaching twice is a no-op. The store is
+    // kept here so the wg-cloudjoin-* handlers below can use it.
+    try {
+      const attached = cloudJoin.attachJoinRoutes(cloudServer, {
+        store: cloudJoin.configBackedStore(getCloudConfig(), () => saveCloudConfig()),
+      });
+      if (attached && attached.store) wgJoinStoreInstance = attached.store;
+    } catch (e) { console.error('[Main] Could not attach WireGuard Cloud-join routes:', e.message); }
   }
   return cloudServer;
 }
+// The pending-request store attached to the Cloud server above (null
+// until getCloudServer() has run once).
+let wgJoinStoreInstance = null;
+// Client-side join requests THIS machine sent: requestId ->
+// { serverId, deviceName, privateKey, createdAt }. The private key
+// lives only here, in memory, until the server approves (or the
+// request expires / the app quits — then the user simply sends a
+// fresh request). It is never written to disk and never sent to the
+// renderer.
+const wgPendingJoins = new Map();
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
@@ -94,11 +119,19 @@ function getWgConfig() {
   if (typeof s.endpoint !== 'string') s.endpoint = '';
   if (!Array.isArray(s.peers)) s.peers = [];
   if (!('client' in wgConfig)) wgConfig.client = null;
+  if (!('nat' in wgConfig) || typeof wgConfig.nat !== 'object' || !wgConfig.nat) wgConfig.nat = null;
   if (!('transport' in wgConfig) || typeof wgConfig.transport !== 'object' || !wgConfig.transport) wgConfig.transport = {};
-  /* Phase 2 prep (core requirement 2026-11-24): a saved transport
-     override — e.g. an AmneziaWG binary once the obfuscation method is
-     chosen — is applied to the wrapper here at startup. Empty object
-     = stock wireguard.exe, i.e. Phase 1 behavior unchanged. */
+  /* Phase 2 (core requirement 2026-11-24): AmneziaWG is the
+     transport — stock WireGuard cannot be used, it does not
+     understand the obfuscation fields and both ends must run
+     AmneziaWG. The choice lives in wireguard.json as
+     `transportName` ('amneziawg' | 'wireguard'); a fresh config
+     defaults to AmneziaWG, and an explicit 'wireguard' stays a
+     fallback the user can go back to. The per-binary `transport`
+     override below still wins when it is set (custom install path,
+     tests). */
+  if (wgConfig.transportName !== 'amneziawg' && wgConfig.transportName !== 'wireguard') wgConfig.transportName = 'amneziawg';
+  wireguard.setTransport(wgConfig.transportName);
   wireguard.setTransportBinaries(wgConfig.transport);
   return wgConfig;
 }
@@ -135,8 +168,40 @@ function wgPublicConfig() {
   const server = Object.assign({}, c.server);
   delete server.privateKey;
   const client = c.client ? Object.assign({}, c.client) : null;
-  if (client) delete client.privateKey;
+  if (client) { delete client.privateKey; delete client.obfuscation; }
   return { server, client };
+}
+/* The obfuscation set every server/invite config carries, as the
+   [Interface] lines buildServerConf/buildClientConf take. Generated
+   ONCE (generateObfuscationParams) and stored in wireguard.json
+   under `obfuscation` — never regenerated silently, or every
+   existing peer breaks (S1–S4/H1–H4 must match on both ends). A
+   stored set that fails validation throws here instead of writing
+   a .conf that silently fails to connect. */
+function wgObfuscationLines() {
+  const c = getWgConfig();
+  if (!c.obfuscation || typeof c.obfuscation !== 'object') {
+    const p = wireguard.generateObfuscationParams();
+    const v = wireguard.validateObfuscationParams(p);
+    if (!v.ok) throw new Error('Could not generate the obfuscation settings: ' + v.errors.join(' '));
+    c.obfuscation = p;
+    saveWgConfig();
+    return wireguard.obfuscationParamsToLines(p);
+  }
+  return wireguard.obfuscationParamsToLines(c.obfuscation);
+}
+/* Lines for a stored client config: the set that was in effect when
+   the client connected — the server's own set for our invites, the
+   imported set for a foreign .conf. A hand-typed foreign connect
+   has no set: injecting ours would break its handshake, so it gets
+   none and the user must import the server's .conf instead. */
+function wgLinesForObfuscation(set) {
+  if (!set || typeof set !== 'object') return undefined;
+  return wireguard.obfuscationParamsToLines(set);
+}
+function wgHasObfuscation() {
+  const c = getWgConfig();
+  return !!c.obfuscation && wireguard.validateObfuscationParams(c.obfuscation).ok;
 }
 
 const isDevelopment = !app.isPackaged;
@@ -1900,7 +1965,12 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
     else cfg.clients.push(rec);
     saveCloudConfig();
-    return { success: true, id };
+    // Return the id the record is actually stored under: on an
+    // update-in-place that is the pre-existing id, NOT the fresh
+    // 'srv-…' id generated above — callers (connect, join) look the
+    // record up by the returned id, and a wrong one made reconnects
+    // fail with "Password needed" on every re-save.
+    return { success: true, id: rec.id };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -2215,10 +2285,13 @@ ipcMain.handle('vpn-open-oauth-page', async () => {
 });
 
 // ---------- TechVision WireGuard VPN (self-hosted WireGuard) ----------
-// The module only shells out to the WireGuard CLI that is already
-// installed on the machine; it implements no VPN protocol of its own.
-// Live state comes from `wg show`; stored state (keys, peers, client
-// config) comes from wireguard.json. Cloud join is Phase 2 — not here.
+// The module shells out to the AmneziaWG CLI (awg / amneziawg.exe);
+// when it is missing, the UI offers a one-click install of the
+// official MSI (verified signature, one UAC prompt). It implements
+// no VPN protocol of its own. Live state comes from `awg show`;
+// stored state (keys, peers, client config, obfuscation set) comes
+// from wireguard.json. Cloud join is wired below (wg-cloudjoin-*):
+// the join routes attach to the Cloud server in getCloudServer().
 ipcMain.handle('wg-get-status', async () => {
   try {
     const st = await wireguard.getStatus();
@@ -2227,13 +2300,20 @@ ipcMain.handle('wg-get-status', async () => {
     const liveClientPeer = (st.client && Array.isArray(st.client.peers) && st.client.peers[0]) || null;
     const pub = wgPublicConfig();
     return Object.assign({}, st, {
-      server: st.server ? Object.assign({}, pub.server, { publicKey: c.server.publicKey || st.server.publicKey, listenPort: c.server.listenPort, address: c.server.address }) : null,
+      transport: wireguard.getTransport(),
+      obfuscated: wgHasObfuscation(),
+      server: Object.assign({}, pub.server, { publicKey: c.server.publicKey || (st.server && st.server.publicKey), listenPort: c.server.listenPort, address: c.server.address }),
       client: c.client ? Object.assign({}, pub.client, liveClientPeer ? {
         latestHandshake: liveClientPeer.latestHandshake ? liveClientPeer.latestHandshake.getTime() : null,
         transferRx: liveClientPeer.transferRx, transferTx: liveClientPeer.transferTx,
         endpoint: liveClientPeer.endpoint, online: !!liveClientPeer.latestHandshake,
       } : { online: false, latestHandshake: null, transferRx: 0, transferTx: 0 }) : null,
       peers: wgPeersWithLive(liveServerPeers),
+      nat: natGateway.natService.status(),
+      /* The saved site-to-site config (wireguard.json `nat`), or
+         null when nothing has been saved yet — the NAT editor form
+         prefills from this, and Start stays disabled without it. */
+      natConfig: c.nat || null,
     });
   } catch (e) { return { installed: false, serverRunning: false, clientRunning: false, server: null, client: null, peers: [], error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
 });
@@ -2261,7 +2341,7 @@ ipcMain.handle('wg-start-server', async () => {
       // showing a wrong address.
       try { const ip = await cloudServerMod.detectPublicIP(); if (ip) { c.server.endpoint = ip; saveWgConfig(); } } catch (e) {}
     }
-    const conf = wireguard.buildServerConf({ privateKey: c.server.privateKey, address: c.server.address, listenPort: c.server.listenPort, peers: c.server.peers });
+    const conf = wireguard.buildServerConf({ privateKey: c.server.privateKey, address: c.server.address, listenPort: c.server.listenPort, peers: c.server.peers, extraInterfaceLines: wgObfuscationLines() });
     const r = await wireguard.installTunnelService(wireguard.SERVER_TUNNEL, conf);
     if (!r.success) return { success: false, error: r.error, declined: !!r.declined };
     return { success: true, publicKey: c.server.publicKey, endpoint: c.server.endpoint || null, listenPort: c.server.listenPort };
@@ -2286,29 +2366,41 @@ ipcMain.handle('wg-set-endpoint', async (event, endpoint) => {
 // by the app — the user never picks an IP. If the server is running,
 // the peer is applied live with `wg set`; otherwise it lands in the
 // config and applies at the next start.
+// Add one peer: the single code path for adding a peer — the
+// wg-add-peer handler below and the Cloud-join approve handler both
+// call this (the join module's contract: approve MUST use the same
+// path wg-add-peer uses). Validate, allocate the next free tunnel
+// address with nextTunnelIp, push, save, and apply live with `wg set`
+// when the server is running. The tunnel address is allocated here,
+// inside this function: the join approve computes the same next free
+// address from the same peer list, and between the two there is no
+// await, so the two agree.
+async function wgAddPeerInternal(name, publicKey) {
+  if (!name) return { success: false, error: 'Give the device a name first.' };
+  if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'That is not a valid WireGuard public key (44 characters, ending in =).' };
+  const c = getWgConfig();
+  if ((c.server.peers || []).some((p) => p.publicKey === publicKey)) return { success: false, error: 'This device is already a peer.' };
+  const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp));
+  if (!tunnelIp) return { success: false, error: 'No free tunnel address left (10.0.0.2 – 10.0.0.254 are all taken).' };
+  const peer = { name, publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
+  c.server.peers.push(peer);
+  saveWgConfig();
+  let liveApplied = false, liveError = null;
+  try {
+    const st = await wireguard.getStatus();
+    if (st.serverRunning) {
+      const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, publicKey, peer.allowedIPs);
+      liveApplied = !!r.success;
+      if (!r.success) liveError = r.error;
+    }
+  } catch (e) { liveError = e && e.message ? e.message : String(e); }
+  return { success: true, peer, liveApplied, liveError };
+}
 ipcMain.handle('wg-add-peer', async (event, opts) => {
   try {
     const name = String((opts && opts.name) || '').trim().replace(/[\r\n]/g, ' ');
     const publicKey = String((opts && opts.publicKey) || '').trim();
-    if (!name) return { success: false, error: 'Give the device a name first.' };
-    if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'That is not a valid WireGuard public key (44 characters, ending in =).' };
-    const c = getWgConfig();
-    if ((c.server.peers || []).some((p) => p.publicKey === publicKey)) return { success: false, error: 'This device is already a peer.' };
-    const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp));
-    if (!tunnelIp) return { success: false, error: 'No free tunnel address left (10.0.0.2 – 10.0.0.254 are all taken).' };
-    const peer = { name, publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
-    c.server.peers.push(peer);
-    saveWgConfig();
-    let liveApplied = false, liveError = null;
-    try {
-      const st = await wireguard.getStatus();
-      if (st.serverRunning) {
-        const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, publicKey, peer.allowedIPs);
-        liveApplied = !!r.success;
-        if (!r.success) liveError = r.error;
-      }
-    } catch (e) { liveError = e && e.message ? e.message : String(e); }
-    return { success: true, peer, liveApplied, liveError };
+    return await wgAddPeerInternal(name, publicKey);
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not add the peer.' }; }
 });
 ipcMain.handle('wg-remove-peer', async (event, opts) => {
@@ -2353,7 +2445,7 @@ ipcMain.handle('wg-generate-invite', async (event, opts) => {
     const kp = await wireguard.genkeypair();
     if (!kp.success) return { success: false, error: kp.error };
     const endpoint = c.server.endpoint + ':' + c.server.listenPort;
-    const conf = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: c.server.publicKey, endpoint, allowedIPs: wireguard.TUNNEL_SUBNET });
+    const conf = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: c.server.publicKey, endpoint, allowedIPs: wireguard.TUNNEL_SUBNET, extraInterfaceLines: wgObfuscationLines() });
     const peer = { name, publicKey: kp.publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
     c.server.peers.push(peer);
     saveWgConfig();
@@ -2395,6 +2487,7 @@ ipcMain.handle('wg-import-conf', async (event, opts) => {
         serverPublicKey: serverPeer.publicKey || null,
         endpoint: serverPeer.endpoint || null,
         allowedIPs: serverPeer.allowedIPs || null,
+        hasObfuscation: !!wireguard.obfuscationParamsFromExtra(parsed.interface.extra),
       },
     };
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read that config file.' }; }
@@ -2413,10 +2506,12 @@ ipcMain.handle('wg-connect', async (event, opts) => {
     let meta = {};
     // Reconnect with the stored client config (one click — the private
     // key never leaves main, so the renderer cannot rebuild it).
+    // The stored obfuscation set rides along, so a reconnect rebuilds
+    // exactly the config that connected the first time.
     if (o.reconnect) {
       const stored = getWgConfig().client;
       if (!stored || !wireguard.isWgKey(stored.privateKey) || !wireguard.isWgKey(stored.serverPublicKey)) return { success: false, error: 'No saved client config to reconnect with.' };
-      confText = wireguard.buildClientConf({ privateKey: stored.privateKey, address: (stored.tunnelIp || '10.0.0.2') + '/32', serverPublicKey: stored.serverPublicKey, endpoint: stored.endpoint, allowedIPs: stored.allowedIPs || wireguard.TUNNEL_SUBNET });
+      confText = wireguard.buildClientConf({ privateKey: stored.privateKey, address: (stored.tunnelIp || '10.0.0.2') + '/32', serverPublicKey: stored.serverPublicKey, endpoint: stored.endpoint, allowedIPs: stored.allowedIPs || wireguard.TUNNEL_SUBNET, extraInterfaceLines: wgLinesForObfuscation(stored.obfuscation) });
       meta = stored;
     } else if (o.confText && String(o.confText).trim()) {
       const parsed = wireguard.parseConf(String(o.confText));
@@ -2432,6 +2527,11 @@ ipcMain.handle('wg-connect', async (event, opts) => {
         tunnelIp: wireguard.tunnelIpOf(parsed.interface.address) || '',
         allowedIPs: parsed.peers[0].allowedIPs || wireguard.TUNNEL_SUBNET,
       };
+      // Keep the imported config's obfuscation set (if any) so a later
+      // reconnect rebuilds the same config — installing confText as-is
+      // already carries it this time.
+      const importedObf = wireguard.obfuscationParamsFromExtra(parsed.interface.extra);
+      if (importedObf) meta.obfuscation = importedObf;
     } else {
       if (!wireguard.isWgKey(o.serverPublicKey)) return { success: false, error: 'That is not a valid server public key.' };
       if (!o.endpoint || !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(String(o.endpoint).trim())) return { success: false, error: 'Endpoint must be host:port, e.g. myhome.ddns.net:51820.' };
@@ -2440,6 +2540,10 @@ ipcMain.handle('wg-connect', async (event, opts) => {
       const kp = await wireguard.genkeypair();
       if (!kp.success) return { success: false, error: kp.error };
       const allowedIPs = o.fullTunnel ? '0.0.0.0/0, ::/0' : wireguard.TUNNEL_SUBNET;
+      // No obfuscation lines here on purpose: this is a foreign
+      // server typed by hand, and its obfuscation set is unknown —
+      // injecting ours would break the handshake. Import the
+      // server's .conf instead (wg-import-conf keeps its set).
       confText = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: String(o.serverPublicKey).trim(), endpoint: String(o.endpoint).trim(), allowedIPs });
       meta = { privateKey: kp.privateKey, publicKey: kp.publicKey, serverPublicKey: String(o.serverPublicKey).trim(), endpoint: String(o.endpoint).trim(), tunnelIp, allowedIPs };
     }
@@ -2460,8 +2564,243 @@ ipcMain.handle('wg-disconnect', async () => {
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disconnect.' }; }
 });
 ipcMain.handle('wg-open-download', async () => {
-  try { await require('electron').shell.openExternal(wireguard.WG_DOWNLOAD_URL); return { success: true }; }
+  // Manual fallback for the one-click install: the official
+  // AmneziaWG releases page (same MSI the installer downloads).
+  try { await require('electron').shell.openExternal(wireguard.AMNEZIAWG_RELEASES_URL); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
+});
+// ---------- TechVision WireGuard VPN — Cloud join ----------
+// The third key-exchange option (spec: "Join via Cloud"). The client
+// sends a join request through its own Cloud connection — same
+// username/password, same TLS-pinned channel, no third party — and
+// this machine, as the server, shows the request in its peer list;
+// Approve sends the server public key + endpoint + tunnel IP back
+// over the same channel, and the client connects by itself.
+// Server side (this machine is the hub): list / approve / reject.
+// The approve uses wgAddPeerInternal — the same code path wg-add-peer
+// uses — and hands the client the server's obfuscation set
+// (extraInterfaceLines), so the joined client speaks AmneziaWG with
+// the same S1–S4/H1–H4; without them its handshake would fail.
+// A live Cloud session for a saved server: reuse the session the
+// Cloud view already opened, or log in with the saved password the
+// way cloud-client-connect does (one click, no typing). Only used
+// when the user SENDS a join request — polling never logs in by
+// itself (a dead session after a server restart must surface as
+// 'server-restarted' and stop, not silently re-login).
+async function wgEnsureCloudSession(serverId) {
+  const existing = cloudSessions.get(serverId);
+  if (existing && existing.token) return { success: true, conn: existing };
+  const cfg = getCloudConfig();
+  const rec = (cfg.clients || []).find((c) => c.id === serverId);
+  if (!rec) return { success: false, error: 'Cloud server not found.' };
+  if (!rec.certPem) return { success: false, error: 'Not connected to this Cloud server — open the Cloud view and connect first.' };
+  if (!rec.password) return { success: false, error: 'Not connected to this Cloud server — open the Cloud view and connect first (or save the password for one-click reconnect).' };
+  try {
+    const conn = await cloudClient.login(rec.host, parseInt(rec.port, 10), rec.certPem, rec.user, rec.password);
+    const info = await cloudClient.info(conn);
+    cloudSessions.set(serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
+    return { success: true, conn: cloudSessions.get(serverId) };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not connect to the Cloud server.' }; }
+}
+ipcMain.handle('wg-cloudjoin-list', async () => {
+  try {
+    if (!wgJoinStoreInstance) { getCloudServer(); }
+    if (!wgJoinStoreInstance) return { success: false, error: 'Cloud join is not set up yet.' };
+    return { success: true, requests: cloudJoin.listJoinRequests(wgJoinStoreInstance) };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not list join requests.' }; }
+});
+ipcMain.handle('wg-cloudjoin-approve', async (event, opts) => {
+  try {
+    if (!wgJoinStoreInstance) { getCloudServer(); }
+    if (!wgJoinStoreInstance) return { success: false, error: 'Cloud join is not set up yet.' };
+    const c = getWgConfig();
+    let extraInterfaceLines = [];
+    try { extraInterfaceLines = wgObfuscationLines(); }
+    catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read the obfuscation settings.' }; }
+    const endpoint = c.server.endpoint ? c.server.endpoint + ':' + c.server.listenPort : '';
+    return await cloudJoin.approveJoinRequest(wgJoinStoreInstance, String((opts && opts.id) || ''), {
+      serverPublicKey: c.server.publicKey,
+      endpoint,
+      getPeers: () => (getWgConfig().server.peers || []).slice(),
+      addPeer: (peer) => wgAddPeerInternal(peer.name, peer.publicKey),
+      extraInterfaceLines,
+    });
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not approve the join request.' }; }
+});
+ipcMain.handle('wg-cloudjoin-reject', async (event, opts) => {
+  try {
+    if (!wgJoinStoreInstance) { getCloudServer(); }
+    if (!wgJoinStoreInstance) return { success: false, error: 'Cloud join is not set up yet.' };
+    return cloudJoin.rejectJoinRequest(wgJoinStoreInstance, String((opts && opts.id) || ''));
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not reject the join request.' }; }
+});
+ipcMain.handle('wg-cloudjoin-request', async (event, opts) => {
+  try {
+    const serverId = String((opts && opts.serverId) || '');
+    const deviceName = String((opts && opts.deviceName) || '');
+    if (!serverId) return { success: false, error: 'Pick a saved Cloud server first.' };
+    const sess = await wgEnsureCloudSession(serverId);
+    if (!sess.success) return sess;
+    const r = await cloudJoin.submitJoinRequest(sess.conn, deviceName, {});
+    if (!r.success) return r;
+    // The private key stays in main memory only — the renderer gets
+    // the request id, never the key.
+    wgPendingJoins.set(r.requestId, { serverId, deviceName: r.deviceName, privateKey: r.privateKey, createdAt: Date.now() });
+    return { success: true, requestId: r.requestId, deviceName: r.deviceName, status: 'pending', expiresAt: r.expiresAt || null };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not send the join request.' }; }
+});
+ipcMain.handle('wg-cloudjoin-poll', async (event, opts) => {
+  try {
+    const requestId = String((opts && opts.requestId) || '');
+    const pending = wgPendingJoins.get(requestId);
+    if (!pending) return { success: false, code: 'not-found', retryable: false, error: 'Join request not found — it may have expired, or the app was restarted. Send a new join request.' };
+    // Existing session only: a dead session must surface as
+    // 'server-restarted', never trigger a silent re-login here.
+    const conn = cloudSessions.get(pending.serverId);
+    if (!conn || !conn.token) { wgPendingJoins.delete(requestId); return { success: false, code: 'not-connected', retryable: false, error: 'Not connected to the Cloud server any more. Send the join request again.' }; }
+    const r = await cloudJoin.pollJoinStatus(conn, requestId, { privateKey: pending.privateKey });
+    if (!r.success) {
+      if (r.code === 'server-restarted' || r.code === 'expired') wgPendingJoins.delete(requestId);
+      return r;
+    }
+    if (r.status === 'approved') {
+      wgPendingJoins.delete(requestId);
+      // confText carries the private key (the same precedent as the
+      // invite conf the renderer already receives for QR/copy) — the
+      // renderer hands it straight to wg-connect, nothing else.
+      return { success: true, status: 'approved', confText: r.confText, tunnelIp: r.tunnelIp, endpoint: r.endpoint };
+    }
+    return { success: true, status: r.status };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not check the join request.' }; }
+});
+ipcMain.handle('wg-cloudjoin-cancel', async (event, opts) => {
+  try {
+    const requestId = String((opts && opts.requestId) || '');
+    const pending = wgPendingJoins.get(requestId);
+    wgPendingJoins.delete(requestId);
+    if (pending) {
+      const conn = cloudSessions.get(pending.serverId);
+      if (conn && conn.token) {
+        try { await cloudJoin.cancelJoinRequest(conn, requestId); } catch (e) { /* local drop is enough */ }
+      }
+    }
+    return { success: true };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not cancel the join request.' }; }
+});
+// ---------- TechVision WireGuard VPN — gateway NAT service ----------
+// One TechVision PC per site is the gateway (see src/nat-gateway.js):
+// it forwards + NATs for its whole LAN, so printers/cameras/PCs need
+// no install. The config is stored in wireguard.json under `nat`
+// (IPs and names only, no secrets). A config passed here is
+// validated and saved; with no config, the stored one is used.
+// On non-Windows the service validates the config and then fails
+// cleanly with "Windows only" — it never pretends to run.
+ipcMain.handle('wg-nat-start', async (event, opts) => {
+  try {
+    const c = getWgConfig();
+    let config = null;
+    if (opts && typeof opts === 'object' && (opts.mode || opts.mappings)) {
+      const v = natGateway.validateNatConfig(opts);
+      if (!v.ok) return { success: false, error: v.errors[0], errors: v.errors };
+      config = v.config;
+      c.nat = config;
+      saveWgConfig();
+    } else {
+      if (!c.nat) return { success: false, error: 'No site-to-site configuration saved yet — the NAT mappings (which remote devices appear as which virtual addresses) have to be set up first.' };
+      config = c.nat;
+    }
+    /* The remote gateway peer must exist before the NAT service can
+       run: its AllowedIPs are extended with the mapped remote
+       addresses (same-subnet) or the remote subnet (different-
+       subnet), so translated packets actually enter the tunnel.
+       Checked here, before any UAC prompt or setup, so a missing
+       peer is a clean error instead of a half-started gateway. */
+    const peer = (c.server.peers || []).find((p) => p.tunnelIp === config.remoteTunnelIp);
+    if (!peer) return { success: false, error: 'The remote gateway (' + config.remoteTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then start the NAT service.' };
+    const natHooks = {
+      applyPeerAllowedIPs: async (remoteTunnelIp, allowedIPs) => {
+        const cc = getWgConfig();
+        const p = (cc.server.peers || []).find((x) => x.tunnelIp === remoteTunnelIp);
+        if (!p) return { success: false, error: 'The remote gateway peer (' + remoteTunnelIp + ') was removed.' };
+        const previous = p.allowedIPs || (p.tunnelIp + '/32');
+        let live = null;
+        try { live = await wireguard.getStatus(); } catch (e) {}
+        if (live && live.serverRunning) {
+          const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, p.publicKey, allowedIPs);
+          if (!r.success) return { success: false, error: 'Could not extend the remote gateway peer\'s routes live: ' + (r.error || 'wireguard set failed') };
+        }
+        p.allowedIPs = allowedIPs;
+        saveWgConfig();
+        return { success: true, previousAllowedIPs: previous };
+      },
+      restorePeerAllowedIPs: async (remoteTunnelIp, previousAllowedIPs) => {
+        const cc = getWgConfig();
+        const p = (cc.server.peers || []).find((x) => x.tunnelIp === remoteTunnelIp);
+        if (!p) return { success: true };
+        let live = null;
+        try { live = await wireguard.getStatus(); } catch (e) {}
+        if (live && live.serverRunning) {
+          const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, p.publicKey, previousAllowedIPs);
+          if (!r.success) return { success: false, error: 'Could not restore the remote gateway peer\'s routes live: ' + (r.error || 'wireguard set failed') };
+        }
+        p.allowedIPs = previousAllowedIPs;
+        saveWgConfig();
+        return { success: true };
+      },
+    };
+    return await natGateway.natService.start(config, natHooks);
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not start the NAT service.' }; }
+});
+ipcMain.handle('wg-nat-stop', async () => {
+  try { return await natGateway.natService.stop(); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not stop the NAT service.' }; }
+});
+ipcMain.handle('wg-nat-status', async () => {
+  try { return { success: true, nat: natGateway.natService.status() }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read the NAT status.' }; }
+});
+/* Save the site-to-site config only — the NAT editor form calls
+   this; Start reads the saved config back. Validation is
+   validateNatConfig plus two checks that need live state: the remote
+   gateway must be an existing server peer (its AllowedIPs get
+   extended at start, and a missing peer is a clean error here
+   instead of a half-started gateway), and no virtual address may
+   sit inside the tunnel subnet (a mapped device is addressed on
+   the LAN, never inside 10.0.0.0/24). Nothing is written unless
+   every check passes. */
+ipcMain.handle('wg-nat-save', async (event, input) => {
+  try {
+    const v = natGateway.validateNatConfig(input);
+    if (!v.ok) return { success: false, error: v.errors[0], errors: v.errors };
+    const cfg = v.config;
+    const c = getWgConfig();
+    const peer = (c.server.peers || []).find((p) => p.tunnelIp === cfg.remoteTunnelIp);
+    if (!peer) return { success: false, error: 'The remote gateway (' + cfg.remoteTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save the NAT configuration.', errors: ['The remote gateway (' + cfg.remoteTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save the NAT configuration.'] };
+    const tunnelCidr = natGateway.parseCidr(wireguard.TUNNEL_SUBNET);
+    const tunnelClash = [];
+    if (cfg.mode === 'same-subnet') {
+      if (tunnelCidr && natGateway.inSubnet(cfg.farVirtIp, tunnelCidr)) tunnelClash.push('farVirtIp ' + cfg.farVirtIp + ' is inside the tunnel subnet ' + wireguard.TUNNEL_SUBNET + ' — a virtual address must be on the LAN.');
+      cfg.mappings.forEach((m, i) => {
+        if (tunnelCidr && natGateway.inSubnet(m.virt, tunnelCidr)) tunnelClash.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is inside the tunnel subnet ' + wireguard.TUNNEL_SUBNET + ' — a virtual address must be on the LAN.');
+      });
+    }
+    if (tunnelClash.length > 0) return { success: false, error: tunnelClash[0], errors: tunnelClash };
+    c.nat = cfg;
+    saveWgConfig();
+    return { success: true, nat: cfg };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not save the NAT configuration.' }; }
+});
+// One-click AmneziaWG install: download the official MSI, verify its
+// Authenticode signature, install silently (one UAC prompt). Progress
+// mirrors vpn-install-connect: { phase, pct, text } on
+// 'wg-install-progress'. On Windows only — anywhere else the wrapper
+// refuses before fetching anything.
+ipcMain.handle('wg-install-amneziawg', async (event) => {
+  try {
+    return await wireguard.downloadAndInstallAmnezia((p) => {
+      try { if (!event.sender.isDestroyed()) event.sender.send('wg-install-progress', p); } catch (e) {}
+    });
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install AmneziaWG.' }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {

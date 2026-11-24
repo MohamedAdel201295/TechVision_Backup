@@ -497,17 +497,19 @@
     <div class="card vpn-hero">
       <div class="vpn-status-row">
         <div>
-          <div class="t-label">WireGuard status</div>
+          <div class="t-label">AmneziaWG status</div>
           <div class="vpn-status"><span id="wgStatusDot" class="vpn-dot"></span><span id="wgStatusText">Checking…</span></div>
           <div class="t-sub" id="wgStatusSub"></div>
+          <div class="t-sub" id="wgTransportLine" style="display:none;"></div>
         </div>
         <button class="btn" type="button" id="wgRefreshBtn">Refresh</button>
       </div>
       <div id="wgNotInstalled" style="display:none;">
-        <p style="margin:8px 0 4px;">WireGuard is not installed on this computer.</p>
-        <p class="t-sub" style="margin:0 0 10px;">Download it from wireguard.com/install and install it, then press Check again. Installing a tunnel needs administrator permission once.</p>
+        <p style="margin:8px 0 4px;">AmneziaWG is not installed on this computer.</p>
+        <p class="t-sub" style="margin:0 0 10px;">Install it with one click — TechVision downloads the official AmneziaWG installer, checks its signature, and installs it. Installing a tunnel needs administrator permission once.</p>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
-          <button class="btn" type="button" id="wgDownloadBtn">Download WireGuard</button>
+          <button class="btn btn-primary" type="button" id="wgInstallBtn">Install AmneziaWG</button>
+          <button class="btn" type="button" id="wgDownloadBtn">Download manually</button>
           <button class="btn btn-ghost" type="button" id="wgRecheckBtn">Check again</button>
         </div>
       </div>
@@ -533,6 +535,11 @@
       </div>
       <div class="vpn-sec-label">Devices (peers)</div>
       <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Generate an invite below and a device will show up here.</p></div></div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Join requests — devices asking to join over Cloud</div>
+        <div class="t-sub">A device sends its public key through your Cloud connection. Approve it here and it gets its tunnel address back over the same channel — nothing to type.</div>
+        <div id="wgJoinList" style="margin-top:6px;"><div class="t-sub">No join requests.</div></div>
+      </div>
       <div style="margin-top:12px;">
         <div class="t-label">Add a device by hand</div>
         <div class="t-sub">The device shows its public key — paste it here (once).</div>
@@ -570,7 +577,7 @@
       </div>
       <div style="margin-top:12px;">
         <div class="t-label">Or paste a config</div>
-        <textarea id="wgImportText" rows="5" class="wg-conf" placeholder="Paste a WireGuard .conf here…" style="width:100%;"></textarea>
+        <textarea id="wgImportText" rows="5" class="wg-conf" placeholder="Paste an AmneziaWG .conf here…" style="width:100%;"></textarea>
         <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgImportTextBtn">Import pasted config</button>
         </div>
@@ -587,6 +594,66 @@
           <span class="t-sub">Route <b>all</b> traffic through the tunnel (full tunnel). Only the tunnel subnet goes through it otherwise. If the server goes down while this is on, this machine loses its internet too.</span>
         </label>
       </div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Or join over Cloud — no typing</div>
+        <div class="t-sub">Send a join request through a saved Cloud server. The server operator approves it there, and this machine connects by itself.</div>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+          <select id="wgJoinServer" style="flex:1; min-width:160px;"></select>
+          <input type="text" id="wgJoinDeviceName" placeholder="This device's name, e.g. laptop" autocomplete="off" style="flex:1; min-width:140px;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgJoinSendBtn">Send join request</button>
+        </div>
+        <div class="t-sub" id="wgJoinStatus" style="margin-top:6px;"></div>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgJoinCancelBtn" style="display:none; margin-top:6px;">Cancel request</button>
+      </div>
+    </div>
+    <div class="card" id="wgNatCard">
+      <div class="vpn-sec-label">Site-to-site — link two networks</div>
+      <div class="t-sub">One TechVision PC per site is the gateway: it sees its whole LAN, and any device on either network reaches any device on the other through its own gateway — no install on printers, cameras or other PCs. The gateway translates addresses where the two networks collide.</div>
+      <div class="t-sub vpn-note" id="wgNatStatus" style="margin-top:10px;">NAT service: stopped.</div>
+      <fieldset id="wgNatFieldset" style="border:0; padding:0; margin:12px 0 0;">
+        <div class="t-label">Site-to-site configuration</div>
+        <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:6px;">
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeSame" value="same-subnet" checked> Same subnet — both networks are 192.168.1.0/24</label>
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeDiff" value="different-subnet"> Different subnets — e.g. 16 and 1</label>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+          <input type="text" id="wgNatLocalSubnet" placeholder="This network, e.g. 192.168.1.0/24" autocomplete="off" style="flex:1; min-width:160px;">
+          <input type="text" id="wgNatRemoteSubnet" placeholder="Other network, e.g. 192.168.1.0/24" autocomplete="off" style="flex:1; min-width:160px;">
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+          <input type="text" id="wgNatGatewayLanIp" placeholder="This PC's LAN address, e.g. 192.168.1.10" autocomplete="off" style="flex:1; min-width:160px;">
+          <input type="text" id="wgNatGatewayTunnelIp" placeholder="This gateway's tunnel address, e.g. 10.0.0.1" autocomplete="off" style="flex:1; min-width:160px;">
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+          <input type="text" id="wgNatRemoteTunnelIp" placeholder="Other gateway's tunnel address, e.g. 10.0.0.2" autocomplete="off" style="flex:1; min-width:160px;">
+          <select id="wgNatRemotePeerPick" style="flex:1; min-width:160px;"><option value="">Pick a peer…</option></select>
+        </div>
+        <div style="margin-top:8px;">
+          <input type="text" id="wgNatInterface" placeholder="LAN interface name (optional — auto-detected when empty)" autocomplete="off" style="width:100%;">
+        </div>
+        <div id="wgNatSameOnly" style="margin-top:8px;">
+          <input type="text" id="wgNatFarVirtIp" placeholder="This gateway's virtual address on the other network, e.g. 192.168.1.201" autocomplete="off" style="width:100%;">
+          <div class="t-label" style="margin-top:10px;">Mapped devices — remote device → address it appears as here</div>
+          <div id="wgNatMappingsRows"></div>
+          <button class="btn btn-ghost btn-sm" type="button" id="wgNatAddMappingBtn" style="margin-top:6px;">+ Add mapping</button>
+        </div>
+        <div class="t-sub" id="wgNatDiffHint" style="display:none; margin-top:8px;">Different subnets need no mappings — the remote addresses are real and routable, so the gateway just forwards them. Fill in the subnets above and save.</div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center;">
+          <button class="btn btn-primary btn-sm" type="button" id="wgNatSaveBtn">Save site-to-site configuration</button>
+          <span class="t-sub" id="wgNatFormError" style="color:var(--danger);"></span>
+        </div>
+      </fieldset>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+        <button class="btn btn-primary" type="button" id="wgNatStartBtn">Start NAT service</button>
+        <button class="btn btn-ghost" type="button" id="wgNatStopBtn">Stop NAT service</button>
+      </div>
+      <div class="vpn-sec-label">Router step — different subnets only</div>
+      <div class="t-sub">When the two networks have <b>different</b> subnets (for example 192.168.16.0/24 and 192.168.1.0/24), add <b>one static route on each router</b> so each LAN finds its gateway. When both networks use the <b>same</b> subnet, no router change is needed at all — the gateway handles the collision itself.</div>
+      <div class="t-sub" style="margin-top:8px; font-family:monospace;">
+        On the 192.168.16.0/24 router: route 192.168.1.0/24 via this gateway PC (its 192.168.16.x address)<br>
+        On the 192.168.1.0/24 router: route 192.168.16.0/24 via the other gateway PC (its 192.168.1.x address)
+      </div>
+      <div class="t-sub" style="margin-top:8px;">Same-subnet example: a remote printer at 192.168.1.3 appears on this network as 192.168.1.203 — open, print and share it at the .203 address and the gateway translates it.</div>
     </div>
   </div>
   </main>
