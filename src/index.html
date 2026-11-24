@@ -352,6 +352,7 @@
           <div id="cloudCrumbs" class="cloud-crumbs"></div>
           <button class="btn btn-ghost btn-sm" type="button" id="cloudDisconnectBtn">Disconnect</button>
         </div>
+        <div class="cloud-conn-banner" id="cloudConnBanner" style="display:none;"></div>
         <div class="cloud-browser-toolbar">
           <button class="btn btn-ghost btn-sm" type="button" id="cloudUpBtn" title="Go to the parent folder">← Up</button>
           <button class="btn btn-sm" type="button" id="cloudDownloadBtn">⬇ Download</button>
@@ -394,7 +395,7 @@
       </div>
       <div id="vpnNotInstalled" style="display:none;">
         <p style="margin:8px 0 4px;">Tailscale is not installed on this computer.</p>
-        <p class="t-sub" style="margin:0 0 10px;">Press <b>Install &amp; connect</b> and the app downloads Tailscale from tailscale.com, checks the installer's signature, and installs it — Windows will ask for administrator permission once — then signs you in. Or install it yourself from the button below.</p>
+        <p class="t-sub" style="margin:0 0 10px;">Press <b>Install &amp; connect</b> and the app downloads Tailscale from tailscale.com, checks the installer's signature, and installs it (Windows asks for administrator permission once), then signs you in.</p>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn" type="button" id="vpnDownloadBtn">Download Tailscale</button>
           <button class="btn btn-ghost" type="button" id="vpnRecheckBtn">Check again</button>
@@ -402,7 +403,7 @@
       </div>
       <div id="vpnInstallBox" style="display:none; margin-top:12px;">
         <div id="vpnAdminForm">
-          <p class="t-sub" style="margin:0 0 8px;">Tailscale needs administrator rights to install. Leave the fields empty and press <b>Install</b> to approve with the Windows prompt — or, on a domain PC, type the administrator account here and the app installs with those credentials instead. The password is used once for this install and never stored.</p>
+          <p class="t-sub" style="margin:0 0 8px;">Leave the fields empty to approve with the Windows prompt — or, on a domain PC, type the administrator account here. The password is used once and never stored.</p>
           <div class="field">
             <label for="vpnAdminUser">Administrator user name</label>
             <input type="text" id="vpnAdminUser" placeholder="e.g. DOMAIN\admin" autocomplete="off">
@@ -440,32 +441,34 @@
       <div class="t-sub" id="vpnRoutesNote" style="display:none;"></div>
       <button class="btn btn-ghost btn-sm" type="button" id="vpnApproveBtn" style="display:none; margin-top:6px;">Open admin console to approve the route</button>
       <div class="toggle-row" style="margin-top:12px;">
-        <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale normally asks you to sign in again after 180 days. With this on, the app turns that off automatically right after you connect — using the OAuth client or API token below, because the Tailscale command line cannot do it.</div></div>
+        <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale asks you to sign in again after 180 days. This switch turns that off for real.</div></div>
         <label class="switch"><input type="checkbox" id="vpnKeyExpiryToggle" checked><span class="slider"></span></label>
       </div>
       <div class="t-sub" id="vpnKeyExpiryState" style="margin-top:6px;"></div>
-      <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" type="button" id="vpnKeyExpiryBtn">Disable key expiry now</button></div>
-      <div style="margin-top:12px;">
-        <div class="t-label">Tailscale OAuth client (recommended — set once, never expires)</div>
-        <div class="t-sub">The app needs one credential to turn off key expiry from inside the app, and this is the one that never needs pasting again: the app exchanges it for its own short-lived tokens and refreshes them itself. Create it once in the admin console (Settings → Trust credentials → OAuth clients), grant the Devices scope (devices:core), then paste the client ID and secret here. They are stored in the app settings (like the email password) and can be revoked any time from the same page.</div>
-        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <input type="text" id="vpnOauthClientId" placeholder="OAuth client ID (tskey-client-…)" autocomplete="off" style="flex:1; min-width:180px;">
-          <input type="password" id="vpnOauthClientSecret" placeholder="OAuth client secret" autocomplete="off" style="flex:1; min-width:180px;">
+      <details id="vpnApiCreds" style="margin-top:12px;">
+        <summary class="t-label" style="cursor:pointer;">API credentials — needed for key expiry and route approval</summary>
+        <div style="margin-top:8px;">
+          <div class="t-label">Tailscale OAuth client (recommended — set once, never expires)</div>
+          <div class="t-sub">Create it in the admin console (Settings → Trust credentials → OAuth clients) with the Devices and Routes scopes. The app mints its own tokens after that — nothing to paste again.</div>
+          <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+            <input type="text" id="vpnOauthClientId" placeholder="OAuth client ID (tskey-client-…)" autocomplete="off" style="flex:1; min-width:180px;">
+            <input type="password" id="vpnOauthClientSecret" placeholder="OAuth client secret" autocomplete="off" style="flex:1; min-width:180px;">
+          </div>
+          <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+            <button class="btn btn-ghost btn-sm" type="button" id="vpnOauthSaveBtn">Save OAuth client</button>
+            <button class="btn btn-ghost btn-sm" type="button" id="vpnOauthOpenBtn">Create an OAuth client</button>
+          </div>
         </div>
-        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <button class="btn btn-ghost btn-sm" type="button" id="vpnOauthSaveBtn">Save OAuth client</button>
-          <button class="btn btn-ghost btn-sm" type="button" id="vpnOauthOpenBtn">Create an OAuth client</button>
+        <div style="margin-top:12px;">
+          <div class="t-label">Tailscale API access token (alternative — expires within 90 days)</div>
+          <div class="t-sub">Generate it in the admin console (Settings → Keys). It stops working when it expires.</div>
+          <div style="display:flex; gap:8px; margin-top:6px;">
+            <input type="password" id="vpnApiToken" placeholder="tskey-api-…" autocomplete="off" style="flex:1;">
+            <button class="btn btn-ghost btn-sm" type="button" id="vpnApiTokenSaveBtn">Save token</button>
+            <button class="btn btn-ghost btn-sm" type="button" id="vpnApiTokenOpenBtn">Generate a token</button>
+          </div>
         </div>
-      </div>
-      <div style="margin-top:12px;">
-        <div class="t-label">Tailscale API access token (alternative — expires within 90 days)</div>
-        <div class="t-sub">The simpler alternative if you do not want an OAuth client: generate one in the admin console (Settings → Keys → Generate API access token) and paste it here. It stops working when it expires and must be regenerated.</div>
-        <div style="display:flex; gap:8px; margin-top:6px;">
-          <input type="password" id="vpnApiToken" placeholder="tskey-api-…" autocomplete="off" style="flex:1;">
-          <button class="btn btn-ghost btn-sm" type="button" id="vpnApiTokenSaveBtn">Save token</button>
-          <button class="btn btn-ghost btn-sm" type="button" id="vpnApiTokenOpenBtn">Generate a token</button>
-        </div>
-      </div>
+      </details>
     </div>
     <div class="card">
       <h3 style="margin:0 0 4px;font-size:16px;">Devices on your network</h3>

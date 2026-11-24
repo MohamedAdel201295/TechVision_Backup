@@ -814,10 +814,25 @@
       var body = document.createElement('div'); body.className = 'job-body';
       var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = srv.name;
       var meta = document.createElement('div'); meta.className = 'job-meta';
-      meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet');
+      meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet') + (srv.hasPassword ? ' — password saved on this device' : '');
       var acts = document.createElement('div'); acts.className = 'drawer-actions';
-      var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open';
-      open.addEventListener('click', function () { openCloudConnect(srv); });
+      // One click when the password is saved on this device: connect
+      // straight in (the main process uses the stored password). Without
+      // one, the connect box opens and asks for it.
+      var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = (srv.hasPassword && srv.fingerprint) ? 'Connect' : 'Open';
+      open.addEventListener('click', function () {
+        if (srv.hasPassword && srv.fingerprint) cloudConnectSaved(srv);
+        else openCloudConnect(srv);
+      });
+      var forget = null;
+      if (srv.hasPassword) {
+        forget = document.createElement('button'); forget.className = 'btn btn-ghost btn-sm'; forget.type = 'button'; forget.textContent = '🔑 Forget password';
+        forget.addEventListener('click', async function () {
+          if (!api || typeof api.cloudClientForgetPassword !== 'function') return cloudMissing();
+          try { var r = await api.cloudClientForgetPassword(srv.id); if (r && r.success) { toast('Cloud', 'Saved password forgotten — you will type it next time.', 'success'); await loadCloud(); } else toast('Forget failed', (r && r.error) || 'Could not forget the password.', 'error'); }
+          catch (e) { toast('Forget error', e && e.message ? e.message : 'Could not forget the password.', 'error'); }
+        });
+      }
       var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Remove';
       del.addEventListener('click', function () {
         askConfirm('Remove server "' + srv.name + '" from the list?', async function () {
@@ -826,7 +841,7 @@
           catch (e) { toast('Remove error', e && e.message ? e.message : 'Could not remove server.', 'error'); }
         });
       });
-      acts.appendChild(open); acts.appendChild(del);
+      acts.appendChild(open); if (forget) acts.appendChild(forget); acts.appendChild(del);
       body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
       card.appendChild(body);
       list.appendChild(card);
@@ -850,12 +865,22 @@
     cloudPendingProbe = null;
   }
 
-  async function cloudConnectFlow(autoTrust) {
+  // One click on a saved server: the password is already on this device
+  // (the main process uses the stored one), so go straight in — no box.
+  async function cloudConnectSaved(srv) {
+    cloudSelected = srv;
+    cloudPendingProbe = null;
+    await cloudConnectFlow(true, null);
+  }
+
+  // passwordOverride: undefined = read the connect box (the usual path);
+  // null = use the password saved on this device (one-click reconnect).
+  async function cloudConnectFlow(autoTrust, passwordOverride) {
     if (!cloudSelected) return;
     if (!api || typeof api.cloudClientProbe !== 'function' || typeof api.cloudClientConnect !== 'function') return cloudMissing();
     var btn = $('cloudConnectBtn');
     var pass = $('cloudConnectPass');
-    var password = pass ? pass.value : '';
+    var password = passwordOverride !== undefined ? (passwordOverride || '') : (pass ? pass.value : '');
     var justTrusted = null; // fingerprint trusted in this very click
     // No trusted certificate yet: probe the server first (nothing
     // sensitive is sent to probe), then trust its fingerprint.
@@ -911,8 +936,9 @@
         if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
       }
     }
-    // Trusted certificate: connect with the password.
-    if (!password) { toast('Password needed', 'Enter the password for user ' + (cloudSelected.user || '') + '.', 'error'); return; }
+    // Trusted certificate: connect with the password — typed in the box,
+    // or the one saved on this device when this is a one-click reconnect.
+    if (!password && !cloudSelected.hasPassword) { toast('Password needed', 'Enter the password for user ' + (cloudSelected.user || '') + '.', 'error'); return; }
     try {
       if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
       var certPem = cloudSelected.certPem;
@@ -928,7 +954,7 @@
       }
       var r = await api.cloudClientConnect({
         serverId: cloudSelected.id, host: cloudSelected.host, port: cloudSelected.port,
-        certPem: certPem, user: cloudSelected.user, password: password,
+        certPem: certPem, user: cloudSelected.user, password: password || null,
       });
       if (!r || !r.success) { toast('Connection failed', (r && r.error) || 'Wrong user name or password.', 'error'); return; }
       // Keep the server name: closeCloudConnect() clears cloudSelected.
@@ -939,7 +965,12 @@
       var browser = $('cloudBrowser'); if (browser) browser.style.display = '';
       toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).') + (justTrusted ? ' Server fingerprint ' + justTrusted.slice(0, 16) + '… trusted.' : ''));
       renderCloudHome();
+      // Re-read the config: a typed password was just saved on this
+      // device, so the server card must now show Connect + Forget
+      // without waiting for the user to navigate away and back.
+      await loadCloud();
       await cloudBrowse('');
+      cloudStartPoller();
     } catch (e) {
       toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
     } finally {
@@ -951,12 +982,131 @@
     if (cloudConn && api && typeof api.cloudClientDisconnect === 'function') {
       try { await api.cloudClientDisconnect(cloudConn.serverId); } catch (e) {}
     }
+    cloudStopPoller();
+    cloudLinkDown = false;
+    cloudReloginTried = false;
+    cloudSetConnBanner(false);
     cloudConn = null;
     cloudPath = '';
     cloudSelectedEntry = null;
     cloudClipboard = null;
     var browser = $('cloudBrowser'); if (browser) browser.style.display = 'none';
     renderCloudHome();
+  }
+
+  /* ---------- Cloud client auto-refresh ----------
+     While connected, the file list is re-read every 10 seconds, so a
+     file added on the server (or a server that goes down) shows up on
+     its own — no manual Refresh, no disconnect + Save & connect.
+     - List succeeds and the folder changed: re-render (the selection
+       is kept by name, like a manual refresh).
+     - Server unreachable: the browser shows "Disconnected — retrying"
+       and the poller keeps trying; the moment the server answers, the
+       list comes back on its own.
+     - Session dead (the server was stopped — stopping clears sessions):
+       sign in again automatically with the password saved on this
+       device. Exactly one attempt per incident: a wrong saved password
+       must not hammer the server into its login lockout. Without a
+       saved password the client disconnects and says so. */
+  var cloudPollTimer = null;
+  var cloudPollBusy = false;
+  var cloudLinkDown = false;
+  var cloudReloginTried = false;
+  var cloudLastSig = '';
+  function cloudStartPoller() {
+    cloudStopPoller();
+    cloudPollTimer = setInterval(cloudPollTick, 10000);
+  }
+  function cloudStopPoller() {
+    if (cloudPollTimer) { clearInterval(cloudPollTimer); cloudPollTimer = null; }
+  }
+  function cloudEntriesSig(entries) {
+    return (entries || []).map(function (e) { return e.name + '|' + (e.isDir ? 'd' : 'f') + '|' + (e.size || 0) + '|' + (e.mtime || ''); }).join('\n');
+  }
+  function cloudSetConnBanner(show, text) {
+    var b = $('cloudConnBanner');
+    if (!b) return;
+    if (show) { b.style.display = ''; b.textContent = text || ''; }
+    else b.style.display = 'none';
+  }
+  async function cloudPollTick() {
+    if (!cloudConn || cloudPollBusy || cloudTransferBusy) return;
+    if (cloudPanel !== 'client') return; // only while the client panel is open
+    if (!api || typeof api.cloudClientList !== 'function') return;
+    cloudPollBusy = true;
+    try {
+      var r = await api.cloudClientList(cloudConn.serverId, cloudPath);
+      if (r && r.success) {
+        if (cloudLinkDown) { cloudLinkDown = false; cloudSetConnBanner(false); cloudReloginTried = false; toast('Reconnected', 'The server is reachable again.', 'success'); renderCloudHome(); }
+        if ((r.path || '') === cloudPath && cloudEntriesSig(r.entries || []) !== cloudLastSig) renderCloudBrowser(r.entries || []);
+        return;
+      }
+      if (r && r.code === 'auth') { await cloudPollRelogin(); return; }
+      if (r && r.code === 'unreachable') {
+        if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+        return;
+      }
+      // Any other error (e.g. the folder was deleted on the server):
+      // leave the view alone — a manual browse will surface it.
+    } catch (e) {
+      if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+    } finally { cloudPollBusy = false; }
+  }
+  async function cloudPollRelogin() {
+    if (cloudReloginTried) return;
+    cloudReloginTried = true;
+    var srv = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === cloudConn.serverId; });
+    if (!srv || !srv.hasPassword) {
+      // No saved password: nothing automatic to do — disconnect and
+      // say so instead of looping on a dead session.
+      toast('Session expired', 'The server was restarted or the session ended. Press Connect on the server to sign in again.', 'error');
+      await cloudDisconnect();
+      return;
+    }
+    try {
+      // The renderer never holds the certificate itself — re-probe for
+      // it (the fingerprint must still match the trusted one).
+      var certPem = srv.certPem || null;
+      if (!certPem) {
+        var p = await api.cloudClientProbe(srv.host, srv.port);
+        if (!p || !p.success) {
+          cloudReloginTried = false;
+          if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+          return;
+        }
+        if (p.fingerprint !== srv.fingerprint) {
+          toast('Certificate changed', 'The server certificate does not match the trusted fingerprint. Remove the server and add it again.', 'error');
+          await cloudDisconnect();
+          return;
+        }
+        certPem = p.certPem;
+      }
+      var r = await api.cloudClientConnect({
+        serverId: srv.id, host: srv.host, port: srv.port,
+        certPem: certPem, user: srv.user, password: null,
+      });
+      if (r && r.success) {
+        cloudConn = { serverId: srv.id, info: r.info, name: srv.name };
+        cloudLinkDown = false;
+        cloudSetConnBanner(false);
+        cloudReloginTried = false;
+        toast('Reconnected', 'Signed in again automatically.', 'success');
+        renderCloudHome();
+        await cloudBrowse(cloudPath);
+        return;
+      }
+      if (r && /Cannot reach the server|did not answer in time/i.test(r.error || '')) {
+        // The server is down, not the password: keep retrying the list,
+        // and allow one fresh login attempt once it answers again.
+        cloudReloginTried = false;
+        if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+        return;
+      }
+      toast('Session expired', 'Could not sign in again automatically: ' + ((r && r.error) || 'unknown error') + ' — press Connect on the server to sign in again.', 'error');
+      await cloudDisconnect();
+    } catch (e) {
+      if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+    }
   }
 
   function cloudJoin(base, name) { return base ? base + '/' + name : name; }
@@ -978,6 +1128,7 @@
 
   async function cloudBrowse(relPath) {
     if (!cloudConn) return;
+    if (cloudLinkDown) return; // the banner already says why; the poller clears this
     if (!api || typeof api.cloudClientList !== 'function') return cloudMissing();
     try {
       var r = await api.cloudClientList(cloudConn.serverId, relPath || '');
@@ -1017,13 +1168,13 @@
   }
 
   function cloudUpdateToolbar() {
-    var sel = cloudSelectedEntry, canWrite = cloudCanWrite();
-    var dl = $('cloudDownloadBtn'); if (dl) dl.disabled = !sel || sel.isDir;
+    var sel = cloudSelectedEntry, canWrite = cloudCanWrite() && !cloudLinkDown;
+    var dl = $('cloudDownloadBtn'); if (dl) dl.disabled = !sel || sel.isDir || cloudLinkDown;
     var cp = $('cloudCopyBtn'); if (cp) cp.disabled = !sel || !canWrite;
     var ps = $('cloudPasteBtn'); if (ps) ps.disabled = !cloudClipboard || !canWrite;
     var rn = $('cloudRenameBtn'); if (rn) rn.disabled = !sel || !canWrite;
     var del = $('cloudDeleteBtn'); if (del) del.disabled = !sel || !canWrite;
-    var up = $('cloudUpBtn'); if (up) up.disabled = !cloudPath;
+    var up = $('cloudUpBtn'); if (up) up.disabled = !cloudPath || cloudLinkDown;
     var ub = $('cloudUploadBtn'); if (ub) ub.disabled = !canWrite;
     var mb = $('cloudMkdirBtn'); if (mb) mb.disabled = !canWrite;
     var ci = $('cloudClipboardInfo');
@@ -1096,6 +1247,7 @@
 
   function renderCloudBrowser(entries) {
     cloudLastEntries = entries || [];
+    cloudLastSig = cloudEntriesSig(entries || []);
     var crumbs = $('cloudCrumbs');
     if (crumbs) {
       crumbs.innerHTML = '';
@@ -1606,13 +1758,7 @@
     var tg = $('vpnSubnetToggle');
     var advertising = (st.advertiseRoutes || []).indexOf(st.lanSubnet) >= 0;
     if (tg) tg.checked = !!advertising;
-    var rn = $('vpnRoutesNote');
-    if (rn) {
-      if (advertising) { rn.style.display = ''; rn.textContent = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.'; }
-      else rn.style.display = 'none';
-    }
-    var ab = $('vpnApproveBtn');
-    if (ab) ab.style.display = advertising ? '' : 'none';
+    refreshVpnRoutesState();
     var ss = $('vpnSubnetSub');
     if (ss) ss.textContent = st.lanSubnet
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
@@ -1681,26 +1827,76 @@
       return false;
     }
   }
-  // The real key-expiry state from the Tailscale API — the toggle above
-  // is only the "try to turn it off" preference, this line is the truth.
+  // The real key-expiry state from the Tailscale API — the toggle is a
+  // real switch, and this line is its confirmation: it shows what the
+  // API says, and the toggle is set to match it.
   async function refreshVpnKeyExpiryState() {
     var el = $('vpnKeyExpiryState');
     if (!el) return;
     var auth = vpnAuth();
-    if (!auth) { el.textContent = 'Key expiry state: unknown — save an OAuth client or an API access token below and the app will show the real state here.'; return; }
+    if (!auth) { el.textContent = 'Key expiry state: unknown — open “API credentials” below and save an OAuth client or a token.'; return; }
     if (!api || typeof api.vpnKeyExpiryState !== 'function') return;
     el.textContent = 'Key expiry state: checking…';
     try {
       var r = await api.vpnKeyExpiryState(auth);
       if (r && r.success) {
+        var ket = $('vpnKeyExpiryToggle');
+        if (ket) ket.checked = !!r.disabled;
         el.textContent = r.disabled
           ? 'Key expiry: OFF — this device stays connected, no more sign-ins.'
           : 'Key expiry: ON — the device will ask to sign in again when the key expires' + (r.expires ? ' (' + r.expires + ')' : '') + '.';
-        if (r.disabled) await saveVpnSettings({ keyExpiryDisabled: true });
+        if (r.disabled) await saveVpnSettings({ keyExpiryDisabled: true, autoDisableKeyExpiry: true });
+        else await saveVpnSettings({ keyExpiryDisabled: false });
       } else {
         el.textContent = 'Key expiry state: unknown — ' + ((r && r.error) || 'could not read it.');
       }
     } catch (e) { el.textContent = 'Key expiry state: unknown — ' + (e && e.message ? e.message : 'could not read it.'); }
+  }
+  // Turn key expiry back ON through the API (the toggle flipped off).
+  async function enableVpnKeyExpiry() {
+    if (!api || typeof api.vpnEnableKeyExpiry !== 'function') return false;
+    try {
+      var r = await api.vpnEnableKeyExpiry(vpnAuth());
+      if (r && r.success) {
+        await saveVpnSettings({ keyExpiryDisabled: false });
+        toast('VPN', 'Key expiry is on again — the device will ask to sign in again when the key expires.', 'success');
+        refreshVpnKeyExpiryState();
+        return true;
+      }
+      toast('VPN', 'Could not turn key expiry back on: ' + ((r && r.error) || 'unknown error'), 'error');
+      return false;
+    } catch (e) {
+      toast('VPN error', e && e.message ? e.message : 'Could not turn key expiry back on.', 'error');
+      return false;
+    }
+  }
+  // The real route state from the API: advertising + approved, or
+  // advertising and still waiting. The console button only shows when
+  // the route is waiting — with a credential saved the toggle approves
+  // it itself and the button never appears.
+  async function refreshVpnRoutesState() {
+    var rn = $('vpnRoutesNote');
+    var ab = $('vpnApproveBtn');
+    if (!rn && !ab) return;
+    var st = vpnStatusCache || {};
+    var advertising = (st.advertiseRoutes || []).indexOf(st.lanSubnet) >= 0;
+    if (!advertising || !st.connected) { if (rn) rn.style.display = 'none'; if (ab) ab.style.display = 'none'; return; }
+    var waiting = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.';
+    var auth = vpnAuth();
+    if (!auth || !api || typeof api.vpnGetRoutes !== 'function') {
+      if (rn) { rn.style.display = ''; rn.textContent = waiting; }
+      if (ab) ab.style.display = '';
+      return;
+    }
+    try {
+      var r = await api.vpnGetRoutes(auth);
+      var approved = !!(r && r.success && (r.routes || []).some(function (x) { return x.route === st.lanSubnet && x.enabled; }));
+      if (rn) { rn.style.display = ''; rn.textContent = approved ? ('Advertising ' + st.lanSubnet + ' — approved.') : ('Advertising ' + st.lanSubnet + ' — waiting for approval…'); }
+      if (ab) ab.style.display = approved ? 'none' : '';
+    } catch (e) {
+      if (rn) { rn.style.display = ''; rn.textContent = waiting; }
+      if (ab) ab.style.display = '';
+    }
   }
   async function maybeDisableVpnKeyExpiry() {
     if (vpnKeyExpiryAttempted) return;
@@ -1991,15 +2187,18 @@
     if (vrc) vrc.addEventListener('click', function () { loadVpn(); });
     var vke = $('vpnKeyExpiryToggle');
     if (vke) vke.addEventListener('change', async function () {
-      await saveVpnSettings({ autoDisableKeyExpiry: vke.checked });
-      if (vke.checked) { vpnKeyExpiryAttempted = false; maybeDisableVpnKeyExpiry(); }
-    });
-    var vkb = $('vpnKeyExpiryBtn');
-    if (vkb) vkb.addEventListener('click', async function () {
-      if (vpnBusy) return;
-      vpnBusy = true; vkb.disabled = true;
-      try { await disableVpnKeyExpiry(false); }
-      finally { vpnBusy = false; vkb.disabled = false; }
+      var wantOff = vke.checked; // ON = key expiry OFF (stay connected forever)
+      await saveVpnSettings({ autoDisableKeyExpiry: wantOff });
+      var ok = wantOff ? await disableVpnKeyExpiry(false) : await enableVpnKeyExpiry();
+      if (!ok) {
+        // The switch must never lie: if the API said no, snap it back
+        // to where it was, and open the credentials so the user can see
+        // what is missing.
+        vke.checked = !wantOff;
+        await saveVpnSettings({ autoDisableKeyExpiry: !wantOff });
+        if (!vpnAuth()) { var d = $('vpnApiCreds'); if (d) d.open = true; }
+      }
+      refreshVpnKeyExpiryState();
     });
     var vts = $('vpnApiTokenSaveBtn');
     if (vts) vts.addEventListener('click', async function () {
@@ -2008,6 +2207,7 @@
       await saveVpnSettings({ apiToken: token });
       toast('VPN', token ? 'API token saved.' : 'API token removed.', 'success');
       refreshVpnKeyExpiryState();
+      refreshVpnRoutesState();
     });
     var vos = $('vpnOauthSaveBtn');
     if (vos) vos.addEventListener('click', async function () {
@@ -2018,6 +2218,7 @@
       await saveVpnSettings({ oauthClientId: id, oauthClientSecret: sec });
       toast('VPN', (id && sec) ? 'OAuth client saved.' : 'OAuth client removed.', 'success');
       refreshVpnKeyExpiryState();
+      refreshVpnRoutesState();
     });
     var voo = $('vpnOauthOpenBtn');
     if (voo) voo.addEventListener('click', async function () {
@@ -2034,14 +2235,18 @@
       if (!api || typeof api.vpnSetRoutes !== 'function') return vpnMissing();
       var on = vst.checked;
       try {
-        var r = await api.vpnSetRoutes(on);
+        var r = await api.vpnSetRoutes(on, vpnAuth());
         if (r && r.success) {
-          // Advertising alone does nothing — the route only works after
-          // it is approved in the Tailscale admin console, which the app
-          // cannot do itself. Open the console right away so the approval
-          // is one click away instead of a step the user has to find.
-          if (on && typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
-          toast('VPN', on ? 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' : 'No longer sharing your home network.', 'success');
+          if (on) {
+            if (r.approved) toast('VPN', 'Sharing your home network — the route was approved automatically.', 'success');
+            else {
+              // No credential saved (or the approval failed): the route
+              // is advertised but does nothing until it is approved in
+              // the console — open it right away, and keep the button.
+              if (typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
+              toast('VPN', 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' + (r.approveError ? ' The automatic approval failed: ' + r.approveError : ''), 'success');
+            }
+          } else toast('VPN', 'No longer sharing your home network.', 'success');
         } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
         await loadVpn();
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }

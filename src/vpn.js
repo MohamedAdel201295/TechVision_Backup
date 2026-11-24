@@ -269,7 +269,7 @@ async function setConnected(on, timeoutMs, onAuthUrl) {
   return { success: true, needsLogin: !!url, authUrl: url };
 }
 
-async function setSubnetRouter(on) {
+async function setSubnetRouter(on, auth) {
   const subnet = lanSubnet();
   if (on && !subnet) return { success: false, error: 'Could not find your home network address.' };
   if (on && !isCidr(subnet)) return { success: false, error: 'Invalid network address.' };
@@ -278,7 +278,18 @@ async function setSubnetRouter(on) {
   if (r.notFound) return { success: false, error: 'Tailscale is not installed on this computer.' };
   if (r.timedOut) return { success: false, error: 'Tailscale did not answer in time. Try again.' };
   if (r.code !== 0) return { success: false, error: 'Could not change the subnet router setting.' };
-  return { success: true, subnet: on ? subnet : null };
+  if (!on) return { success: true, subnet: null, approved: false };
+  // Advertising alone does nothing — approve the route through the API
+  // when a credential is saved (OAuth client needs the devices:routes
+  // scope; an API token inherits the user's access). Without one, the
+  // caller falls back to the admin console button.
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if ((a.clientId && a.clientSecret) || (a.apiToken && String(a.apiToken).trim())) {
+    const ap = await approveRoutes(auth, [subnet]);
+    if (ap.success) return { success: true, subnet, approved: true };
+    return { success: true, subnet, approved: false, approveError: ap.error };
+  }
+  return { success: true, subnet, approved: false };
 }
 
 /* ---------- Tailscale API: key expiry (the real integration) ----------
@@ -394,9 +405,53 @@ function authRefusedError(via, status) {
 }
 
 async function disableKeyExpiryViaApi(auth) {
+  return setKeyExpiryDisabled(auth, true);
+}
+
+/* Set the key-expiry flag either way: disabled=true turns expiry off
+   (the toggle ON), disabled=false turns it back on (the toggle OFF).
+   The toggle is a real switch, not a preference — flipping it calls
+   this immediately and the state line shows what the API says. */
+async function setKeyExpiryDisabled(auth, disabled) {
   const { id, error } = await selfDeviceId();
   if (!id) return { success: false, error };
-  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/key', auth, { method: 'POST', body: { keyExpiryDisabled: true } });
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/key', auth, { method: 'POST', body: { keyExpiryDisabled: !!disabled } });
+  if (r.ok) return { success: true, via: 'api' };
+  if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
+  return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+}
+
+async function enableKeyExpiry(auth) {
+  return setKeyExpiryDisabled(auth, false);
+}
+
+/* ---------- Tailscale API: subnet route approval ----------
+ * Advertising a route (tailscale up --advertise-routes) is only half
+ * the job: the route does nothing until the tailnet admin approves it.
+ * The admin console approval is the same API call the console itself
+ * makes — POST /device/{deviceId}/routes {"routes": [...]} (scope
+ * devices:routes) — so with an OAuth client or API token saved, the
+ * app approves the route itself and the console button is not needed.
+ * Without a credential the app can only advertise, and the user still
+ * has to approve it in the console. GET /device/{deviceId}/routes
+ * returns the real state ({routes: [{route, advertised, enabled}]}),
+ * so the view can say whether the route is approved or still waiting. */
+async function getDeviceRoutes(auth) {
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/routes', auth, { method: 'GET' });
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
+    return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+  }
+  const routes = Array.isArray((r.body || {}).routes) ? r.body.routes : [];
+  return { success: true, routes: routes.map((x) => ({ route: x.route, advertised: !!x.advertised, enabled: !!x.enabled })) };
+}
+
+async function approveRoutes(auth, routes) {
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/routes', auth, { method: 'POST', body: { routes: routes || [] } });
   if (r.ok) return { success: true, via: 'api' };
   if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
   return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
@@ -447,7 +502,7 @@ async function disableKeyExpiry(auth) {
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
-  disableKeyExpiry, getKeyExpiryState, disableKeyExpiryViaApi, exchangeOAuthToken, pickLanSubnet, tailnetFromDns, buildInstallScript,
+  disableKeyExpiry, enableKeyExpiry, getKeyExpiryState, disableKeyExpiryViaApi, exchangeOAuthToken, getDeviceRoutes, approveRoutes, pickLanSubnet, tailnetFromDns, buildInstallScript,
   parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,
 };
 

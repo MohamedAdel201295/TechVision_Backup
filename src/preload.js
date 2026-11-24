@@ -93,6 +93,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // TechVision Cloud — client (passwords are never stored)
   cloudClientSave: (s) => ipcRenderer.invoke('cloud-client-save', s),
   cloudClientRemove: (id) => ipcRenderer.invoke('cloud-client-remove', id),
+  cloudClientForgetPassword: (id) => ipcRenderer.invoke('cloud-client-forget-password', id),
   cloudClientProbe: (host, port) => ipcRenderer.invoke('cloud-client-probe', host, port),
   cloudClientConnect: (opts) => ipcRenderer.invoke('cloud-client-connect', opts),
   cloudClientDisconnect: (serverId) => ipcRenderer.invoke('cloud-client-disconnect', serverId),
@@ -106,10 +107,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // TechVision VPN — Tailscale client manager (no VPN of its own)
   vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
   vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
-  vpnSetRoutes: (on) => ipcRenderer.invoke('vpn-set-routes', on),
+  vpnSetRoutes: (on, auth) => ipcRenderer.invoke('vpn-set-routes', on, auth),
   vpnInstallConnect: (adminCreds) => ipcRenderer.invoke('vpn-install-connect', adminCreds || null),
   vpnDisableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-disable-key-expiry', auth),
+  vpnEnableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-enable-key-expiry', auth),
   vpnKeyExpiryState: (auth) => ipcRenderer.invoke('vpn-key-expiry-state', auth),
+  vpnGetRoutes: (auth) => ipcRenderer.invoke('vpn-get-routes', auth),
   vpnOpenKeysPage: () => ipcRenderer.invoke('vpn-open-keys-page'),
   vpnOpenOauthPage: () => ipcRenderer.invoke('vpn-open-oauth-page'),
   onVpnInstallProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('vpn-install-progress', h); return () => ipcRenderer.removeListener('vpn-install-progress', h); },

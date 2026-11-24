@@ -486,6 +486,7 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .cloud-crumb:hover { background: var(--hover); }
 .cloud-crumb-sep { color: var(--muted-2); }
 .cloud-browser-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.cloud-conn-banner { margin: 0 0 12px; padding: 8px 10px; border: 1px solid rgba(245, 158, 11, .45); background: var(--warning-bg); color: var(--warning); border-radius: 8px; font-size: 13px; }
 .cloud-transfer { margin: 4px 0 12px; }
 .cloud-transfer .progress-track { margin: 0 0 6px; }
 

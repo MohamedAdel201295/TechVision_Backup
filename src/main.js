@@ -1702,7 +1702,7 @@ ipcMain.handle('cloud-get-config', async () => {
       fingerprint: cfg.server.cert ? cfg.server.cert.fingerprint : null,
       accessMode: cfg.server.accessMode === 'tailscale' ? 'tailscale' : 'normal',
     },
-    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, accessMode: c.accessMode === 'tailscale' ? 'tailscale' : 'normal' })),
+    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: c.accessMode === 'tailscale' ? 'tailscale' : 'normal' })),
   };
 });
 
@@ -1795,7 +1795,14 @@ ipcMain.handle('cloud-user-set-password', async (event, name, password) => {
   }
 });
 
-// Saved servers (client side). Passwords are never stored here.
+// Saved servers (client side). The password for a server IS stored on
+// this device, in cloud.json next to the server record — the user asked
+// for one-click reconnect instead of typing it every time (same choice
+// as the SMTP password in settings.json). It never leaves main: the
+// renderer only sees hasPassword, and connect uses the stored password
+// when none is typed. Remove it any time with "Forget saved password"
+// on the server card; changing the password on the server just means
+// the next connect asks for the new one.
 ipcMain.handle('cloud-client-save', async (event, s) => {
   try {
     const cfg = getCloudConfig();
@@ -1815,7 +1822,7 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     const accessMode = s.accessMode === 'tailscale' ? 'tailscale'
       : s.accessMode === 'normal' ? 'normal'
       : (existing && existing.accessMode === 'tailscale' ? 'tailscale' : 'normal');
-    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode };
+    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode, password: (s.password && String(s.password)) || (existing && existing.password) || null };
     if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
     else cfg.clients.push(rec);
     saveCloudConfig();
@@ -1823,6 +1830,15 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
+});
+
+ipcMain.handle('cloud-client-forget-password', async (event, id) => {
+  const cfg = getCloudConfig();
+  const rec = (cfg.clients || []).find((c) => c.id === id);
+  if (!rec) return { success: false, error: 'Server not found.' };
+  rec.password = null;
+  saveCloudConfig();
+  return { success: true };
 });
 
 ipcMain.handle('cloud-client-remove', async (event, id) => {
@@ -1845,9 +1861,17 @@ ipcMain.handle('cloud-client-probe', async (event, host, port) => {
 
 ipcMain.handle('cloud-client-connect', async (event, opts) => {
   try {
-    const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, opts.password);
+    // No password typed: use the one saved for this server, so a
+    // reconnect is one click. A password the user types wins, and a
+    // successful login with it remembers it for next time.
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === opts.serverId);
+    const password = (opts.password && String(opts.password)) || (rec && rec.password) || '';
+    if (!password) return { success: false, error: 'Password needed — enter the password for user ' + (opts.user || '') + '.' };
+    const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, password);
     const info = await cloudClient.info(conn);
     cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
+    if (rec && opts.password && String(opts.password)) { rec.password = String(opts.password); saveCloudConfig(); }
     return { success: true, info };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
@@ -1865,12 +1889,18 @@ ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
 
 ipcMain.handle('cloud-client-list', async (event, serverId, relPath) => {
   const conn = cloudSessions.get(serverId);
-  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  if (!conn) return { success: false, error: 'Not connected to this server.', code: 'auth' };
   try {
     const r = await cloudClient.list(conn, relPath || '');
     return { success: true, path: r.path, entries: r.entries };
   } catch (e) {
-    return { success: false, error: e && e.message ? e.message : String(e) };
+    const msg = e && e.message ? e.message : String(e);
+    // The auto-refresh poller needs to tell "server gone" from
+    // "session dead" from "something else", without parsing toasts.
+    const code = /Not signed in/i.test(msg) ? 'auth'
+      : /Cannot reach the server|did not answer in time|ECONNREFUSED|ENOTFOUND|socket hang up|certificate/i.test(msg) ? 'unreachable'
+      : 'other';
+    return { success: false, error: msg, code };
   }
 });
 
@@ -1962,16 +1992,24 @@ ipcMain.handle('vpn-set-connected', async (event, on) => {
   }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
 });
-ipcMain.handle('vpn-set-routes', async (event, on) => {
-  try { return await vpn.setSubnetRouter(!!on); }
+ipcMain.handle('vpn-set-routes', async (event, on, auth) => {
+  try { return await vpn.setSubnetRouter(!!on, auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
-ipcMain.handle('vpn-disable-key-expiry', async (event, apiToken) => {
-  try { return await vpn.disableKeyExpiry(apiToken); }
+ipcMain.handle('vpn-get-routes', async (event, auth) => {
+  try { return await vpn.getDeviceRoutes(auth); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read routes.' }; }
+});
+ipcMain.handle('vpn-disable-key-expiry', async (event, auth) => {
+  try { return await vpn.disableKeyExpiry(auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }
 });
-ipcMain.handle('vpn-key-expiry-state', async (event, apiToken) => {
-  try { return await vpn.getKeyExpiryState(apiToken); }
+ipcMain.handle('vpn-enable-key-expiry', async (event, auth) => {
+  try { return await vpn.enableKeyExpiry(auth); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not enable key expiry.' }; }
+});
+ipcMain.handle('vpn-key-expiry-state', async (event, auth) => {
+  try { return await vpn.getKeyExpiryState(auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read key expiry state.' }; }
 });
 ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
