@@ -50,22 +50,52 @@ function isCidr(s) {
 }
 
 /* First non-internal IPv4 interface -> its network as CIDR, e.g. 192.168.1.0/24. */
-function lanSubnet() {
-  try {
-    const ifs = os.networkInterfaces();
-    for (const name of Object.keys(ifs)) {
+const VIRTUAL_IFACE_RE = /docker|veth|vmware|virtual|vbox|tailscale|wintun|wsl|hyper-v|tap|tun|br-/i;
+function isPrivateIpv4(ip) {
+  const p = String(ip || '').split('.').map(Number);
+  if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
+  if (p[0] === 10) return true;
+  if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+  if (p[0] === 192 && p[1] === 168) return true;
+  return false;
+}
+function cidrOf(a) {
+  const ip = String(a.address || '').split('.').map(Number);
+  const mask = String(a.netmask || '').split('.').map(Number);
+  if (ip.length !== 4 || mask.length !== 4 || ip.some(Number.isNaN) || mask.some(Number.isNaN)) return null;
+  const net = ip.map((b, i) => b & mask[i]);
+  const prefix = mask.reduce((n, b) => n + b.toString(2).split('1').length - 1, 0);
+  const cidr = net.join('.') + '/' + prefix;
+  return isCidr(cidr) ? cidr : null;
+}
+// Pick the LAN subnet from an os.networkInterfaces() table. Pure, so
+// it is unit-testable. Passes: (1) a real private LAN on a real
+// adapter, (2) anything on a real adapter, (3) anything at all.
+// Virtual adapters (Docker, VMware, WSL, Tailscale itself) and
+// link-local addresses (169.254.x) never win while a real LAN exists —
+// advertising a virtual subnet would send the tailnet nowhere.
+function pickLanSubnet(ifs) {
+  const passes = [
+    (name, a) => !VIRTUAL_IFACE_RE.test(name) && isPrivateIpv4(a.address),
+    (name, a) => !VIRTUAL_IFACE_RE.test(name),
+    () => true,
+  ];
+  for (const ok of passes) {
+    for (const name of Object.keys(ifs || {})) {
       for (const a of ifs[name] || []) {
         if (a.family !== 'IPv4' || a.internal) continue;
-        const ip = a.address.split('.').map(Number);
-        const mask = a.netmask.split('.').map(Number);
-        const net = ip.map((b, i) => b & mask[i]);
-        const prefix = mask.reduce((n, b) => n + b.toString(2).split('1').length - 1, 0);
-        const cidr = net.join('.') + '/' + prefix;
-        if (isCidr(cidr)) return cidr;
+        if (String(a.address || '').startsWith('169.254.')) continue;
+        if (!ok(name, a)) continue;
+        const cidr = cidrOf(a);
+        if (cidr) return cidr;
       }
     }
-  } catch (e) { /* fall through */ }
+  }
   return null;
+}
+function lanSubnet() {
+  try { return pickLanSubnet(os.networkInterfaces()); }
+  catch (e) { return null; }
 }
 
 function tailnetFromDns(dnsName) {
@@ -172,7 +202,7 @@ async function disableKeyExpiry() {
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, MSI_URL,
-  disableKeyExpiry,
+  disableKeyExpiry, pickLanSubnet, tailnetFromDns, buildInstallScript,
 };
 
 /* ---------- Auto-install (Windows only) ----------
@@ -184,16 +214,23 @@ module.exports = {
    afterwards. On any other OS this returns an error telling the user
    to install Tailscale manually — there is no silent install there. */
 
-/* Download a file, following up to 5 redirects. onProgress(done, total). */
+/* Download a file, following up to 5 redirects. onProgress(done, total).
+   An https download never downgrades to http mid-redirect. */
 function downloadFile(url, dest, onProgress) {
   return new Promise((resolve, reject) => {
+    const initialHttps = String(url).startsWith('https:');
     const get = (u, hops) => {
       if (hops > 5) return reject(new Error('Too many redirects while downloading.'));
       const lib = u.startsWith('https:') ? https : http;
       const req = lib.get(u, { headers: { 'User-Agent': 'TechVision-Backup/1.0' } }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const next = new URL(res.headers.location, u).toString();
+          if (initialHttps && !next.startsWith('https:')) {
+            res.resume();
+            return reject(new Error('Download redirected to an insecure address.'));
+          }
           res.resume();
-          return get(new URL(res.headers.location, u).toString(), hops + 1);
+          return get(next, hops + 1);
         }
         if (res.statusCode !== 200) {
           res.resume();
@@ -235,23 +272,31 @@ function verifySignature(file) {
   });
 }
 
+/* The PowerShell that runs the MSI install elevated. Extracted so it
+   is testable: $p.WaitForExit() — not Start-Process -Wait, which is
+   known to return early when combined with -Verb RunAs, leaving the
+   installer still running while the app thinks it finished. */
+function buildInstallScript(msiPath) {
+  return [
+    '$ErrorActionPreference = "Stop"',
+    'try {',
+    '  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList \'/i\', \'"' + msiPath + '"\', \'/qn\', \'/norestart\', \'TS_NOLAUNCH=true\' -Verb RunAs -PassThru',
+    '  $p.WaitForExit()',
+    '  exit $p.ExitCode',
+    '} catch {',
+    '  exit 2',
+    '}',
+  ].join('\r\n');
+}
+
 /* Silent per-machine MSI install, elevated once via UAC.
    TS_NOLAUNCH=true stops the Tailscale tray app from popping up —
    TechVision is the UI here. Returns { success, declined?, error? }. */
 function installMsiElevated(msiPath) {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') return resolve({ success: false, error: 'Automatic install is available on Windows only.' });
-    const script = [
-      '$ErrorActionPreference = "Stop"',
-      'try {',
-      '  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList \'/i\', \'"' + msiPath + '"\', \'/qn\', \'/norestart\', \'TS_NOLAUNCH=true\' -Verb RunAs -Wait -PassThru',
-      '  exit $p.ExitCode',
-      '} catch {',
-      '  exit 2',
-      '}',
-    ].join('\r\n');
     const scriptPath = path.join(os.tmpdir(), 'techvision-install-tailscale.ps1');
-    fs.writeFileSync(scriptPath, script, 'utf8');
+    fs.writeFileSync(scriptPath, buildInstallScript(msiPath), 'utf8');
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { timeout: 600000, windowsHide: true }, (err) => {
       try { fs.unlinkSync(scriptPath); } catch (e) {}
       if (err) {
@@ -291,6 +336,7 @@ async function installAndConnect(progress) {
       emit('downloading', total > 0 ? Math.round((done / total) * 100) : 0, 'Downloading Tailscale…');
     });
   } catch (e) {
+    try { fs.unlinkSync(msi); } catch (_) {}
     return { success: false, error: 'Could not download Tailscale: ' + e.message };
   }
   emit('verifying', 0, 'Verifying the installer…');

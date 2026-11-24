@@ -17,6 +17,8 @@ const crypto = require('crypto');
 const https = require('https');
 
 const API_TIMEOUT_MS = 15000;
+const TRANSFER_STALL_MS = 60000; // no data for this long = give up
+const MAX_JSON_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 function fingerprintOfDer(derBuffer) {
   return crypto.createHash('sha256').update(derBuffer).digest('hex');
@@ -68,8 +70,15 @@ function doJson(conn, method, apiPath, body) {
     if (data) headers['Content-Length'] = Buffer.byteLength(data);
     const req = https.request(pinnedOptions(conn, method, apiPath, headers), (res) => {
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      let size = 0;
+      let tooBig = false;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > MAX_JSON_RESPONSE_BYTES) { tooBig = true; req.destroy(new Error('Server response is too large.')); return; }
+        chunks.push(c);
+      });
       res.on('end', () => {
+        if (tooBig) return reject(new Error('Server response is too large.'));
         let obj = {};
         try { obj = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch (e) { /* keep {} */ }
         if (res.statusCode >= 400) return reject(new Error((obj && obj.error) || ('Server error ' + res.statusCode)));
@@ -91,6 +100,10 @@ function mapTlsError(e) {
     return 'The server certificate does not match the trusted one. If the server was reinstalled, remove it and add it again to trust the new certificate.';
   }
   return e.message || String(e);
+}
+
+async function logout(conn) {
+  try { await doJson(conn, 'POST', '/api/logout'); } catch (e) { /* the token is dropped locally either way */ }
 }
 
 async function login(host, port, certPem, user, password) {
@@ -123,6 +136,23 @@ async function rename(conn, from, to) {
 
 function download(conn, relPath, destPath, onProgress) {
   return new Promise((resolve, reject) => {
+    let done = false;
+    const fail = (e) => {
+      if (done) return;
+      done = true;
+      try { req.destroy(); } catch (_) {}
+      try { if (ws) ws.destroy(); } catch (_) {}
+      // Never leave a truncated file that looks like a good download.
+      try { fs.unlinkSync(destPath); } catch (_) {}
+      reject(e);
+    };
+    let ws = null;
+    let stallTimer = null;
+    const armStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => fail(new Error('Download stalled — no data for a minute.')), TRANSFER_STALL_MS);
+      if (stallTimer.unref) stallTimer.unref();
+    };
     const headers = {};
     if (conn.token) headers.Authorization = 'Bearer ' + conn.token;
     const req = https.request(pinnedOptions(conn, 'GET', '/api/download?path=' + encodeURIComponent(relPath), headers), (res) => {
@@ -132,23 +162,33 @@ function download(conn, relPath, destPath, onProgress) {
         res.on('end', () => {
           let msg = 'Download failed.';
           try { msg = JSON.parse(Buffer.concat(chunks).toString('utf8')).error || msg; } catch (e) {}
-          reject(new Error(msg));
+          fail(new Error(msg));
         });
         return;
       }
       const total = parseInt(res.headers['content-length'] || '0', 10) || 0;
-      let done = 0;
-      const ws = fs.createWriteStream(destPath);
+      let received = 0;
+      ws = fs.createWriteStream(destPath);
+      armStall();
       res.on('data', (c) => {
-        done += c.length;
-        if (typeof onProgress === 'function') { try { onProgress(done, total); } catch (e) {} }
+        received += c.length;
+        armStall();
+        if (typeof onProgress === 'function') { try { onProgress(received, total); } catch (e) {} }
       });
       res.pipe(ws);
-      ws.on('finish', () => resolve({ size: done }));
-      ws.on('error', reject);
-      res.on('error', reject);
+      ws.on('finish', () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        if (done) return;
+        // The server promised `total` bytes: a short file is a failed
+        // download, not a successful one.
+        if (total > 0 && received !== total) return fail(new Error('Download was cut short (' + received + ' of ' + total + ' bytes). Try again.'));
+        done = true;
+        resolve({ size: received });
+      });
+      ws.on('error', (e) => fail(e));
+      res.on('error', (e) => fail(e));
     });
-    req.on('error', (e) => reject(new Error(mapTlsError(e))));
+    req.on('error', (e) => fail(new Error(mapTlsError(e))));
     req.end();
   });
 }
@@ -157,28 +197,50 @@ function upload(conn, localPath, remoteDir, onProgress) {
   return new Promise((resolve, reject) => {
     let total = 0;
     try { total = fs.statSync(localPath).size; } catch (e) { return reject(e); }
+    let done = false;
+    const fail = (e) => {
+      if (done) return;
+      done = true;
+      try { rs.destroy(); } catch (_) {}
+      try { req.destroy(); } catch (_) {}
+      reject(e);
+    };
     const headers = { 'X-Filename': path.basename(localPath) };
     if (conn.token) headers.Authorization = 'Bearer ' + conn.token;
+    let stallTimer = null;
+    const armStall = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => fail(new Error('Upload stalled — no data sent for a minute.')), TRANSFER_STALL_MS);
+      if (stallTimer.unref) stallTimer.unref();
+    };
     const req = https.request(pinnedOptions(conn, 'POST', '/api/upload?path=' + encodeURIComponent(remoteDir || ''), headers), (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        // The server answered early (e.g. read-only or too large):
+        // stop sending the rest of the file.
+        try { rs.destroy(); } catch (_) {}
         let obj = {};
         try { obj = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch (e) {}
-        if (res.statusCode >= 400) return reject(new Error((obj && obj.error) || ('Upload failed (' + res.statusCode + ')')));
+        if (done) return;
+        if (res.statusCode >= 400) return fail(new Error((obj && obj.error) || ('Upload failed (' + res.statusCode + ')')));
+        done = true;
         resolve(obj);
       });
     });
-    req.on('error', (e) => reject(new Error(mapTlsError(e))));
+    req.on('error', (e) => fail(new Error(mapTlsError(e))));
     let sent = 0;
     const rs = fs.createReadStream(localPath);
+    armStall();
     rs.on('data', (c) => {
       sent += c.length;
+      armStall();
       if (typeof onProgress === 'function') { try { onProgress(sent, total); } catch (e) {} }
     });
-    rs.on('error', reject);
+    rs.on('error', (e) => fail(e));
     rs.pipe(req);
   });
 }
 
-module.exports = { probeServer, login, info, list, mkdir, remove, rename, download, upload, fingerprintOfDer, derToPem };
+module.exports = { probeServer, login, logout, info, list, mkdir, remove, rename, download, upload, fingerprintOfDer, derToPem };

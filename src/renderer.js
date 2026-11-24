@@ -619,7 +619,7 @@
     var ss = $('cloudServerModeStatus');
     if (ss) ss.textContent = s.running ? ('Running — port ' + (s.port || 8443)) : 'Stopped';
     var cs = $('cloudClientModeStatus');
-    if (cs) cs.textContent = cloudConn ? ('Connected as ' + (cloudConn.info.user || '') + ' @ ' + (cloudSelected ? cloudSelected.name : '')) : 'Not connected';
+    if (cs) cs.textContent = cloudConn ? ('Connected as ' + (cloudConn.info.user || '') + ' @ ' + (cloudConn.name || '')) : 'Not connected';
   }
 
   /* ---------- Cloud access: Normal vs Tailscale VPN ----------
@@ -819,6 +819,7 @@
             id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
             port: cloudSelected.port, user: cloudSelected.user,
             fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
+            accessMode: cloudClientAccess,
           });
           if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
           cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
@@ -871,7 +872,8 @@
         certPem: certPem, user: cloudSelected.user, password: password,
       });
       if (!r || !r.success) { toast('Connection failed', (r && r.error) || 'Wrong user name or password.', 'error'); return; }
-      cloudConn = { serverId: cloudSelected.id, info: r.info };
+      // Keep the server name: closeCloudConnect() clears cloudSelected.
+      cloudConn = { serverId: cloudSelected.id, info: r.info, name: cloudSelected.name };
       if (pass) pass.value = '';
       closeCloudConnect();
       cloudPath = '';
@@ -897,6 +899,17 @@
   }
 
   function cloudJoin(base, name) { return base ? base + '/' + name : name; }
+  // A rename / new-folder name is one segment, not a path: no slashes,
+  // no "..", none of the characters Windows forbids in a file name.
+  function isSingleCloudName(val) {
+    if (typeof val !== 'string') return false;
+    var v = val.trim();
+    if (!v || v === '.' || v === '..') return false;
+    if (/[/\\]/.test(v)) return false;
+    if (/[<>:"|?*\u0000-\u001f]/.test(v)) return false;
+    return true;
+  }
+  var cloudTransferBusy = false; // one transfer at a time (no double-clicks)
   function cloudParent(p) {
     var i = p.lastIndexOf('/');
     return i < 0 ? '' : p.slice(0, i);
@@ -920,7 +933,7 @@
     if (crumbs) {
       crumbs.innerHTML = '';
       var rootBtn = document.createElement('button');
-      rootBtn.className = 'cloud-crumb'; rootBtn.type = 'button'; rootBtn.textContent = (cloudSelected ? cloudSelected.name : 'Server') + ' /';
+      rootBtn.className = 'cloud-crumb'; rootBtn.type = 'button'; rootBtn.textContent = (cloudConn && cloudConn.name ? cloudConn.name : 'Server') + ' /';
       rootBtn.addEventListener('click', function () { cloudBrowse(''); });
       crumbs.appendChild(rootBtn);
       var parts = cloudPath ? cloudPath.split('/') : [];
@@ -969,6 +982,7 @@
         ren.addEventListener('click', function () {
           askCloudInput('Rename', 'New name', e.name, async function (val) {
             if (!val || val === e.name) return;
+            if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
             if (!api || typeof api.cloudClientRename !== 'function') return cloudMissing();
             try {
               var r = await api.cloudClientRename(cloudConn.serverId, rel, cloudJoin(cloudPath, val));
@@ -998,11 +1012,12 @@
   }
 
   async function cloudDownload(relPath) {
-    if (!cloudConn) return;
+    if (!cloudConn || cloudTransferBusy) return;
     if (!api || typeof api.showOpenDialog !== 'function' || typeof api.cloudClientDownload !== 'function') return cloudMissing();
     try {
       var pick = await api.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
       if (!pick || pick.canceled || !pick.filePaths || !pick.filePaths.length) return;
+      cloudTransferBusy = true;
       showCloudTransfer('Downloading…', 0);
       var r = await api.cloudClientDownload(cloudConn.serverId, relPath, pick.filePaths[0]);
       hideCloudTransfer();
@@ -1011,15 +1026,18 @@
     } catch (e) {
       hideCloudTransfer();
       toast('Download error', e && e.message ? e.message : 'Could not download.', 'error');
+    } finally {
+      cloudTransferBusy = false;
     }
   }
 
   async function cloudUpload() {
-    if (!cloudConn) return;
+    if (!cloudConn || cloudTransferBusy) return;
     if (!api || typeof api.showOpenDialog !== 'function' || typeof api.cloudClientUpload !== 'function') return cloudMissing();
     try {
       var pick = await api.showOpenDialog({ properties: ['openFile'] });
       if (!pick || pick.canceled || !pick.filePaths || !pick.filePaths.length) return;
+      cloudTransferBusy = true;
       showCloudTransfer('Uploading…', 0);
       var r = await api.cloudClientUpload(cloudConn.serverId, pick.filePaths[0], cloudPath);
       hideCloudTransfer();
@@ -1028,6 +1046,8 @@
     } catch (e) {
       hideCloudTransfer();
       toast('Upload error', e && e.message ? e.message : 'Could not upload.', 'error');
+    } finally {
+      cloudTransferBusy = false;
     }
   }
 
@@ -1856,6 +1876,7 @@
     if (cmb) cmb.addEventListener('click', function () {
       askCloudInput('New folder', 'Folder name', '', async function (val) {
         if (!val) return;
+        if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
         if (!api || typeof api.cloudClientMkdir !== 'function') return cloudMissing();
         try {
           var r = await api.cloudClientMkdir(cloudConn.serverId, cloudJoin(cloudPath, val));

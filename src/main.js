@@ -321,6 +321,24 @@ function appendAppLog(level, message) {
   } catch (e) { /* logging must never break a backup */ }
 }
 
+// Last resort: an uncaught exception used to kill the whole app —
+// scheduler, tray and Cloud server included — with no message at all.
+// Log it and keep running instead; the individual handlers are still
+// responsible for their own errors, this only stops one bad request
+// from taking everything down.
+process.on('uncaughtException', (err) => {
+  try {
+    console.error('[Main] Uncaught exception:', err);
+    appendAppLog('error', '[Main] Uncaught exception: ' + (err && err.stack ? err.stack : String(err)));
+  } catch (e) { /* logging must never break the app */ }
+});
+process.on('unhandledRejection', (reason) => {
+  try {
+    console.error('[Main] Unhandled rejection:', reason);
+    appendAppLog('error', '[Main] Unhandled rejection: ' + (reason && reason.stack ? reason.stack : String(reason)));
+  } catch (e) { /* logging must never break the app */ }
+});
+
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
   let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
@@ -1493,6 +1511,8 @@ ipcMain.handle('cloud-server-save', async (event, opts) => {
       await getCloudServer().stop();
     }
   } catch (e) {
+    // The server is down: do not leave enabled=true in the config.
+    try { cfg.server.enabled = false; saveCloudConfig(); } catch (_) {}
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
   return { success: true, status: getCloudServer().status() };
@@ -1503,8 +1523,12 @@ ipcMain.handle('cloud-server-start', async () => {
     const cfg = getCloudConfig();
     cfg.server.enabled = true;
     saveCloudConfig();
-    return { success: true, status: await getCloudServer().start() };
+    const status = await getCloudServer().start();
+    return { success: true, status };
   } catch (e) {
+    // Do not leave enabled=true in the config when the server is
+    // actually down — the next launch would fail the same way.
+    try { const cfg = getCloudConfig(); cfg.server.enabled = false; saveCloudConfig(); } catch (_) {}
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
 });
@@ -1556,11 +1580,18 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     if (!host) return { success: false, error: 'Server address is required.' };
     if (!port || port < 1 || port > 65535) return { success: false, error: 'Port must be between 1 and 65535.' };
     const id = s.id || ('srv-' + Date.now());
-    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode: s.accessMode === 'tailscale' ? 'tailscale' : 'normal' };
     // Same host + port + user is the same server: update it in place
     // instead of adding a duplicate row every time it is saved again.
     let i = cfg.clients.findIndex((c) => c.id === id);
-    if (i < 0) i = cfg.clients.findIndex((c) => c.host === host && c.port === port && c.user === rec.user);
+    if (i < 0) i = cfg.clients.findIndex((c) => c.host === host && c.port === port && c.user === String(s.user || ''));
+    const existing = i >= 0 ? cfg.clients[i] : null;
+    // Keep the saved access mode when the caller did not send one
+    // (e.g. the trust flow): a Tailscale server must not silently
+    // become Normal on re-save.
+    const accessMode = s.accessMode === 'tailscale' ? 'tailscale'
+      : s.accessMode === 'normal' ? 'normal'
+      : (existing && existing.accessMode === 'tailscale' ? 'tailscale' : 'normal');
+    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode };
     if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
     else cfg.clients.push(rec);
     saveCloudConfig();
@@ -1600,6 +1631,10 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
 });
 
 ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
+  const conn = cloudSessions.get(serverId);
+  if (conn) {
+    try { await cloudClient.logout(conn); } catch (e) { /* local drop is enough */ }
+  }
   cloudSessions.delete(serverId);
   return { success: true };
 });
