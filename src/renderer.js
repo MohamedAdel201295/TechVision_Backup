@@ -322,6 +322,7 @@
     if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
     if (vpnView) vpnView.style.display = name === 'vpn' ? '' : 'none';
     if (modulesView) modulesView.style.display = name === 'modules' ? '' : 'none';
+    var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
     document.body.classList.toggle('modules-mode', name === 'modules');
     var bb = $('backBar'); if (bb) bb.style.display = name === 'modules' ? 'none' : '';
     var hdr = $('appHeader'); if (hdr) hdr.style.display = name === 'modules' ? 'none' : '';
@@ -1884,6 +1885,9 @@
   // The console button only shows when the approval is missing and
   // the API cannot do it, and the note then carries the real reason.
   var vpnRoutesLastApproveTry = 0;
+  var vpnRoutesApprovedHint = null; // {subnet, at} — a successful approve
+  // call is trusted for a minute, so the note says "approved" at once
+  // instead of waiting for the control plane to show it on a re-read.
   async function refreshVpnRoutesState() {
     var rn = $('vpnRoutesNote');
     var ab = $('vpnApproveBtn');
@@ -1901,6 +1905,7 @@
       if (rn) { rn.style.display = ''; rn.textContent = approvedNote; }
       if (ab) ab.style.display = 'none';
     };
+    if (vpnRoutesApprovedHint && vpnRoutesApprovedHint.subnet === st.lanSubnet && Date.now() - vpnRoutesApprovedHint.at < 60000) { showApproved(); return; }
     var auth = vpnAuth();
     if (!auth || !api || typeof api.vpnGetRoutes !== 'function') { showWaiting(); return; }
     try {
@@ -1911,7 +1916,7 @@
       if (typeof api.vpnApproveRoutes === 'function' && Date.now() - vpnRoutesLastApproveTry > 60000) {
         vpnRoutesLastApproveTry = Date.now();
         var ap = await api.vpnApproveRoutes(auth, [st.lanSubnet]);
-        if (ap && ap.success) { showApproved(); return; }
+        if (ap && ap.success) { vpnRoutesApprovedHint = { subnet: st.lanSubnet, at: Date.now() }; showApproved(); return; }
         showWaiting('Advertising ' + st.lanSubnet + ' — automatic approval failed: ' + ((ap && ap.error) || 'unknown error') + ' — approve it in the Tailscale admin console.');
         return;
       }
@@ -2179,7 +2184,7 @@
       var ap = $('vpnAdminPass'); if (ap) ap.value = '';
       var vcb3 = $('vpnConnectBtn'); if (vcb3) { vcb3.disabled = false; vcb3.textContent = 'Install & connect'; }
     });
-    var vrb = $('vpnRefreshBtn');
+    var vrb = $('vpnTopRefreshBtn');
     if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
     // Peers appear on their own: while the VPN view is open, or the Cloud
     // client panel is open in Tailscale mode, re-read Tailscale status
@@ -2259,19 +2264,36 @@
       try {
         var r = await api.vpnSetRoutes(on, vpnAuth());
         if (r && r.success) {
+          // Update the cached status right away, so the view agrees
+          // with the toggle without waiting for a slow `tailscale
+          // status` re-read — and trust the approve call itself: the
+          // note must say "approved" now, not after the next 15-second
+          // poll (the control plane can take a few seconds to show it
+          // on a re-read, which is exactly the long "waiting…" the
+          // user saw).
+          if (vpnStatusCache) {
+            var adv = vpnStatusCache.advertiseRoutes || [];
+            if (on && r.subnet && adv.indexOf(r.subnet) < 0) adv = adv.concat([r.subnet]);
+            if (!on) adv = [];
+            vpnStatusCache.advertiseRoutes = adv;
+            if (r.subnet) vpnStatusCache.lanSubnet = r.subnet;
+          }
           if (on) {
-            if (r.approved) toast('VPN', 'Sharing your home network — the route was approved automatically.', 'success');
-            else {
-              // No credential saved (or the approval failed): the route
-              // is advertised but does nothing until it is approved in
-              // the console — open it right away, and keep the button.
+            if (r.approved) {
+              vpnRoutesApprovedHint = { subnet: r.subnet, at: Date.now() };
+              toast('VPN', 'Sharing your home network — the route was approved automatically.', 'success');
+            } else {
+              vpnRoutesApprovedHint = null;
               if (typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
               toast('VPN', 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' + (r.approveError ? ' The automatic approval failed: ' + r.approveError : ''), 'success');
             }
-          } else toast('VPN', 'No longer sharing your home network.', 'success');
-        } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
-        await loadVpn();
-      } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
+          } else {
+            vpnRoutesApprovedHint = null;
+            toast('VPN', 'No longer sharing your home network.', 'success');
+          }
+          refreshVpnRoutesState();
+        } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; await loadVpn(); }
+      } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; await loadVpn(); }
     });
     var vab2 = $('vpnApproveBtn');
     if (vab2) vab2.addEventListener('click', async function () {

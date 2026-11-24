@@ -234,6 +234,7 @@ async function ensureGuiRunning() {
 }
 
 async function setConnected(on, timeoutMs, onAuthUrl) {
+  cachedDeviceId = null; // the identity may have changed; re-read it once on next use
   if (on) {
     // Open the Tailscale app first when it is not running — otherwise
     // the backend never leaves NoState and Connect looks dead.
@@ -375,11 +376,20 @@ async function apiFetch(apiPath, authHeader, opts) {
   } finally { clearTimeout(timer); }
 }
 
+/* The device ID never changes for this device, but reading it costs a
+   slow `tailscale status --json` call every time — and every API
+   operation (key expiry, routes) used to pay that cost, which is why
+   flipping the subnet toggle felt like it took forever. Read it once
+   and keep it; a connect/disconnect clears it in case the identity
+   changed. */
+let cachedDeviceId = null;
 async function selfDeviceId() {
+  if (cachedDeviceId) return { id: cachedDeviceId, error: null };
   const st = await getStatus();
   if (!st.installed) return { id: null, error: 'Tailscale is not installed on this computer.' };
   if (!st.connected) return { id: null, error: 'Connect to Tailscale first.' };
   if (!st.deviceId) return { id: null, error: 'Could not find this device in Tailscale status.' };
+  cachedDeviceId = st.deviceId;
   return { id: st.deviceId, error: null };
 }
 
