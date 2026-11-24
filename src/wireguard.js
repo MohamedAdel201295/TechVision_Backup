@@ -777,8 +777,18 @@ function downloadAmneziaInstaller(destDir, onProgress) {
 /* Parses the JSON from Get-AuthenticodeSignature. Windows PowerShell
    5.1 renders enums as NUMBERS (Valid = 0), PowerShell 7 as names —
    accept both (same lesson as vpn.js parseSignatureResult). Valid
-   only when the status is Valid AND the signer subject names Amnezia
-   — a valid signature from anyone else is not this installer. */
+   only when the status is Valid AND the signer is the Amnezia
+   project's publisher. VERIFIED 2026-11-24 against the real 3.1.0
+   MSI (amneziawg-amd64-3.1.0.msi, 3,641,344 bytes): the signer is
+   NOT "Amnezia" — it is "Privacy Technologies OU" (CN=Privacy
+   Technologies OU, O=Privacy Technologies OU, S=Harjumaa, C=EE,
+   issued by Sectigo Public Code Signing CA R36, cert valid
+   2023-08-31 → 2026-08-30, timestamped so Windows still reports
+   Valid). The earlier /Amnezia/i-only check rejected this real
+   installer with "(signature status: Valid)" — a valid signature
+   from the real publisher. Accept both names; when the status is
+   Valid but the signer matches neither, the detail names the
+   signer so the failure is diagnosable from the toast alone. */
 function parseAmneziaSignatureResult(stdout) {
   try {
     const j = JSON.parse(stdout);
@@ -786,8 +796,9 @@ function parseAmneziaSignatureResult(stdout) {
     const st = o.Status;
     const statusName = typeof st === 'number' ? (st === 0 ? 'Valid' : 'Status(' + st + ')') : (st || 'unknown');
     const subject = typeof o.Subject === 'string' ? o.Subject : null;
-    const valid = (st === 'Valid' || st === 0) && !!subject && /Amnezia/i.test(subject);
-    return { ok: valid, status: statusName, subject };
+    const valid = (st === 'Valid' || st === 0) && !!subject && (/Amnezia/i.test(subject) || /Privacy Technologies/i.test(subject));
+    const detail = (!valid && (st === 'Valid' || st === 0) && subject) ? ('signer is not Amnezia: ' + subject) : undefined;
+    return { ok: valid, status: statusName, subject, detail };
   } catch (e) {
     return { ok: false, status: 'check-failed', detail: 'could not read the signature result' };
   }

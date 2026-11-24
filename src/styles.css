@@ -568,7 +568,7 @@ body.modules-mode #appHeader { display: none !important; }
 .seg-btn:hover { border-color: rgba(14, 165, 233, .4); }
 .seg-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
-/* ---------- TechVision VPN ---------- */
+/* ---------- TechVision Tailscale VPN ---------- */
 /* Plain card: the VPN view (3 times) and the WireGuard view use .card.
    Before this rule the sections were bare divs with no background,
    border or padding — the page looked flat. */

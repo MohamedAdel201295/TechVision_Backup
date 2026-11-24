@@ -37,7 +37,7 @@
       <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
     </div>
     <div class="nav-group" id="navGroupVpn" style="display:none;">
-      <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> VPN</button>
+      <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> Tailscale VPN</button>
     </div>
     <div class="nav-group" id="navGroupWireguard" style="display:none;">
       <button class="nav-item" type="button" data-nav="wireguard"><span class="ico">🔐</span> WireGuard VPN</button>
@@ -66,7 +66,7 @@
           </button>
           <button class="module-card" type="button" data-module-enter="vpn">
             <span class="module-card-ico">🛡️</span>
-            <span class="module-card-title">TechVision VPN</span>
+            <span class="module-card-title">TechVision Tailscale VPN</span>
           </button>
           <button class="module-card" type="button" data-module-enter="wireguard">
             <span class="module-card-ico">🔐</span>
@@ -403,7 +403,6 @@
         <button class="btn" type="button" id="vpnConnectBtn">Connect</button>
       </div>
       <div id="vpnNotInstalled" style="display:none;">
-        <p style="margin:8px 0 4px;">Tailscale is not installed on this computer.</p>
         <p class="t-sub" style="margin:0 0 10px;">Press <b>Install &amp; connect</b> and the app downloads Tailscale from tailscale.com, checks the installer's signature, and installs it (Windows asks for administrator permission once), then signs you in.</p>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn" type="button" id="vpnDownloadBtn">Download Tailscale</button>
@@ -505,7 +504,6 @@
         <button class="btn" type="button" id="wgRefreshBtn">Refresh</button>
       </div>
       <div id="wgNotInstalled" style="display:none;">
-        <p style="margin:8px 0 4px;">AmneziaWG is not installed on this computer.</p>
         <p class="t-sub" style="margin:0 0 10px;">Install it with one click — TechVision downloads the official AmneziaWG installer, checks its signature, and installs it. Installing a tunnel needs administrator permission once.</p>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn btn-primary" type="button" id="wgInstallBtn">Install AmneziaWG</button>

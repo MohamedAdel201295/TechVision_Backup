@@ -355,7 +355,7 @@
     if (name === 'vpn') {
       applyModuleUI('vpn');
       setBackTitle('VPN');
-      setAppTitle('TechVision VPN', 'Your private network — every device, anywhere, as if it were home.');
+      setAppTitle('TechVision Tailscale VPN', 'Your private network — every device, anywhere, as if it were home.');
       loadVpn();
     }
     if (name === 'wireguard') {
@@ -1850,7 +1850,7 @@
     var e = $('vaultUnlockError'); if (e) e.classList.remove('show');
   }
 
-  /* ---------- TechVision VPN (Tailscale client manager) ----------
+  /* ---------- TechVision Tailscale VPN (Tailscale client manager) ----------
      One panel per machine: status, connect/disconnect, peers, subnet
      router. There is no VPN server to build — Tailscale is a mesh and
      its coordination server is Tailscale's own. The Cloud module plugs

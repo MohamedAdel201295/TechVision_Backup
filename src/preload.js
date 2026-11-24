@@ -133,7 +133,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wgNatStatus: () => ipcRenderer.invoke('wg-nat-status'),
   wgNatSave: (config) => ipcRenderer.invoke('wg-nat-save', config),
   wgInstallAmneziawg: () => ipcRenderer.invoke('wg-install-amneziawg'),
-  // TechVision VPN — Tailscale client manager (no VPN of its own)
+  // TechVision Tailscale VPN — Tailscale client manager (no VPN of its own)
   vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
   vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
   vpnSetRoutes: (on, auth) => ipcRenderer.invoke('vpn-set-routes', on, auth),

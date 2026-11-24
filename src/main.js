@@ -2182,7 +2182,7 @@ ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
   return { success: true, dest };
 });
 
-// ---------- TechVision VPN (Tailscale client manager) ----------
+// ---------- TechVision Tailscale VPN (Tailscale client manager) ----------
 // The module only shells out to the Tailscale CLI that is already
 // installed on the machine; it implements no VPN of its own.
 ipcMain.handle('vpn-get-status', async () => {
