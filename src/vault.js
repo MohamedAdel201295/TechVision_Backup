@@ -37,7 +37,10 @@ function readVault(userDataDir) {
   const p = getVaultPath(userDataDir);
   if (!fs.existsSync(p)) return null;
   const data = JSON.parse(fs.readFileSync(p, 'utf-8'));
-  if (!data || data.version !== 1 || !data.salt || !data.check || typeof data.jobs !== 'object') {
+  // jobs must be a plain object: a torn write that left `jobs: []`
+  // (or null) used to pass the typeof check and then either throw a
+  // TypeError on store or silently lose every stored password.
+  if (!data || data.version !== 1 || !data.salt || !data.check || !data.jobs || typeof data.jobs !== 'object' || Array.isArray(data.jobs)) {
     throw new Error('Vault file is corrupt or from an unknown version.');
   }
   return data;
@@ -46,7 +49,23 @@ function readVault(userDataDir) {
 function writeVault(userDataDir, data) {
   const dir = path.join(userDataDir, '.techvision');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(getVaultPath(userDataDir), JSON.stringify(data, null, 2));
+  // Atomic write: a direct overwrite used to leave a truncated
+  // vault.json after a crash/power loss/disk-full mid-write, losing
+  // EVERY stored job password unrecoverably. Write to a temp file,
+  // keep the previous good copy as vault.json.bak, then rename.
+  const vaultPath = getVaultPath(userDataDir);
+  const tmpPath = vaultPath + '.tmp-' + process.pid;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+  try {
+    if (fs.existsSync(vaultPath)) fs.copyFileSync(vaultPath, vaultPath + '.bak');
+  } catch (e) { /* backup copy is best-effort; the rename still proceeds */ }
+  fs.renameSync(tmpPath, vaultPath);
+}
+
+// Wipe derived key material from memory when the vault is locked.
+// Assigning the reference to null alone leaves the bytes in the heap.
+function lockVault(key) {
+  if (key && Buffer.isBuffer(key)) key.fill(0);
 }
 
 function deriveKey(masterPassword, saltB64) {
@@ -127,21 +146,27 @@ function changeMasterPassword(userDataDir, oldPassword, newPassword) {
     throw new Error('New master password must be at least 8 characters.');
   }
   const oldKey = unlockVault(userDataDir, oldPassword); // throws on wrong old password
-  const data = readVault(userDataDir);
-  const newSalt = crypto.randomBytes(16).toString('base64');
-  const newKey = deriveKey(newPassword, newSalt);
-  // Re-encrypt every stored job password under the new key.
-  const jobs = {};
-  for (const jobId of Object.keys(data.jobs)) {
-    const pw = decryptWithKey(oldKey, data.jobs[jobId]);
-    jobs[jobId] = encryptWithKey(newKey, pw);
+  try {
+    const data = readVault(userDataDir);
+    const newSalt = crypto.randomBytes(16).toString('base64');
+    const newKey = deriveKey(newPassword, newSalt);
+    // Re-encrypt every stored job password under the new key.
+    // A corrupt entry throws here BEFORE anything is written, so the
+    // vault is never left half-re-encrypted.
+    const jobs = {};
+    for (const jobId of Object.keys(data.jobs)) {
+      const pw = decryptWithKey(oldKey, data.jobs[jobId]);
+      jobs[jobId] = encryptWithKey(newKey, pw);
+    }
+    writeVault(userDataDir, { version: 1, salt: newSalt, check: encryptWithKey(newKey, CHECK_PLAINTEXT), jobs: jobs });
+    return newKey;
+  } finally {
+    lockVault(oldKey);
   }
-  writeVault(userDataDir, { version: 1, salt: newSalt, check: encryptWithKey(newKey, CHECK_PLAINTEXT), jobs: jobs });
-  return newKey;
 }
 
 module.exports = {
-  getVaultPath, vaultExists, setupVault, unlockVault,
+  getVaultPath, vaultExists, setupVault, unlockVault, lockVault,
   storeJobPassword, getJobPassword, hasJobPassword,
   removeJobPassword, changeMasterPassword
 };

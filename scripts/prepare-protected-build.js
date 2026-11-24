@@ -48,7 +48,7 @@ const stagingSrc = path.join(stagingDir, 'src');
 const MAIN_FILES = [
   'main.js', 'techvision-core.js', 'restore.js', 'zip-aes.js',
   'mailer.js', 'vault.js', 'drive-resolver.js',
-  'cloud-server.js', 'cloud-client.js',
+  'cloud-server.js', 'cloud-client.js', 'vpn.js',
 ];
 // preload.js is deliberately NOT compiled (see the header comment).
 const RENDERER_FILES = [

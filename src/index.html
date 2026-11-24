@@ -22,6 +22,7 @@
       <div class="nav-label">Modules</div>
       <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
       <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
+      <button class="module-item" type="button" data-module="vpn"><span class="ico">🛡️</span> VPN</button>
     </div>
     <div class="nav-group" id="navGroupBackup">
       <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
@@ -33,6 +34,9 @@
     <div class="nav-group" id="navGroupCloud" style="display:none;">
       <button class="nav-item" type="button" data-nav="cloud-server"><span class="ico">🖥️</span> Server</button>
       <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
+    </div>
+    <div class="nav-group" id="navGroupVpn" style="display:none;">
+      <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> VPN</button>
     </div>
     <div class="sidebar-foot">
       <div>TechVision Backup</div>
@@ -55,6 +59,10 @@
           <button class="module-card" type="button" data-module-enter="cloud">
             <span class="module-card-ico">☁</span>
             <span class="module-card-title">TechVision Cloud</span>
+          </button>
+          <button class="module-card" type="button" data-module-enter="vpn">
+            <span class="module-card-ico">🛡️</span>
+            <span class="module-card-title">TechVision VPN</span>
           </button>
         </div>
       </div>
@@ -227,6 +235,19 @@
         <label class="switch"><input type="checkbox" id="cloudServerEnabled"><span class="slider"></span></label>
       </div>
       <div class="field">
+        <label>How clients reach this server</label>
+        <div class="seg" id="cloudServerAccessSeg">
+          <button class="seg-btn active" type="button" data-access="normal">🌐 Normal (Internet)</button>
+          <button class="seg-btn" type="button" data-access="tailscale">🛡️ Tailscale VPN</button>
+        </div>
+        <div class="hint" id="cloudServerAccessHint">Clients use your public static IP or DDNS + this port (forward the port in your router).</div>
+      </div>
+      <div class="field" id="cloudTailscaleInfo" style="display:none;">
+        <label>Tailscale address of this computer</label>
+        <div id="cloudTailscaleIp" class="cloud-muted">Checking Tailscale…</div>
+        <div class="hint">Clients on the same Tailscale network use this address + the port. No port forwarding needed.</div>
+      </div>
+      <div class="field">
         <label for="cloudServerPort">Port</label>
         <input type="text" id="cloudServerPort" value="8443" autocomplete="off">
         <div class="hint">Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.</div>
@@ -236,7 +257,7 @@
         <div id="cloudServerAddrs" class="cloud-muted">Detect your addresses to see them here.</div>
         <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn" style="margin-top:6px;">Detect my addresses</button>
       </div>
-      <div class="settings-guide">
+      <div class="settings-guide" id="cloudForwardGuide">
         <div class="settings-guide-title">To reach this server from outside</div>
         <ul>
           <li>Router: forward TCP port <b id="cloudGuidePort">8443</b> to this computer's LAN address.</li>
@@ -278,6 +299,19 @@
       <div class="field">
         <label for="cloudClientName">Name</label>
         <input type="text" id="cloudClientName" placeholder="e.g. Home server" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>Connection</label>
+        <div class="seg" id="cloudClientAccessSeg">
+          <button class="seg-btn active" type="button" data-access="normal">🌐 Normal (Internet)</button>
+          <button class="seg-btn" type="button" data-access="tailscale">🛡️ Tailscale VPN</button>
+        </div>
+        <div class="hint" id="cloudClientAccessHint">Public IP, DDNS hostname or LAN IP of the server.</div>
+      </div>
+      <div class="field" id="cloudClientPeerField" style="display:none;">
+        <label for="cloudClientPeer">Pick a device from your Tailscale network</label>
+        <select id="cloudClientPeer"></select>
+        <div class="hint">Both devices must be on the same Tailscale network — see the VPN module.</div>
       </div>
       <div class="field">
         <label for="cloudClientHost">Server address (public IP, LAN IP or hostname)</label>
@@ -336,6 +370,58 @@
           <p>Nothing here yet.</p>
         </div>
       </div>
+    </div>
+  </div>
+  <div id="view-vpn" style="display:none;">
+    <div class="card">
+      <div class="vpn-status-row">
+        <div>
+          <div class="t-label">Tailscale status</div>
+          <div class="vpn-status" id="vpnStatusText">Checking…</div>
+          <div class="t-sub" id="vpnStatusSub"></div>
+        </div>
+        <button class="btn" type="button" id="vpnConnectBtn">Connect</button>
+      </div>
+      <div id="vpnNotInstalled" style="display:none;">
+        <p style="margin:8px 0 4px;">Tailscale is not installed on this computer.</p>
+        <p class="t-sub" style="margin:0 0 10px;">Press <b>Install &amp; connect</b> and the app downloads Tailscale from tailscale.com, checks the installer's signature, and installs it — Windows will ask for administrator permission once — then signs you in. Or install it yourself from the button below.</p>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn" type="button" id="vpnDownloadBtn">Download Tailscale</button>
+          <button class="btn btn-ghost" type="button" id="vpnRecheckBtn">Check again</button>
+        </div>
+      </div>
+      <div id="vpnInstallBox" style="display:none; margin-top:12px;">
+        <div class="progress-track"><div class="progress-fill" id="vpnInstallFill" style="width:0%"></div></div>
+        <div class="cloud-muted" id="vpnInstallText" style="margin-top:6px;"></div>
+      </div>
+      <div id="vpnLoginBox" style="display:none;">
+        <p style="margin:8px 0 4px;">Sign in to Tailscale to join your private network.</p>
+        <p class="t-sub" style="margin:0 0 6px;">A browser window may have opened — complete the sign-in there, then press Refresh.</p>
+        <p class="t-sub" id="vpnAuthUrl" style="word-break:break-all; margin:0;"></p>
+      </div>
+    </div>
+    <div class="card" id="vpnDetailsCard" style="display:none;">
+      <div class="vpn-facts">
+        <div><div class="t-label">Your Tailscale IP</div><div class="vpn-fact" id="vpnSelfIp">—</div></div>
+        <div><div class="t-label">Network</div><div class="vpn-fact" id="vpnTailnet">—</div></div>
+        <div><div class="t-label">This device</div><div class="vpn-fact" id="vpnSelfName">—</div></div>
+      </div>
+      <div class="toggle-row" style="margin-top:12px;">
+        <div><div class="t-label">Share my home network (subnet router)</div><div class="t-sub" id="vpnSubnetSub">Let devices on Tailscale reach your whole home network (printer, camera, router).</div></div>
+        <label class="switch"><input type="checkbox" id="vpnSubnetToggle"><span class="slider"></span></label>
+      </div>
+      <div class="t-sub" id="vpnRoutesNote" style="display:none;"></div>
+      <div class="toggle-row" style="margin-top:12px;">
+        <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale normally asks you to sign in again after 180 days. With this on, the app turns that off automatically right after you connect.</div></div>
+        <label class="switch"><input type="checkbox" id="vpnKeyExpiryToggle" checked><span class="slider"></span></label>
+      </div>
+      <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" type="button" id="vpnKeyExpiryBtn">Disable key expiry now</button></div>
+    </div>
+    <div class="card">
+      <h3 style="margin:0 0 4px;font-size:16px;">Devices on your network</h3>
+      <p class="cloud-muted" style="margin:0 0 10px;">Tap "Open in Cloud" to open a device's shared folder with the Cloud client.</p>
+      <div id="vpnPeersList"><div class="empty-state"><div class="big">🛡️</div><h3>No devices yet</h3><p>Sign in to Tailscale and your devices will show up here.</p></div></div>
+      <button class="btn btn-ghost" type="button" id="vpnRefreshBtn" style="margin-top:10px;">⟳ Refresh</button>
     </div>
   </div>
   </main>

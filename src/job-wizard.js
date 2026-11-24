@@ -11,6 +11,68 @@
   var hasSavedPassword = false; // vault already holds a password for this job
 
   function $(id) { return document.getElementById(id); }
+  function driveLetterOf(p) {
+    if (typeof p !== 'string') return null;
+    var m = /^([A-Za-z]):[\\/]/.exec(p.trim());
+    return m ? m[1].toUpperCase() : null;
+  }
+  // How this job finds its drive again: by name, by letter, or by
+  // serial number. The three choices sit at the top of the Source and
+  // Destination steps — the user picks one first, then Browses. The
+  // values are read automatically from the drive that is picked; the
+  // serial is never typed. On a path with no drive letter (a UNC path,
+  // or Linux) the choice is hidden: there is nothing to remap.
+  function matchMode(which) {
+    var checked = document.querySelector('input[name="' + (which === 'source' ? 'sourceMatch' : 'destMatch') + '"]:checked');
+    var v = checked ? checked.value : 'label';
+    return (v === 'letter' || v === 'serial' || v === 'label') ? v : 'label';
+  }
+  function setMatchMode(which, mode) {
+    var name = which === 'source' ? 'sourceMatch' : 'destMatch';
+    var m = (mode === 'letter' || mode === 'serial' || mode === 'label') ? mode : 'label';
+    var radio = document.querySelector('input[name="' + name + '"][value="' + m + '"]');
+    if (radio && !radio.disabled) radio.checked = true;
+  }
+  function setText(id, text) { var el = $(id); if (el) el.textContent = text; }
+  async function refreshDriveMatch(which) {
+    var isSrc = which === 'source';
+    var field = $(isSrc ? 'sourceMatchField' : 'destMatchField');
+    var pathVal = $(isSrc ? 'sourceDir' : 'destDir').value.trim();
+    var letter = driveLetterOf(pathVal);
+    if (!field) return;
+    if (!letter) { field.style.display = 'none'; return; }
+    field.style.display = '';
+    var drives = [];
+    try { if (api && typeof api.getDrives === 'function') drives = await api.getDrives() || []; } catch (e) { drives = []; }
+    var info = null;
+    for (var i = 0; i < drives.length; i++) {
+      if (drives[i] && String(drives[i].letter || '').toUpperCase() === letter) { info = drives[i]; break; }
+    }
+    var p = isSrc ? 'sourceMatch' : 'destMatch';
+    setText(p + 'Label', info && info.label ? '— ' + info.label : '— unknown');
+    setText(p + 'Letter', '— ' + letter + ':');
+    setText(p + 'Serial', info && info.serial ? '— ' + info.serial : '— not readable');
+    var serialRadio = document.querySelector('input[name="' + p + '"][value="serial"]');
+    if (serialRadio) {
+      serialRadio.disabled = !(info && info.serial);
+      if (serialRadio.disabled && serialRadio.checked) setMatchMode(which, 'label');
+    }
+  }
+  function matchSummary(which) {
+    var mode = matchMode(which);
+    var pathVal = $(which === 'source' ? 'sourceDir' : 'destDir').value.trim();
+    var letter = driveLetterOf(pathVal);
+    if (!letter) return '—';
+    if (mode === 'letter') return 'By drive letter (' + letter + ':)';
+    if (mode === 'serial') {
+      var s = $(which === 'source' ? 'sourceMatchSerial' : 'destMatchSerial');
+      var v = s ? s.textContent.replace(/^—\s*/, '') : '';
+      return 'By serial number' + (v && v !== 'not readable' ? ' (' + v + ')' : '');
+    }
+    var l = $(which === 'source' ? 'sourceMatchLabel' : 'destMatchLabel');
+    var lv = l ? l.textContent.replace(/^—\s*/, '') : '';
+    return 'By name' + (lv && lv !== 'unknown' ? ' (' + lv + ')' : '');
+  }
   function toast(title, message, kind) {
     var box = $('toasts'); if (!box) return;
     var el = document.createElement('div');
@@ -105,8 +167,10 @@
       name: $('jobName').value.trim(),
       source: $('sourceDir').value.trim(),
       sourceDirectory: $('sourceDir').value.trim(),
+      sourceDriveMatch: { mode: matchMode('source') },
       destination: $('destDir').value.trim(),
       destinationDirectory: $('destDir').value.trim(),
+      destinationDriveMatch: { mode: matchMode('dest') },
       includePatterns: patterns.slice(),
       allowIncremental: $('optIncremental').checked,
       compress: $('optCompress').checked,
@@ -124,7 +188,9 @@
     var rows = [
       ['Job name', j.name || '—'],
       ['Source', j.source || '—'],
+      ['Find source drive', matchSummary('source')],
       ['Destination', j.destination || '—'],
+      ['Find destination drive', matchSummary('dest')],
       ['Include patterns', j.includePatterns.length ? j.includePatterns.join(', ') : 'All files'],
       ['Incremental', j.allowIncremental ? 'Yes' : 'No'],
       ['Compress with ZIP', j.compress ? 'Yes' : 'No'],
@@ -153,7 +219,10 @@
       else if (result && Array.isArray(result.filePaths) && result.filePaths.length) path = result.filePaths[0];
       else if (result && result.filePath) path = result.filePath;
       else if (Array.isArray(result) && result.length) path = result[0];
-      if (path) { $(targetId).value = path; }
+      if (path) {
+        $(targetId).value = path;
+        refreshDriveMatch(targetId === 'destDir' ? 'dest' : 'source');
+      }
       /* Cancelled dialog = do nothing, wizard stays open. */
     } catch (e) {
       toast('Browse failed', e && e.message ? e.message : 'Could not open the folder picker.', 'error');
@@ -166,7 +235,16 @@
     $('createBtn').disabled = true;
     $('createBtn').textContent = 'Creating…';
     try {
-      await api.saveJobConfig(job);
+      // The main process returns { success:false } on a failed save
+      // instead of throwing — the old code ignored the return value
+      // and toasted "Job created" for a job that was never saved.
+      var saved = await api.saveJobConfig(job);
+      if (saved && saved.success === false) {
+        toast('Save failed', saved.error ? ('Could not save the job: ' + saved.error) : 'Could not save the job.', 'error');
+        $('createBtn').disabled = false;
+        $('createBtn').textContent = 'Create Job';
+        return;
+      }
       if (job.encryptionEnabled) {
         var pw = $('encPassword').value;
         if (pw && typeof api.vaultStoreJobPassword === 'function') {
@@ -214,6 +292,10 @@
           $('jobName').value = cfg.name || cfg.jobName || '';
           $('sourceDir').value = cfg.source || cfg.sourceDirectory || '';
           $('destDir').value = cfg.destination || cfg.destinationDirectory || '';
+          if (cfg.sourceDriveMatch && cfg.sourceDriveMatch.mode) setMatchMode('source', cfg.sourceDriveMatch.mode);
+          if (cfg.destinationDriveMatch && cfg.destinationDriveMatch.mode) setMatchMode('dest', cfg.destinationDriveMatch.mode);
+          refreshDriveMatch('source');
+          refreshDriveMatch('dest');
           if (Array.isArray(cfg.includePatterns)) { patterns = cfg.includePatterns.slice(); renderChips(); }
           if (cfg.allowIncremental === false) $('optIncremental').checked = false;
           if (cfg.compress === false) $('optCompress').checked = false;
@@ -253,6 +335,8 @@
     function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
     on('browseSource', 'click', function () { pickFolder('sourceDir', true); });
     on('browseDest', 'click', function () { pickFolder('destDir'); });
+    on('sourceDir', 'change', function () { refreshDriveMatch('source'); });
+    on('destDir', 'change', function () { refreshDriveMatch('dest'); });
     on('addPatternBtn', 'click', addPattern);
     on('patternInput', 'keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
     on('optSchedule', 'change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });

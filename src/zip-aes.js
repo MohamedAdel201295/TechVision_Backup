@@ -35,17 +35,31 @@ const CRC_TABLE = (function () {
   }
   return table;
 })();
-function crc32(buf) {
-  let c = 0xFFFFFFFF;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+function crc32(buf, prev) {
+  // Chainable: crc32(chunk2, crc32(chunk1)) === crc32(Buffer.concat([chunk1, chunk2])).
+  // `prev` is a previously returned value; with no prev it behaves
+  // exactly as before (single-shot CRC of the whole buffer).
+  let c = (prev === undefined ? 0xFFFFFFFF : (prev ^ 0xFFFFFFFF)) >>> 0;
+  for (let i = 0; i < buf.length; i++) c = (CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
   return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// Constant-time buffer comparison (for password-check and auth-code
+// values): Buffer.equals leaks the comparison through timing.
+function timingSafeEqual(a, b) {
+  if (!Buffer.isBuffer(a) || !Buffer.isBuffer(b) || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 // --- Central directory parsing ---
 function findEOCD(buf) {
   const min = Math.max(0, buf.length - 65557);
   for (let i = buf.length - 22; i >= min; i--) {
-    if (buf.readUInt32LE(i) === EOCD_SIG) return i;
+    if (buf.readUInt32LE(i) === EOCD_SIG) {
+      // A signature inside file data is a false positive unless the
+      // comment length matches the distance to the end of the file.
+      if (i + 22 + buf.readUInt16LE(i + 20) === buf.length) return i;
+    }
   }
   throw new Error('Not a ZIP file (end-of-central-directory record not found).');
 }
@@ -65,13 +79,16 @@ function parseExtra(extra, wantId) {
 function parseCentralDirectory(buf) {
   const eocd = findEOCD(buf);
   const count = buf.readUInt16LE(eocd + 10);
+  const cdSize = buf.readUInt32LE(eocd + 12);
   const cdOffset = buf.readUInt32LE(eocd + 16);
-  if (count === 0xFFFF || cdOffset === 0xFFFFFFFF) {
+  if (count === 0xFFFF || cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF) {
     throw new Error('Zip64 archives are not supported by the AES reader.');
   }
+  if (cdOffset + cdSize > buf.length) throw new Error('Central directory is corrupt (extends past the end of the file).');
   const entries = [];
   let off = cdOffset;
   for (let i = 0; i < count; i++) {
+    if (off + 46 > buf.length) throw new Error('Central directory is corrupt (truncated entry).');
     if (buf.readUInt32LE(off) !== CD_SIG) throw new Error('Central directory is corrupt.');
     const flags = buf.readUInt16LE(off + 8);
     const method = buf.readUInt16LE(off + 10);
@@ -82,14 +99,28 @@ function parseCentralDirectory(buf) {
     const extraLen = buf.readUInt16LE(off + 30);
     const commentLen = buf.readUInt16LE(off + 32);
     const localOffset = buf.readUInt32LE(off + 42);
+    if (off + 46 + nameLen + extraLen + commentLen > buf.length) throw new Error('Central directory is corrupt (entry overruns the file).');
+    // Zip64 per-entry sentinels: a value of 0xFFFFFFFF means the real
+    // value lives in a Zip64 extra field, which this reader does not
+    // parse — report Zip64 instead of a bogus 4 GB size.
+    if (compressedSize === 0xFFFFFFFF || uncompressedSize === 0xFFFFFFFF || localOffset === 0xFFFFFFFF) {
+      throw new Error('Zip64 entries are not supported by the AES reader.');
+    }
     const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
     const extra = buf.subarray(off + 46 + nameLen, off + 46 + nameLen + extraLen);
     const aes = parseExtra(extra, AES_EXTRA_ID);
     let aesStrength = 0; let realMethod = method; let aeVersion = 0;
-    if (aes && aes.length >= 7) {
+    if (aes) {
+      // A real WinZip AES extra field is 7 bytes: version (2), vendor
+      // "AE" (2), strength (1), real method (2). An unknown strength
+      // used to be silently treated as AES-256 and reported as
+      // "Wrong password" — reject it here with the real reason.
+      if (aes.length < 7 || aes.toString('ascii', 2, 4) !== 'AE') throw new Error('Unsupported encryption (bad AES extra field) in ' + name);
       aeVersion = aes.readUInt16LE(0);
       aesStrength = aes.readUInt8(4);
       realMethod = aes.readUInt16LE(5);
+      if (aeVersion !== 1 && aeVersion !== 2) throw new Error('Unsupported WinZip AES version ' + aeVersion + ' in ' + name);
+      if (aesStrength < 1 || aesStrength > 3) throw new Error('Unsupported WinZip AES strength ' + aesStrength + ' in ' + name);
     }
     entries.push({
       name: name,
@@ -147,18 +178,25 @@ function aesCtrDecrypt(key, data) {
 }
 
 /** Decrypt + inflate one entry. Throws Error('Wrong password ...') on a bad password. */
-function decryptEntry(zipPath, entry, password) {
+function decryptEntry(zipPath, entry, password, zipBuf) {
   if (!entry.encrypted) throw new Error('Entry is not encrypted: ' + entry.name);
   if (!entry.aesStrength) throw new Error('Unsupported encryption (not WinZip AES): ' + entry.name);
   if (typeof password !== 'string' || !password) throw new Error('A password is required for this encrypted backup.');
-  const buf = fs.readFileSync(zipPath);
+  // Callers that already hold the whole ZIP pass it in (extractEncrypted
+  // reads it once); otherwise read it here. Re-reading the whole file
+  // per entry used to make restores O(entries x archive-size) I/O.
+  const buf = zipBuf || fs.readFileSync(zipPath);
   // Local header: skip name + extra to reach the encrypted blob.
-  if (buf.readUInt32LE(entry.localOffset) !== LFH_SIG) throw new Error('Local file header not found for ' + entry.name);
+  if (entry.localOffset + 30 > buf.length || buf.readUInt32LE(entry.localOffset) !== LFH_SIG) throw new Error('Local file header not found for ' + entry.name);
   const nameLen = buf.readUInt16LE(entry.localOffset + 26);
   const extraLen = buf.readUInt16LE(entry.localOffset + 28);
   const dataStart = entry.localOffset + 30 + nameLen + extraLen;
   const keyLen = aesKeyLength(entry.aesStrength);
   const saltLen = keyLen === 16 ? 8 : (keyLen === 24 ? 12 : 16);
+  // A truncated entry used to be misreported as "Wrong password":
+  // the slices below clamp silently, so check the sizes first.
+  if (dataStart + saltLen + 2 + 10 > dataStart + entry.compressedSize) throw new Error('Backup is corrupt (truncated entry ' + entry.name + ').');
+  if (dataStart + entry.compressedSize > buf.length) throw new Error('Backup is corrupt (truncated entry ' + entry.name + ').');
   const salt = buf.subarray(dataStart, dataStart + saltLen);
   const verify = buf.subarray(dataStart + saltLen, dataStart + saltLen + 2);
   const cipherStart = dataStart + saltLen + 2;
@@ -169,9 +207,9 @@ function decryptEntry(zipPath, entry, password) {
   const aesKey = derived.subarray(0, keyLen);
   const macKey = derived.subarray(keyLen, 2 * keyLen);
   const expectedVerify = derived.subarray(2 * keyLen, 2 * keyLen + 2);
-  if (!expectedVerify.equals(verify)) throw new Error('Wrong password for this encrypted backup.');
+  if (!timingSafeEqual(expectedVerify, verify)) throw new Error('Wrong password for this encrypted backup.');
   const hmac = crypto.createHmac('sha1', macKey).update(ciphertext).digest().subarray(0, 10);
-  if (!hmac.equals(authCode)) throw new Error('Backup is corrupt (authentication failed for ' + entry.name + ').');
+  if (!timingSafeEqual(hmac, authCode)) throw new Error('Backup is corrupt (authentication failed for ' + entry.name + ').');
   const decrypted = aesCtrDecrypt(aesKey, ciphertext);
   let plain;
   if (entry.realMethod === 8) plain = zlib.inflateRawSync(decrypted);
@@ -188,20 +226,43 @@ function decryptEntry(zipPath, entry, password) {
 function extractEncrypted(zipPath, destDir, password, onFile) {
   const buf = fs.readFileSync(zipPath);
   const entries = parseCentralDirectory(buf);
-  if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+  const base = path.resolve(destDir);
+  if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
+  const realBase = fs.realpathSync(base);
   let files = 0; let bytes = 0; const errors = [];
   for (const entry of entries) {
     if (entry.isDir) continue;
-    // Zip-slip guard: entry names must stay inside destDir.
-    const dest = path.join(destDir, entry.name.split('/').join(path.sep));
-    if (!dest.startsWith(path.resolve(destDir) + path.sep) && dest !== path.resolve(destDir)) {
+    // Zip-slip guard: entry names must stay inside destDir. (The
+    // lexical check below uses the resolved base; the realpath check
+    // after mkdir catches a pre-existing symlink inside it.)
+    const dest = path.join(base, entry.name.split('/').join(path.sep));
+    if (dest !== base && !dest.startsWith(base + path.sep)) {
       errors.push('Skipped unsafe path: ' + entry.name);
       continue;
     }
     try {
-      const content = decryptEntry(zipPath, entry, password);
+      const content = decryptEntry(zipPath, entry, password, buf);
       fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, content);
+      const realParent = fs.realpathSync(path.dirname(dest));
+      if (realParent !== realBase && !realParent.startsWith(realBase + path.sep)) {
+        errors.push('Skipped unsafe path: ' + entry.name);
+        continue;
+      }
+      const realDest = path.join(realParent, path.basename(dest));
+      fs.writeFileSync(realDest, content);
+      // Verify the write: read the file back and compare with the
+      // decrypted content (catches a bad disk write). On mismatch,
+      // delete the bad file and record the error.
+      let ok = false;
+      try {
+        ok = crypto.createHash('sha256').update(fs.readFileSync(realDest)).digest('hex') ===
+             crypto.createHash('sha256').update(content).digest('hex');
+      } catch (e) { ok = false; }
+      if (!ok) {
+        try { fs.unlinkSync(realDest); } catch (e) {}
+        errors.push(entry.name + ': written file failed verification');
+        continue;
+      }
       files++; bytes += content.length;
       if (typeof onFile === 'function') onFile(entry.name, content.length);
     } catch (e) {
