@@ -351,7 +351,6 @@
       <div id="cloudBrowser" style="display:none; margin-top:16px;">
         <div class="cloud-browser-head">
           <div id="cloudCrumbs" class="cloud-crumbs"></div>
-          <button class="btn btn-ghost btn-sm" type="button" id="cloudDisconnectBtn">Disconnect</button>
         </div>
         <div class="cloud-conn-banner" id="cloudConnBanner" style="display:none;"></div>
         <div class="cloud-browser-toolbar">
@@ -365,6 +364,7 @@
           <button class="btn btn-sm" type="button" id="cloudUploadBtn">⬆ Upload file…</button>
           <button class="btn btn-sm" type="button" id="cloudMkdirBtn">＋ New folder</button>
           <button class="btn btn-ghost btn-sm" type="button" id="cloudBrowserRefreshBtn">⟳ Refresh</button>
+          <button class="btn btn-ghost btn-sm" type="button" id="cloudDisconnectBtn">Disconnect</button>
           <span id="cloudBrowserInfo" class="cloud-muted"></span>
           <span id="cloudClipboardInfo" class="cloud-muted" style="display:none;"></span>
         </div>
@@ -480,6 +480,7 @@
   </div>
   </main>
 </div>
+<div id="cloudContextMenu" class="cloud-context-menu" style="display:none;"></div>
 <div class="backdrop" id="drawerBackdrop"></div>
 <aside class="drawer" id="jobDrawer" aria-label="Job details">
   <button class="icon-btn close-x" type="button" id="drawerClose" aria-label="Close details">✕</button>

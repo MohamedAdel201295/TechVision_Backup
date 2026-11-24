@@ -4,6 +4,7 @@
  */
 
 const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
+const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
@@ -1965,6 +1966,77 @@ ipcMain.handle('cloud-client-copy', async (event, serverId, from, to) => {
   if (!conn) return { success: false, error: 'Not connected to this server.' };
   try { await cloudClient.copy(conn, from, to); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
+});
+
+// Files the user copied in Windows Explorer: the clipboard holds them
+// as a "FileNameW" list of local paths. The renderer asks for that list
+// when pasting, so a copy in Explorer can land on the server.
+ipcMain.handle('cloud-clipboard-files', async () => {
+  try {
+    const buf = require('electron').clipboard.readBuffer('FileNameW');
+    return cloudClient.parseClipboardFiles(buf);
+  } catch (e) { return []; }
+});
+
+// Upload local paths (files and folders) into a remote folder — the
+// other half of pasting from Windows Explorer.
+ipcMain.handle('cloud-client-upload-files', async (event, serverId, localPaths, remoteDir) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try {
+    const r = await cloudClient.uploadPaths(conn, localPaths || [], remoteDir || '', (name, sent, total) => {
+      try {
+        if (event.sender && !event.sender.isDestroyed()) {
+          event.sender.send('cloud-progress', { kind: 'upload', pct: total ? Math.min(99, 99 * sent / total) : 0, done: sent, total, name });
+        }
+      } catch (e) {}
+    });
+    return { success: true, uploaded: r.uploaded, failed: r.failed || [] };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open a server file with the app Windows would use for it: download a
+// copy into the temp folder and hand it to the OS (music plays, pictures
+// open, a game runs). The copy lives in the temp folder, so editing it
+// does NOT write back to the server — that needs the file mounted as a
+// real drive, which is a separate feature.
+ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  const tmpRoot = path.join(os.tmpdir(), 'TechVision-Cloud');
+  try { fs.mkdirSync(tmpRoot, { recursive: true }); } catch (e) {}
+  // Best-effort cleanup of opened copies older than 7 days, so the temp
+  // folder does not grow forever. Never fails the open.
+  try {
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    for (const f of fs.readdirSync(tmpRoot)) {
+      try {
+        const p = path.join(tmpRoot, f);
+        const st = fs.statSync(p);
+        if (st.isFile() && st.mtimeMs < cutoff) fs.unlinkSync(p);
+      } catch (e) {}
+    }
+  } catch (e) {}
+  // The tag keeps two same-named files from different server folders
+  // from overwriting each other in the temp folder.
+  const tag = require('crypto').createHash('sha1').update(String(relPath)).digest('hex').slice(0, 8);
+  const dest = path.join(tmpRoot, tag + '-' + path.basename(relPath));
+  try {
+    await cloudClient.download(conn, relPath, dest, (done, total) => {
+      try {
+        if (event.sender && !event.sender.isDestroyed()) {
+          event.sender.send('cloud-progress', { kind: 'download', pct: total ? Math.min(99, 99 * done / total) : 0, done, total, name: path.basename(relPath) });
+        }
+      } catch (e) {}
+    });
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+  const err = await require('electron').shell.openPath(dest);
+  if (err) return { success: false, error: 'Downloaded to ' + dest + ' but Windows could not open it: ' + err, dest };
+  return { success: true, dest };
 });
 
 // ---------- TechVision VPN (Tailscale client manager) ----------

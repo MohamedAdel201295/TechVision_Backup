@@ -817,14 +817,22 @@
       var meta = document.createElement('div'); meta.className = 'job-meta';
       meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet') + (srv.hasPassword ? ' — password saved on this device' : '');
       var acts = document.createElement('div'); acts.className = 'drawer-actions';
-      // One click when the password is saved on this device: connect
-      // straight in (the main process uses the stored password). Without
-      // one, the connect box opens and asks for it.
-      var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = (srv.hasPassword && srv.fingerprint) ? 'Connect' : 'Open';
-      open.addEventListener('click', function () {
-        if (srv.hasPassword && srv.fingerprint) cloudConnectSaved(srv);
-        else openCloudConnect(srv);
-      });
+      // Already connected to this server: say so instead of offering
+      // Connect again — Disconnect lives in the browser toolbar below.
+      if (cloudConn && cloudConn.serverId === srv.id) {
+        var badge = document.createElement('span'); badge.className = 'cloud-connected-badge'; badge.textContent = '● Connected';
+        acts.appendChild(badge);
+      } else {
+        // One click when the password is saved on this device: connect
+        // straight in (the main process uses the stored password). Without
+        // one, the connect box opens and asks for it.
+        var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = (srv.hasPassword && srv.fingerprint) ? 'Connect' : 'Open';
+        open.addEventListener('click', function () {
+          if (srv.hasPassword && srv.fingerprint) cloudConnectSaved(srv);
+          else openCloudConnect(srv);
+        });
+        acts.appendChild(open);
+      }
       var forget = null;
       if (srv.hasPassword) {
         forget = document.createElement('button'); forget.className = 'btn btn-ghost btn-sm'; forget.type = 'button'; forget.textContent = '🔑 Forget password';
@@ -838,11 +846,14 @@
       del.addEventListener('click', function () {
         askConfirm('Remove server "' + srv.name + '" from the list?', async function () {
           if (!api || typeof api.cloudClientRemove !== 'function') return cloudMissing();
-          try { await api.cloudClientRemove(srv.id); await loadCloud(); }
+          try {
+            if (cloudConn && cloudConn.serverId === srv.id) await cloudDisconnect();
+            await api.cloudClientRemove(srv.id); await loadCloud();
+          }
           catch (e) { toast('Remove error', e && e.message ? e.message : 'Could not remove server.', 'error'); }
         });
       });
-      acts.appendChild(open); if (forget) acts.appendChild(forget); acts.appendChild(del);
+      if (forget) acts.appendChild(forget); acts.appendChild(del);
       body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
       card.appendChild(body);
       list.appendChild(card);
@@ -980,6 +991,7 @@
   }
 
   async function cloudDisconnect() {
+    cloudHideContextMenu();
     if (cloudConn && api && typeof api.cloudClientDisconnect === 'function') {
       try { await api.cloudClientDisconnect(cloudConn.serverId); } catch (e) {}
     }
@@ -993,6 +1005,9 @@
     cloudClipboard = null;
     var browser = $('cloudBrowser'); if (browser) browser.style.display = 'none';
     renderCloudHome();
+    // The server card must go back to Connect/Open instead of keeping
+    // its "Connected" badge.
+    renderCloudClientList();
   }
 
   /* ---------- Cloud client auto-refresh ----------
@@ -1168,11 +1183,26 @@
     return ext ? ext + ' file' : 'File';
   }
 
+  // Files copied in Windows Explorer also count for Paste: the check is
+  // cheap (one local clipboard read) and cached for 2 seconds, so the
+  // toolbar does not hammer it on every render.
+  var cloudSysClipCache = { at: 0, has: false, count: 0 };
+  async function cloudRefreshSysClip() {
+    if (Date.now() - cloudSysClipCache.at < 2000) return cloudSysClipCache.has;
+    cloudSysClipCache.at = Date.now();
+    try {
+      var f = (api && typeof api.cloudClipboardFiles === 'function') ? await api.cloudClipboardFiles() : [];
+      cloudSysClipCache.has = Array.isArray(f) && f.length > 0;
+      cloudSysClipCache.count = Array.isArray(f) ? f.length : 0;
+    } catch (e) { cloudSysClipCache.has = false; cloudSysClipCache.count = 0; }
+    return cloudSysClipCache.has;
+  }
+
   function cloudUpdateToolbar() {
     var sel = cloudSelectedEntry, canWrite = cloudCanWrite() && !cloudLinkDown;
     var dl = $('cloudDownloadBtn'); if (dl) dl.disabled = !sel || sel.isDir || cloudLinkDown;
     var cp = $('cloudCopyBtn'); if (cp) cp.disabled = !sel || !canWrite;
-    var ps = $('cloudPasteBtn'); if (ps) ps.disabled = !cloudClipboard || !canWrite;
+    var ps = $('cloudPasteBtn'); if (ps) ps.disabled = (!cloudClipboard && !cloudSysClipCache.has) || !canWrite;
     var rn = $('cloudRenameBtn'); if (rn) rn.disabled = !sel || !canWrite;
     var del = $('cloudDeleteBtn'); if (del) del.disabled = !sel || !canWrite;
     var up = $('cloudUpBtn'); if (up) up.disabled = !cloudPath || cloudLinkDown;
@@ -1181,7 +1211,18 @@
     var ci = $('cloudClipboardInfo');
     if (ci) {
       if (cloudClipboard) { ci.style.display = ''; ci.textContent = 'Copied: ' + cloudClipboard.name + ' — open a folder and press Paste.'; }
+      else if (cloudSysClipCache.has) { ci.style.display = ''; ci.textContent = 'Windows clipboard: ' + cloudSysClipCache.count + ' item(s) copied — press Paste to upload here.'; }
       else ci.style.display = 'none';
+    }
+    // Re-check the Windows clipboard in the background: Paste lights up
+    // on its own when the user copies a file in Explorer.
+    if (canWrite && !cloudClipboard) {
+      cloudRefreshSysClip().then(function (has) {
+        if (!has || cloudClipboard) return;
+        var ps2 = $('cloudPasteBtn'); if (ps2) ps2.disabled = false;
+        var ci2 = $('cloudClipboardInfo');
+        if (ci2) { ci2.style.display = ''; ci2.textContent = 'Windows clipboard: ' + cloudSysClipCache.count + ' item(s) copied — press Paste to upload here.'; }
+      });
     }
   }
 
@@ -1195,7 +1236,7 @@
   function cloudOpenEntry(entry) {
     if (!entry) return;
     if (entry.isDir) cloudBrowse(entry.rel);
-    else cloudDownload(entry.rel);
+    else cloudOpenFile(entry);
   }
 
   function cloudRenameSelected() {
@@ -1210,6 +1251,23 @@
         if (r && r.success) { toast('Renamed', entry.name + ' → ' + val, 'success'); await cloudBrowse(cloudPath); }
         else toast('Rename failed', (r && r.error) || 'Could not rename.', 'error');
       } catch (err) { toast('Rename error', err && err.message ? err.message : 'Could not rename.', 'error'); }
+    });
+  }
+
+  // New folder in a folder: the current one, or the folder the user
+  // right-clicked.
+  function cloudNewFolder(targetRel) {
+    var target = (typeof targetRel === 'string') ? targetRel : cloudPath;
+    if (!cloudConn || !cloudCanWrite()) return;
+    askCloudInput('New folder', 'Folder name', '', async function (val) {
+      if (!val) return;
+      if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
+      if (!api || typeof api.cloudClientMkdir !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudClientMkdir(cloudConn.serverId, cloudJoin(target, val));
+        if (r && r.success) { toast('Folder created', val, 'success'); await cloudBrowse(target); }
+        else toast('Create failed', (r && r.error) || 'Could not create folder.', 'error');
+      } catch (e) { toast('Create error', e && e.message ? e.message : 'Could not create folder.', 'error'); }
     });
   }
 
@@ -1234,19 +1292,127 @@
     cloudUpdateToolbar();
   }
 
-  async function cloudPasteClipboard() {
-    if (!cloudClipboard || !cloudCanWrite() || !cloudConn) return;
-    if (!api || typeof api.cloudClientCopy !== 'function') return cloudMissing();
-    var existing = (cloudLastEntries || []).map(function (e) { return e.name; });
-    var destName = cloudCopyName(cloudClipboard.name, cloudClipboard.isDir, existing);
+  // Paste into a folder: the current one, or the folder the user
+  // right-clicked. First the copy made inside this browser (server-side
+  // /api/copy), then files copied in Windows Explorer (uploaded here).
+  async function cloudPasteClipboard(targetRel) {
+    var target = (typeof targetRel === 'string') ? targetRel : cloudPath;
+    if (!cloudConn || !cloudCanWrite()) return;
+    if (cloudClipboard) {
+      if (!api || typeof api.cloudClientCopy !== 'function') return cloudMissing();
+      var existing = (cloudLastEntries || []).map(function (e) { return e.name; });
+      if (target !== cloudPath) {
+        try {
+          var lr = await api.cloudClientList(cloudConn.serverId, target);
+          if (lr && lr.success) existing = (lr.entries || []).map(function (e) { return e.name; });
+        } catch (e) {}
+      }
+      var destName = cloudCopyName(cloudClipboard.name, cloudClipboard.isDir, existing);
+      try {
+        var r = await api.cloudClientCopy(cloudConn.serverId, cloudClipboard.rel, cloudJoin(target, destName));
+        if (r && r.success) { toast('Pasted', cloudClipboard.name + ' → ' + destName, 'success'); await cloudBrowse(target); }
+        else toast('Paste failed', (r && r.error) || 'Could not copy.', 'error');
+      } catch (err) { toast('Paste error', err && err.message ? err.message : 'Could not copy.', 'error'); }
+      return;
+    }
+    var files = [];
+    try { if (api && typeof api.cloudClipboardFiles === 'function') files = await api.cloudClipboardFiles() || []; } catch (e) {}
+    if (files.length) { await cloudUploadClipboardFiles(files, target); return; }
+    toast('Nothing to paste', 'Copy a file first — from this folder, or from Windows Explorer.', '');
+  }
+
+  async function cloudUploadClipboardFiles(files, target) {
+    if (!cloudConn || cloudTransferBusy) return;
+    if (!api || typeof api.cloudClientUploadFiles !== 'function') return cloudMissing();
     try {
-      var r = await api.cloudClientCopy(cloudConn.serverId, cloudClipboard.rel, cloudJoin(cloudPath, destName));
-      if (r && r.success) { toast('Pasted', cloudClipboard.name + ' → ' + destName, 'success'); await cloudBrowse(cloudPath); }
-      else toast('Paste failed', (r && r.error) || 'Could not copy.', 'error');
-    } catch (err) { toast('Paste error', err && err.message ? err.message : 'Could not copy.', 'error'); }
+      cloudTransferBusy = true;
+      showCloudTransfer('Uploading ' + files.length + ' item(s)…', 0);
+      var r = await api.cloudClientUploadFiles(cloudConn.serverId, files, target || '');
+      hideCloudTransfer();
+      if (r && r.success) {
+        var failed = (r.failed || []).length;
+        toast(failed ? 'Uploaded with errors' : 'Uploaded', (r.uploaded || 0) + ' item(s) uploaded' + (failed ? ' — ' + failed + ' failed: ' + (r.failed || []).slice(0, 3).map(function (f) { return f.path; }).join(', ') : '') + '.', failed ? 'error' : 'success');
+        await cloudBrowse(target || '');
+      } else toast('Upload failed', (r && r.error) || 'Could not upload.', 'error');
+    } catch (e) {
+      hideCloudTransfer();
+      toast('Upload error', e && e.message ? e.message : 'Could not upload.', 'error');
+    } finally {
+      cloudTransferBusy = false;
+    }
+  }
+
+  // Open a file the way Windows would: music plays, pictures open, a
+  // game runs — the app downloads a copy to the temp folder and hands
+  // it to the OS. Folders are entered, as before.
+  async function cloudOpenFile(entry) {
+    if (!entry) return;
+    if (entry.isDir) { cloudBrowse(entry.rel); return; }
+    if (!cloudConn || cloudTransferBusy) return;
+    if (!api || typeof api.cloudClientOpen !== 'function') return cloudMissing();
+    try {
+      cloudTransferBusy = true;
+      showCloudTransfer('Opening ' + entry.name + '…', 0);
+      var r = await api.cloudClientOpen(cloudConn.serverId, entry.rel);
+      hideCloudTransfer();
+      if (!r || !r.success) toast('Could not open', (r && r.error) || 'The file could not be opened.', 'error');
+    } catch (e) {
+      hideCloudTransfer();
+      toast('Open error', e && e.message ? e.message : 'Could not open the file.', 'error');
+    } finally {
+      cloudTransferBusy = false;
+    }
+  }
+
+  /* ---------- Right-click menu (Windows Explorer style) ---------- */
+  function cloudHideContextMenu() {
+    var m = $('cloudContextMenu'); if (m) { m.style.display = 'none'; m.innerHTML = ''; }
+  }
+  function cloudContextItem(menu, label, disabled, onClick) {
+    var b = document.createElement('button');
+    b.className = 'cloud-context-item'; b.type = 'button'; b.textContent = label;
+    b.disabled = !!disabled;
+    b.addEventListener('click', function () { cloudHideContextMenu(); if (onClick) onClick(); });
+    menu.appendChild(b);
+    return b;
+  }
+  function cloudContextSep(menu) {
+    var s = document.createElement('div'); s.className = 'cloud-context-sep'; menu.appendChild(s);
+  }
+  async function cloudShowContextMenu(x, y, entry) {
+    var menu = $('cloudContextMenu');
+    if (!menu || !cloudConn) return;
+    var canWrite = cloudCanWrite() && !cloudLinkDown;
+    var hasInternal = !!cloudClipboard;
+    var hasSys = false;
+    if (canWrite && !hasInternal) hasSys = await cloudRefreshSysClip();
+    menu.innerHTML = '';
+    var targetDir = entry && entry.isDir ? entry.rel : cloudPath;
+    if (entry) {
+      cloudContextItem(menu, 'Open', false, function () { cloudOpenEntry(entry); });
+      if (!entry.isDir) cloudContextItem(menu, 'Download', cloudLinkDown, function () { cloudDownload(entry.rel); });
+      cloudContextSep(menu);
+      cloudContextItem(menu, 'Copy', !canWrite, function () { cloudCopySelected(); });
+      cloudContextItem(menu, entry.isDir ? 'Paste into "' + entry.name + '"' : 'Paste here', !canWrite || (!hasInternal && !hasSys), function () { cloudPasteClipboard(targetDir); });
+      cloudContextSep(menu);
+      cloudContextItem(menu, 'Rename', !canWrite, function () { cloudRenameSelected(); });
+      cloudContextItem(menu, 'Delete', !canWrite, function () { cloudDeleteSelected(); });
+      cloudContextSep(menu);
+    } else {
+      cloudContextItem(menu, 'Paste here', !canWrite || (!hasInternal && !hasSys), function () { cloudPasteClipboard(targetDir); });
+      cloudContextSep(menu);
+    }
+    cloudContextItem(menu, entry && entry.isDir ? 'New folder in "' + entry.name + '"' : 'New folder', !canWrite, function () { cloudNewFolder(targetDir); });
+    cloudContextItem(menu, 'Refresh', cloudLinkDown, function () { cloudBrowse(cloudPath); });
+    menu.style.display = '';
+    menu.style.left = '0px'; menu.style.top = '0px';
+    var w = menu.offsetWidth, h = menu.offsetHeight;
+    menu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 4)) + 'px';
+    menu.style.top = Math.max(4, Math.min(y, window.innerHeight - h - 4)) + 'px';
   }
 
   function renderCloudBrowser(entries) {
+    cloudHideContextMenu();
     cloudLastEntries = entries || [];
     cloudLastSig = cloudEntriesSig(entries || []);
     var crumbs = $('cloudCrumbs');
@@ -1286,6 +1452,7 @@
       row.setAttribute('tabindex', '0');
       var rel = cloudJoin(cloudPath, e.name);
       var entry = { name: e.name, isDir: !!e.isDir, rel: rel };
+      row.cloudEntry = entry;
       var nameEl = document.createElement('span'); nameEl.className = 'cx-name';
       nameEl.textContent = (e.isDir ? '📁 ' : '📄 ') + e.name;
       var sizeEl = document.createElement('span'); sizeEl.className = 'cx-size';
@@ -2362,7 +2529,7 @@
         toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error');
       }
     });
-    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); } });
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); cloudHideContextMenu(); } });
 
     document.querySelectorAll('#logsTabs .log-tab').forEach(function (btn) {
       btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
@@ -2501,18 +2668,7 @@
     var cub2 = $('cloudUploadBtn');
     if (cub2) cub2.addEventListener('click', function () { cloudUpload(); });
     var cmb = $('cloudMkdirBtn');
-    if (cmb) cmb.addEventListener('click', function () {
-      askCloudInput('New folder', 'Folder name', '', async function (val) {
-        if (!val) return;
-        if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
-        if (!api || typeof api.cloudClientMkdir !== 'function') return cloudMissing();
-        try {
-          var r = await api.cloudClientMkdir(cloudConn.serverId, cloudJoin(cloudPath, val));
-          if (r && r.success) { toast('Folder created', val, 'success'); await cloudBrowse(cloudPath); }
-          else toast('Create failed', (r && r.error) || 'Could not create folder.', 'error');
-        } catch (e) { toast('Create error', e && e.message ? e.message : 'Could not create folder.', 'error'); }
-      });
-    });
+    if (cmb) cmb.addEventListener('click', function () { cloudNewFolder(cloudPath); });
     var cbr = $('cloudBrowserRefreshBtn');
     if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
     // Explorer toolbar: the actions apply to the selected row.
@@ -2533,6 +2689,19 @@
       if (ev.ctrlKey && (ev.key === 'c' || ev.key === 'C')) { cloudCopySelected(); ev.preventDefault(); }
       else if (ev.ctrlKey && (ev.key === 'v' || ev.key === 'V')) { cloudPasteClipboard(); ev.preventDefault(); }
     });
+    // Right-click in the file list: the Windows menu (Open, Copy, Paste,
+    // Rename, Delete, New folder). A right-click selects the row first.
+    if (cfl) cfl.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      var row = ev.target && ev.target.closest ? ev.target.closest('.cloud-row') : null;
+      var entry = row && row.cloudEntry ? row.cloudEntry : null;
+      if (entry) cloudSelectEntry(entry, row);
+      cloudShowContextMenu(ev.clientX, ev.clientY, entry);
+    });
+    document.addEventListener('click', function (ev) {
+      var m = $('cloudContextMenu');
+      if (m && m.style.display !== 'none' && !m.contains(ev.target)) cloudHideContextMenu();
+    }, true);
     var cpo = $('cloudPromptOk');
     if (cpo) cpo.addEventListener('click', function () {
       var cb = cloudPromptCallback;
