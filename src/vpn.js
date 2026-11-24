@@ -201,7 +201,7 @@ async function disableKeyExpiry() {
 
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
-  installAndConnect, downloadFile, verifySignature, MSI_URL,
+  installAndConnect, downloadFile, verifySignature, parseSignatureResult, MSI_URL,
   disableKeyExpiry, pickLanSubnet, tailnetFromDns, buildInstallScript,
 };
 
@@ -269,6 +269,25 @@ function downloadFile(url, dest, onProgress) {
   });
 }
 
+/* Parses the JSON from Get-AuthenticodeSignature. Windows PowerShell 5.1's
+   ConvertTo-Json renders enums as NUMBERS (Valid = 0), while PowerShell 7
+   renders them as names — accept both, or a valid Tailscale signature is
+   misread as "unknown" (seen on a real device: the toast said
+   "signature status: unknown" for a properly signed installer). */
+function parseSignatureResult(stdout) {
+  try {
+    const j = JSON.parse(stdout);
+    const o = (j && typeof j === 'object' && !Array.isArray(j)) ? j : {};
+    const st = o.Status;
+    const statusName = typeof st === 'number' ? (st === 0 ? 'Valid' : 'Status(' + st + ')') : (st || 'unknown');
+    const subject = typeof o.Subject === 'string' ? o.Subject : null;
+    const valid = (st === 'Valid' || st === 0) && !!subject && /Tailscale/i.test(subject);
+    return { ok: valid, status: statusName, subject };
+  } catch (e) {
+    return { ok: false, status: 'check-failed', detail: 'could not read the signature result' };
+  }
+}
+
 /* Verifies the installer's Authenticode signature. Resolves
    { ok, status, subject?, detail? } — the status is the reason the check
    failed (e.g. 'NotTrusted', 'UnknownError'), so the user sees more than
@@ -277,14 +296,10 @@ function downloadFile(url, dest, onProgress) {
 function verifySignature(file) {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') return resolve({ ok: false, status: 'unsupported-platform' });
-    const ps = "(Get-AuthenticodeSignature -FilePath '" + file.replace(/'/g, "''") + "' | Select-Object Status, @{N='Subject';E={$_.SignerCertificate.Subject}} | ConvertTo-Json -Compress)";
+    const ps = "(Get-AuthenticodeSignature -FilePath '" + file.replace(/'/g, "''") + "' | Select-Object @{N='Status';E={$_.Status.ToString()}}, @{N='Subject';E={$_.SignerCertificate.Subject}} | ConvertTo-Json -Compress)";
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 30000, windowsHide: true }, (err, stdout) => {
       if (err) return resolve({ ok: false, status: 'check-failed', detail: (err.message || 'PowerShell check failed').slice(0, 120) });
-      try {
-        const j = JSON.parse(stdout);
-        const valid = j.Status === 'Valid' && typeof j.Subject === 'string' && /Tailscale/i.test(j.Subject);
-        resolve({ ok: valid, status: j.Status || 'unknown', subject: j.Subject || null });
-      } catch (e) { resolve({ ok: false, status: 'check-failed', detail: 'could not read the signature result' }); }
+      resolve(parseSignatureResult(stdout));
     });
   });
 }
