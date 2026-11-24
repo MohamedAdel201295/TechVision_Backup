@@ -1406,6 +1406,13 @@
         if (au) au.textContent = st.authUrl ? ('Sign-in link: ' + st.authUrl) : '';
         var ob = $('vpnOpenAuthBtn');
         if (ob) ob.style.display = st.authUrl ? '' : 'none';
+        // The hint must match what is actually on screen: when the
+        // daemon has not handed us a login link yet there is no button
+        // below to point at — Sign in is the way to open the page.
+        var lh = $('vpnLoginHint');
+        if (lh) lh.textContent = st.authUrl
+          ? 'Complete the sign-in in your browser, then press Refresh. If no browser window opened, use the button below.'
+          : 'Press Sign in — the sign-in page will open in your browser. Complete it there, then press Refresh.';
       }
       if (dc) dc.style.display = 'none';
       renderVpnPeers([]);
@@ -1445,6 +1452,18 @@
     // First sign-in (or first view while connected): turn off the 180-day
     // key expiry automatically, so the device never asks to sign in again.
     maybeDisableVpnKeyExpiry();
+  }
+
+  // `tailscale up` can return before the daemon reports itself Running, so
+  // a single status read right after connect can catch it mid-startup and
+  // freeze the view on "Not connected" after a "VPN connected." toast.
+  // Re-check a few times until the view agrees with the result.
+  async function pollVpnUntilConnected() {
+    for (var i = 0; i < 4; i++) {
+      if (vpnStatusCache && vpnStatusCache.connected) return;
+      await new Promise(function (res) { setTimeout(res, 2000); });
+      await loadVpn();
+    }
   }
 
   /* ---------- VPN key expiry (stay connected forever) ---------- */
@@ -1490,7 +1509,12 @@
     if (!peers.length) {
       var empty = document.createElement('div');
       empty.className = 'empty-state';
-      empty.innerHTML = '<div class="big">🛡️</div><h3>No devices yet</h3><p>Sign in to Tailscale and your devices will show up here.</p>';
+      // "Sign in..." is wrong once he is signed in — with no other
+      // devices on the tailnet he is simply the only one there.
+      var msg = 'Sign in to Tailscale and your devices will show up here.';
+      if (vpnStatusCache && vpnStatusCache.connected) msg = 'No other devices on your network yet — install Tailscale on another device and it will show up here.';
+      else if (vpnStatusCache && vpnStatusCache.installed && !vpnStatusCache.needsLogin) msg = 'Connect the VPN and your devices will show up here.';
+      empty.innerHTML = '<div class="big">🛡️</div><h3>No devices yet</h3><p>' + msg + '</p>';
       list.appendChild(empty);
       return;
     }
@@ -1672,7 +1696,7 @@
             else toast('VPN', 'Tailscale installed and connected.', 'success');
           } else toast('VPN error', (r && r.error) || 'Could not install Tailscale.', 'error');
         } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not install Tailscale.', 'error'); }
-        finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); }
+        finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); if (r && r.success && !r.needsLogin) await pollVpnUntilConnected(); }
         return;
       }
       vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Working…';
@@ -1684,6 +1708,7 @@
           else toast('VPN', wantOn ? 'VPN connected.' : 'VPN disconnected.', 'success');
         } else toast('VPN error', (r && r.error) || 'Could not change the VPN connection.', 'error');
         await loadVpn();
+        if (r && r.success && wantOn && !r.needsLogin) await pollVpnUntilConnected();
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the VPN connection.', 'error'); }
       finally { vpnBusy = false; }
     });
