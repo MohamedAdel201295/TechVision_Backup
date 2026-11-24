@@ -1443,6 +1443,8 @@
       if (advertising) { rn.style.display = ''; rn.textContent = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.'; }
       else rn.style.display = 'none';
     }
+    var ab = $('vpnApproveBtn');
+    if (ab) ab.style.display = advertising ? '' : 'none';
     var ss = $('vpnSubnetSub');
     if (ss) ss.textContent = st.lanSubnet
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
@@ -1746,10 +1748,20 @@
       try {
         var r = await api.vpnSetRoutes(on);
         if (r && r.success) {
-          toast('VPN', on ? 'Sharing your home network — approve the route once in the Tailscale admin console.' : 'No longer sharing your home network.', 'success');
+          // Advertising alone does nothing — the route only works after
+          // it is approved in the Tailscale admin console, which the app
+          // cannot do itself. Open the console right away so the approval
+          // is one click away instead of a step the user has to find.
+          if (on && typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
+          toast('VPN', on ? 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' : 'No longer sharing your home network.', 'success');
         } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
         await loadVpn();
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
+    });
+    var vab2 = $('vpnApproveBtn');
+    if (vab2) vab2.addEventListener('click', async function () {
+      if (!api || typeof api.vpnOpenAdmin !== 'function') return vpnMissing();
+      await api.vpnOpenAdmin();
     });
     $('drawerClose').addEventListener('click', closeDrawer);
     $('drawerBackdrop').addEventListener('click', closeDrawer);

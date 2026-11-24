@@ -1974,6 +1974,13 @@ ipcMain.handle('vpn-open-auth-url', async (event, url) => {
     return { success: true };
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the sign-in page.' }; }
 });
+// Opens the Tailscale admin console (Machines page), where subnet routes
+// are approved. The app cannot approve its own route — Tailscale requires
+// the tailnet admin to do it in the console.
+ipcMain.handle('vpn-open-admin', async () => {
+  try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/machines'); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the admin console.' }; }
+});
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {
     vaultKey = vault.changeMasterPassword(app.getPath('userData'), oldPassword, newPassword);

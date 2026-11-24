@@ -111,6 +111,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onVpnInstallProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('vpn-install-progress', h); return () => ipcRenderer.removeListener('vpn-install-progress', h); },
   vpnOpenDownload: () => ipcRenderer.invoke('vpn-open-download'),
   vpnOpenAuthUrl: (url) => ipcRenderer.invoke('vpn-open-auth-url', url),
+  vpnOpenAdmin: () => ipcRenderer.invoke('vpn-open-admin'),
   onBackupComplete: (callback) => ipcRenderer.on('backup-complete', (event, ...args) => callback(...args)),
   onJobsUpdated: (callback) => ipcRenderer.on('jobs-updated', () => callback()),
 
