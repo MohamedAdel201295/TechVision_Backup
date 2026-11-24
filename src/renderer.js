@@ -1356,7 +1356,7 @@
     if (!st || !st.installed) {
       if (txt) txt.textContent = 'Not installed';
       if (sub) sub.textContent = 'Tailscale is not installed on this computer.';
-      if (btn) { btn.textContent = 'Connect'; btn.disabled = true; }
+      if (btn) { btn.textContent = 'Install & connect'; btn.disabled = false; }
       if (ni) ni.style.display = '';
       if (lb) lb.style.display = 'none';
       if (dc) dc.style.display = 'none';
@@ -1591,6 +1591,25 @@
     if (vcb) vcb.addEventListener('click', async function () {
       if (!api || typeof api.vpnSetConnected !== 'function') return vpnMissing();
       if (vpnBusy) return;
+      // Not installed yet → one click installs Tailscale, then connects.
+      if (vpnStatusCache && !vpnStatusCache.installed) {
+        if (typeof api.vpnInstallConnect !== 'function' || typeof api.onVpnInstallProgress !== 'function') return vpnMissing();
+        vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Installing…';
+        var ib = $('vpnInstallBox'); if (ib) ib.style.display = '';
+        var stopListen = api.onVpnInstallProgress(function (p) {
+          var f = $('vpnInstallFill'); if (f) f.style.width = Math.max(0, Math.min(100, p.pct || 0)) + '%';
+          var t = $('vpnInstallText'); if (t) t.textContent = p.text || '';
+        });
+        try {
+          var r = await api.vpnInstallConnect();
+          if (r && r.success) {
+            if (r.needsLogin) toast('VPN', 'Tailscale is installed. Sign in to Tailscale in the browser window, then press Refresh.', '');
+            else toast('VPN', 'Tailscale installed and connected.', 'success');
+          } else toast('VPN error', (r && r.error) || 'Could not install Tailscale.', 'error');
+        } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not install Tailscale.', 'error'); }
+        finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); }
+        return;
+      }
       vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Working…';
       try {
         var wantOn = !(vpnStatusCache && vpnStatusCache.connected);

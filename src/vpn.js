@@ -16,22 +16,18 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const https = require('https');
+const http = require('http');
 
 const WIN_CLI = 'C:\\Program Files\\Tailscale\\tailscale.exe';
-
-let cliPathCache = null; // null = not resolved yet
+const MSI_URL = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi';
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 
 function resolveCli() {
-  if (cliPathCache !== null) return cliPathCache;
-  // PATH lookup: execFile('tailscale') resolves through PATH, so we only
-  // need the well-known install path as a fallback (Windows installer
-  // normally puts it on PATH, but not always for the current shell).
-  if (process.platform === 'win32' && fs.existsSync(WIN_CLI)) {
-    cliPathCache = WIN_CLI;
-  } else {
-    cliPathCache = 'tailscale';
-  }
-  return cliPathCache;
+  // Re-checked on every call: the CLI may appear while the app is
+  // running (e.g. right after the auto-install below finishes).
+  if (process.platform === 'win32' && fs.existsSync(WIN_CLI)) return WIN_CLI;
+  return 'tailscale';
 }
 
 function runCli(args, timeoutMs) {
@@ -154,4 +150,142 @@ async function setSubnetRouter(on) {
   return { success: true, subnet: on ? subnet : null };
 }
 
-module.exports = { getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr };
+module.exports = {
+  getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
+  installAndConnect, downloadFile, verifySignature, MSI_URL,
+};
+
+/* ---------- Auto-install (Windows only) ----------
+   One click: download the official MSI from tailscale.com, verify its
+   Authenticode signature (must be Valid, signed by Tailscale), install
+   it silently with one UAC prompt, wait for the CLI, then connect.
+   The download is HTTPS from Tailscale's own package host; nothing is
+   run before the signature check passes. The installer file is deleted
+   afterwards. On any other OS this returns an error telling the user
+   to install Tailscale manually — there is no silent install there. */
+
+/* Download a file, following up to 5 redirects. onProgress(done, total). */
+function downloadFile(url, dest, onProgress) {
+  return new Promise((resolve, reject) => {
+    const get = (u, hops) => {
+      if (hops > 5) return reject(new Error('Too many redirects while downloading.'));
+      const lib = u.startsWith('https:') ? https : http;
+      const req = lib.get(u, { headers: { 'User-Agent': 'TechVision-Backup/1.0' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          return get(new URL(res.headers.location, u).toString(), hops + 1);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error('Download failed (HTTP ' + res.statusCode + ').'));
+        }
+        const total = parseInt(res.headers['content-length'], 10) || 0;
+        let done = 0;
+        const out = fs.createWriteStream(dest);
+        res.on('data', (chunk) => {
+          done += chunk.length;
+          if (done > MAX_DOWNLOAD_BYTES) { req.destroy(); out.destroy(); return reject(new Error('Download is larger than expected.')); }
+          if (onProgress) { try { onProgress(done, total); } catch (e) {} }
+        });
+        res.on('error', (e) => { out.destroy(); reject(e); });
+        out.on('error', reject);
+        out.on('finish', () => resolve({ bytes: done, total }));
+        res.pipe(out);
+      });
+      req.on('error', reject);
+      req.setTimeout(120000, () => { req.destroy(new Error('Download timed out.')); });
+    };
+    get(url, 0);
+  });
+}
+
+/* True only when the file is signed by Tailscale and the signature is
+   valid. Windows only; false everywhere else (and on any check failure). */
+function verifySignature(file) {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve(false);
+    const ps = "(Get-AuthenticodeSignature -FilePath '" + file.replace(/'/g, "''") + "' | Select-Object Status, @{N='Subject';E={$_.SignerCertificate.Subject}} | ConvertTo-Json -Compress)";
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 30000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(false);
+      try {
+        const j = JSON.parse(stdout);
+        resolve(j.Status === 'Valid' && typeof j.Subject === 'string' && /Tailscale/i.test(j.Subject));
+      } catch (e) { resolve(false); }
+    });
+  });
+}
+
+/* Silent per-machine MSI install, elevated once via UAC.
+   TS_NOLAUNCH=true stops the Tailscale tray app from popping up —
+   TechVision is the UI here. Returns { success, declined?, error? }. */
+function installMsiElevated(msiPath) {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32') return resolve({ success: false, error: 'Automatic install is available on Windows only.' });
+    const script = [
+      '$ErrorActionPreference = "Stop"',
+      'try {',
+      '  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList \'/i\', \'"' + msiPath + '"\', \'/qn\', \'/norestart\', \'TS_NOLAUNCH=true\' -Verb RunAs -Wait -PassThru',
+      '  exit $p.ExitCode',
+      '} catch {',
+      '  exit 2',
+      '}',
+    ].join('\r\n');
+    const scriptPath = path.join(os.tmpdir(), 'techvision-install-tailscale.ps1');
+    fs.writeFileSync(scriptPath, script, 'utf8');
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { timeout: 600000, windowsHide: true }, (err) => {
+      try { fs.unlinkSync(scriptPath); } catch (e) {}
+      if (err) {
+        if (err.code === 2) return resolve({ success: false, declined: true, error: 'Installation was cancelled (administrator permission was not granted).' });
+        return resolve({ success: false, error: 'Tailscale installation failed (code ' + err.code + ').' });
+      }
+      resolve({ success: true });
+    });
+  });
+}
+
+async function waitForCli(timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 60000);
+  while (Date.now() < deadline) {
+    const r = await runCli(['version'], 5000);
+    if (!r.notFound && r.code === 0) return true;
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  return false;
+}
+
+/* Full one-click flow. progress({ phase, pct, text }) reports
+   downloading / verifying / installing / waiting / connecting. */
+async function installAndConnect(progress) {
+  const emit = (phase, pct, text) => { if (progress) { try { progress({ phase, pct, text }); } catch (e) {} } };
+  if (process.platform !== 'win32') {
+    return { success: false, error: 'Automatic install is available on Windows only. Install Tailscale from tailscale.com/download, then press Connect.' };
+  }
+  const st0 = await getStatus();
+  if (st0.installed) return setConnected(true);
+  const dir = path.join(os.tmpdir(), 'TechVision');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+  const msi = path.join(dir, 'tailscale-setup-latest-amd64.msi');
+  emit('downloading', 0, 'Downloading Tailscale…');
+  try {
+    await downloadFile(MSI_URL, msi, (done, total) => {
+      emit('downloading', total > 0 ? Math.round((done / total) * 100) : 0, 'Downloading Tailscale…');
+    });
+  } catch (e) {
+    return { success: false, error: 'Could not download Tailscale: ' + e.message };
+  }
+  emit('verifying', 0, 'Verifying the installer…');
+  const ok = await verifySignature(msi);
+  if (!ok) {
+    try { fs.unlinkSync(msi); } catch (e) {}
+    return { success: false, error: 'The downloaded installer could not be verified. Install Tailscale manually from tailscale.com/download.' };
+  }
+  emit('installing', 0, 'Installing Tailscale — Windows will ask for administrator permission once.');
+  const ins = await installMsiElevated(msi);
+  try { fs.unlinkSync(msi); } catch (e) {}
+  if (!ins.success) return { success: false, error: ins.error || 'Tailscale installation failed.' };
+  emit('waiting', 0, 'Waiting for Tailscale…');
+  const found = await waitForCli(60000);
+  if (!found) return { success: false, error: 'Tailscale was installed but the command was not found. Restart the app and try again.' };
+  emit('connecting', 0, 'Connecting…');
+  return setConnected(true);
+}

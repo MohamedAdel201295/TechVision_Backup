@@ -384,11 +384,15 @@
       </div>
       <div id="vpnNotInstalled" style="display:none;">
         <p style="margin:8px 0 4px;">Tailscale is not installed on this computer.</p>
-        <p class="t-sub" style="margin:0 0 10px;">Install it once from tailscale.com/download, sign in with the same account on every device, and this panel will light up. The app never installs it for you.</p>
+        <p class="t-sub" style="margin:0 0 10px;">Press <b>Install &amp; connect</b> and the app downloads Tailscale from tailscale.com, checks the installer's signature, and installs it — Windows will ask for administrator permission once — then signs you in. Or install it yourself from the button below.</p>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn" type="button" id="vpnDownloadBtn">Download Tailscale</button>
           <button class="btn btn-ghost" type="button" id="vpnRecheckBtn">Check again</button>
         </div>
+      </div>
+      <div id="vpnInstallBox" style="display:none; margin-top:12px;">
+        <div class="progress-track"><div class="progress-fill" id="vpnInstallFill" style="width:0%"></div></div>
+        <div class="cloud-muted" id="vpnInstallText" style="margin-top:6px;"></div>
       </div>
       <div id="vpnLoginBox" style="display:none;">
         <p style="margin:8px 0 4px;">Sign in to Tailscale to join your private network.</p>

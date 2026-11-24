@@ -1686,6 +1686,13 @@ ipcMain.handle('vpn-set-routes', async (event, on) => {
   try { return await vpn.setSubnetRouter(!!on); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
+ipcMain.handle('vpn-install-connect', async (event) => {
+  try {
+    return await vpn.installAndConnect((p) => {
+      try { if (!event.sender.isDestroyed()) event.sender.send('vpn-install-progress', p); } catch (e) {}
+    });
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install Tailscale.' }; }
+});
 ipcMain.handle('vpn-open-download', async () => {
   try { await require('electron').shell.openExternal('https://tailscale.com/download'); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
