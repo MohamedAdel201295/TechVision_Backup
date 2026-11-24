@@ -159,6 +159,7 @@ async function getStatus() {
     authUrl: j.AuthURL || null,
     selfName: self.HostName || null,
     selfIp,
+    deviceId: self.ID || null, // the node ID the Tailscale API needs
     tailnet: tailnetFromDns(self.DNSName),
     peers,
     advertiseRoutes,
@@ -280,12 +281,86 @@ async function setSubnetRouter(on) {
   return { success: true, subnet: on ? subnet : null };
 }
 
-/* Disable key expiry for this device (`tailscale set --key-expiry=off`).
-   Runs on the device itself — no API token needed. The device must
-   already be connected. Tailscale normally makes the node key expire
+/* ---------- Tailscale API: key expiry (the real integration) ----------
+ * `tailscale set --key-expiry=off` is NOT a real CLI flag — the official
+ * CLI has no way to turn off key expiry (the only nearby command is the
+ * debug-only `tailscale debug set-expire`), so that call always failed
+ * with "unknown flag" and the view hid the reason behind a generic
+ * toast. The documented route is the Tailscale API:
+ *   POST /api/v2/device/{deviceID}/key  {"keyExpiryDisabled": true}
+ * authenticated with an API access token (tskey-api-...) generated in
+ * the admin console (Settings -> Keys -> Generate API access token).
+ * GET /api/v2/device/{deviceID} returns the real keyExpiryDisabled
+ * flag, so the view can show the truth instead of the preference.
+ * The token belongs to the tailnet admin; it is stored in the app
+ * settings (same as the SMTP password) and can be revoked any time
+ * from the admin console. */
+const TAILSCALE_API_BASE = 'https://api.tailscale.com/api/v2';
+
+async function apiFetch(apiPath, apiToken, opts) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(TAILSCALE_API_BASE + apiPath, {
+      method: (opts && opts.method) || 'GET',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(String(apiToken) + ':').toString('base64'),
+        'Content-Type': 'application/json',
+      },
+      body: opts && opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: ctrl.signal,
+    });
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* empty body on success */ }
+    return { ok: res.ok, status: res.status, body };
+  } catch (e) {
+    return { ok: false, status: 0, body: null, error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+  } finally { clearTimeout(timer); }
+}
+
+async function selfDeviceId() {
+  const st = await getStatus();
+  if (!st.installed) return { id: null, error: 'Tailscale is not installed on this computer.' };
+  if (!st.connected) return { id: null, error: 'Connect to Tailscale first.' };
+  if (!st.deviceId) return { id: null, error: 'Could not find this device in Tailscale status.' };
+  return { id: st.deviceId, error: null };
+}
+
+async function disableKeyExpiryViaApi(apiToken) {
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiFetch('/device/' + encodeURIComponent(id) + '/key', apiToken, { method: 'POST', body: { keyExpiryDisabled: true } });
+  if (r.ok) return { success: true, via: 'api' };
+  if (r.status === 401 || r.status === 403) return { success: false, error: 'Tailscale API refused the token (HTTP ' + r.status + '). Check the API access token in the VPN settings.' };
+  return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+}
+
+/* The real key-expiry state of this device, from the API. Returns
+   { success, disabled, expires } — disabled is the flag itself, so it
+   stays true even though the `expires` timestamp goes stale after the
+   flag is set (Tailscale keeps the original expiry time). */
+async function getKeyExpiryState(apiToken) {
+  if (!apiToken || !String(apiToken).trim()) return { success: false, error: 'No API token saved.' };
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiFetch('/device/' + encodeURIComponent(id), String(apiToken).trim(), { method: 'GET' });
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) return { success: false, error: 'Tailscale API refused the token (HTTP ' + r.status + ').' };
+    return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+  }
+  const b = r.body || {};
+  return { success: true, disabled: b.keyExpiryDisabled === true, expires: b.expires || null };
+}
+
+/* Disable key expiry for this device. With an API token the documented
+   API route is used; without one the old CLI call is kept as a
+   fallback (it fails on current Tailscale builds — there is no
+   --key-expiry flag — but the real error is now returned instead of
+   being swallowed). Tailscale normally makes the node key expire
    after 180 days and asks for another sign-in; with expiry off the
-   device stays connected forever. Returns { success, error? }. */
-async function disableKeyExpiry() {
+   device stays connected forever. Returns { success, error?, via? }. */
+async function disableKeyExpiry(apiToken) {
+  if (apiToken && String(apiToken).trim()) return disableKeyExpiryViaApi(String(apiToken).trim());
   const st = await getStatus();
   if (!st.installed) return { success: false, error: 'Tailscale is not installed on this computer.' };
   if (!st.connected) return { success: false, error: 'Connect to Tailscale first.' };
@@ -296,13 +371,13 @@ async function disableKeyExpiry() {
     const msg = (r.stderr || '').trim() || 'Could not disable key expiry.';
     return { success: false, error: msg };
   }
-  return { success: true };
+  return { success: true, via: 'cli' };
 }
 
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
-  disableKeyExpiry, pickLanSubnet, tailnetFromDns, buildInstallScript,
+  disableKeyExpiry, getKeyExpiryState, disableKeyExpiryViaApi, pickLanSubnet, tailnetFromDns, buildInstallScript,
   parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,
 };
 

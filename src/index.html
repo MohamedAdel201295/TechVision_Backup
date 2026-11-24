@@ -440,10 +440,19 @@
       <div class="t-sub" id="vpnRoutesNote" style="display:none;"></div>
       <button class="btn btn-ghost btn-sm" type="button" id="vpnApproveBtn" style="display:none; margin-top:6px;">Open admin console to approve the route</button>
       <div class="toggle-row" style="margin-top:12px;">
-        <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale normally asks you to sign in again after 180 days. With this on, the app turns that off automatically right after you connect.</div></div>
+        <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale normally asks you to sign in again after 180 days. With this on, the app turns that off automatically right after you connect — using the API token below, because the Tailscale command line cannot do it.</div></div>
         <label class="switch"><input type="checkbox" id="vpnKeyExpiryToggle" checked><span class="slider"></span></label>
       </div>
+      <div class="t-sub" id="vpnKeyExpiryState" style="margin-top:6px;"></div>
       <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" type="button" id="vpnKeyExpiryBtn">Disable key expiry now</button></div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Tailscale API access token</div>
+        <div class="t-sub">Needed to turn off key expiry from inside the app. Generate one in the Tailscale admin console: Settings → Keys → Generate API access token. It is stored in the app settings (like the email password) and can be revoked any time from the same page.</div>
+        <div style="display:flex; gap:8px; margin-top:6px;">
+          <input type="password" id="vpnApiToken" placeholder="tskey-api-…" autocomplete="off" style="flex:1;">
+          <button class="btn btn-ghost btn-sm" type="button" id="vpnApiTokenSaveBtn">Save token</button>
+        </div>
+      </div>
     </div>
     <div class="card">
       <h3 style="margin:0 0 4px;font-size:16px;">Devices on your network</h3>

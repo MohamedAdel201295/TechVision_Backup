@@ -1618,10 +1618,12 @@
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
       : 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
     var ket = $('vpnKeyExpiryToggle'); if (ket) ket.checked = vpnKeyExpiryWanted();
+    var tok = $('vpnApiToken'); if (tok) tok.value = (settings.vpn && settings.vpn.apiToken) || '';
     renderVpnPeers(st.peers || []);
     // First sign-in (or first view while connected): turn off the 180-day
     // key expiry automatically, so the device never asks to sign in again.
     maybeDisableVpnKeyExpiry();
+    refreshVpnKeyExpiryState();
   }
 
   // `tailscale up` can return before the daemon reports itself Running, so
@@ -1652,18 +1654,44 @@
   async function disableVpnKeyExpiry(quiet) {
     if (!api || typeof api.vpnDisableKeyExpiry !== 'function') return false;
     try {
-      var r = await api.vpnDisableKeyExpiry();
+      var token = (settings.vpn && settings.vpn.apiToken) || '';
+      var r = await api.vpnDisableKeyExpiry(token || undefined);
       if (r && r.success) {
         await saveVpnSettings({ keyExpiryDisabled: true });
         if (!quiet) toast('VPN', 'Key expiry is off — this device will stay connected, no more sign-ins.', 'success');
+        refreshVpnKeyExpiryState();
         return true;
       }
-      if (!quiet) toast('VPN', 'Could not turn off key expiry automatically. You can turn it off in the Tailscale admin console (Machines → this device → Disable key expiry).', 'error');
+      // Show the real reason, not the old generic sentence: the failure
+      // used to be invisible (the CLI flag does not exist), which is
+      // exactly why the toggle looked on while nothing had happened.
+      if (!quiet) toast('VPN', 'Could not turn off key expiry automatically: ' + ((r && r.error) || 'unknown error') + ' — you can also turn it off in the Tailscale admin console (Machines → this device → Disable key expiry).', 'error');
       return false;
     } catch (e) {
       if (!quiet) toast('VPN error', e && e.message ? e.message : 'Could not turn off key expiry.', 'error');
       return false;
     }
+  }
+  // The real key-expiry state from the Tailscale API — the toggle above
+  // is only the "try to turn it off" preference, this line is the truth.
+  async function refreshVpnKeyExpiryState() {
+    var el = $('vpnKeyExpiryState');
+    if (!el) return;
+    var token = (settings.vpn && settings.vpn.apiToken) || '';
+    if (!token) { el.textContent = 'Key expiry state: unknown — save a Tailscale API access token below and the app will show the real state here.'; return; }
+    if (!api || typeof api.vpnKeyExpiryState !== 'function') return;
+    el.textContent = 'Key expiry state: checking…';
+    try {
+      var r = await api.vpnKeyExpiryState(token);
+      if (r && r.success) {
+        el.textContent = r.disabled
+          ? 'Key expiry: OFF — this device stays connected, no more sign-ins.'
+          : 'Key expiry: ON — the device will ask to sign in again when the key expires' + (r.expires ? ' (' + r.expires + ')' : '') + '.';
+        if (r.disabled) await saveVpnSettings({ keyExpiryDisabled: true });
+      } else {
+        el.textContent = 'Key expiry state: unknown — ' + ((r && r.error) || 'could not read it.');
+      }
+    } catch (e) { el.textContent = 'Key expiry state: unknown — ' + (e && e.message ? e.message : 'could not read it.'); }
   }
   async function maybeDisableVpnKeyExpiry() {
     if (vpnKeyExpiryAttempted) return;
@@ -1963,6 +1991,14 @@
       vpnBusy = true; vkb.disabled = true;
       try { await disableVpnKeyExpiry(false); }
       finally { vpnBusy = false; vkb.disabled = false; }
+    });
+    var vts = $('vpnApiTokenSaveBtn');
+    if (vts) vts.addEventListener('click', async function () {
+      var inp = $('vpnApiToken');
+      var token = inp ? inp.value.trim() : '';
+      await saveVpnSettings({ apiToken: token });
+      toast('VPN', token ? 'API token saved.' : 'API token removed.', 'success');
+      refreshVpnKeyExpiryState();
     });
     var vst = $('vpnSubnetToggle');
     if (vst) vst.addEventListener('change', async function () {

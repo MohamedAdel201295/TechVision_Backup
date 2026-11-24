@@ -1966,9 +1966,13 @@ ipcMain.handle('vpn-set-routes', async (event, on) => {
   try { return await vpn.setSubnetRouter(!!on); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
-ipcMain.handle('vpn-disable-key-expiry', async () => {
-  try { return await vpn.disableKeyExpiry(); }
+ipcMain.handle('vpn-disable-key-expiry', async (event, apiToken) => {
+  try { return await vpn.disableKeyExpiry(apiToken); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }
+});
+ipcMain.handle('vpn-key-expiry-state', async (event, apiToken) => {
+  try { return await vpn.getKeyExpiryState(apiToken); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read key expiry state.' }; }
 });
 ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
   try {
