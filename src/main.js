@@ -172,6 +172,12 @@ function normalizeJobObject(job, defaultType = 'full') {
     compress: job.compress !== undefined ? job.compress : undefined,
     compression: job.compression || (job.compress === false ? 'none' : undefined),
     allowIncremental: job.allowIncremental,
+    // Include/exclude patterns used to be dropped here — the wizard
+    // saved them and the engine honours them, but every run path
+    // (scheduled, dashboard, job-run-backup) goes through normalize,
+    // so no run ever used them and every backup took EVERYTHING.
+    includePatterns: Array.isArray(job.includePatterns) ? job.includePatterns.filter((p) => typeof p === 'string') : undefined,
+    excludePatterns: Array.isArray(job.excludePatterns) ? job.excludePatterns.filter((p) => typeof p === 'string') : undefined,
     sourceVolumeLabel: job.sourceVolumeLabel || null,
     destinationVolumeLabel: job.destinationVolumeLabel || null,
     sourceDriveMatch: job.sourceDriveMatch || null,
@@ -224,8 +230,28 @@ function mergeJobEntries(entries) {
     // two separate tasks. Run records carry jobId; templates carry id.
     const key = (isRunRecord ? (entry.jobId || entry.name) : (entry.id || entry.name) || 'Unnamed Job').toLowerCase();
     let job = byName.get(key);
+    if (!job && !isRunRecord) {
+      // Legacy run records (saved before jobId existed) key by name,
+      // not by the job id — a template for the same job would
+      // otherwise create a second, run-less entry. Adopt the
+      // name-keyed job instead of duplicating it.
+      const byNameKey = (entry.name || '').toLowerCase();
+      for (const cand of merged) {
+        if (!cand.loaded && (cand.name || '').toLowerCase() === byNameKey) {
+          job = cand;
+          byName.set(key, job); // the template's id-key points at it too
+          break;
+        }
+      }
+    }
     if (!job) {
-      job = normalizeJobObject(entry, isRunRecord ? 'full' : 'template');
+      // A run record's own id is the RUN's id, not the job's: use the
+      // record's jobId when it has one, so the merged job keeps the
+      // identity its template file and vault entries use.
+      const entryForJob = (isRunRecord && entry.jobId)
+        ? Object.assign({}, entry, { id: entry.jobId })
+        : entry;
+      job = normalizeJobObject(entryForJob, isRunRecord ? 'full' : 'template');
       job.runs = [];
       job.runCount = 0;
       if (isRunRecord) {
@@ -250,6 +276,7 @@ function mergeJobEntries(entries) {
       // Template: keep the job's identity/paths, preserve any runs
       // already merged from history records.
       job.loaded = true;
+      if (entry.id) job.id = entry.id; // the template's id is authoritative
       if (entry.source) job.source = entry.source;
       if (entry.destination) job.destination = entry.destination;
       if (entry.schedule) job.schedule = entry.schedule;
@@ -257,6 +284,16 @@ function mergeJobEntries(entries) {
       if (entry.compression) job.compression = entry.compression;
       if (entry.allowIncremental !== undefined) job.allowIncremental = entry.allowIncremental;
       if (entry.verify !== undefined) job.verify = entry.verify;
+      // These used to be lost when a job was rebuilt from its runs
+      // after a restart: patterns, drive-match and encryption came
+      // only from the template, and the merge never copied them.
+      if (Array.isArray(entry.includePatterns)) job.includePatterns = entry.includePatterns.filter((p) => typeof p === 'string');
+      if (Array.isArray(entry.excludePatterns)) job.excludePatterns = entry.excludePatterns.filter((p) => typeof p === 'string');
+      if (entry.sourceDriveMatch) job.sourceDriveMatch = entry.sourceDriveMatch;
+      if (entry.destinationDriveMatch) job.destinationDriveMatch = entry.destinationDriveMatch;
+      if (entry.sourceVolumeLabel) job.sourceVolumeLabel = entry.sourceVolumeLabel;
+      if (entry.destinationVolumeLabel) job.destinationVolumeLabel = entry.destinationVolumeLabel;
+      if (entry.encryptionEnabled !== undefined) job.encryptionEnabled = entry.encryptionEnabled === true;
       if (entry.options) job.options = entry.options;
       if (entry.lastScheduledRun) job.lastScheduledRun = entry.lastScheduledRun;
       if (!job.runs.length) {
@@ -432,6 +469,9 @@ async function loadStoredJobs() {
   // with the job's runs attached, instead of a PENDING template row
   // plus a separate row per run.
   jobHistory = mergeJobEntries(jobHistory);
+  // Restore any drive-wait in progress from before the restart, so
+  // its 2-hour budget continues instead of restarting.
+  loadWaitingState();
 }
 
 // Save job history to disk
@@ -444,22 +484,78 @@ function saveJobHistory() {
     }
     // Persist runs as flat records (the on-disk history.json format),
     // one per run, so they survive a restart and merge back into their
-    // job on load. Templates with no runs save nothing.
+    // job on load. Templates with no runs save nothing. Every record
+    // carries its jobId: without it, a run record reloaded after a
+    // restart was keyed by NAME and gave the job the RUN's id, so
+    // Edit opened a blank wizard, vault lookups used the wrong id,
+    // and two same-named jobs merged into one.
     const recordsToSave = [];
     for (const j of jobHistory) {
       for (const r of (j.runs || [])) {
         recordsToSave.push({
-          id: r.id, name: j.name, type: r.type, status: r.status,
+          id: r.id, jobId: j.id || r.jobId || null, name: j.name, type: r.type, status: r.status,
           success: r.success, source: j.source, destination: j.destination,
           timestamp: r.timestamp, files: r.files, size: r.size,
           duration: r.duration, error: r.error || null, result: r.result || null
         });
       }
     }
-    fs.writeFileSync(historyPath, JSON.stringify(recordsToSave, null, 2));
+    // Atomic write: a torn history.json used to lose every run record.
+    const tmpPath = historyPath + '.tmp-' + process.pid;
+    fs.writeFileSync(tmpPath, JSON.stringify(recordsToSave, null, 2));
+    fs.renameSync(tmpPath, historyPath);
     console.log(`[Main] Saved ${recordsToSave.length} job history records`);
   } catch (e) {
     console.error('[Main] Failed to save job history:', e.message);
+  }
+}
+
+// Persist the drive-wait state so the 2-hour budget survives an app
+// restart: waitingForDrive used to live only in memory, so restarting
+// the app while a job was waiting reset its 2h clock to zero.
+function getWaitingPath() {
+  return path.join(path.dirname(getHistoryPath()), 'waiting.json');
+}
+
+function saveWaitingState() {
+  try {
+    const waiting = [];
+    for (const j of jobHistory) {
+      if (j.waitingForDrive) {
+        waiting.push({
+          jobId: j.id || null, name: j.name,
+          since: j.waitingForDrive.since, due: j.waitingForDrive.due,
+          which: j.waitingForDrive.which, path: j.waitingForDrive.path,
+          label: j.waitingForDrive.label || null
+        });
+      }
+    }
+    const waitingPath = getWaitingPath();
+    const tmpPath = waitingPath + '.tmp-' + process.pid;
+    fs.writeFileSync(tmpPath, JSON.stringify(waiting, null, 2));
+    fs.renameSync(tmpPath, waitingPath);
+  } catch (e) {
+    console.error('[Main] Failed to save drive-wait state:', e.message);
+  }
+}
+
+function loadWaitingState() {
+  try {
+    const waitingPath = getWaitingPath();
+    if (!fs.existsSync(waitingPath)) return;
+    const waiting = JSON.parse(fs.readFileSync(waitingPath, 'utf-8'));
+    if (!Array.isArray(waiting)) return;
+    for (const w of waiting) {
+      const job = jobHistory.find(j => (w.jobId && j.id === w.jobId) || j.name === w.name);
+      if (job && w.since) {
+        job.waitingForDrive = {
+          since: w.since, due: w.due || null,
+          which: w.which || 'source', path: w.path || null, label: w.label || null
+        };
+      }
+    }
+  } catch (e) {
+    console.error('[Main] Failed to load drive-wait state:', e.message);
   }
 }
 
@@ -675,7 +771,9 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
       return next; // due already; caller fires once then records lastScheduledRun
     }
     if (target > fromDate) return target;
-    target.setDate(target.getDate() + 7);
+    // No last run and the time already passed today: due now, like
+    // daily/monthly — the old code waited a whole week for a brand
+    // new weekly job whose time had passed.
     return target;
   }
   // A run time that already passed TODAY is due, not tomorrow — but
@@ -687,7 +785,13 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
   if (freq === 'monthly') {
     if (target > fromDate) return target;
     if (!alreadyRanForTarget) return target; // due already; caller fires once then records lastScheduledRun
+    // Clamp to the last day of the next month: Jan 31 + 1 month used
+    // to roll over to Mar 3 (setMonth overflows the day).
+    const day = target.getDate();
+    target.setDate(1);
     target.setMonth(target.getMonth() + 1);
+    const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+    target.setDate(Math.min(day, lastDay));
     return target;
   }
   // Daily (default)
@@ -718,12 +822,26 @@ async function executeScheduledBackup(job, resolved) {
     encryptionEnabled: job.encryptionEnabled === true, id: job.id
   };
   // Encrypted job, vault locked (or no password saved): the schedule
-  // cannot run without the password, so skip this run and say so in
-  // the log instead of failing silently or running unencrypted.
+  // cannot run without the password, so skip this run. The skip used
+  // to be a single console.log — invisible in the app: no log entry,
+  // no history record, and lastScheduledRun never advanced, so the
+  // job was retried silently on every 30-second tick forever.
   if (jobConfig.encryptionEnabled) {
     const pw = resolveBackupPassword(jobConfig);
     if (!pw) {
-      console.log(`[Scheduler] Skipped encrypted job ${job.name}: vault is locked or no password is saved. Unlock the vault in Settings to let scheduled encrypted backups run.`);
+      const msg = `Skipped encrypted job "${job.name}": the vault is locked or no password is saved. Unlock the vault in Settings to let scheduled encrypted backups run.`;
+      console.log(`[Scheduler] ${msg}`);
+      appendAppLog('warn', msg);
+      recordRun(job.name, {
+        id: `${job.name}-scheduled-skipped-${Date.now()}`, jobId: job.id || null, name: job.name,
+        type: 'full', success: false, status: 'skipped',
+        source: jobPathValue(job.source), destination: jobPathValue(job.destination),
+        timestamp: new Date().toISOString(), files: 0, size: 0, duration: 0,
+        error: msg, result: null
+      });
+      job.lastScheduledRun = new Date().toISOString();
+      saveJobHistory();
+      notifyJobsUpdated();
       return;
     }
     jobConfig.encryptionPassword = pw;
@@ -789,9 +907,12 @@ async function checkSchedules() {
 
     // Removable drive? Resolve source + destination: the volume may
     // have come back on another letter, or be unplugged right now.
+    // A destination folder that does not exist yet is NOT a missing
+    // drive — the engine creates it — so the job waits only when the
+    // source is missing or the destination's drive is provably absent.
     const resolved = await resolveJobPaths(job);
-    if (resolved.source.found && resolved.destination.found) {
-      if (job.waitingForDrive) { delete job.waitingForDrive; notifyJobsUpdated(); }
+    if (resolved.source.found && (resolved.destination.found || resolved.destination.drivePresent !== false)) {
+      if (job.waitingForDrive) { delete job.waitingForDrive; saveWaitingState(); notifyJobsUpdated(); }
       executeScheduledBackup(job, resolved);
       continue;
     }
@@ -806,6 +927,7 @@ async function checkSchedules() {
         which: missing, path: missingPath,
         label: missing === 'source' ? driveMatchLabel(job, 'source') : driveMatchLabel(job, 'destination')
       };
+      saveWaitingState();
       appendAppLog('warn', `Job "${job.name}" is due but the ${missing} drive is missing (${missingPath}). Waiting for the drive — the job will run as soon as it appears.`);
       console.log(`[Scheduler] Job ${job.name} waiting for ${missing} drive: ${missingPath}`);
       notifyJobsUpdated();
@@ -814,7 +936,8 @@ async function checkSchedules() {
     // Still waiting: give up after DRIVE_WAIT_MS, record the failure
     // and email about it — the user asked for an error, not silence.
     if (now - new Date(job.waitingForDrive.since) >= DRIVE_WAIT_MS) {
-      const errText = `Source drive not found: ${job.waitingForDrive.path} (volume "${job.waitingForDrive.label || 'unknown'}") was not available within 2 hours of the scheduled time.`;
+      const which = job.waitingForDrive.which || 'source';
+      const errText = `${which === 'destination' ? 'Destination' : 'Source'} drive not found: ${job.waitingForDrive.path} (volume "${job.waitingForDrive.label || 'unknown'}") was not available within 2 hours of the scheduled time.`;
       const jobRecord = {
         id: `${job.name}-scheduled-${Date.now()}`, jobId: job.id || null, name: job.name,
         type: 'full', success: false, status: 'failed',
@@ -825,6 +948,7 @@ async function checkSchedules() {
       recordRun(job.name, jobRecord);
       job.lastScheduledRun = now.toISOString();
       delete job.waitingForDrive;
+      saveWaitingState();
       saveJobHistory();
       notifyJobsUpdated();
       notifyEmail('failed', Object.assign({}, jobRecord, { error: errText }));
@@ -849,9 +973,16 @@ function captureDriveMatch(jobConfig, which, drives) {
   const info = driveResolver.driveInfoForLetter(drives, letter);
   const match = {
     mode: mode,
-    label: (info && info.label) || prev.label || null,
-    serial: (info && info.serial) || prev.serial || null,
-    serialKind: (info && info.serialKind) || prev.serialKind || null
+    // Drive present: take what it reports right now. An empty label
+    // means the volume is unlabeled — keeping the previous label
+    // would leave a stale match from before a rename. A serial that
+    // cannot be read right now keeps the stored one (a hardware
+    // serial does not change; unreadable now is not a different disk).
+    // Drive absent: keep the stored values; an edit made while the
+    // drive is unplugged must not wipe the match.
+    label: info ? (info.label || null) : (prev.label || null),
+    serial: info ? (info.serial || prev.serial || null) : (prev.serial || null),
+    serialKind: info ? (info.serialKind || prev.serialKind || null) : (prev.serialKind || null)
   };
   jobConfig[matchKey] = match;
   if (match.label) jobConfig[labelKey] = match.label;
@@ -934,6 +1065,14 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'full' };
     jobConfig.encryptionPassword = pw;
   }
+  // Never run the same job twice at once (manual + scheduled, or a
+  // double-click): two engines would write the same backup folder
+  // and the same state file.
+  for (const [, a] of activeJobs) {
+    if (a.name === jobName || (jobConfig.id && a.jobId === jobConfig.id)) {
+      return { success: false, error: 'ALREADY_RUNNING', message: `A backup of "${jobName}" is already running.`, name: jobName, status: 'failed', type: 'full' };
+    }
+  }
   const engine = new BackupEngine(jobConfig);
 
   // Real progress for the window that started the run: the renderer
@@ -944,13 +1083,23 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   };
 
   const jobId = `${jobName}-${Date.now()}`;
-  activeJobs.set(jobId, { name: jobName, status: 'running' });
+  activeJobs.set(jobId, { name: jobName, jobId: jobConfig.id || null, status: 'running' });
 
   notifyEmail('started', { name: jobName, type: 'full', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
 
   engine.logger = true; // Enable logging
 
-  const result = await engine.run_full_backup();
+  // The engine returns failed results instead of throwing, but a
+  // setup failure (bad destination, engine bug) must still be
+  // recorded as a failed run — not an unhandled IPC rejection with
+  // no history entry and no email.
+  let result;
+  try {
+    result = await engine.run_full_backup();
+  } catch (e) {
+    result = { success: false, files_backed_up: 0, total_bytes: 0, duration_seconds: 0, error_messages: [e.message], backup_path: '' };
+    appendAppLog('error', `Manual backup "${jobName}" FAILED: ${e.message}`);
+  }
   
   const jobRecord = {
     id: jobId,
@@ -975,8 +1124,11 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 
   // The run used a password the user typed: if the vault is unlocked,
   // save it there (encrypted) so scheduled runs of this job work too.
+  // A failed store used to be swallowed silently — the job looked
+  // encrypted while no password was stored, so scheduled runs were
+  // then skipped with no explanation.
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
-    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) {}
+    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
   }
   notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
@@ -1004,6 +1156,12 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
     jobConfig.encryptionPassword = pw;
   }
+  // Never run the same job twice at once (see the full backup).
+  for (const [, a] of activeJobs) {
+    if (a.name === jobName || (jobConfig.id && a.jobId === jobConfig.id)) {
+      return { success: false, error: 'ALREADY_RUNNING', message: `A backup of "${jobName}" is already running.`, name: jobName, status: 'failed', type: 'incremental' };
+    }
+  }
   const engine = new BackupEngine(jobConfig);
 
   // Real progress for the window that started the run (see full backup).
@@ -1012,12 +1170,18 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   };
 
   const jobId = `${jobName}-${Date.now()}`;
-  activeJobs.set(jobId, { name: jobName, status: 'running' });
+  activeJobs.set(jobId, { name: jobName, jobId: jobConfig.id || null, status: 'running' });
   notifyEmail('started', { name: jobName, type: 'incremental', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
 
   engine.logger = true;
 
-  const result = await engine.run_incremental_backup();
+  let result;
+  try {
+    result = await engine.run_incremental_backup();
+  } catch (e) {
+    result = { success: false, files_backed_up: 0, total_bytes: 0, duration_seconds: 0, error_messages: [e.message], backup_path: '' };
+    appendAppLog('error', `Manual incremental backup "${jobName}" FAILED: ${e.message}`);
+  }
   
   const jobRecord = {
     id: jobId,
@@ -1041,7 +1205,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   activeJobs.delete(jobId);
 
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
-    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) {}
+    try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
   }
   notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Incremental backup completed: ${jobName}`);
@@ -1278,7 +1442,11 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
   jobConfig.id = fileId;
   const jobPath = path.join(jobsDir, `${fileId}.json`);
   try {
-    fs.writeFileSync(jobPath, JSON.stringify(jobConfig, null, 2));
+    // Atomic write: a torn job file used to load as a corrupt template
+    // (or fail to load at all) after a crash mid-save.
+    const tmpPath = jobPath + '.tmp-' + process.pid;
+    fs.writeFileSync(tmpPath, JSON.stringify(jobConfig, null, 2));
+    fs.renameSync(tmpPath, jobPath);
     // Migration: old configs were saved by name (<name>.json). If one
     // exists for this job, remove it so it is not loaded as a second job.
     const oldNamePath = path.join(jobsDir, `${jobConfig.name}.json`);
@@ -1496,6 +1664,7 @@ ipcMain.handle('vault-unlock', async (event, masterPassword) => {
   } catch (e) { return { success: false, error: e.message }; }
 });
 ipcMain.handle('vault-lock', async () => {
+  if (vaultKey) vault.lockVault(vaultKey);
   vaultKey = null;
   return { success: true };
 });
@@ -1838,43 +2007,89 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
   if (!job) {
     return { success: false, error: 'Job not found' };
   }
-  
-  // Use job configuration for backup
+  const jobName = job.name || 'Unnamed Job';
+  // Never run the same job twice at once (see backup-run-full).
+  for (const [, a] of activeJobs) {
+    if (a.name === jobName || a.jobId === job.id) {
+      return { success: false, error: 'ALREADY_RUNNING', message: `A backup of "${jobName}" is already running.`, name: jobName };
+    }
+  }
+  // Resolve removable drives first (the old handler skipped this
+  // entirely, so a job whose disk had moved letters failed inside
+  // the engine with a confusing error).
+  const src = await driveResolver.resolvePathAsync(jobPathValue(job.source), job.sourceDriveMatch || job.sourceVolumeLabel || null);
+  const dst = await driveResolver.resolvePathAsync(jobPathValue(job.destination), job.destinationDriveMatch || job.destinationVolumeLabel || null);
+  // A missing SOURCE always blocks the run. A missing DESTINATION
+  // blocks it only when its drive is provably absent: a destination
+  // folder that does not exist yet is created by the engine, so
+  // reporting "drive not found" for it was wrong.
+  const missing = !src.found ? { which: 'source', res: src } : ((!dst.found && dst.drivePresent === false) ? { which: 'destination', res: dst } : null);
+  if (missing) {
+    const errText = `${missing.which === 'source' ? 'Source' : 'Destination'} drive not found: ${missing.res.path} — plug the disk back in and run again.`;
+    appendAppLog('error', `Manual backup "${jobName}" FAILED: ${errText}`);
+    notifyEmail('failed', { name: jobName, type: 'full', files: 0, size: 0, duration: 0, error: errText });
+    return { success: false, error: 'SOURCE_DRIVE_NOT_FOUND', message: errText, name: jobName, status: 'failed' };
+  }
+
+  // Use the job's full configuration — the old handler rebuilt a
+  // partial config that dropped the include/exclude patterns, ran
+  // FULL every time, and never passed the compression setting.
   const backupConfig = {
     name: job.name,
-    source: job.source,
-    destination: job.destination,
+    source: src.remapped ? src.path : job.source,
+    destination: dst.remapped ? dst.path : job.destination,
     compression: job.compression,
+    compress: job.compress,
     encryptionEnabled: job.encryptionEnabled === true,
+    allowIncremental: job.allowIncremental,
+    includePatterns: job.includePatterns,
+    excludePatterns: job.excludePatterns,
     id: job.id,
-    options: job.options || { incremental: false, compress: true, verify: true }
+    options: job.options || {}
   };
   if (backupConfig.encryptionEnabled) {
     const pw = resolveBackupPassword(backupConfig);
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED' };
     backupConfig.encryptionPassword = pw;
   }
-  
-  const engine = new BackupEngine(backupConfig);
-  engine.logger = true;
-  
-  const result = await engine.run_full_backup();
-  
-  job.status = result.success ? 'completed' : 'failed';
-  job.timestamp = new Date().toISOString();
-  job.files = result.files_backed_up;
-  job.size = result.total_bytes;
-  job.duration = result.duration_seconds;
-  job.result = result;
-  
-  // Update history
-  const idx = jobHistory.findIndex(j => j.id === jobId);
-  if (idx >= 0) {
-    jobHistory[idx] = job;
+
+  const useIncremental = backupConfig.allowIncremental === true && (job.runCount > 0 || (job.runs && job.runs.length > 0));
+  const runType = useIncremental ? 'incremental' : 'full';
+  const runJobId = `${jobName}-${Date.now()}`;
+  activeJobs.set(runJobId, { name: jobName, jobId: job.id, status: 'running' });
+  notifyEmail('started', { name: jobName, type: runType, source: jobPathValue(backupConfig.source), destination: jobPathValue(backupConfig.destination) });
+
+  let result;
+  try {
+    const engine = new BackupEngine(backupConfig);
+    engine.logger = true;
+    result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
+  } catch (e) {
+    result = { success: false, files_backed_up: 0, total_bytes: 0, duration_seconds: 0, error_messages: [e.message], backup_path: '' };
+    appendAppLog('error', `Manual backup "${jobName}" FAILED: ${e.message}`);
   }
+
+  const jobRecord = {
+    id: runJobId,
+    jobId: job.id || null,
+    name: jobName,
+    type: runType,
+    success: result.success,
+    status: result.success ? 'completed' : 'failed',
+    source: jobPathValue(backupConfig.source),
+    destination: jobPathValue(backupConfig.destination),
+    timestamp: new Date().toISOString(),
+    files: result.files_backed_up,
+    size: result.total_bytes,
+    duration: result.duration_seconds,
+    result: result
+  };
+  recordRun(jobName, jobRecord);
   saveJobHistory();
-  
-  return { success: true, job: job };
+  notifyJobsUpdated();
+  activeJobs.delete(runJobId);
+  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+  return { success: result.success, job: job, result: result };
 });
 
 ipcMain.handle('job-restore', async (event, jobId) => {
@@ -1891,10 +2106,19 @@ ipcMain.handle('job-restore', async (event, jobId) => {
   if (!restoreDir) {
     return { success: false, error: 'Restore cancelled' };
   }
-  
+
+  // An encrypted job's restore used to call restore_all with no
+  // password at all, so it always failed with "password required".
+  // Resolve it the same way a backup run does (typed password, then
+  // the vault when unlocked).
+  let restorePassword = null;
+  if (job.encryptionEnabled === true) {
+    restorePassword = resolveBackupPassword({ id: job.id, encryptionEnabled: true });
+    if (!restorePassword) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', message: 'This backup is encrypted. Unlock the vault (or enter the backup password) and try again.' };
+  }
   const restoreEngine = new RestoreEngine();
-  const result = await restoreEngine.restore_all(job.result.backup_path, restoreDir);
-  
+  const result = await restoreEngine.restore_all(job.result.backup_path, restoreDir, restorePassword);
+
   return { success: result.success, files_restored: result.files_restored || 0, errors: result.errors || [] };
 });
 

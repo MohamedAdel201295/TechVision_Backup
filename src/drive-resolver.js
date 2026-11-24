@@ -11,8 +11,10 @@
  * The serial is the hardware serial when the drive reports one, and
  * the volume serial (XXXX-XXXX) otherwise. It is read automatically
  * at save time — the user never types it, and never needs to see the
- * drive's name or letter for it to work. When serial mode cannot find
- * a drive by serial, it falls back to the stored label.
+ * drive's name or letter for it to work. Serial mode NEVER falls
+ * back to the label: two disks can share a label, and the fallback
+ * is exactly what serial mode exists to prevent. A serial that
+ * cannot be found is a failure, not a label match.
  * Old jobs that only have sourceVolumeLabel keep working as 'label'.
  *
  * Drive listing uses PowerShell (Get-CimInstance Win32_Volume, plus
@@ -83,7 +85,9 @@ function parsePowerShellJson(text) {
         guid: guid,
         volumeSerial: volumeSerial,
         serial: hw || volumeSerial,
-        serialKind: hw ? 'hardware' : 'volume'
+        // A drive that reports neither serial claims no serial at all:
+        // the old code reported serialKind 'volume' with a null serial.
+        serialKind: hw ? 'hardware' : (volumeSerial ? 'volume' : null)
       };
     })
     .filter(Boolean);
@@ -160,7 +164,11 @@ function normalizeStored(stored) {
     return {
       mode: mode,
       label: (typeof stored.label === 'string' && stored.label.trim()) ? stored.label.trim() : null,
-      serial: normalizeSerial(stored.serial)
+      serial: normalizeSerial(stored.serial),
+      // serialKind tells callers which kind of serial the stored value
+      // is; dropping it lost the distinction between a hardware serial
+      // and a volume serial (XXXX-XXXX).
+      serialKind: (stored.serialKind === 'hardware' || stored.serialKind === 'volume') ? stored.serialKind : null
     };
   }
   return null;
@@ -170,6 +178,29 @@ function rebuildWithLetter(savedPath, letter) {
   return letter + ':' + savedPath.slice(2);
 }
 
+// Verify the drive at the saved letter against the stored match.
+// Returns 'ok' (matches, or nothing to check), 'mismatch' (the drive
+// at that letter is provably NOT the job's drive), or 'unknown'
+// (no drive list, or the letter is not in it — accept the literal
+// path rather than break a job over a stale list).
+function checkLiteralIdentity(savedPath, match, drives) {
+  if (!match || match.mode === 'letter') return 'ok';
+  const letter = driveLetterOf(savedPath);
+  if (!letter || !Array.isArray(drives)) return 'unknown';
+  const at = driveInfoForLetter(drives, letter);
+  if (!at) return 'unknown';
+  if (match.mode === 'serial' && match.serial) {
+    const want = match.serial;
+    if (normalizeSerial(at.serial) === want || normalizeSerial(at.volumeSerial) === want) return 'ok';
+    return 'mismatch';
+  }
+  if (match.label) {
+    if (at.label && at.label.trim().toLowerCase() === match.label.trim().toLowerCase()) return 'ok';
+    return 'mismatch';
+  }
+  return 'ok';
+}
+
 /**
  * Resolve a saved source/destination path.
  * @param {string} savedPath  the path stored on the job
@@ -177,26 +208,45 @@ function rebuildWithLetter(savedPath, letter) {
  *   volume label; object = { mode, label, serial }; null = literal only)
  * @param {Array} [drives]  optional drive list (for tests; otherwise
  *   pass null and use listDrives first)
- * @returns {{found:boolean, path:string, letter:string|null, label:string|null, remapped:boolean}}
+ * @returns {{found:boolean, path:string, letter:string|null, label:string|null, remapped:boolean, identityMismatch?:boolean, serialNotFound?:boolean}}
  */
 function resolvePath(savedPath, stored, drives) {
   const letter = driveLetterOf(savedPath);
   const match = normalizeStored(stored);
+  // Is the saved DRIVE present, even if the exact folder is not?
+  // A destination folder may legitimately not exist yet (the engine
+  // creates it); only a missing drive should block or wait. null =
+  // cannot tell (no letter, e.g. a Linux path, or no drive list).
+  const letterPresent = () => {
+    if (!letter || !Array.isArray(drives)) return null;
+    return drives.some((d) => d.letter === letter);
+  };
+  let identityMismatch = false;
   if (savedPath && fs.existsSync(savedPath)) {
-    return { found: true, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false };
+    // The literal path exists — but is it the job's drive? A different
+    // disk can mount on the same letter with the same folder path, and
+    // the old code returned immediately here without checking, which
+    // defeated the whole drive-match feature in the most dangerous
+    // case. On a mismatch, fall through and look for the real drive
+    // on another letter instead of silently using the wrong disk.
+    if (checkLiteralIdentity(savedPath, match, drives) === 'mismatch') {
+      identityMismatch = true;
+    } else {
+      return { found: true, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false, drivePresent: true };
+    }
   }
   // 'letter' mode (and no match info at all): the saved path is the
   // whole truth — never guess another drive.
   if (!match || match.mode === 'letter') {
-    return { found: false, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false };
+    return { found: false, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false, identityMismatch: identityMismatch, drivePresent: letterPresent() };
   }
   if (!letter || !Array.isArray(drives)) {
-    return { found: false, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false };
+    return { found: false, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false, identityMismatch: identityMismatch, drivePresent: null };
   }
   // 'serial' mode: find the disk by its serial number, on any letter.
   // Compare against both the hardware serial and the volume serial,
   // so a drive saved from the WMIC fallback still matches. If no
-  // drive matches by serial, fall through to the stored label.
+  // drive matches by serial, FAIL — never fall back to the label.
   if (match.mode === 'serial' && match.serial) {
     const want = match.serial;
     const hit = drives.find(function (d) {
@@ -205,34 +255,57 @@ function resolvePath(savedPath, stored, drives) {
     if (hit) {
       const rebuilt = rebuildWithLetter(savedPath, hit.letter);
       if (fs.existsSync(rebuilt)) {
-        return { found: true, path: rebuilt, letter: hit.letter, label: hit.label || match.label, remapped: true };
+        return { found: true, path: rebuilt, letter: hit.letter, label: hit.label || match.label, remapped: true, drivePresent: true };
       }
+      // The right disk is here, the folder is not: the drive is
+      // present (a destination can still be created on it). Return
+      // the rebuilt path, not the stale saved letter, so the caller
+      // creates/reports on the correct drive.
+      return { found: false, path: rebuilt, letter: hit.letter, label: hit.label || match.label, remapped: true, identityMismatch: identityMismatch, drivePresent: true };
     }
+    return { found: false, path: savedPath, letter: letter, label: match.label, remapped: false, identityMismatch: identityMismatch, serialNotFound: true, drivePresent: false };
   }
-  // 'label' mode (and the serial fallback): match the volume label.
-  // Try EVERY drive with that label, not just the first — two disks
-  // can share a label, and the file may only be on the second one.
+  // 'label' mode (and serial mode with no serial stored): match the
+  // volume label. Try EVERY drive with that label, not just the first
+  // — two disks can share a label, and the file may only be on the
+  // second one.
   if (match.label) {
     const wantLabel = match.label.trim().toLowerCase();
+    let labelDrivePresent = false;
+    let firstCandidate = null;
     for (const d of drives) {
       if (!d.label || d.label.toLowerCase() !== wantLabel) continue;
+      labelDrivePresent = true;
       const rebuilt = rebuildWithLetter(savedPath, d.letter);
+      if (!firstCandidate) firstCandidate = { path: rebuilt, letter: d.letter, label: d.label };
       if (fs.existsSync(rebuilt)) {
-        return { found: true, path: rebuilt, letter: d.letter, label: d.label, remapped: true };
+        return { found: true, path: rebuilt, letter: d.letter, label: d.label, remapped: true, drivePresent: true };
       }
     }
+    // A drive with the label exists but the folder does not: return
+    // the path rebuilt on that drive (not the stale saved letter) so
+    // a destination can be created there and errors name the right disk.
+    if (firstCandidate) {
+      return { found: false, path: firstCandidate.path, letter: firstCandidate.letter, label: firstCandidate.label, remapped: true, identityMismatch: identityMismatch, drivePresent: true };
+    }
+    return { found: false, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false, identityMismatch: identityMismatch, drivePresent: false };
   }
-  return { found: false, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false };
+  return { found: false, path: savedPath, letter: letter, label: (match && match.label) || null, remapped: false, identityMismatch: identityMismatch, drivePresent: letterPresent() };
 }
 
 async function resolvePathAsync(savedPath, stored) {
-  if (savedPath && fs.existsSync(savedPath)) {
-    const match = normalizeStored(stored);
-    return { found: true, path: savedPath, letter: driveLetterOf(savedPath), label: (match && match.label) || null, remapped: false };
-  }
   const match = normalizeStored(stored);
-  if (!match || match.mode === 'letter') {
-    return { found: false, path: savedPath, letter: driveLetterOf(savedPath), label: (match && match.label) || null, remapped: false };
+  if (savedPath && fs.existsSync(savedPath)) {
+    if (!match || match.mode === 'letter') {
+      return { found: true, path: savedPath, letter: driveLetterOf(savedPath), label: (match && match.label) || null, remapped: false, drivePresent: true };
+    }
+    // Verify the drive at this letter before trusting the literal
+    // path; a wrong disk here must be caught, not accepted.
+    const drives = await listDrives();
+    if (checkLiteralIdentity(savedPath, match, drives) !== 'mismatch') {
+      return { found: true, path: savedPath, letter: driveLetterOf(savedPath), label: match.label, remapped: false, drivePresent: true };
+    }
+    return resolvePath(savedPath, stored, drives);
   }
   const drives = await listDrives();
   return resolvePath(savedPath, stored, drives);

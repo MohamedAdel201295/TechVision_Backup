@@ -25,7 +25,9 @@ function readEmailSettings(userDataDir) {
 }
 
 function isConfigured(email) {
-  return Boolean(email && email.enabled && email.to && email.smtpUser && email.smtpPass);
+  // smtpHost matters: without it a cleared host silently fell back to
+  // smtp.gmail.com while the user believed mail was off/unconfigured.
+  return Boolean(email && email.enabled && email.to && email.smtpUser && email.smtpPass && email.smtpHost);
 }
 
 // Which kinds this install wants mail for. Defaults: all on.
@@ -37,8 +39,11 @@ function wants(email, kind) {
   return true;
 }
 
-async function sendMail(userDataDir, subject, text) {
-  const email = readEmailSettings(userDataDir);
+async function sendMail(userDataDir, subject, text, emailSettings) {
+  // Read the settings once: notify() used to read them, then sendMail
+  // read them again, so a Settings change between the two reads could
+  // send with a different host/password than the one that was checked.
+  const email = emailSettings || readEmailSettings(userDataDir);
   if (!email.enabled) return { sent: false, reason: 'Email notifications are off in Settings.' };
   if (!email.to || !email.smtpUser || !email.smtpPass) {
     return { sent: false, reason: 'Email notifications are not set up: fill in the recipient, Gmail address and App Password in Settings.' };
@@ -53,10 +58,19 @@ async function sendMail(userDataDir, subject, text) {
     const port = Number(email.smtpPort) || 465;
     // Port decides the encryption: 465 = implicit SSL, 587 = STARTTLS.
     // Company mail servers usually run on one of these two.
+    // requireTLS on 587: STARTTLS used to be opportunistic, so on a
+    // network that strips it the credentials and the mail went in
+    // cleartext. Now the send fails loudly instead.
+    // Timeouts: a hung SMTP server used to stall the main process
+    // indefinitely (no timeout was set at all).
     const transporter = nodemailer.createTransport({
       host: email.smtpHost || 'smtp.gmail.com',
       port: port,
       secure: port === 465,
+      requireTLS: port === 587,
+      connectionTimeout: 30000,
+      greetingTimeout: 30000,
+      socketTimeout: 30000,
       auth: { user: email.smtpUser, pass: email.smtpPass }
     });
     await transporter.sendMail({
@@ -98,7 +112,7 @@ function eventText(kind, job, extra) {
       return '- ' + m.job.name + ' (was due ' + m.due.toLocaleString() + ')';
     }).join('\n');
     return 'TechVision Backup was not running, so these scheduled backups missed their time. ' +
-      'They will run now that the app is open again.\n\n' + list + '\n\nTime checked: ' + when +
+      'They will be retried now that the app is open again — a job whose drive is missing, or whose vault is locked, waits instead of running.\n\n' + list + '\n\nTime checked: ' + when +
       '\nTip: keep Start with Windows on so schedules are not missed.';
   }
   return String(extra || '');
@@ -114,7 +128,7 @@ async function notify(userDataDir, kind, job, extra) {
       failed: 'Backup FAILED: ' + ((job && job.name) || ''),
       missed: 'Service was down — scheduled backup(s) missed'
     };
-    return await sendMail(userDataDir, subjects[kind] || kind, eventText(kind, job, extra));
+    return await sendMail(userDataDir, subjects[kind] || kind, eventText(kind, job, extra), email);
   } catch (e) {
     return { sent: false, reason: e && e.message ? e.message : String(e) };
   }

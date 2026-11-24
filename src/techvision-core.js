@@ -83,6 +83,7 @@ class JobConfig {
       destination: this.destination,
       schedule: this.schedule,
       compression: this.compression,
+      encryptionEnabled: this.encryptionEnabled,
       options: this.options
     }, null, 2);
   }
@@ -128,7 +129,10 @@ class JobConfig {
     if (!Array.isArray(patterns) || patterns.length === 0) {
       return ['*.*'];
     }
-    return patterns.filter((p) => typeof p === 'string' && p.length > 0);
+    const clean = patterns.filter((p) => typeof p === 'string' && p.length > 0);
+    // A list that filters down to nothing (['', 123]) used to match
+    // NO file at all — treat it as "no filter", like an empty list.
+    return clean.length ? clean : ['*.*'];
   }
 
   /**
@@ -138,28 +142,44 @@ class JobConfig {
     if (!this.source.exclude) {
       return [];
     }
-    return this.source.exclude;
+    // Same filter as include patterns: a non-string entry (e.g. a
+    // number from a hand-edited job file) used to throw TypeError
+    // inside shouldExclude and fail EVERY file in the run.
+    if (!Array.isArray(this.source.exclude)) return [];
+    return this.source.exclude.filter((p) => typeof p === 'string' && p.length > 0);
+  }
+
+  /**
+   * Match one pattern against a file. Patterns are case-insensitive
+   * (Windows paths are): `*.txt` matches the extension, `report.pdf`
+   * matches that exact file name, and a bare word like `temp` matches
+   * any file under a folder of that name (or a file of that name).
+   */
+  _matchPattern(filePath, pattern) {
+    const p = String(pattern).toLowerCase();
+    if (p === '*' || p === '*.*') return true;
+    const fileName = path.basename(filePath).toLowerCase();
+    const rel = path.relative(
+      (this.source && this.source.path) || '', filePath).replace(/\\/g, '/').toLowerCase();
+    if (p.indexOf('*') !== -1) {
+      // `*.ext` — extension match; anything else with a `*` is a
+      // simple "ends with the part after the star" match.
+      if (p.startsWith('*')) return fileName.endsWith(p.substring(1));
+      return fileName.indexOf(p.replace(/\*/g, '')) !== -1;
+    }
+    if (p.indexOf('/') !== -1) return rel === p || rel.endsWith('/' + p);
+    if (fileName === p) return true;
+    // Bare word: a folder segment of that name anywhere in the path.
+    return rel.split('/').indexOf(p) !== -1;
   }
 
   /**
    * Check if path should be included
    */
   shouldInclude(filePath) {
-    const fileName = path.basename(filePath);
     const patterns = this.getIncludePatterns();
-    
     for (const pattern of patterns) {
-      if (typeof pattern !== 'string') continue;
-      // Handle *.txt, *.pdf patterns - and *.* for all files
-      if (pattern === '*' || pattern === '*.*') {
-        return true;
-      }
-      if (pattern.startsWith('*')) {
-        const ext = pattern.substring(1); // Get .txt or .*
-        if (fileName.endsWith(ext)) {
-          return true;
-        }
-      }
+      if (this._matchPattern(filePath, pattern)) return true;
     }
     return false;
   }
@@ -169,15 +189,8 @@ class JobConfig {
    */
   shouldExclude(filePath) {
     const patterns = this.getExcludePatterns();
-    const fileName = path.basename(filePath);
-    
     for (const pattern of patterns) {
-      if (pattern.startsWith('*')) {
-        const ext = pattern.substring(1);
-        if (fileName.endsWith(ext)) {
-          return true;
-        }
-      }
+      if (this._matchPattern(filePath, pattern)) return true;
     }
     return false;
   }
@@ -234,7 +247,22 @@ class BackupState {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(this.stateFile, JSON.stringify(this.state, null, 2));
+    // Atomic write: a torn .backup_state.json (crash / disk full
+    // mid-write) used to load as {} and silently re-back up everything
+    // — or worse, lose the record of what was backed up. Write to a
+    // temp file in the same folder and rename over it.
+    const tmp = this.stateFile + '.tmp-' + process.pid;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2));
+      fs.renameSync(tmp, this.stateFile);
+      return true;
+    } catch (e) {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e2) {}
+      // The state is advisory (a stale state only costs a re-backup),
+      // so a failed save must never fail the backup itself.
+      console.error('Error saving backup state:', e.message);
+      return false;
+    }
   }
 
   get(filePath) {
@@ -244,11 +272,29 @@ class BackupState {
 
   set(filePath, info) {
     const relative = path.relative(this.getBaseDir(), filePath).replace(/\\/g, '/');
+    if (relative === '__meta__') return; // metadata key, never a file
     this.state[relative] = info;
   }
 
   getBaseDir() {
-    return this.state['__base_dir__'] || process.cwd();
+    // Metadata lives under __meta__ now: a real source file literally
+    // named __base_dir__ used to collide with the old flat key and
+    // turn getBaseDir() into a file-info object (TypeError on the next
+    // run). Old state files still have the flat key — read it as a
+    // fallback.
+    const meta = this.state['__meta__'];
+    if (meta && typeof meta === 'object' && typeof meta.baseDir === 'string') return meta.baseDir;
+    if (typeof this.state['__base_dir__'] === 'string') return this.state['__base_dir__'];
+    return process.cwd();
+  }
+
+  setBaseDir(dir) {
+    this.state['__meta__'] = { baseDir: dir };
+    // Remove the LEGACY flat metadata key — but only when it is a
+    // string. A real source file literally named __base_dir__ stores
+    // its file info under that key; deleting it unconditionally made
+    // every incremental re-back that file up forever.
+    if (typeof this.state['__base_dir__'] === 'string') delete this.state['__base_dir__'];
   }
 }
 
@@ -265,13 +311,35 @@ class BackupEngine {
     const destPath = (this.jobConfig.destination && this.jobConfig.destination.path) || '';
     this.logsDir = destPath ? path.join(destPath, 'logs') : './logs';
     this.backupDir = destPath || './backup';
-    
-    // Ensure directories exist
-    if (!fs.existsSync(this.logsDir)) {
-      fs.mkdirSync(this.logsDir, { recursive: true });
-    }
-    if (!fs.existsSync(this.backupDir)) {
-      fs.mkdirSync(this.backupDir, { recursive: true });
+    // The backup folder is named after the job: sanitize it, because
+    // a job literally named ".." used to make the backup folder the
+    // PARENT of the destination (and "." the destination itself).
+    this.backupName = String(this.jobConfig.name || 'job')
+      .replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^\.+$/, '_') || 'job';
+    this._collectErrors = [];
+
+    // Setup must not throw out of the constructor: a destination that
+    // is an existing file, read-only, or on a disconnected drive used
+    // to crash the IPC handler with no history record. Record the
+    // failure and let the run methods return it as a failed result.
+    this._initError = null;
+    if (!destPath) {
+      // No destination at all: the run methods report "no destination"
+      // — but the constructor used to mkdir ./backup (and ./logs) in
+      // the working directory first, so a job with an empty destination
+      // "succeeded" into <cwd>/backup with no warning. Create nothing.
+      this._initError = new Error('No destination folder is set for this job.');
+    } else {
+      try {
+        if (!fs.existsSync(this.logsDir)) {
+          fs.mkdirSync(this.logsDir, { recursive: true });
+        }
+        if (!fs.existsSync(this.backupDir)) {
+          fs.mkdirSync(this.backupDir, { recursive: true });
+        }
+      } catch (e) {
+        this._initError = e;
+      }
     }
   }
 
@@ -339,11 +407,22 @@ class BackupEngine {
     return new Promise((resolve, reject) => {
       const rs = fs.createReadStream(file);
       const ws = fs.createWriteStream(dest);
+      let failed = false;
+      const fail = (err) => {
+        if (failed) return;
+        failed = true;
+        try { rs.destroy(); } catch (e) {}
+        try { ws.destroy(); } catch (e) {}
+        // A failed copy must not leave a truncated file behind that
+        // looks like a successful backup — remove the partial file.
+        try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch (e) {}
+        reject(err);
+      };
       rs.on('data', chunk => {
         if (typeof onProgress === 'function') { try { onProgress(chunk.length); } catch (e) {} }
       });
-      rs.on('error', reject);
-      ws.on('error', reject);
+      rs.on('error', fail);
+      ws.on('error', fail);
       ws.on('finish', () => resolve(dest));
       rs.pipe(ws);
     });
@@ -358,8 +437,29 @@ class BackupEngine {
     const logFile = path.join(this.logsDir, `full_backup_${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
     result.log_file = logFile;
 
-    const sourceDir = this.jobConfig.source.path;
-    const backupName = path.basename(this.jobConfig.name);
+    let sourceDir = this.jobConfig.source.path;
+    const backupName = this.backupName;
+
+    // Setup failed in the constructor (destination is a file, is
+    // read-only, or sits on a disconnected drive): report it as a
+    // failed run instead of throwing out of the IPC handler.
+    if (this._initError) {
+      result.success = false;
+      result.error_messages.push(`Cannot use destination: ${this._initError.message}`);
+      this.log('error', `Full backup failed: ${this._initError.message}`);
+      this._writeLog(logFile, result);
+      return result;
+    }
+    // An empty destination used to silently fall back to ./backup in
+    // the process working directory — a backup the user never asked
+    // for, in a place they never look.
+    if (!this.jobConfig.destination || !this.jobConfig.destination.path) {
+      result.success = false;
+      result.error_messages.push('No destination folder is set for this job.');
+      this.log('error', 'Full backup failed: no destination folder is set for this job.');
+      this._writeLog(logFile, result);
+      return result;
+    }
 
     // Never record a 0-file backup as COMPLETED when the source is
     // missing — that was the old bug (source.path was undefined).
@@ -371,9 +471,22 @@ class BackupEngine {
       return result;
     }
 
+    // A symlinked source folder is followed to its real path, so
+    // relative entry names stay consistent (see _collectFiles).
+    try { sourceDir = fs.realpathSync(sourceDir); } catch (e) {}
+
     // Single-file source: relative paths are computed from the file's
     // parent folder, so the backed-up file keeps its own name.
-    const sourceBase = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
+    let sourceBase;
+    try {
+      sourceBase = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
+    } catch (e) {
+      result.success = false;
+      result.error_messages.push(`Cannot read source: ${e.message}`);
+      this.log('error', `Full backup failed: ${e.message}`);
+      this._writeLog(logFile, result);
+      return result;
+    }
 
     // Create backup directory
     const backupSubDir = path.join(this.backupDir, backupName);
@@ -389,6 +502,11 @@ class BackupEngine {
     const plainCopy = this.jobConfig.compression === 'none' && !this.jobConfig.encryptionEnabled;
     const copyDir = path.join(backupSubDir, `${backupName}_full_${stamp}`);
     if (plainCopy) fs.mkdirSync(copyDir, { recursive: true });
+    // Never back the backup up into itself: when the destination
+    // lives inside the source, the backup folder, the logs folder and
+    // the state file are excluded from collection.
+    const stateFile = path.join(backupSubDir, '.backup_state.json');
+    const excludePaths = [path.resolve(backupSubDir), path.resolve(this.logsDir), path.resolve(stateFile)];
 
     this.log('info', `Starting FULL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
@@ -411,10 +529,37 @@ class BackupEngine {
       // Create ZIP archive (skipped for plain-copy backups)
       let archive = null;
       let outputClosed = null;
+      let outputStream = null;
+      // A failing source stream never surfaces as an archiver error
+      // (verified against the installed archiver: the queue stalls
+      // and finalize()/outputClosed never settle), so the stream's
+      // own error handler rejects this promise and the finalize race
+      // below fails the run cleanly instead of hanging forever.
+      let streamError = null;
+      let failArchive = null;
+      const archiveFailed = new Promise((_, reject) => { failArchive = reject; });
+      // These promises can reject while the file loop is still
+      // running — before the race below attaches to them. Mark the
+      // rejections handled at once; the race still reports them.
+      archiveFailed.catch(() => {});
+      const onStreamError = (err) => {
+        if (!streamError) {
+          streamError = err;
+          if (failArchive) failArchive(err);
+          // Release the output file handle so the partial ZIP can be
+          // deleted by the failure path.
+          try { if (outputStream) outputStream.destroy(); } catch (e) {}
+        }
+      };
       if (!plainCopy) {
         const output = fs.createWriteStream(zipPath);
+        outputStream = output;
         archive = this.jobConfig.createArchive();
-        archive.on('error', err => { throw err; });
+        // An archiver error must settle the run as a failure through
+        // outputClosed's reject (below) — the old listener threw here,
+        // which is an uncaught exception in an async event handler:
+        // it skipped the reject listener, so the backup promise never
+        // settled and the UI hung forever.
         archive.on('progress', prog => {
           this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
         });
@@ -427,6 +572,10 @@ class BackupEngine {
           output.on('error', reject);
           archive.on('error', reject);
         });
+        // The archive can emit 'error' while the file loop is still
+        // running, before the race below awaits this promise — mark
+        // the rejection handled now; the race still reports it.
+        outputClosed.catch(() => {});
         output.on('close', () => {
           this.log('info', `Archive created: ${archive.pointer()} bytes`);
         });
@@ -434,8 +583,16 @@ class BackupEngine {
       }
 
       // Collect all files
-      const files = this._collectFiles(sourceDir);
+      const files = this._collectFiles(sourceDir, excludePaths);
       this.log('info', `Found ${files.length} files to backup`);
+      // Unreadable subtrees found during collection are failures, not
+      // silent omissions: report them instead of a clean COMPLETED.
+      for (const ce of this._collectErrors) {
+        result.files_failed++;
+        result.error_messages.push(ce);
+        this.log('error', ce);
+      }
+      this._collectErrors = [];
       // Stable denominator for real progress: total bytes of all files.
       for (const f of files) { try { totalBytes += fs.statSync(f).size; } catch (e) {} }
       const emitLive = (name) => {
@@ -443,12 +600,23 @@ class BackupEngine {
       };
       // Files that are never read (excluded, locked, failed, or not
       // included) still count, so the bar keeps moving past them.
-      const markSkipped = (size, name) => { bytesDone += size; filesSeen++; emitLive(name); };
+      // `counted` is how many bytes of this file already flowed through
+      // a data handler — a file that failed halfway must not be
+      // counted twice (the old code added its full size on top).
+      const markSkipped = (size, name, counted) => {
+        bytesDone += Math.max(0, size - (counted || 0));
+        filesSeen++;
+        emitLive(name);
+      };
+      // Info (size/mtime/hash) of files actually backed up in this
+      // run — the state file is built from this, and only this.
+      const backedUpInfo = new Map();
 
       for (const file of files) {
         let stats = null;
         try { stats = fs.statSync(file); } catch (e) {}
         const fileSize = stats ? stats.size : 0;
+        let fileCounted = 0;
         try {
           const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
           currentFileName = relativePath;
@@ -456,13 +624,13 @@ class BackupEngine {
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
             result.files_skipped++;
-            markSkipped(fileSize, relativePath);
+            markSkipped(fileSize, relativePath, 0);
             continue;
           }
 
           if (!this.jobConfig.shouldInclude(file)) {
             result.files_skipped++;
-            markSkipped(fileSize, relativePath);
+            markSkipped(fileSize, relativePath, 0);
             continue;
           }
 
@@ -477,7 +645,7 @@ class BackupEngine {
               result.files_skipped++;
               this.log('warn', `[SKIPPED-LOCKED] ${relativePath}: ${e.code} - VSS deferred, use vssadmin for locked files`);
               result.error_messages.push(`SKIPPED-LOCKED: ${relativePath}: ${e.code}`);
-              markSkipped(fileSize, relativePath);
+              markSkipped(fileSize, relativePath, 0);
               continue;
             }
           }
@@ -489,66 +657,98 @@ class BackupEngine {
             result.files_failed++;
             result.error_messages.push(`Failed to backup ${file}: file disappeared before it could be read`);
             this.log('error', `Failed to backup ${file}: file disappeared before it could be read`);
-            markSkipped(0, relativePath);
+            markSkipped(0, relativePath, 0);
             continue;
           }
+
+          // Hash the file BEFORE it is archived: the state must record
+          // the bytes that went into the ZIP. The old code re-hashed
+          // everything AFTER the run, so a file that changed mid-run
+          // got the NEW hash in the state while the ZIP held the OLD
+          // bytes — and the next incremental never repaired it.
+          const fileInfo = await this.getFileInfo(file);
 
           // File is readable: copy it as-is, or add it to the ZIP
           if (plainCopy) {
             await this._copyPlainFile(file, sourceBase, copyDir, (n) => {
               bytesDone += n;
+              fileCounted += n;
               emitLive(relativePath);
             });
           } else {
             // Counted read stream: archiver reads the file through it
             // while compressing, so 'data' events ARE the real work.
             const rs = fs.createReadStream(file);
-            rs.on('data', chunk => { bytesDone += chunk.length; emitLive(relativePath); });
+            rs.on('data', chunk => { bytesDone += chunk.length; fileCounted += chunk.length; emitLive(relativePath); });
+            // A stream error needs its own listener (otherwise it is
+            // an uncaught exception) and it must fail the run: see
+            // onStreamError — archiver alone never reports it.
+            rs.on('error', onStreamError);
             rs.pause();
             archive.append(rs, { name: relativePath, stats });
           }
+          backedUpInfo.set(relativePath, fileInfo);
           result.files_backed_up++;
           result.total_bytes += fileSize;
           this.log('info', `Backed up: ${relativePath}`);
           filesSeen++;
         } catch (err) {
-          result.files_failed++;
-          result.error_messages.push(`Failed to backup ${file}: ${err.message}`);
-          this.log('error', `Failed to backup ${file}: ${err.message}`);
-          markSkipped(fileSize, file);
+          // A file that fails on the actual read (locked between the
+          // probe and the read, deleted mid-run, I/O error) is a
+          // locked skip when the OS says so, a failure otherwise —
+          // never a silent success.
+          if (err && (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EBUSY')) {
+            result.locked_files_skipped++;
+            result.files_skipped++;
+            this.log('warn', `[SKIPPED-LOCKED] ${file}: ${err.code} - VSS deferred`);
+            result.error_messages.push(`SKIPPED-LOCKED: ${file}: ${err.code}`);
+          } else {
+            result.files_failed++;
+            result.error_messages.push(`Failed to backup ${file}: ${err.message}`);
+            this.log('error', `Failed to backup ${file}: ${err.message}`);
+          }
+          markSkipped(fileSize, file, fileCounted);
         }
       }
 
-      if (!plainCopy) { await archive.finalize(); await outputClosed; }
+      if (!plainCopy) {
+        // Race the normal completion against a source-stream failure:
+        // archiver never reports a failing stream, so without this
+        // race the run would hang here forever. The loser's rejection
+        // is swallowed — the race reports the outcome.
+        const normalPath = (async () => { await archive.finalize(); await outputClosed; })();
+        normalPath.catch(() => {});
+        await Promise.race([normalPath, archiveFailed]);
+        if (streamError) throw streamError;
+      }
 
       // Set the backup path on result
       result.backup_path = plainCopy ? copyDir : zipPath;
       result.backup_format = plainCopy ? 'folder' : (this.jobConfig.encryptionEnabled ? 'zip-encrypted' : 'zip');
       result.encrypted = this.jobConfig.encryptionEnabled;
 
-      // Save state for incremental backups
-      const stateFile = path.join(backupSubDir, '.backup_state.json');
+      // Save state for incremental backups: a FRESH state built only
+      // from the files this run actually backed up. The old code
+      // re-hashed every included file after the run — so excluded
+      // files, locked files and files that failed all got recorded as
+      // backed up, and the next incremental silently skipped them
+      // forever. Files deleted from the source drop out of the state
+      // with the rebuild, instead of accumulating forever.
       const backupState = new BackupState(stateFile);
-      backupState.state['__base_dir__'] = sourceBase;
-      
-      // Save file states
-      for (const file of files) {
-        try {
-          if (this.jobConfig.shouldInclude(file)) {
-            const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
-            const fileInfo = await this.getFileInfo(file);
-            backupState.set(file, fileInfo);
-          }
-        } catch (e) {
-          // Skip files that can't be processed
-        }
+      backupState.state = {};
+      backupState.setBaseDir(sourceBase);
+      for (const [relativePath, info] of backedUpInfo) {
+        backupState.state[relativePath] = info;
       }
       backupState.save();
-      
+
       // A full backup that archived 0 files (empty source, everything
-      // excluded, or all files locked) must not be reported COMPLETED.
-      result.success = result.files_backed_up > 0;
-      if (!result.success) result.error_messages.push('No files were backed up (source empty, everything excluded, or all files locked).');
+      // excluded, or all files locked) must not be reported COMPLETED —
+      // and neither must a run where any file failed: 99 of 100 files
+      // is a partial backup, not a completed one.
+      result.success = result.files_backed_up > 0 && result.files_failed === 0;
+      if (result.files_backed_up === 0) result.error_messages.push('No files were backed up (source empty, everything excluded, or all files locked).');
+      if (result.files_failed > 0) result.error_messages.push(`${result.files_failed} file(s) failed to back up — see the log for details.`);
       const duration = (Date.now() - startTime) / 1000;
       result.duration_seconds = duration;
       const mbSize = (result.total_bytes / 1024 / 1024).toFixed(2);
@@ -559,6 +759,13 @@ class BackupEngine {
       result.success = false;
       result.error_messages.push(err.message);
       this.log('error', `Full backup failed: ${err.message}`);
+      // A failed ZIP is truncated (no central directory) — delete it
+      // so it can never be mistaken for a valid backup. A failed
+      // plain-copy folder keeps the files that did copy (only the
+      // failed file's partial is removed, in _copyPlainFile).
+      if (!plainCopy) {
+        try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+      }
     }
 
     this._writeLog(logFile, result);
@@ -574,8 +781,23 @@ class BackupEngine {
     const logFile = path.join(this.logsDir, `incremental_backup_${new Date().toISOString().replace(/[:.]/g, '-')}.log`);
     result.log_file = logFile;
 
-    const sourceDir = this.jobConfig.source.path;
-    const backupName = path.basename(this.jobConfig.name);
+    let sourceDir = this.jobConfig.source.path;
+    const backupName = this.backupName;
+
+    if (this._initError) {
+      result.success = false;
+      result.error_messages.push(`Cannot use destination: ${this._initError.message}`);
+      this.log('error', `Incremental backup failed: ${this._initError.message}`);
+      this._writeLog(logFile, result);
+      return result;
+    }
+    if (!this.jobConfig.destination || !this.jobConfig.destination.path) {
+      result.success = false;
+      result.error_messages.push('No destination folder is set for this job.');
+      this.log('error', 'Incremental backup failed: no destination folder is set for this job.');
+      this._writeLog(logFile, result);
+      return result;
+    }
 
     if (!sourceDir || !fs.existsSync(sourceDir)) {
       result.success = false;
@@ -584,6 +806,8 @@ class BackupEngine {
       this._writeLog(logFile, result);
       return result;
     }
+
+    try { sourceDir = fs.realpathSync(sourceDir); } catch (e) {}
 
     // Create backup directory
     const backupSubDir = path.join(this.backupDir, backupName);
@@ -594,14 +818,26 @@ class BackupEngine {
     // Initialize backup state
     const stateFile = path.join(backupSubDir, '.backup_state.json');
     const backupState = new BackupState(stateFile);
-    const sourceBaseInc = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
-    backupState.state['__base_dir__'] = sourceBaseInc;
+    let sourceBaseInc;
+    try {
+      sourceBaseInc = fs.statSync(sourceDir).isFile() ? path.dirname(sourceDir) : sourceDir;
+    } catch (e) {
+      result.success = false;
+      result.error_messages.push(`Cannot read source: ${e.message}`);
+      this.log('error', `Incremental backup failed: ${e.message}`);
+      this._writeLog(logFile, result);
+      return result;
+    }
+    backupState.setBaseDir(sourceBaseInc);
 
     const stampInc = new Date().toISOString().replace(/[:.]/g, '-');
     const zipPath = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.zip`);
     const plainCopyInc = this.jobConfig.compression === 'none' && !this.jobConfig.encryptionEnabled;
     const copyDirInc = path.join(backupSubDir, `${backupName}_incremental_${stampInc}`);
     if (plainCopyInc) fs.mkdirSync(copyDirInc, { recursive: true });
+    // Same exclusion as full backups: never back the backup up into
+    // itself when the destination lives inside the source.
+    const excludePathsInc = [path.resolve(backupSubDir), path.resolve(this.logsDir), path.resolve(stateFile)];
 
     this.log('info', `Starting INCREMENTAL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
@@ -622,10 +858,30 @@ class BackupEngine {
       // Create ZIP archive (skipped for plain-copy backups)
       let archive = null;
       let outputClosed = null;
+      let outputStream = null;
+      // See the full backup: a failing source stream never surfaces
+      // as an archiver error, so the stream's own error handler
+      // rejects this promise and the finalize race fails the run.
+      let streamError = null;
+      let failArchive = null;
+      const archiveFailed = new Promise((_, reject) => { failArchive = reject; });
+      archiveFailed.catch(() => {});
+      const onStreamError = (err) => {
+        if (!streamError) {
+          streamError = err;
+          if (failArchive) failArchive(err);
+          try { if (outputStream) outputStream.destroy(); } catch (e) {}
+        }
+      };
       if (!plainCopyInc) {
         const output = fs.createWriteStream(zipPath);
+        outputStream = output;
         archive = this.jobConfig.createArchive();
-        archive.on('error', err => { throw err; });
+        // An archiver error must settle the run as a failure through
+        // outputClosed's reject (below) — the old listener threw here,
+        // which is an uncaught exception in an async event handler:
+        // it skipped the reject listener, so the backup promise never
+        // settled and the UI hung forever.
         archive.on('progress', prog => {
           this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
         });
@@ -636,6 +892,7 @@ class BackupEngine {
           output.on('error', reject);
           archive.on('error', reject);
         });
+        outputClosed.catch(() => {}); // see the full backup
         output.on('close', () => {
           this.log('info', `Archive created: ${archive.pointer()} bytes`);
         });
@@ -643,18 +900,23 @@ class BackupEngine {
       }
 
       // Collect current files
-      const currentFiles = this._collectFiles(sourceDir);
+      const currentFiles = this._collectFiles(sourceDir, excludePathsInc);
       let filesNeedingBackup = 0;
       for (const f of currentFiles) { try { totalBytes += fs.statSync(f).size; } catch (e) {} }
       const emitLive = (name) => {
         this._emitProgress(99 * bytesDone / (totalBytes || 1), plainCopyInc ? 'copying' : 'writing', name, filesSeen, currentFiles.length, bytesDone, totalBytes);
       };
-      const markSkipped = (size, name) => { bytesDone += size; filesSeen++; emitLive(name); };
+      const markSkipped = (size, name, counted) => {
+        bytesDone += Math.max(0, size - (counted || 0));
+        filesSeen++;
+        emitLive(name);
+      };
 
       for (const file of currentFiles) {
         let stats = null;
         try { stats = fs.statSync(file); } catch (e) {}
         const fileSize = stats ? stats.size : 0;
+        let fileCounted = 0;
         try {
           const relativePath = path.relative(sourceBaseInc, file).replace(/\\/g, '/');
           currentFileName = relativePath;
@@ -662,13 +924,13 @@ class BackupEngine {
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
             result.files_skipped++;
-            markSkipped(fileSize, relativePath);
+            markSkipped(fileSize, relativePath, 0);
             continue;
           }
 
           if (!this.jobConfig.shouldInclude(file)) {
             result.files_skipped++;
-            markSkipped(fileSize, relativePath);
+            markSkipped(fileSize, relativePath, 0);
             continue;
           }
 
@@ -681,15 +943,28 @@ class BackupEngine {
               result.files_skipped++;
               this.log('warn', `[SKIPPED-LOCKED] ${relativePath}: ${e.code} - VSS deferred`);
               result.error_messages.push(`SKIPPED-LOCKED: ${relativePath}: ${e.code}`);
-              markSkipped(fileSize, relativePath);
+              markSkipped(fileSize, relativePath, 0);
               continue;
             }
           }
 
-          // Check if file needs backup
-          const currentInfo = await this.getFileInfo(file);
+          // Does this file need backing up? Size + mtime first (cheap):
+          // only when they match do we hash to confirm it is really
+          // unchanged. The old code hashed every file in full before
+          // even looking at size/mtime, so a changed 10 GB file was
+          // read twice for no reason.
           const prevInfo = prevState[relativePath];
-          const needsBackup = this._needsBackup(file, prevInfo, currentInfo);
+          let currentInfo = null;
+          let needsBackup;
+          // mtime is stored as stats.mtimeMs (a number) by
+          // getFileInfo — comparing it with stats.mtime (a Date)
+          // is always false and would re-back up every file.
+          if (prevInfo && stats && prevInfo.size === stats.size && prevInfo.mtime === stats.mtimeMs) {
+            currentInfo = await this.getFileInfo(file);
+            needsBackup = this._needsBackup(file, prevInfo, currentInfo);
+          } else {
+            needsBackup = true; // new file, or size/mtime changed
+          }
 
           if (needsBackup) {
             // A file that vanished after collection must not fail the
@@ -698,55 +973,93 @@ class BackupEngine {
               result.files_failed++;
               result.error_messages.push(`Failed to backup ${file}: file disappeared before it could be read`);
               this.log('error', `Failed to backup ${file}: file disappeared before it could be read`);
-              markSkipped(0, relativePath);
-            } else if (plainCopyInc) {
+              markSkipped(0, relativePath, 0);
+              // No state update: the next run retries it.
+              continue;
+            }
+            if (plainCopyInc) {
               await this._copyPlainFile(file, sourceBaseInc, copyDirInc, (n) => {
                 bytesDone += n;
+                fileCounted += n;
                 emitLive(relativePath);
               });
               result.files_backed_up++;
-              result.total_bytes += currentInfo.size;
+              result.total_bytes += fileSize;
               filesNeedingBackup++;
               this.log('info', `Incremental update: ${relativePath}`);
               filesSeen++;
             } else {
               const rs = fs.createReadStream(file);
-              rs.on('data', chunk => { bytesDone += chunk.length; emitLive(relativePath); });
+              rs.on('data', chunk => { bytesDone += chunk.length; fileCounted += chunk.length; emitLive(relativePath); });
+              // See the full-backup loop: the stream error must fail
+              // the run through onStreamError, archiver never does.
+              rs.on('error', onStreamError);
               rs.pause();
               archive.append(rs, { name: relativePath, stats });
               result.files_backed_up++;
-              result.total_bytes += currentInfo.size;
+              result.total_bytes += fileSize;
               filesNeedingBackup++;
               this.log('info', `Incremental update: ${relativePath}`);
               filesSeen++;
             }
+            // Hash for the state AFTER the backup (or reuse the hash
+            // from the unchanged check): the state must describe the
+            // bytes that actually went into this backup.
+            if (!currentInfo) {
+              try { currentInfo = await this.getFileInfo(file); } catch (e) { currentInfo = null; }
+            }
+            if (currentInfo) backupState.set(file, currentInfo);
           } else {
             result.files_skipped++;
             this.log('debug', `Skipped (unchanged): ${relativePath}`);
-            markSkipped(fileSize, relativePath);
+            markSkipped(fileSize, relativePath, 0);
+            // Unchanged: refresh the state entry with the (identical)
+            // info so the state stays in sync.
+            if (currentInfo) backupState.set(file, currentInfo);
           }
-
-          // Update state
-          backupState.set(file, currentInfo);
         } catch (err) {
-          result.files_failed++;
-          result.error_messages.push(`Failed to backup ${file}: ${err.message}`);
-          this.log('error', `Failed to backup ${file}: ${err.message}`);
-          markSkipped(fileSize, file);
+          if (err && (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EBUSY')) {
+            result.locked_files_skipped++;
+            result.files_skipped++;
+            this.log('warn', `[SKIPPED-LOCKED] ${file}: ${err.code} - VSS deferred`);
+            result.error_messages.push(`SKIPPED-LOCKED: ${file}: ${err.code}`);
+          } else {
+            result.files_failed++;
+            result.error_messages.push(`Failed to backup ${file}: ${err.message}`);
+            this.log('error', `Failed to backup ${file}: ${err.message}`);
+          }
+          markSkipped(fileSize, file, fileCounted);
         }
       }
 
-      if (!plainCopyInc) { await archive.finalize(); await outputClosed; }
+      if (!plainCopyInc) {
+        const normalPath = (async () => { await archive.finalize(); await outputClosed; })();
+        normalPath.catch(() => {});
+        await Promise.race([normalPath, archiveFailed]);
+        if (streamError) throw streamError;
+      }
 
       // Set the backup path on result
       result.backup_path = plainCopyInc ? copyDirInc : zipPath;
       result.backup_format = plainCopyInc ? 'folder' : (this.jobConfig.encryptionEnabled ? 'zip-encrypted' : 'zip');
       result.encrypted = this.jobConfig.encryptionEnabled;
 
+      // Prune the state: files deleted from the source drop out, so
+      // the state file stops growing forever and cannot resurrect
+      // deleted files into the next incremental's decisions.
+      const liveKeys = new Set(currentFiles.map((f) => path.relative(sourceBaseInc, f).replace(/\\/g, '/')));
+      for (const key of Object.keys(backupState.state)) {
+        if (key !== '__meta__' && key !== '__base_dir__' && !liveKeys.has(key)) delete backupState.state[key];
+      }
       // Save updated state
       backupState.save();
-      
-      result.success = true;
+
+      // An incremental that failed on any file must not report
+      // success — the old code returned success:true unconditionally,
+      // even with every file failed and an empty ZIP. Zero changed
+      // files is still a success (nothing to do).
+      result.success = result.files_failed === 0;
+      if (result.files_failed > 0) result.error_messages.push(`${result.files_failed} file(s) failed to back up — see the log for details.`);
       const duration = (Date.now() - startTime) / 1000;
       result.duration_seconds = duration;
       const mbSize = (result.total_bytes / 1024 / 1024).toFixed(2);
@@ -758,6 +1071,9 @@ class BackupEngine {
       result.success = false;
       result.error_messages.push(err.message);
       this.log('error', `Incremental backup failed: ${err.message}`);
+      if (!plainCopyInc) {
+        try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+      }
     }
 
     this._writeLog(logFile, result);
@@ -786,36 +1102,72 @@ class BackupEngine {
   }
 
   /**
-   * Collect all files from directory
+   * Collect all files from directory. Symlinked directories are
+   * skipped (a symlink loop used to recurse until the stack overflowed
+   * and the same file landed in the ZIP dozens of times); symlinked
+   * files are backed up by content, as before. `excludePaths` are
+   * absolute paths (the backup folder itself, the logs folder, the
+   * state file) that must never be collected when the destination
+   * lives inside the source.
    */
-  _collectFiles(dir) {
+  _collectFiles(dir, excludePaths) {
     const files = [];
-    
+
     if (!fs.existsSync(dir)) {
       return files;
     }
     // Single-file source: the backup is just that one file.
+    // (A symlinked source folder itself is followed here — the loop
+    // risk is only from links *inside* the tree, which are skipped
+    // below — but the run methods resolve the source to its real path
+    // first, so this stays consistent.)
     try {
       if (fs.statSync(dir).isFile()) return [dir];
     } catch (e) {
       return files;
     }
 
+    const isExcluded = (p) => {
+      if (!excludePaths || !excludePaths.length) return false;
+      const abs = path.resolve(p);
+      return excludePaths.some((x) => abs === x || abs.startsWith(x + path.sep));
+    };
+    if (isExcluded(dir)) return files;
+
     const items = fs.readdirSync(dir);
-    
+
     for (const item of items) {
       const fullPath = path.join(dir, item);
-      
+
       try {
-        const stats = fs.statSync(fullPath);
-        
-        if (stats.isDirectory()) {
-          const subFiles = this._collectFiles(fullPath);
+        const lst = fs.lstatSync(fullPath);
+
+        if (lst.isSymbolicLink()) {
+          // Resolve the target to decide: directory link -> skip
+          // (prevents loops and escaping the source tree); file link
+          // -> back up the target's content under the link's name.
+          let targetIsDir = false;
+          try { targetIsDir = fs.statSync(fullPath).isDirectory(); } catch (e) { targetIsDir = false; }
+          if (targetIsDir) {
+            this.log('warn', `Skipped symlinked directory: ${fullPath}`);
+            continue;
+          }
+          files.push(fullPath);
+          continue;
+        }
+
+        if (lst.isDirectory()) {
+          if (isExcluded(fullPath)) continue;
+          const subFiles = this._collectFiles(fullPath, excludePaths);
           files.push(...subFiles);
         } else {
           files.push(fullPath);
         }
       } catch (e) {
+        // An unreadable subfolder used to vanish silently: the run
+        // reported success while a whole subtree was missing. Record
+        // it so the run reports the failure.
+        this._collectErrors.push(`Cannot access: ${fullPath}: ${e.message}`);
         this.log('warn', `Cannot access: ${fullPath}`);
       }
     }
@@ -828,38 +1180,51 @@ class BackupEngine {
    */
   log(level, message) {
     const timestamp = new Date().toISOString();
-    const logMessage = `[${timestamp}] ${level.toUpperCase()}: ${message}`;
-    
+    // Strip newlines: a file or job name containing \n could forge
+    // log lines (log injection) in the written log files.
+    const clean = String(message).replace(/[\r\n]+/g, ' ');
+    const logMessage = `[${timestamp}] ${level.toUpperCase()}: ${clean}`;
+
     if (this.logger) {
       console.log(logMessage);
     }
   }
 
   _writeLog(logFile, result) {
-    const content = [
-      `== TechVision Backup Log ==`,
-      `Backup: ${this.jobConfig.name}`,
-      `Timestamp: ${result.timestamp}`,
-      ``,
-      `Result:`,
-      `  Success: ${result.success}`,
-      `  Files backed up: ${result.files_backed_up}`,
-      `  Files skipped: ${result.files_skipped}`,
-      `  Locked files skipped: ${result.locked_files_skipped}`,
-      `  Files failed: ${result.files_failed}`,
-      `  Total bytes: ${result.total_bytes}`,
-      `  Duration: ${result.duration_seconds}s`,
-      `  Log file: ${result.log_file}`,
-      ``,
-      result.error_messages.length > 0 ? `Errors:` : `No errors`,
-      ...result.error_messages
-    ].join('\n');
+    // No destination means no log folder either: never create ./logs
+    // in the working directory for a job that has nowhere to back up to.
+    if (!this.jobConfig.destination || !this.jobConfig.destination.path) return;
+    // Writing the log must never throw the backup result away: a full
+    // disk after a good ZIP used to make the caller see a throw
+    // instead of the successful result.
+    try {
+      const content = [
+        `== TechVision Backup Log ==`,
+        `Backup: ${this.jobConfig.name}`,
+        `Timestamp: ${result.timestamp}`,
+        ``,
+        `Result:`,
+        `  Success: ${result.success}`,
+        `  Files backed up: ${result.files_backed_up}`,
+        `  Files skipped: ${result.files_skipped}`,
+        `  Locked files skipped: ${result.locked_files_skipped}`,
+        `  Files failed: ${result.files_failed}`,
+        `  Total bytes: ${result.total_bytes}`,
+        `  Duration: ${result.duration_seconds}s`,
+        `  Log file: ${result.log_file}`,
+        ``,
+        result.error_messages.length > 0 ? `Errors:` : `No errors`,
+        ...result.error_messages
+      ].join('\n');
 
-    const dir = path.dirname(logFile);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+      const dir = path.dirname(logFile);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(logFile, content);
+    } catch (e) {
+      console.error('Error writing backup log:', e.message);
     }
-    fs.writeFileSync(logFile, content);
   }
 }
 

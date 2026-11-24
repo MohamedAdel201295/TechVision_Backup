@@ -235,7 +235,16 @@
     $('createBtn').disabled = true;
     $('createBtn').textContent = 'Creating…';
     try {
-      await api.saveJobConfig(job);
+      // The main process returns { success:false } on a failed save
+      // instead of throwing — the old code ignored the return value
+      // and toasted "Job created" for a job that was never saved.
+      var saved = await api.saveJobConfig(job);
+      if (saved && saved.success === false) {
+        toast('Save failed', saved.error ? ('Could not save the job: ' + saved.error) : 'Could not save the job.', 'error');
+        $('createBtn').disabled = false;
+        $('createBtn').textContent = 'Create Job';
+        return;
+      }
       if (job.encryptionEnabled) {
         var pw = $('encPassword').value;
         if (pw && typeof api.vaultStoreJobPassword === 'function') {
