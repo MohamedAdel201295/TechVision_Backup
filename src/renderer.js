@@ -837,7 +837,7 @@
     cloudSelected = srv;
     cloudPendingProbe = null;
     var box = $('cloudConnectBox'); if (box) box.style.display = '';
-    var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name;
+    var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name + (srv.user ? ' as ' + srv.user : '');
     var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
     var pass = $('cloudConnectPass'); if (pass) pass.value = presetPassword || '';
     var btn = $('cloudConnectBtn'); if (btn) btn.textContent = 'Connect';
