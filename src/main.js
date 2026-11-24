@@ -174,6 +174,8 @@ function normalizeJobObject(job, defaultType = 'full') {
     allowIncremental: job.allowIncremental,
     sourceVolumeLabel: job.sourceVolumeLabel || null,
     destinationVolumeLabel: job.destinationVolumeLabel || null,
+    sourceDriveMatch: job.sourceDriveMatch || null,
+    destinationDriveMatch: job.destinationDriveMatch || null,
     waitingForDrive: job.waitingForDrive || null,
     encryptionEnabled: job.encryptionEnabled === true,
     verify: job.verify,
@@ -802,7 +804,7 @@ async function checkSchedules() {
       job.waitingForDrive = {
         since: now.toISOString(), due: next.toISOString(),
         which: missing, path: missingPath,
-        label: missing === 'source' ? (job.sourceVolumeLabel || null) : (job.destinationVolumeLabel || null)
+        label: missing === 'source' ? driveMatchLabel(job, 'source') : driveMatchLabel(job, 'destination')
       };
       appendAppLog('warn', `Job "${job.name}" is due but the ${missing} drive is missing (${missingPath}). Waiting for the drive — the job will run as soon as it appears.`);
       console.log(`[Scheduler] Job ${job.name} waiting for ${missing} drive: ${missingPath}`);
@@ -832,11 +834,42 @@ async function checkSchedules() {
   }
 }
 
+// Fill in a job's drive-match record for one side (source/destination)
+// from the live drive list: keep the mode the wizard sent (default
+// 'label'), read the label and serial automatically. A value already
+// stored survives when the drive is unplugged right now.
+function captureDriveMatch(jobConfig, which, drives) {
+  const pathKey = which === 'source' ? 'source' : 'destination';
+  const matchKey = which === 'source' ? 'sourceDriveMatch' : 'destinationDriveMatch';
+  const labelKey = which === 'source' ? 'sourceVolumeLabel' : 'destinationVolumeLabel';
+  const letter = driveResolver.driveLetterOf(jobPathValue(jobConfig[pathKey]));
+  if (!letter) return;
+  const prev = (jobConfig[matchKey] && typeof jobConfig[matchKey] === 'object') ? jobConfig[matchKey] : {};
+  const mode = (prev.mode === 'letter' || prev.mode === 'serial' || prev.mode === 'label') ? prev.mode : 'label';
+  const info = driveResolver.driveInfoForLetter(drives, letter);
+  const match = {
+    mode: mode,
+    label: (info && info.label) || prev.label || null,
+    serial: (info && info.serial) || prev.serial || null,
+    serialKind: (info && info.serialKind) || prev.serialKind || null
+  };
+  jobConfig[matchKey] = match;
+  if (match.label) jobConfig[labelKey] = match.label;
+}
+
+// The human-readable name of a job's drive for logs and messages:
+// the match record's label first, then the legacy volume label.
+function driveMatchLabel(job, which) {
+  const m = which === 'source' ? job.sourceDriveMatch : job.destinationDriveMatch;
+  if (m && m.label) return m.label;
+  return which === 'source' ? (job.sourceVolumeLabel || null) : (job.destinationVolumeLabel || null);
+}
+
 // Resolve a job's source + destination through the drive watcher.
 // Returns { source: {...}, destination: {...} } per drive-resolver.
 async function resolveJobPaths(job) {
-  const source = await driveResolver.resolvePathAsync(jobPathValue(job.source), job.sourceVolumeLabel || null);
-  const destination = await driveResolver.resolvePathAsync(jobPathValue(job.destination), job.destinationVolumeLabel || null);
+  const source = await driveResolver.resolvePathAsync(jobPathValue(job.source), job.sourceDriveMatch || job.sourceVolumeLabel || null);
+  const destination = await driveResolver.resolvePathAsync(jobPathValue(job.destination), job.destinationDriveMatch || job.destinationVolumeLabel || null);
   return { source: source, destination: destination };
 }
 
@@ -881,8 +914,8 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   // Removable drive missing? Fail with a clear error (and an email)
   // instead of letting the engine fail on a path that does not exist.
   {
-    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceVolumeLabel || null);
-    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationVolumeLabel || null);
+    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceDriveMatch || jobConfig.sourceVolumeLabel || null);
+    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationDriveMatch || jobConfig.destinationVolumeLabel || null);
     const missing = !src.found ? { which: 'source', res: src } : (!dst.found ? { which: 'destination', res: dst } : null);
     if (missing) {
       const errText = `${missing.which === 'source' ? 'Source' : 'Destination'} drive not found: ${missing.res.path}` +
@@ -953,8 +986,8 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   const jobName = jobConfig.name || `incremental-${Date.now()}`;
   {
-    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceVolumeLabel || null);
-    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationVolumeLabel || null);
+    const src = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.source), jobConfig.sourceDriveMatch || jobConfig.sourceVolumeLabel || null);
+    const dst = await driveResolver.resolvePathAsync(jobPathValue(jobConfig.destination), jobConfig.destinationDriveMatch || jobConfig.destinationVolumeLabel || null);
     const missing = !src.found ? { which: 'source', res: src } : (!dst.found ? { which: 'destination', res: dst } : null);
     if (missing) {
       const errText = `${missing.which === 'source' ? 'Source' : 'Destination'} drive not found: ${missing.res.path}` +
@@ -1210,6 +1243,12 @@ ipcMain.handle('job-get-config', async (event, jobId) => {
   }
 });
 
+// Drive list for the job wizard: the wizard shows how each drive can
+// be found again (by name / letter / serial) after Browse picks a path.
+ipcMain.handle('get-drives', async () => {
+  try { return await driveResolver.listDrives(); } catch (e) { return []; }
+});
+
 ipcMain.handle('job-save-config', async (event, jobConfig) => {
   // A job password must never reach disk in a job file: strip every
   // password field before writing, whatever the caller sent.
@@ -1218,21 +1257,19 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     if (jobConfig.encryption && typeof jobConfig.encryption === 'object') delete jobConfig.encryption.password;
     delete jobConfig.password;
   }
-  // Removable drives: remember the volume label (e.g. "Nile view") of
-  // the source/destination drive, so a later run can find the same
-  // disk when Windows gives it another letter. Only set when the
-  // drive is actually present right now.
+  // Removable drives: remember HOW to find the source/destination
+  // drive again — by name, by letter, or by serial number. The wizard
+  // sends the mode the user picked; the label and serial are read
+  // here from the live drive list, so the user never types a serial.
+  // Only set when the drive is actually present right now; a stored
+  // value survives an edit made while the drive is unplugged.
   try {
     const drives = await driveResolver.listDrives();
     if (jobConfig) {
-      const sLetter = driveResolver.driveLetterOf(jobPathValue(jobConfig.source));
-      const sLabel = driveResolver.labelForLetter(drives, sLetter);
-      if (sLabel) jobConfig.sourceVolumeLabel = sLabel;
-      const dLetter = driveResolver.driveLetterOf(jobPathValue(jobConfig.destination));
-      const dLabel = driveResolver.labelForLetter(drives, dLetter);
-      if (dLabel) jobConfig.destinationVolumeLabel = dLabel;
+      captureDriveMatch(jobConfig, 'source', drives);
+      captureDriveMatch(jobConfig, 'destination', drives);
     }
-  } catch (e) { /* labels stay as they were; literal paths still work */ }
+  } catch (e) { /* match info stays as it was; literal paths still work */ }
   const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
   if (!fs.existsSync(jobsDir)) {
     fs.mkdirSync(jobsDir, { recursive: true });

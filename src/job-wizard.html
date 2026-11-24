@@ -33,6 +33,15 @@
           <input type="text" id="jobName" value="My Backup" placeholder="My Backup">
           <div class="field-error" id="jobNameError">Please enter a job name.</div>
         </div>
+        <div class="field" id="sourceMatchField">
+          <label>Find this drive again by</label>
+          <div class="radio-row">
+            <label><input type="radio" name="sourceMatch" value="label" checked> Name <span id="sourceMatchLabel" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="sourceMatch" value="letter"> Drive letter <span id="sourceMatchLetter" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="sourceMatch" value="serial"> Serial number <span id="sourceMatchSerial" style="color:var(--muted-2);font-size:12px;"></span></label>
+          </div>
+          <div class="hint">Pick one first, then Browse. The name, letter and serial are read automatically from the drive you pick — you never type a serial.</div>
+        </div>
         <div class="field">
           <label for="sourceDir">Source — folder or file</label>
           <div class="input-row">
@@ -55,6 +64,15 @@
 
       <!-- Step 2: Destination -->
       <section class="step-panel" data-panel="2">
+        <div class="field" id="destMatchField">
+          <label>Find this drive again by</label>
+          <div class="radio-row">
+            <label><input type="radio" name="destMatch" value="label" checked> Name <span id="destMatchLabel" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="destMatch" value="letter"> Drive letter <span id="destMatchLetter" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="destMatch" value="serial"> Serial number <span id="destMatchSerial" style="color:var(--muted-2);font-size:12px;"></span></label>
+          </div>
+          <div class="hint">Pick one first, then Browse. The name, letter and serial are read automatically from the drive you pick — you never type a serial.</div>
+        </div>
         <div class="field">
           <label for="destDir">Destination Directory</label>
           <div class="input-row">

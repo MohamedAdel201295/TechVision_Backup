@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getStoredJobs: () => ipcRenderer.invoke('job-list-stored'),
     getJobConfig: (jobId) => ipcRenderer.invoke('job-get-config', jobId),
     saveJobConfig: (jobConfig) => ipcRenderer.invoke('job-save-config', jobConfig),
+    getDrives: () => ipcRenderer.invoke('get-drives'),
 
     // Settings
     getSettings: () => ipcRenderer.invoke('settings-get'),
