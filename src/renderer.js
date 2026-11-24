@@ -1362,6 +1362,7 @@
      in here: "Open in Cloud" jumps to the Cloud client with a peer's
      Tailscale IP prefilled (and the connection mode set to Tailscale). */
   var vpnStatusCache = null;
+  var vpnAuthUrlCache = null;
   var vpnBusy = false;
 
   function vpnMissing() { toast('VPN', 'The VPN bridge is not available in this build.', 'error'); }
@@ -1400,8 +1401,11 @@
       if (btn) btn.textContent = 'Sign in';
       if (lb) {
         lb.style.display = '';
+        vpnAuthUrlCache = st.authUrl || null;
         var au = $('vpnAuthUrl');
         if (au) au.textContent = st.authUrl ? ('Sign-in link: ' + st.authUrl) : '';
+        var ob = $('vpnOpenAuthBtn');
+        if (ob) ob.style.display = st.authUrl ? '' : 'none';
       }
       if (dc) dc.style.display = 'none';
       renderVpnPeers([]);
@@ -1685,6 +1689,12 @@
     });
     var vrb = $('vpnRefreshBtn');
     if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
+    var vab = $('vpnOpenAuthBtn');
+    if (vab) vab.addEventListener('click', async function () {
+      if (!vpnAuthUrlCache) return;
+      if (!api || typeof api.vpnOpenAuthUrl !== 'function') return vpnMissing();
+      await api.vpnOpenAuthUrl(vpnAuthUrlCache);
+    });
     var vdb = $('vpnDownloadBtn');
     if (vdb) vdb.addEventListener('click', async function () {
       if (!api || typeof api.vpnOpenDownload !== 'function') return vpnMissing();

@@ -154,17 +154,32 @@ async function getStatus() {
   };
 }
 
-async function setConnected(on) {
+/* The Tailscale sign-in URL, from `tailscale up` output or a status
+   report. Only login.tailscale.com counts — never open an arbitrary URL
+   from CLI output in a browser. */
+function extractLoginUrl(text) {
+  const m = String(text || '').match(/https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+/);
+  return m ? m[0] : null;
+}
+
+async function setConnected(on, timeoutMs) {
   const args = on ? ['up'] : ['down'];
-  const r = await runCli(args, 60000);
+  const r = await runCli(args, timeoutMs || 60000);
   if (r.notFound) return { success: false, error: 'Tailscale is not installed on this computer.' };
-  if (r.timedOut) return { success: false, error: 'Tailscale is taking a long time — if a browser sign-in window opened, complete it there, then press Refresh.' };
+  if (r.timedOut) {
+    // `tailscale up` blocks while it waits for the browser sign-in — and
+    // on some machines it never opens the browser at all. The login URL
+    // is in the output it already printed; hand it back instead of
+    // dropping it, so the app can open it itself.
+    const url = extractLoginUrl((r.stdout || '') + '\n' + (r.stderr || ''));
+    return { success: false, needsLogin: !!url, authUrl: url, error: 'Tailscale is taking a long time — if a browser sign-in window opened, complete it there, then press Refresh.' };
+  }
   const out = (r.stdout || '') + '\n' + (r.stderr || '');
   if (r.code !== 0) {
-    const url = (out.match(/https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+/) || [])[0] || null;
+    const url = extractLoginUrl(out);
     return { success: false, needsLogin: !!url, authUrl: url, error: 'Tailscale could not ' + (on ? 'connect' : 'disconnect') + '.' };
   }
-  const url = (out.match(/https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+/) || [])[0] || null;
+  const url = extractLoginUrl(out);
   return { success: true, needsLogin: !!url, authUrl: url };
 }
 
@@ -201,7 +216,7 @@ async function disableKeyExpiry() {
 
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
-  installAndConnect, downloadFile, verifySignature, parseSignatureResult, MSI_URL,
+  installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
   disableKeyExpiry, pickLanSubnet, tailnetFromDns, buildInstallScript,
 };
 

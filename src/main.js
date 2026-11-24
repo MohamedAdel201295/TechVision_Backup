@@ -1920,7 +1920,14 @@ ipcMain.handle('vpn-get-status', async () => {
   catch (e) { return { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
 });
 ipcMain.handle('vpn-set-connected', async (event, on) => {
-  try { return await vpn.setConnected(!!on); }
+  try {
+    const r = await vpn.setConnected(!!on);
+    // `tailscale up` tries to open the sign-in page itself, but on some
+    // machines no browser appears — open it from here so the user is
+    // never stuck staring at a 60-second timeout.
+    if (r && r.authUrl) openLoginUrl(r.authUrl);
+    return r;
+  }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
 });
 ipcMain.handle('vpn-set-routes', async (event, on) => {
@@ -1933,14 +1940,30 @@ ipcMain.handle('vpn-disable-key-expiry', async () => {
 });
 ipcMain.handle('vpn-install-connect', async (event) => {
   try {
-    return await vpn.installAndConnect((p) => {
+    const r = await vpn.installAndConnect((p) => {
       try { if (!event.sender.isDestroyed()) event.sender.send('vpn-install-progress', p); } catch (e) {}
     });
+    if (r && r.authUrl) openLoginUrl(r.authUrl);
+    return r;
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install Tailscale.' }; }
 });
 ipcMain.handle('vpn-open-download', async () => {
   try { await require('electron').shell.openExternal('https://tailscale.com/download'); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
+});
+// Opens a Tailscale sign-in link in the default browser. Only
+// login.tailscale.com URLs are ever opened from here.
+function openLoginUrl(url) {
+  try {
+    if (typeof url === 'string' && /^https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+$/.test(url)) require('electron').shell.openExternal(url);
+  } catch (e) {}
+}
+ipcMain.handle('vpn-open-auth-url', async (event, url) => {
+  try {
+    if (typeof url !== 'string' || !/^https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+$/.test(url)) return { success: false, error: 'Not a Tailscale sign-in link.' };
+    await require('electron').shell.openExternal(url);
+    return { success: true };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the sign-in page.' }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {
