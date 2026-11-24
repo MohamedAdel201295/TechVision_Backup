@@ -1686,6 +1686,10 @@ ipcMain.handle('vpn-set-routes', async (event, on) => {
   try { return await vpn.setSubnetRouter(!!on); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
+ipcMain.handle('vpn-disable-key-expiry', async () => {
+  try { return await vpn.disableKeyExpiry(); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }
+});
 ipcMain.handle('vpn-install-connect', async (event) => {
   try {
     return await vpn.installAndConnect((p) => {

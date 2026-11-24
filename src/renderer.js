@@ -1416,7 +1416,48 @@
     if (ss) ss.textContent = st.lanSubnet
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
       : 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
+    var ket = $('vpnKeyExpiryToggle'); if (ket) ket.checked = vpnKeyExpiryWanted();
     renderVpnPeers(st.peers || []);
+    // First sign-in (or first view while connected): turn off the 180-day
+    // key expiry automatically, so the device never asks to sign in again.
+    maybeDisableVpnKeyExpiry();
+  }
+
+  /* ---------- VPN key expiry (stay connected forever) ---------- */
+  var vpnKeyExpiryAttempted = false; // one auto attempt per app session
+  function vpnKeyExpiryWanted() {
+    return !(settings.vpn && settings.vpn.autoDisableKeyExpiry === false);
+  }
+  async function saveVpnSettings(patch) {
+    var v = Object.assign({}, (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {}, patch);
+    try {
+      var next = Object.assign({}, settings, { vpn: v });
+      await api.saveSettings(next);
+      settings = next;
+    } catch (e) { /* keep the in-memory value; the toggle still works this session */ }
+  }
+  async function disableVpnKeyExpiry(quiet) {
+    if (!api || typeof api.vpnDisableKeyExpiry !== 'function') return false;
+    try {
+      var r = await api.vpnDisableKeyExpiry();
+      if (r && r.success) {
+        await saveVpnSettings({ keyExpiryDisabled: true });
+        if (!quiet) toast('VPN', 'Key expiry is off — this device will stay connected, no more sign-ins.', 'success');
+        return true;
+      }
+      if (!quiet) toast('VPN', 'Could not turn off key expiry automatically. You can turn it off in the Tailscale admin console (Machines → this device → Disable key expiry).', 'error');
+      return false;
+    } catch (e) {
+      if (!quiet) toast('VPN error', e && e.message ? e.message : 'Could not turn off key expiry.', 'error');
+      return false;
+    }
+  }
+  async function maybeDisableVpnKeyExpiry() {
+    if (vpnKeyExpiryAttempted) return;
+    if (!vpnKeyExpiryWanted()) return;
+    if (settings.vpn && settings.vpn.keyExpiryDisabled === true) return;
+    vpnKeyExpiryAttempted = true;
+    await disableVpnKeyExpiry(false);
   }
 
   function renderVpnPeers(peers) {
@@ -1631,6 +1672,18 @@
     });
     var vrc = $('vpnRecheckBtn');
     if (vrc) vrc.addEventListener('click', function () { loadVpn(); });
+    var vke = $('vpnKeyExpiryToggle');
+    if (vke) vke.addEventListener('change', async function () {
+      await saveVpnSettings({ autoDisableKeyExpiry: vke.checked });
+      if (vke.checked) { vpnKeyExpiryAttempted = false; maybeDisableVpnKeyExpiry(); }
+    });
+    var vkb = $('vpnKeyExpiryBtn');
+    if (vkb) vkb.addEventListener('click', async function () {
+      if (vpnBusy) return;
+      vpnBusy = true; vkb.disabled = true;
+      try { await disableVpnKeyExpiry(false); }
+      finally { vpnBusy = false; vkb.disabled = false; }
+    });
     var vst = $('vpnSubnetToggle');
     if (vst) vst.addEventListener('change', async function () {
       if (!api || typeof api.vpnSetRoutes !== 'function') return vpnMissing();

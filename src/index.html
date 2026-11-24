@@ -411,6 +411,11 @@
         <label class="switch"><input type="checkbox" id="vpnSubnetToggle"><span class="slider"></span></label>
       </div>
       <div class="t-sub" id="vpnRoutesNote" style="display:none;"></div>
+      <div class="toggle-row" style="margin-top:12px;">
+        <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale normally asks you to sign in again after 180 days. With this on, the app turns that off automatically right after you connect.</div></div>
+        <label class="switch"><input type="checkbox" id="vpnKeyExpiryToggle" checked><span class="slider"></span></label>
+      </div>
+      <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" type="button" id="vpnKeyExpiryBtn">Disable key expiry now</button></div>
     </div>
     <div class="card">
       <h3 style="margin:0 0 4px;font-size:16px;">Devices on your network</h3>

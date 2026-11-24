@@ -150,9 +150,29 @@ async function setSubnetRouter(on) {
   return { success: true, subnet: on ? subnet : null };
 }
 
+/* Disable key expiry for this device (`tailscale set --key-expiry=off`).
+   Runs on the device itself — no API token needed. The device must
+   already be connected. Tailscale normally makes the node key expire
+   after 180 days and asks for another sign-in; with expiry off the
+   device stays connected forever. Returns { success, error? }. */
+async function disableKeyExpiry() {
+  const st = await getStatus();
+  if (!st.installed) return { success: false, error: 'Tailscale is not installed on this computer.' };
+  if (!st.connected) return { success: false, error: 'Connect to Tailscale first.' };
+  const r = await runCli(['set', '--key-expiry=off'], 30000);
+  if (r.notFound) return { success: false, error: 'Tailscale is not installed on this computer.' };
+  if (r.timedOut) return { success: false, error: 'Tailscale did not answer in time. Try again.' };
+  if (r.code !== 0) {
+    const msg = (r.stderr || '').trim() || 'Could not disable key expiry.';
+    return { success: false, error: msg };
+  }
+  return { success: true };
+}
+
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, MSI_URL,
+  disableKeyExpiry,
 };
 
 /* ---------- Auto-install (Windows only) ----------
