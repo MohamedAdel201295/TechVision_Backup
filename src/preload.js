@@ -101,6 +101,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cloudClientMkdir: (serverId, relPath) => ipcRenderer.invoke('cloud-client-mkdir', serverId, relPath),
   cloudClientDelete: (serverId, relPath) => ipcRenderer.invoke('cloud-client-delete', serverId, relPath),
   cloudClientRename: (serverId, from, to) => ipcRenderer.invoke('cloud-client-rename', serverId, from, to),
+  // TechVision VPN — Tailscale client manager (no VPN of its own)
+  vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
+  vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
+  vpnSetRoutes: (on) => ipcRenderer.invoke('vpn-set-routes', on),
+  vpnOpenDownload: () => ipcRenderer.invoke('vpn-open-download'),
   onBackupComplete: (callback) => ipcRenderer.on('backup-complete', (event, ...args) => callback(...args)),
   onJobsUpdated: (callback) => ipcRenderer.on('jobs-updated', () => callback()),
 

@@ -13,6 +13,7 @@ const vault = require('./vault.js');
 const driveResolver = require('./drive-resolver.js');
 const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
+const vpn = require('./vpn.js');
 // How long a due scheduled job waits for a missing removable drive
 // before it is recorded as failed (and emailed about): 2 hours.
 const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
@@ -1457,8 +1458,9 @@ ipcMain.handle('cloud-get-config', async () => {
       running: srv.isRunning(),
       users: srv.listUsers(),
       fingerprint: cfg.server.cert ? cfg.server.cert.fingerprint : null,
+      accessMode: cfg.server.accessMode === 'tailscale' ? 'tailscale' : 'normal',
     },
-    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null })),
+    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, accessMode: c.accessMode === 'tailscale' ? 'tailscale' : 'normal' })),
   };
 });
 
@@ -1476,8 +1478,10 @@ ipcMain.handle('cloud-server-save', async (event, opts) => {
   if (!port || port < 1 || port > 65535) return { success: false, error: 'Port must be between 1 and 65535.' };
   const wasRunning = getCloudServer().isRunning();
   const portChanged = cfg.server.port !== port;
+  const accessMode = (opts && opts.accessMode === 'tailscale') ? 'tailscale' : 'normal';
   cfg.server.enabled = !!(opts && opts.enabled);
   cfg.server.port = port;
+  cfg.server.accessMode = accessMode;
   saveCloudConfig();
   try {
     if (wasRunning && portChanged) {
@@ -1552,7 +1556,7 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     if (!host) return { success: false, error: 'Server address is required.' };
     if (!port || port < 1 || port > 65535) return { success: false, error: 'Port must be between 1 and 65535.' };
     const id = s.id || ('srv-' + Date.now());
-    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null };
+    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode: s.accessMode === 'tailscale' ? 'tailscale' : 'normal' };
     // Same host + port + user is the same server: update it in place
     // instead of adding a duplicate row every time it is saved again.
     let i = cfg.clients.findIndex((c) => c.id === id);
@@ -1665,6 +1669,26 @@ ipcMain.handle('cloud-client-rename', async (event, serverId, from, to) => {
   if (!conn) return { success: false, error: 'Not connected to this server.' };
   try { await cloudClient.rename(conn, from, to); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
+});
+
+// ---------- TechVision VPN (Tailscale client manager) ----------
+// The module only shells out to the Tailscale CLI that is already
+// installed on the machine; it implements no VPN of its own.
+ipcMain.handle('vpn-get-status', async () => {
+  try { return await vpn.getStatus(); }
+  catch (e) { return { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
+});
+ipcMain.handle('vpn-set-connected', async (event, on) => {
+  try { return await vpn.setConnected(!!on); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
+});
+ipcMain.handle('vpn-set-routes', async (event, on) => {
+  try { return await vpn.setSubnetRouter(!!on); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
+});
+ipcMain.handle('vpn-open-download', async () => {
+  try { await require('electron').shell.openExternal('https://tailscale.com/download'); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {

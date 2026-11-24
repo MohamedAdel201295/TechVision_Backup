@@ -51,7 +51,7 @@ function fingerprintOfCertPem(certPem) {
 }
 
 function defaultServerConfig() {
-  return { enabled: false, port: 8443, cert: null, users: [] };
+  return { enabled: false, port: 8443, cert: null, users: [], accessMode: 'normal' };
 }
 
 function ensureCert(cfg) {
