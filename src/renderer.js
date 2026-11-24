@@ -605,6 +605,9 @@
   function showCloudPanel(panel) {
     cloudPanel = panel;
     var modes = $('cloudModes'); if (modes) modes.style.display = panel === 'home' ? '' : 'none';
+    // The "your own remote drive" intro belongs to the Cloud home only —
+    // inside Server/Client it is just a repeated sentence above the panel.
+    var ht = $('cloudViewHeadText'); if (ht) ht.style.display = panel === 'home' ? '' : 'none';
     var sp = $('cloudServerPanel'); if (sp) sp.style.display = panel === 'server' ? '' : 'none';
     var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
     if (panel === 'server') renderCloudServer();
@@ -703,27 +706,37 @@
     if (cloudClientAccess === 'tailscale') populateCloudPeers();
   }
 
+  // Signature of the last peer list the picker was built from. The list
+  // is re-read on a timer while the client panel is open (see the
+  // poller in the wiring), so a device that joins later appears on its
+  // own — but rebuilding the <select> on every tick would close an open
+  // dropdown and drop the selection, so an unchanged list is left alone.
+  var lastCloudPeerSig = null;
   async function populateCloudPeers() {
     var sel = $('cloudClientPeer'); if (!sel) return;
+    if (!sel.options.length) { var chk = document.createElement('option'); chk.value = ''; chk.textContent = 'Checking Tailscale…'; sel.appendChild(chk); }
+    if (!api || typeof api.vpnGetStatus !== 'function') { sel.innerHTML = ''; var na = document.createElement('option'); na.value = ''; na.textContent = 'VPN module is not available.'; sel.appendChild(na); return; }
+    var st;
+    try { st = await api.vpnGetStatus(); }
+    catch (e) { sel.innerHTML = ''; var oe = document.createElement('option'); oe.value = ''; oe.textContent = 'Could not read Tailscale status.'; sel.appendChild(oe); return; }
+    var sig = JSON.stringify({ installed: !!st.installed, connected: !!st.connected, peers: (st.peers || []).map(function (p) { return [p.ip, p.name, p.online]; }) });
+    if (sig === lastCloudPeerSig) return;
+    lastCloudPeerSig = sig;
+    var prevValue = sel.value;
     sel.innerHTML = '';
-    var opt0 = document.createElement('option'); opt0.value = ''; opt0.textContent = 'Checking Tailscale…';
-    sel.appendChild(opt0);
-    if (!api || typeof api.vpnGetStatus !== 'function') { opt0.textContent = 'VPN module is not available.'; return; }
-    try {
-      var st = await api.vpnGetStatus();
-      sel.innerHTML = '';
-      if (!st || !st.installed) { var o1 = document.createElement('option'); o1.value = ''; o1.textContent = 'Tailscale is not installed — see the VPN module.'; sel.appendChild(o1); return; }
-      if (!st.connected) { var o2 = document.createElement('option'); o2.value = ''; o2.textContent = 'Tailscale is not connected — connect it from the VPN module.'; sel.appendChild(o2); return; }
-      var peers = st.peers || [];
-      if (!peers.length) { var o3 = document.createElement('option'); o3.value = ''; o3.textContent = 'No other devices on your Tailscale network yet.'; sel.appendChild(o3); return; }
-      var blank = document.createElement('option'); blank.value = ''; blank.textContent = 'Choose a device…'; sel.appendChild(blank);
-      peers.forEach(function (p) {
-        if (!p.ip) return;
-        var o = document.createElement('option'); o.value = p.ip; o.textContent = p.name + ' — ' + p.ip + (p.online ? '' : ' (offline)');
-        o.setAttribute('data-peer-name', p.name);
-        sel.appendChild(o);
-      });
-    } catch (e) { sel.innerHTML = ''; var oe = document.createElement('option'); oe.value = ''; oe.textContent = 'Could not read Tailscale status.'; sel.appendChild(oe); }
+    if (!st || !st.installed) { var o1 = document.createElement('option'); o1.value = ''; o1.textContent = 'Tailscale is not installed — see the VPN module.'; sel.appendChild(o1); return; }
+    if (!st.connected) { var o2 = document.createElement('option'); o2.value = ''; o2.textContent = 'Tailscale is not connected — connect it from the VPN module.'; sel.appendChild(o2); return; }
+    var peers = st.peers || [];
+    if (!peers.length) { var o3 = document.createElement('option'); o3.value = ''; o3.textContent = 'No other devices on your Tailscale network yet.'; sel.appendChild(o3); return; }
+    var blank = document.createElement('option'); blank.value = ''; blank.textContent = 'Choose a device…'; sel.appendChild(blank);
+    peers.forEach(function (p) {
+      if (!p.ip) return;
+      var o = document.createElement('option'); o.value = p.ip; o.textContent = p.name + ' — ' + p.ip + (p.online ? '' : ' (offline)');
+      o.setAttribute('data-peer-name', p.name);
+      sel.appendChild(o);
+    });
+    // A rebuild must not drop the device the user already picked.
+    if (prevValue) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevValue) { sel.value = prevValue; break; } }
   }
 
   function renderCloudServer() {
@@ -1540,8 +1553,15 @@
     await disableVpnKeyExpiry(false);
   }
 
+  // Same idea as populateCloudPeers: the VPN view is re-read on a timer
+  // while it is open, so only rebuild the list when something actually
+  // changed (a device joining/leaving, or a state change).
+  var lastVpnPeersSig = null;
   function renderVpnPeers(peers) {
     var list = $('vpnPeersList'); if (!list) return;
+    var sig = JSON.stringify({ peers: (peers || []).map(function (p) { return [p.ip, p.name, p.online, p.os]; }), connected: !!(vpnStatusCache && vpnStatusCache.connected), installed: !!(vpnStatusCache && vpnStatusCache.installed), needsLogin: !!(vpnStatusCache && vpnStatusCache.needsLogin) });
+    if (sig === lastVpnPeersSig) return;
+    lastVpnPeersSig = sig;
     list.innerHTML = '';
     if (!peers.length) {
       var empty = document.createElement('div');
@@ -1710,6 +1730,7 @@
     var cps = $('cloudClientPeer');
     if (cps) cps.addEventListener('change', function () {
       var host = $('cloudClientHost'); if (host && cps.value) host.value = cps.value;
+      var port = $('cloudClientPort'); if (port && cps.value && !port.value) port.value = '8443';
       var name = $('cloudClientName');
       if (name && !name.value && cps.selectedOptions && cps.selectedOptions[0]) name.value = cps.selectedOptions[0].getAttribute('data-peer-name') || '';
     });
@@ -1751,6 +1772,19 @@
     });
     var vrb = $('vpnRefreshBtn');
     if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
+    // Peers appear on their own: while the VPN view is open, or the Cloud
+    // client panel is open in Tailscale mode, re-read Tailscale status
+    // every 15s so a device that joins shows up without re-opening the
+    // view or re-picking anything. Both renderers skip rebuilding when
+    // nothing changed, so an open dropdown or a selection is never
+    // disturbed; skipped while an install/connect is in progress.
+    setInterval(function () {
+      if (vpnBusy) return;
+      var vpnView = $('view-vpn');
+      if (vpnView && vpnView.style.display !== 'none') loadVpn();
+      var cloudView = $('view-cloud');
+      if (cloudView && cloudView.style.display !== 'none' && cloudPanel === 'client' && cloudClientAccess === 'tailscale') populateCloudPeers();
+    }, 15000);
     var vab = $('vpnOpenAuthBtn');
     if (vab) vab.addEventListener('click', async function () {
       if (!vpnAuthUrlCache) return;
