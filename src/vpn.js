@@ -383,6 +383,8 @@ async function apiFetch(apiPath, authHeader, opts) {
    and keep it; a connect/disconnect clears it in case the identity
    changed. */
 let cachedDeviceId = null;
+let lastDeviceId = null; // kept even across disconnects: a stale id only
+// risks a 404 on a verify call, and a 404 still proves the credential.
 async function selfDeviceId() {
   if (cachedDeviceId) return { id: cachedDeviceId, error: null };
   const st = await getStatus();
@@ -390,6 +392,7 @@ async function selfDeviceId() {
   if (!st.connected) return { id: null, error: 'Connect to Tailscale first.' };
   if (!st.deviceId) return { id: null, error: 'Could not find this device in Tailscale status.' };
   cachedDeviceId = st.deviceId;
+  lastDeviceId = st.deviceId;
   return { id: st.deviceId, error: null };
 }
 
@@ -413,6 +416,24 @@ function authRefusedError(via, status, scope) {
   const need = scope || 'devices:core';
   if (via === 'oauth') return 'Tailscale API refused the OAuth client (HTTP ' + status + '). Check the client ID and secret, and that the client has the ' + need + ' scope.';
   return 'Tailscale API refused the token (HTTP ' + status + '). Check the API access token in the VPN settings.';
+}
+
+/* Does the saved credential actually work? "Saved" says nothing about
+   that, so the UI shows a word instead — Connected or Disconnected.
+   Any non-401/403 answer proves the credential authenticates, so even
+   a 404 (device id unknown — e.g. never connected on this machine)
+   counts as valid; only a refused auth or a failed exchange means the
+   credential itself is wrong. Returns { valid, via?, error? }. */
+async function verifyApiAuth(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if (!a.clientId && !a.apiToken) return { valid: false, error: 'No API credentials saved.' };
+  const idRes = await selfDeviceId().catch(() => ({ id: null }));
+  const id = (idRes && idRes.id) || lastDeviceId || 'nUNKNOWN';
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id), auth, { method: 'GET' });
+  if (r.ok) return { valid: true, via: r.via };
+  if (r.status === 404) return { valid: true, via: r.via };
+  if (r.status === 401 || r.status === 403) return { valid: false, via: r.via, error: authRefusedError(r.via, r.status) };
+  return { valid: false, via: r.via || null, error: r.error || ('Tailscale API answered HTTP ' + (r.status || '?') + '.') };
 }
 
 async function disableKeyExpiryViaApi(auth) {
@@ -513,7 +534,7 @@ async function disableKeyExpiry(auth) {
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
-  disableKeyExpiry, enableKeyExpiry, getKeyExpiryState, disableKeyExpiryViaApi, exchangeOAuthToken, getDeviceRoutes, approveRoutes, pickLanSubnet, tailnetFromDns, buildInstallScript,
+  disableKeyExpiry, enableKeyExpiry, getKeyExpiryState, verifyApiAuth, disableKeyExpiryViaApi, exchangeOAuthToken, getDeviceRoutes, approveRoutes, pickLanSubnet, tailnetFromDns, buildInstallScript,
   parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,
 };
 

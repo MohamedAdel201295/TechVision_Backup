@@ -436,7 +436,8 @@
         <div><div class="t-label">This device</div><div class="vpn-fact" id="vpnSelfName">—</div></div>
       </div>
       <details id="vpnApiCreds" class="vpn-creds-box">
-        <summary class="t-label" style="cursor:pointer;">API credentials — needed for key expiry and route approval</summary>
+        <summary class="t-label" style="cursor:pointer;">API credentials — needed for key expiry and route approval <span id="vpnApiCredsStatusWord" class="t-sub"></span></summary>
+        <div class="t-sub" id="vpnApiCredsStatus" style="margin-top:8px;"></div>
         <div style="margin-top:8px;">
           <div class="t-label">Tailscale OAuth client (recommended — set once, never expires)</div>
           <div class="t-sub">Create it in the admin console (Settings → Trust credentials → OAuth clients) with the Devices and Routes scopes. The app mints its own tokens after that — nothing to paste again.</div>

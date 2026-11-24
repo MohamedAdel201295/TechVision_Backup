@@ -1773,6 +1773,7 @@
     // key expiry automatically, so the device never asks to sign in again.
     maybeDisableVpnKeyExpiry();
     refreshVpnKeyExpiryState();
+    refreshVpnApiCredsStatus(false);
   }
 
   // `tailscale up` can return before the daemon reports itself Running, so
@@ -1855,6 +1856,43 @@
         el.textContent = 'Key expiry state: unknown — ' + ((r && r.error) || 'could not read it.');
       }
     } catch (e) { el.textContent = 'Key expiry state: unknown — ' + (e && e.message ? e.message : 'could not read it.'); }
+  }
+  // "Saved" says nothing about whether the credential actually works,
+  // so the credentials box carries a word of its own — Connected or
+  // Disconnected — visible in the summary even while the box is
+  // collapsed, with the full reason inside. Verified on load (at most
+  // once a minute) and right after every save.
+  var vpnApiCredsLastVerify = 0;
+  var vpnApiCredsVerifying = false;
+  async function refreshVpnApiCredsStatus(force) {
+    var word = $('vpnApiCredsStatusWord');
+    var line = $('vpnApiCredsStatus');
+    if (!word && !line) return;
+    var setWord = function (text, cls) { if (word) { word.textContent = text; word.className = 't-sub ' + (cls || ''); } };
+    var setLine = function (text, cls) { if (line) { line.textContent = text; line.className = 't-sub ' + (cls || ''); } };
+    var auth = vpnAuth();
+    if (!auth) { setWord('· Not saved', ''); setLine('No credentials saved yet — save an OAuth client or a token below, and this line will say whether it works.'); return; }
+    if (!force && Date.now() - vpnApiCredsLastVerify < 60000) return;
+    if (vpnApiCredsVerifying) return;
+    if (!api || typeof api.vpnVerifyApi !== 'function') return;
+    vpnApiCredsVerifying = true;
+    setWord('· Verifying…', '');
+    setLine('Verifying the credentials with the Tailscale API…');
+    try {
+      var r = await api.vpnVerifyApi(auth);
+      vpnApiCredsLastVerify = Date.now();
+      if (r && r.valid) {
+        var via = r.via === 'oauth' ? 'OAuth client' : (r.via === 'token' ? 'API token' : 'credentials');
+        setWord('· Connected', 'vpn-creds-ok');
+        setLine('Connected — the ' + via + ' works with the Tailscale API.');
+      } else {
+        setWord('· Disconnected', 'vpn-creds-bad');
+        setLine('Disconnected — ' + ((r && r.error) || 'the credentials did not work.'));
+      }
+    } catch (e) {
+      setWord('· Disconnected', 'vpn-creds-bad');
+      setLine('Disconnected — ' + (e && e.message ? e.message : 'could not check the credentials.'));
+    } finally { vpnApiCredsVerifying = false; }
   }
   // Turn key expiry back ON through the API (the toggle flipped off).
   async function enableVpnKeyExpiry() {
@@ -2233,6 +2271,8 @@
       var token = inp ? inp.value.trim() : '';
       await saveVpnSettings({ apiToken: token });
       toast('VPN', token ? 'API token saved.' : 'API token removed.', 'success');
+      var d0 = $('vpnApiCreds'); if (d0) d0.open = true;
+      refreshVpnApiCredsStatus(true);
       refreshVpnKeyExpiryState();
       refreshVpnRoutesState();
     });
@@ -2244,6 +2284,8 @@
       var sec = secInp ? secInp.value.trim() : '';
       await saveVpnSettings({ oauthClientId: id, oauthClientSecret: sec });
       toast('VPN', (id && sec) ? 'OAuth client saved.' : 'OAuth client removed.', 'success');
+      var d1 = $('vpnApiCreds'); if (d1) d1.open = true;
+      refreshVpnApiCredsStatus(true);
       refreshVpnKeyExpiryState();
       refreshVpnRoutesState();
     });

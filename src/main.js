@@ -2016,6 +2016,10 @@ ipcMain.handle('vpn-key-expiry-state', async (event, auth) => {
   try { return await vpn.getKeyExpiryState(auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read key expiry state.' }; }
 });
+ipcMain.handle('vpn-verify-api', async (event, auth) => {
+  try { return await vpn.verifyApiAuth(auth); }
+  catch (e) { return { valid: false, error: e && e.message ? e.message : 'Could not check the credentials.' }; }
+});
 ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
   try {
     let openedUrl = null;
