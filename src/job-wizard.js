@@ -40,15 +40,24 @@
     var pathVal = $(isSrc ? 'sourceDir' : 'destDir').value.trim();
     var letter = driveLetterOf(pathVal);
     if (!field) return;
+    // Nothing picked yet: keep the three choices visible. Hiding the
+    // field here used to be harmless (this only ran after a Browse),
+    // but the match radios now call this too, and clicking one before
+    // Browsing must not make the whole block vanish.
+    if (!pathVal) return;
     if (!letter) { field.style.display = 'none'; return; }
     field.style.display = '';
+    var p = isSrc ? 'sourceMatch' : 'destMatch';
+    // The drive list comes from PowerShell and takes a moment: show
+    // that the serial is being read instead of leaving the value blank
+    // until the call returns.
+    setText(p + 'Serial', '— reading…');
     var drives = [];
     try { if (api && typeof api.getDrives === 'function') drives = await api.getDrives() || []; } catch (e) { drives = []; }
     var info = null;
     for (var i = 0; i < drives.length; i++) {
       if (drives[i] && String(drives[i].letter || '').toUpperCase() === letter) { info = drives[i]; break; }
     }
-    var p = isSrc ? 'sourceMatch' : 'destMatch';
     setText(p + 'Label', info && info.label ? '— ' + info.label : '— unknown');
     setText(p + 'Letter', '— ' + letter + ':');
     setText(p + 'Serial', info && info.serial ? '— ' + info.serial : '— not readable');
@@ -119,6 +128,16 @@
       if (!destOk) toast('Missing information', 'Please choose a destination folder.', 'warning');
       return destOk;
     }
+    if (n === 3) {
+      if ($('optSchedule').checked) {
+        var f3 = document.querySelector('input[name="frequency"]:checked');
+        if (f3 && f3.value === 'Custom' && !document.querySelector('input[name="customDay"]:checked')) {
+          toast('Pick at least one day', 'A custom schedule needs at least one day selected.', 'warning');
+          return false;
+        }
+      }
+      return true;
+    }
     if (n === 4) {
       if (!$('optEncrypt').checked) return true;
       // A saved vault password counts: blank fields keep it.
@@ -155,10 +174,28 @@
     $('patternInput').value = '';
     renderChips();
   }
+  var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  function scheduleSummary(s) {
+    if (!s) return 'Manual only';
+    var time = s.time || '02:00';
+    if ((s.frequency || '') === 'Custom') {
+      var days = Array.isArray(s.days) ? s.days : [];
+      var names = days.map(function (d) { return DAY_NAMES[d] || ''; }).filter(Boolean);
+      return 'Custom (' + (names.join(', ') || 'no days') + ') at ' + time;
+    }
+    return (s.frequency || 'Daily') + ' at ' + time;
+  }
   function collectJob() {
     var freq = 'Daily';
     var checked = document.querySelector('input[name="frequency"]:checked');
     if (checked) freq = checked.value;
+    var schedEnabled = $('optSchedule').checked;
+    var sched = { enabled: schedEnabled, frequency: freq, time: $('scheduleTime').value || '02:00' };
+    if (freq === 'Custom') {
+      sched.days = Array.prototype.map.call(document.querySelectorAll('input[name="customDay"]:checked'), function (c) { return parseInt(c.value, 10); });
+    }
+    var levelRadio = document.querySelector('input[name="compressLevel"]:checked');
+    var level = levelRadio && levelRadio.value === 'advanced' ? 'advanced' : 'standard';
     return {
       // Every job gets a unique id. Two jobs may share a name, but they
       // must stay two separate tasks — the old code keyed everything by
@@ -174,11 +211,11 @@
       includePatterns: patterns.slice(),
       allowIncremental: $('optIncremental').checked,
       compress: $('optCompress').checked,
-      compression: $('optCompress').checked ? 'standard' : 'none',
+      compression: $('optCompress').checked ? level : 'none',
       encryptionEnabled: $('optEncrypt').checked,
       verify: $('optVerify').checked,
       use_vss: false,
-      schedule: $('optSchedule').checked ? { enabled: true, frequency: freq, time: $('scheduleTime').value || '02:00' } : { enabled: false, frequency: freq, time: $('scheduleTime').value || '02:00' },
+      schedule: sched,
       type: 'TEMPLATE',
       status: 'PENDING'
     };
@@ -193,10 +230,10 @@
       ['Find destination drive', matchSummary('dest')],
       ['Include patterns', j.includePatterns.length ? j.includePatterns.join(', ') : 'All files'],
       ['Incremental', j.allowIncremental ? 'Yes' : 'No'],
-      ['Compress with ZIP', j.compress ? 'Yes' : 'No'],
+      ['Compress with ZIP', j.compress ? (j.compression === 'advanced' ? 'Yes — Advanced (Deflate level 9)' : 'Yes — Standard (Deflate level 6)') : 'No'],
       ['Encryption', j.encryptionEnabled ? 'AES-256' + (j.compress ? ' (compression + encryption)' : ' (encryption only, files stored uncompressed)') : 'Off'],
       ['Verify after backup', j.verify ? 'Yes' : 'No'],
-      ['Schedule', j.schedule.enabled ? j.schedule.frequency + ' at ' + j.schedule.time : 'Manual only']
+      ['Schedule', j.schedule.enabled ? scheduleSummary(j.schedule) : 'Manual only']
     ];
     $('reviewBox').innerHTML = rows.map(function (r) {
       var div = document.createElement('div');
@@ -298,7 +335,18 @@
           refreshDriveMatch('dest');
           if (Array.isArray(cfg.includePatterns)) { patterns = cfg.includePatterns.slice(); renderChips(); }
           if (cfg.allowIncremental === false) $('optIncremental').checked = false;
-          if (cfg.compress === false) $('optCompress').checked = false;
+          if (cfg.compress === false) { $('optCompress').checked = false; var clf = $('compressLevelField'); if (clf) clf.style.display = 'none'; }
+          if (cfg.compression === 'advanced') { var adv = document.querySelector('input[name="compressLevel"][value="advanced"]'); if (adv) adv.checked = true; }
+          if (cfg.schedule && cfg.schedule.enabled) {
+            $('optSchedule').checked = true;
+            $('scheduleFields').style.display = 'block';
+            if (cfg.schedule.frequency) { var fr = document.querySelector('input[name="frequency"][value="' + cfg.schedule.frequency + '"]'); if (fr) fr.checked = true; }
+            if (cfg.schedule.time) $('scheduleTime').value = cfg.schedule.time;
+            if (cfg.schedule.frequency === 'Custom' && Array.isArray(cfg.schedule.days)) {
+              $('customDaysField').style.display = 'block';
+              cfg.schedule.days.forEach(function (d) { var cb = document.querySelector('input[name="customDay"][value="' + d + '"]'); if (cb) cb.checked = true; });
+            }
+          }
           if (cfg.verify === false) $('optVerify').checked = false;
           if (cfg.encryptionEnabled === true) {
             $('optEncrypt').checked = true;
@@ -337,11 +385,18 @@
     on('browseDest', 'click', function () { pickFolder('destDir'); });
     on('sourceDir', 'change', function () { refreshDriveMatch('source'); });
     on('destDir', 'change', function () { refreshDriveMatch('dest'); });
+    // Picking a match radio re-reads the drive right away, so the
+    // serial (or name/letter) shows the moment the user selects it —
+    // the old code only refreshed on Browse/change, so the serial
+    // stayed blank until the user left the step and came back.
+    document.querySelectorAll('input[name="sourceMatch"]').forEach(function (r) { r.addEventListener('change', function () { refreshDriveMatch('source'); }); });
+    document.querySelectorAll('input[name="destMatch"]').forEach(function (r) { r.addEventListener('change', function () { refreshDriveMatch('dest'); }); });
+    document.querySelectorAll('input[name="frequency"]').forEach(function (r) { r.addEventListener('change', function () { $('customDaysField').style.display = r.value === 'Custom' ? 'block' : 'none'; }); });
     on('addPatternBtn', 'click', addPattern);
     on('patternInput', 'keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
     on('optSchedule', 'change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });
     on('optEncrypt', 'change', function (ev) { $('encFields').style.display = ev.target.checked ? 'block' : 'none'; if (ev.target.checked) updateEncNote(); });
-    on('optCompress', 'change', function () { if ($('optEncrypt').checked) updateEncNote(); });
+    on('optCompress', 'change', function () { var clf = $('compressLevelField'); if (clf) clf.style.display = $('optCompress').checked ? '' : 'none'; if ($('optEncrypt').checked) updateEncNote(); });
     on('nextBtn', 'click', function () { if (validateStep(step)) showStep(Math.min(5, step + 1)); });
     on('backBtn', 'click', function () { showStep(Math.max(1, step - 1)); });
     on('createBtn', 'click', createJob);

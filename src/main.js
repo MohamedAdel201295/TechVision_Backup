@@ -776,6 +776,24 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
     // new weekly job whose time had passed.
     return target;
   }
+  if (freq === 'custom') {
+    // Custom: run on the picked weekdays (schedule.days, JS day
+    // numbers 0=Sun..6=Sat) at the picked time. Scan today + the next
+    // 7 days for the first picked weekday; a picked weekday today
+    // whose time already passed is due now unless already run for it.
+    const days = Array.isArray(schedule.days) ? schedule.days.map((d) => Number(d)).filter((d) => d >= 0 && d <= 6) : [];
+    if (!days.length) return null;
+    const lastDate = lastRun ? new Date(lastRun) : null;
+    for (let i = 0; i < 8; i++) {
+      const cand = new Date(fromDate);
+      cand.setDate(cand.getDate() + i);
+      if (!days.includes(cand.getDay())) continue;
+      cand.setHours(target.getHours(), target.getMinutes(), 0, 0);
+      if (cand > fromDate) return cand;
+      if (i === 0 && (!lastDate || isNaN(lastDate) || lastDate < cand)) return cand;
+    }
+    return null;
+  }
   // A run time that already passed TODAY is due, not tomorrow — but
   // only if we have not already run for it (lastRun at/after target).
   // This is what makes a daily/monthly job actually fire, and what

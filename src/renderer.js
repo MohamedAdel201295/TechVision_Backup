@@ -493,8 +493,8 @@
   function compressionLabel(job) {
     var c = (job.compression || (job.raw && job.raw.compression) || 'standard').toLowerCase();
     if (c === 'none') return 'No compression — plain files';
-    if (c === 'advanced') return 'Advanced (max compression)';
-    return 'Standard compression';
+    if (c === 'advanced') return 'Advanced — Deflate level 9';
+    return 'Standard — Deflate level 6';
   }
   function renderJobsView() {
     var list = $('jobsList');
@@ -550,7 +550,7 @@
         card.querySelector('.job-body').appendChild(wdiv);
       }
       var sched = job.schedule || (job.raw && job.raw.schedule) || null;
-      card.querySelector('.d-schedule').textContent = sched && sched.enabled ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00') : 'Manual only';
+      card.querySelector('.d-schedule').textContent = scheduleLabel(sched) || 'Manual only';
       card.querySelector('.d-next').textContent = nextRunText(job);
       card.querySelector('.d-compress').textContent = compressionLabel(job);
       card.querySelector('.d-files').textContent = job.runs && job.runs.length ? job.files + ' files · ' + formatBytes(job.size) : '—';
@@ -1133,15 +1133,38 @@
   }
 
   /* ---------- schedule display ---------- */
+  var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  function scheduleLabel(s) {
+    if (!s || !s.enabled) return null;
+    var time = s.time || '02:00';
+    if ((s.frequency || '').toLowerCase() === 'custom') {
+      var names = (Array.isArray(s.days) ? s.days : []).map(function (d) { return DAY_NAMES[d] || ''; }).filter(Boolean);
+      return 'Custom (' + (names.join(', ') || 'no days') + ') at ' + time;
+    }
+    return (s.frequency || 'Daily') + ' at ' + time;
+  }
   function nextRunText(job) {
     var s = job.schedule || (job.raw && job.raw.schedule) || null;
     if (!s || !s.enabled) return 'No schedule — manual only';
     var freq = s.frequency || 'Daily';
     var time = s.time || '02:00';
     var m = /^(\d{1,2}):(\d{2})$/.exec(time);
-    if (!m) return freq + ' at ' + time;
+    if (!m) return scheduleLabel(s);
     var next = new Date();
     next.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+    if (freq.toLowerCase() === 'custom') {
+      var days = Array.isArray(s.days) ? s.days : [];
+      var found = null;
+      for (var i = 0; i < 8; i++) {
+        var c = new Date(); c.setDate(c.getDate() + i);
+        if (days.indexOf(c.getDay()) < 0) continue;
+        c.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+        if (c > new Date()) { found = c; break; }
+        if (i === 0) { found = c; break; } // due today
+      }
+      if (found) next = found;
+      return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
+    }
     if (freq.toLowerCase() === 'weekly') {
       if (next <= new Date()) next.setDate(next.getDate() + 7);
     } else if (freq.toLowerCase() === 'monthly') {
@@ -1149,7 +1172,7 @@
     } else if (next <= new Date()) {
       next.setDate(next.getDate() + 1);
     }
-    return freq + ' at ' + time + ' — next: ' + formatDate(next.toISOString());
+    return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
   }
 
   /* ---------- job details drawer ---------- */
@@ -1176,9 +1199,7 @@
     $('drawerDuration').textContent = formatDuration(job.duration);
     $('drawerLastRun').textContent = formatDate(job.timestamp);
     var sched = job.schedule || (job.raw && job.raw.schedule) || null;
-    $('drawerSchedule').textContent = sched && sched.enabled
-      ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00')
-      : 'Manual only — no schedule set';
+    $('drawerSchedule').textContent = scheduleLabel(sched) || 'Manual only — no schedule set';
     $('drawerNextRun').textContent = nextRunText(job);
     var runsBox = $('drawerRuns');
     if (runsBox) {
