@@ -1619,6 +1619,8 @@
       : 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
     var ket = $('vpnKeyExpiryToggle'); if (ket) ket.checked = vpnKeyExpiryWanted();
     var tok = $('vpnApiToken'); if (tok) tok.value = (settings.vpn && settings.vpn.apiToken) || '';
+    var ocid = $('vpnOauthClientId'); if (ocid) ocid.value = (settings.vpn && settings.vpn.oauthClientId) || '';
+    var osec = $('vpnOauthClientSecret'); if (osec) osec.value = (settings.vpn && settings.vpn.oauthClientSecret) || '';
     renderVpnPeers(st.peers || []);
     // First sign-in (or first view while connected): turn off the 180-day
     // key expiry automatically, so the device never asks to sign in again.
@@ -1643,6 +1645,14 @@
   function vpnKeyExpiryWanted() {
     return !(settings.vpn && settings.vpn.autoDisableKeyExpiry === false);
   }
+  // The API credential for key expiry: OAuth client first (never
+  // expires), API token second. null = nothing saved yet.
+  function vpnAuth() {
+    var v = (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {};
+    if (v.oauthClientId && v.oauthClientSecret) return { clientId: v.oauthClientId, clientSecret: v.oauthClientSecret };
+    if (v.apiToken && String(v.apiToken).trim()) return { apiToken: v.apiToken };
+    return null;
+  }
   async function saveVpnSettings(patch) {
     var v = Object.assign({}, (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {}, patch);
     try {
@@ -1654,8 +1664,7 @@
   async function disableVpnKeyExpiry(quiet) {
     if (!api || typeof api.vpnDisableKeyExpiry !== 'function') return false;
     try {
-      var token = (settings.vpn && settings.vpn.apiToken) || '';
-      var r = await api.vpnDisableKeyExpiry(token || undefined);
+      var r = await api.vpnDisableKeyExpiry(vpnAuth());
       if (r && r.success) {
         await saveVpnSettings({ keyExpiryDisabled: true });
         if (!quiet) toast('VPN', 'Key expiry is off — this device will stay connected, no more sign-ins.', 'success');
@@ -1677,12 +1686,12 @@
   async function refreshVpnKeyExpiryState() {
     var el = $('vpnKeyExpiryState');
     if (!el) return;
-    var token = (settings.vpn && settings.vpn.apiToken) || '';
-    if (!token) { el.textContent = 'Key expiry state: unknown — save a Tailscale API access token below and the app will show the real state here.'; return; }
+    var auth = vpnAuth();
+    if (!auth) { el.textContent = 'Key expiry state: unknown — save an OAuth client or an API access token below and the app will show the real state here.'; return; }
     if (!api || typeof api.vpnKeyExpiryState !== 'function') return;
     el.textContent = 'Key expiry state: checking…';
     try {
-      var r = await api.vpnKeyExpiryState(token);
+      var r = await api.vpnKeyExpiryState(auth);
       if (r && r.success) {
         el.textContent = r.disabled
           ? 'Key expiry: OFF — this device stays connected, no more sign-ins.'
@@ -1999,6 +2008,26 @@
       await saveVpnSettings({ apiToken: token });
       toast('VPN', token ? 'API token saved.' : 'API token removed.', 'success');
       refreshVpnKeyExpiryState();
+    });
+    var vos = $('vpnOauthSaveBtn');
+    if (vos) vos.addEventListener('click', async function () {
+      var idInp = $('vpnOauthClientId');
+      var secInp = $('vpnOauthClientSecret');
+      var id = idInp ? idInp.value.trim() : '';
+      var sec = secInp ? secInp.value.trim() : '';
+      await saveVpnSettings({ oauthClientId: id, oauthClientSecret: sec });
+      toast('VPN', (id && sec) ? 'OAuth client saved.' : 'OAuth client removed.', 'success');
+      refreshVpnKeyExpiryState();
+    });
+    var voo = $('vpnOauthOpenBtn');
+    if (voo) voo.addEventListener('click', async function () {
+      if (!api || typeof api.vpnOpenOauthPage !== 'function') return vpnMissing();
+      await api.vpnOpenOauthPage();
+    });
+    var vto = $('vpnApiTokenOpenBtn');
+    if (vto) vto.addEventListener('click', async function () {
+      if (!api || typeof api.vpnOpenKeysPage !== 'function') return vpnMissing();
+      await api.vpnOpenKeysPage();
     });
     var vst = $('vpnSubnetToggle');
     if (vst) vst.addEventListener('change', async function () {

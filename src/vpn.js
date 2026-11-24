@@ -288,23 +288,69 @@ async function setSubnetRouter(on) {
  * with "unknown flag" and the view hid the reason behind a generic
  * toast. The documented route is the Tailscale API:
  *   POST /api/v2/device/{deviceID}/key  {"keyExpiryDisabled": true}
- * authenticated with an API access token (tskey-api-...) generated in
- * the admin console (Settings -> Keys -> Generate API access token).
+ * with one of two credentials, both created once by the tailnet admin
+ * in the console (the app cannot create them — only a signed-in admin
+ * can, which is the whole point of the control-plane check):
+ *   1. OAuth client (Settings -> Trust credentials -> OAuth clients,
+ *      scope devices:core) — the secret never expires; the app
+ *      exchanges it for a 1-hour access token and refreshes it itself,
+ *      so after the one-time setup nothing is ever pasted again.
+ *   2. API access token (Settings -> Keys, tskey-api-...) — simpler,
+ *      but it expires within 90 days and must be regenerated.
  * GET /api/v2/device/{deviceID} returns the real keyExpiryDisabled
  * flag, so the view can show the truth instead of the preference.
- * The token belongs to the tailnet admin; it is stored in the app
- * settings (same as the SMTP password) and can be revoked any time
- * from the admin console. */
+ * Credentials are stored in the app settings (same as the SMTP
+ * password) and can be revoked any time from the console. */
 const TAILSCALE_API_BASE = 'https://api.tailscale.com/api/v2';
 
-async function apiFetch(apiPath, apiToken, opts) {
+let oauthTokenCache = null; // { clientId, accessToken, expiresAt }
+
+async function exchangeOAuthToken(clientId, clientSecret) {
+  const now = Date.now();
+  if (oauthTokenCache && oauthTokenCache.clientId === clientId && oauthTokenCache.expiresAt - 60000 > now) return { token: oauthTokenCache.accessToken };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const body = new URLSearchParams({ grant_type: 'client_credentials', client_id: clientId, client_secret: clientSecret });
+    const res = await fetch(TAILSCALE_API_BASE + '/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+      signal: ctrl.signal,
+    });
+    let j = null;
+    try { j = await res.json(); } catch (e) { /* fall through */ }
+    if (!res.ok || !j || !j.access_token) return { error: 'Tailscale refused the OAuth client (HTTP ' + res.status + '). Check the client ID and secret in the VPN settings.' };
+    oauthTokenCache = { clientId, accessToken: j.access_token, expiresAt: now + ((j.expires_in || 3600) * 1000) };
+    return { token: j.access_token };
+  } catch (e) {
+    return { error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+  } finally { clearTimeout(timer); }
+}
+
+/* Resolve the API credential the app should use, in order:
+   1. OAuth client (never expires, auto-refreshed) — { clientId, clientSecret }
+   2. API access token (expires within 90 days) — { apiToken } or a bare string
+   Returns { header, via } or { error, via }. */
+async function resolveApiAuth(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if (a.clientId && a.clientSecret) {
+    const ex = await exchangeOAuthToken(String(a.clientId).trim(), String(a.clientSecret).trim());
+    if (ex.error) return { error: ex.error, via: 'oauth' };
+    return { header: 'Bearer ' + ex.token, via: 'oauth' };
+  }
+  if (a.apiToken && String(a.apiToken).trim()) return { header: 'Basic ' + Buffer.from(String(a.apiToken).trim() + ':').toString('base64'), via: 'token' };
+  return { error: 'No API credential saved.', via: null };
+}
+
+async function apiFetch(apiPath, authHeader, opts) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
     const res = await fetch(TAILSCALE_API_BASE + apiPath, {
       method: (opts && opts.method) || 'GET',
       headers: {
-        Authorization: 'Basic ' + Buffer.from(String(apiToken) + ':').toString('base64'),
+        Authorization: authHeader,
         'Content-Type': 'application/json',
       },
       body: opts && opts.body ? JSON.stringify(opts.body) : undefined,
@@ -326,12 +372,33 @@ async function selfDeviceId() {
   return { id: st.deviceId, error: null };
 }
 
-async function disableKeyExpiryViaApi(apiToken) {
+/* One API call with the resolved credential; on a 401 with OAuth the
+   cached token is dropped and the call is retried once with a fresh one. */
+async function apiCallWithAuth(apiPath, auth, opts) {
+  const first = await resolveApiAuth(auth);
+  if (first.error) return { ok: false, status: 0, body: null, error: first.error, via: first.via || null };
+  const r = await apiFetch(apiPath, first.header, opts);
+  if (r.status === 401 && first.via === 'oauth') {
+    oauthTokenCache = null;
+    const second = await resolveApiAuth(auth);
+    if (second.error) return { ok: false, status: 0, body: null, error: second.error, via: 'oauth' };
+    const r2 = await apiFetch(apiPath, second.header, opts);
+    return { ok: r2.ok, status: r2.status, body: r2.body, error: r2.error, via: 'oauth' };
+  }
+  return { ok: r.ok, status: r.status, body: r.body, error: r.error, via: first.via };
+}
+
+function authRefusedError(via, status) {
+  if (via === 'oauth') return 'Tailscale API refused the OAuth client (HTTP ' + status + '). Check the client ID and secret, and that the client has the Devices (devices:core) scope.';
+  return 'Tailscale API refused the token (HTTP ' + status + '). Check the API access token in the VPN settings.';
+}
+
+async function disableKeyExpiryViaApi(auth) {
   const { id, error } = await selfDeviceId();
   if (!id) return { success: false, error };
-  const r = await apiFetch('/device/' + encodeURIComponent(id) + '/key', apiToken, { method: 'POST', body: { keyExpiryDisabled: true } });
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/key', auth, { method: 'POST', body: { keyExpiryDisabled: true } });
   if (r.ok) return { success: true, via: 'api' };
-  if (r.status === 401 || r.status === 403) return { success: false, error: 'Tailscale API refused the token (HTTP ' + r.status + '). Check the API access token in the VPN settings.' };
+  if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
   return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
 }
 
@@ -339,28 +406,31 @@ async function disableKeyExpiryViaApi(apiToken) {
    { success, disabled, expires } — disabled is the flag itself, so it
    stays true even though the `expires` timestamp goes stale after the
    flag is set (Tailscale keeps the original expiry time). */
-async function getKeyExpiryState(apiToken) {
-  if (!apiToken || !String(apiToken).trim()) return { success: false, error: 'No API token saved.' };
+async function getKeyExpiryState(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if (!a.clientId && !a.apiToken) return { success: false, error: 'No API credential saved.' };
   const { id, error } = await selfDeviceId();
   if (!id) return { success: false, error };
-  const r = await apiFetch('/device/' + encodeURIComponent(id), String(apiToken).trim(), { method: 'GET' });
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id), auth, { method: 'GET' });
   if (!r.ok) {
-    if (r.status === 401 || r.status === 403) return { success: false, error: 'Tailscale API refused the token (HTTP ' + r.status + ').' };
+    if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
     return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
   }
   const b = r.body || {};
   return { success: true, disabled: b.keyExpiryDisabled === true, expires: b.expires || null };
 }
 
-/* Disable key expiry for this device. With an API token the documented
-   API route is used; without one the old CLI call is kept as a
-   fallback (it fails on current Tailscale builds — there is no
-   --key-expiry flag — but the real error is now returned instead of
-   being swallowed). Tailscale normally makes the node key expire
-   after 180 days and asks for another sign-in; with expiry off the
-   device stays connected forever. Returns { success, error?, via? }. */
-async function disableKeyExpiry(apiToken) {
-  if (apiToken && String(apiToken).trim()) return disableKeyExpiryViaApi(String(apiToken).trim());
+/* Disable key expiry for this device. With a saved credential the
+   documented API route is used (OAuth first, then API token); without
+   one the old CLI call is kept as a fallback (it fails on current
+   Tailscale builds — there is no --key-expiry flag — but the real
+   error is now returned instead of being swallowed). Tailscale
+   normally makes the node key expire after 180 days and asks for
+   another sign-in; with expiry off the device stays connected
+   forever. Returns { success, error?, via? }. */
+async function disableKeyExpiry(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if ((a.clientId && a.clientSecret) || (a.apiToken && String(a.apiToken).trim())) return disableKeyExpiryViaApi(auth);
   const st = await getStatus();
   if (!st.installed) return { success: false, error: 'Tailscale is not installed on this computer.' };
   if (!st.connected) return { success: false, error: 'Connect to Tailscale first.' };
@@ -377,7 +447,7 @@ async function disableKeyExpiry(apiToken) {
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
-  disableKeyExpiry, getKeyExpiryState, disableKeyExpiryViaApi, pickLanSubnet, tailnetFromDns, buildInstallScript,
+  disableKeyExpiry, getKeyExpiryState, disableKeyExpiryViaApi, exchangeOAuthToken, pickLanSubnet, tailnetFromDns, buildInstallScript,
   parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,
 };
 

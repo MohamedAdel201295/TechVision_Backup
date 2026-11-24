@@ -2014,6 +2014,14 @@ ipcMain.handle('vpn-open-admin', async () => {
   try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/machines'); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the admin console.' }; }
 });
+ipcMain.handle('vpn-open-keys-page', async () => {
+  try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/settings/keys'); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the Keys page.' }; }
+});
+ipcMain.handle('vpn-open-oauth-page', async () => {
+  try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/settings/oauth'); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the OAuth clients page.' }; }
+});
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {
     vaultKey = vault.changeMasterPassword(app.getPath('userData'), oldPassword, newPassword);
