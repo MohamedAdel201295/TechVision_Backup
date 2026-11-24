@@ -12,7 +12,7 @@
  * computed locally from os.networkInterfaces() and validated as a CIDR
  * — never free text from the renderer. Every call has a timeout.
  */
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -20,6 +20,7 @@ const https = require('https');
 const http = require('http');
 
 const WIN_CLI = 'C:\\Program Files\\Tailscale\\tailscale.exe';
+const WIN_GUI = 'C:\\Program Files\\Tailscale\\tailscale-ipn.exe';
 const MSI_URL = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi';
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 
@@ -120,7 +121,7 @@ function tailnetFromDns(dnsName) {
 async function getStatus() {
   const r = await runCli(['status', '--json'], 10000);
   if (r.notFound) return { installed: false, connected: false, error: 'Tailscale is not installed on this computer.' };
-  if (r.timedOut) return { installed: true, connected: false, error: 'Tailscale did not answer in time. Is the Tailscale service running?' };
+  if (r.timedOut) return { installed: true, connected: false, guiRunning: await guiRunning(), error: 'Tailscale did not answer in time. Is the Tailscale service running?' };
   let j = null;
   try { j = JSON.parse(r.stdout); } catch (e) { /* fall through */ }
   if (!j) return { installed: true, connected: false, error: 'Could not read Tailscale status.' };
@@ -153,6 +154,7 @@ async function getStatus() {
     installed: true,
     connected,
     backendState: backend,
+    guiRunning: await guiRunning(),
     needsLogin: backend === 'NeedsLogin',
     authUrl: j.AuthURL || null,
     selfName: self.HostName || null,
@@ -172,7 +174,70 @@ function extractLoginUrl(text) {
   return m ? m[0] : null;
 }
 
+/* The Tailscale tray app (tailscale-ipn.exe) is a separate per-user
+   process from the Windows service, and the service alone is NOT
+   enough: with no GUI process running, the backend sits in NoState
+   and never connects — `tailscale up` can even report success while
+   the view stays stuck on "Not connected", and the tray icon is
+   nowhere to be seen. The installer runs with TS_NOLAUNCH=true, so
+   after our one-click install the GUI never starts on its own.
+   Relaunching the GUI needs no admin rights. */
+function parseTasklistOutput(text) {
+  return /(^|\r?\n)\s*tailscale-ipn\.exe\s/i.test(String(text || ''));
+}
+
+function guiRunning() {
+  if (process.platform !== 'win32') return Promise.resolve(true);
+  return new Promise((resolve) => {
+    execFile('tasklist', ['/FI', 'IMAGENAME eq tailscale-ipn.exe', '/NH'], { timeout: 10000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(false);
+      resolve(parseTasklistOutput(stdout || ''));
+    });
+  });
+}
+
+function launchGui() {
+  if (process.platform !== 'win32') return Promise.resolve(false);
+  if (!fs.existsSync(WIN_GUI)) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(WIN_GUI, [], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.on('error', () => resolve(false));
+      child.unref();
+      resolve(true);
+    } catch (e) { resolve(false); }
+  });
+}
+
+// The backend state without the debug-prefs call: light enough to poll
+// while waiting for the GUI to pull the backend out of NoState.
+async function backendState() {
+  const r = await runCli(['status', '--json'], 10000);
+  if (r.notFound || r.timedOut) return null;
+  try { const j = JSON.parse(r.stdout); return j.BackendState || null; }
+  catch (e) { return null; }
+}
+
+async function ensureGuiRunning() {
+  if (process.platform !== 'win32') return { running: true, launched: false };
+  if (await guiRunning()) return { running: true, launched: false };
+  const launched = await launchGui();
+  if (!launched) return { running: false, launched: false };
+  // The GUI takes a few seconds to pull the backend out of NoState.
+  for (let i = 0; i < 10; i++) {
+    const st = await backendState();
+    if (st && st !== 'NoState' && st !== 'Starting') return { running: true, launched: true };
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  return { running: true, launched: true, backendStillStarting: true };
+}
+
 async function setConnected(on, timeoutMs, onAuthUrl) {
+  if (on) {
+    // Open the Tailscale app first when it is not running — otherwise
+    // the backend never leaves NoState and Connect looks dead.
+    await ensureGuiRunning();
+  }
   const args = on ? ['up'] : ['down'];
   // Fire onAuthUrl the moment the sign-in URL appears in the output —
   // `tailscale up` blocks for up to 60s waiting for the browser login,
@@ -238,6 +303,7 @@ module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
   disableKeyExpiry, pickLanSubnet, tailnetFromDns, buildInstallScript,
+  parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,
 };
 
 /* ---------- Auto-install (Windows only) ----------
@@ -342,8 +408,31 @@ function verifySignature(file) {
 /* The PowerShell that runs the MSI install elevated. Extracted so it
    is testable: $p.WaitForExit() — not Start-Process -Wait, which is
    known to return early when combined with -Verb RunAs, leaving the
-   installer still running while the app thinks it finished. */
-function buildInstallScript(msiPath) {
+   installer still running while the app thinks it finished.
+   Two ways to get administrator rights:
+   - no adminUser: -Verb RunAs, the Windows UAC prompt asks an
+     administrator to approve (the normal case).
+   - adminUser: the MSI runs as the administrator account the user
+     typed (a domain PC where the user is not an admin). The password
+     is NEVER in this script — it is fed on the install process's
+     stdin and read here into a SecureString, so it appears in no
+     file, no command line and no log. */
+function buildInstallScript(msiPath, adminUser) {
+  if (adminUser) {
+    return [
+      '$ErrorActionPreference = "Stop"',
+      'try {',
+      '  $pass = [Console]::In.ReadToEnd() -replace \'\\r?\\n$\', \'\'',
+      '  $sec = ConvertTo-SecureString $pass -AsPlainText -Force',
+      '  $cred = New-Object System.Management.Automation.PSCredential(\'' + String(adminUser).replace(/'/g, "''") + '\', $sec)',
+      '  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList \'/i\', \'"' + msiPath + '"\', \'/qn\', \'/norestart\', \'TS_NOLAUNCH=true\' -Credential $cred -PassThru',
+      '  $p.WaitForExit()',
+      '  exit $p.ExitCode',
+      '} catch {',
+      '  exit 2',
+      '}',
+    ].join('\r\n');
+  }
   return [
     '$ErrorActionPreference = "Stop"',
     'try {',
@@ -356,15 +445,20 @@ function buildInstallScript(msiPath) {
   ].join('\r\n');
 }
 
-/* Silent per-machine MSI install, elevated once via UAC.
+/* Silent per-machine MSI install, elevated once via UAC — or, when
+   adminCreds { user, password } is given (a domain PC), run as that
+   administrator account instead of the UAC prompt. The password is
+   used once, in memory only: it travels on the install process's
+   stdin, is never written to a file or a log, and is never stored.
    TS_NOLAUNCH=true stops the Tailscale tray app from popping up —
    TechVision is the UI here. Returns { success, declined?, error? }. */
-function installMsiElevated(msiPath) {
+function installMsiElevated(msiPath, adminCreds) {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') return resolve({ success: false, error: 'Automatic install is available on Windows only.' });
     const scriptPath = path.join(os.tmpdir(), 'techvision-install-tailscale.ps1');
-    fs.writeFileSync(scriptPath, buildInstallScript(msiPath), 'utf8');
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { timeout: 600000, windowsHide: true }, (err) => {
+    const hasCreds = !!(adminCreds && adminCreds.user && adminCreds.password);
+    fs.writeFileSync(scriptPath, buildInstallScript(msiPath, hasCreds ? adminCreds.user : null), 'utf8');
+    const child = execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { timeout: 600000, windowsHide: true }, (err) => {
       try { fs.unlinkSync(scriptPath); } catch (e) {}
       if (err) {
         if (err.code === 2) return resolve({ success: false, declined: true, error: 'Installation was cancelled (administrator permission was not granted).' });
@@ -372,6 +466,13 @@ function installMsiElevated(msiPath) {
       }
       resolve({ success: true });
     });
+    // Feed the administrator password on stdin only when the
+    // credential path is used; close stdin either way so the script
+    // never blocks waiting for input it will not read.
+    if (child.stdin) {
+      try { if (hasCreds) child.stdin.write(String(adminCreds.password) + '\n'); } catch (e) {}
+      try { child.stdin.end(); } catch (e) {}
+    }
   });
 }
 
@@ -389,11 +490,12 @@ async function waitForCli(timeoutMs) {
    downloading / verifying / installing / waiting / connecting.
    onAuthUrl(url) fires the moment the sign-in URL appears, so the
    browser opens without waiting for `tailscale up` to finish. */
-async function installAndConnect(progress, onAuthUrl) {
+async function installAndConnect(progress, onAuthUrl, adminCreds) {
   const emit = (phase, pct, text) => { if (progress) { try { progress({ phase, pct, text }); } catch (e) {} } };
   if (process.platform !== 'win32') {
     return { success: false, error: 'Automatic install is available on Windows only. Install Tailscale from tailscale.com/download, then press Connect.' };
   }
+  const hasCreds = !!(adminCreds && adminCreds.user && adminCreds.password);
   const st0 = await getStatus();
   if (st0.installed) return setConnected(true, undefined, onAuthUrl);
   const dir = path.join(os.tmpdir(), 'TechVision');
@@ -415,8 +517,8 @@ async function installAndConnect(progress, onAuthUrl) {
     const why = v.detail ? ' (' + v.detail + ')' : (v.status && v.status !== 'unsupported-platform' ? ' (signature status: ' + v.status + ')' : '');
     return { success: false, error: 'The downloaded installer could not be verified' + why + '. Install Tailscale manually from tailscale.com/download.' };
   }
-  emit('installing', 0, 'Installing Tailscale — Windows will ask for administrator permission once.');
-  const ins = await installMsiElevated(msi);
+  emit('installing', 0, hasCreds ? ('Installing Tailscale as ' + adminCreds.user + '…') : 'Installing Tailscale — Windows will ask for administrator permission once.');
+  const ins = await installMsiElevated(msi, hasCreds ? adminCreds : null);
   try { fs.unlinkSync(msi); } catch (e) {}
   if (!ins.success) return { success: false, error: ins.error || 'Tailscale installation failed.' };
   emit('waiting', 0, 'Waiting for Tailscale…');

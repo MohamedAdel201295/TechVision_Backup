@@ -102,11 +102,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cloudClientMkdir: (serverId, relPath) => ipcRenderer.invoke('cloud-client-mkdir', serverId, relPath),
   cloudClientDelete: (serverId, relPath) => ipcRenderer.invoke('cloud-client-delete', serverId, relPath),
   cloudClientRename: (serverId, from, to) => ipcRenderer.invoke('cloud-client-rename', serverId, from, to),
+  cloudClientCopy: (serverId, from, to) => ipcRenderer.invoke('cloud-client-copy', serverId, from, to),
   // TechVision VPN — Tailscale client manager (no VPN of its own)
   vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
   vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
   vpnSetRoutes: (on) => ipcRenderer.invoke('vpn-set-routes', on),
-  vpnInstallConnect: () => ipcRenderer.invoke('vpn-install-connect'),
+  vpnInstallConnect: (adminCreds) => ipcRenderer.invoke('vpn-install-connect', adminCreds || null),
   vpnDisableKeyExpiry: () => ipcRenderer.invoke('vpn-disable-key-expiry'),
   onVpnInstallProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('vpn-install-progress', h); return () => ipcRenderer.removeListener('vpn-install-progress', h); },
   vpnOpenDownload: () => ipcRenderer.invoke('vpn-open-download'),

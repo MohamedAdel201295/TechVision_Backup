@@ -555,3 +555,18 @@ body.modules-mode #appHeader { display: none !important; }
 .vpn-facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
 .vpn-fact { font-size: 15px; font-weight: 700; word-break: break-all; }
 @media (max-width: 640px) { .vpn-facts { grid-template-columns: 1fr; } }
+
+/* Cloud file browser — Windows Explorer style: one clean list with
+   columns, click to select, double-click to open. */
+.cloud-toolbar-sep { width: 1px; height: 22px; background: var(--border); margin: 0 2px; }
+.cloud-explorer-head, .cloud-row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; }
+.cloud-explorer-head { font-size: 11.5px; font-weight: 700; color: var(--muted); border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: .4px; }
+.cloud-row { border-bottom: 1px solid var(--border); cursor: default; user-select: none; border-radius: 6px; }
+.cloud-row:hover { background: var(--hover); }
+.cloud-row.selected { background: rgba(14, 165, 233, .14); }
+.cx-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.cx-size { flex: 0 0 90px; text-align: right; color: var(--muted); font-size: 12.5px; }
+.cx-mtime { flex: 0 0 150px; color: var(--muted); font-size: 12.5px; }
+.cx-type { flex: 0 0 90px; color: var(--muted); font-size: 12.5px; }
+#cloudFileList { gap: 0; }
+@media (max-width: 640px) { .cx-mtime, .cx-type { display: none; } .cx-size { flex-basis: 70px; } }

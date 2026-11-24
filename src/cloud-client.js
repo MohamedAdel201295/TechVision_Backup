@@ -134,6 +134,10 @@ async function rename(conn, from, to) {
   return doJson(conn, 'POST', '/api/rename', { from, to });
 }
 
+async function copy(conn, from, to) {
+  return doJson(conn, 'POST', '/api/copy', { from, to });
+}
+
 function download(conn, relPath, destPath, onProgress) {
   return new Promise((resolve, reject) => {
     let done = false;
@@ -243,4 +247,4 @@ function upload(conn, localPath, remoteDir, onProgress) {
   });
 }
 
-module.exports = { probeServer, login, logout, info, list, mkdir, remove, rename, download, upload, fingerprintOfDer, derToPem };
+module.exports = { probeServer, login, logout, info, list, mkdir, remove, rename, copy, download, upload, fingerprintOfDer, derToPem };

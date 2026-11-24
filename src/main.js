@@ -1930,6 +1930,13 @@ ipcMain.handle('cloud-client-rename', async (event, serverId, from, to) => {
   catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
 });
 
+ipcMain.handle('cloud-client-copy', async (event, serverId, from, to) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try { await cloudClient.copy(conn, from, to); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
+});
+
 // ---------- TechVision VPN (Tailscale client manager) ----------
 // The module only shells out to the Tailscale CLI that is already
 // installed on the machine; it implements no VPN of its own.
@@ -1963,13 +1970,17 @@ ipcMain.handle('vpn-disable-key-expiry', async () => {
   try { return await vpn.disableKeyExpiry(); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }
 });
-ipcMain.handle('vpn-install-connect', async (event) => {
+ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
   try {
     let openedUrl = null;
     const openOnce = (url) => { if (openedUrl === url) return; openedUrl = url; openLoginUrl(url); };
+    // Administrator credentials, if the user typed them: used once for
+    // this install, never stored, never logged.
+    const creds = (adminCreds && typeof adminCreds === 'object' && adminCreds.user && adminCreds.password)
+      ? { user: String(adminCreds.user), password: String(adminCreds.password) } : null;
     const r = await vpn.installAndConnect((p) => {
       try { if (!event.sender.isDestroyed()) event.sender.send('vpn-install-progress', p); } catch (e) {}
-    }, (url) => openOnce(url));
+    }, (url) => openOnce(url), creds);
     if (r && r.authUrl) openOnce(r.authUrl);
     return r;
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install Tailscale.' }; }

@@ -353,10 +353,21 @@
           <button class="btn btn-ghost btn-sm" type="button" id="cloudDisconnectBtn">Disconnect</button>
         </div>
         <div class="cloud-browser-toolbar">
+          <button class="btn btn-ghost btn-sm" type="button" id="cloudUpBtn" title="Go to the parent folder">← Up</button>
+          <button class="btn btn-sm" type="button" id="cloudDownloadBtn">⬇ Download</button>
+          <button class="btn btn-sm" type="button" id="cloudCopyBtn">⧉ Copy</button>
+          <button class="btn btn-sm" type="button" id="cloudPasteBtn">📋 Paste</button>
+          <button class="btn btn-sm" type="button" id="cloudRenameBtn">✎ Rename</button>
+          <button class="btn btn-danger btn-sm" type="button" id="cloudDeleteBtn">🗑 Delete</button>
+          <span class="cloud-toolbar-sep"></span>
           <button class="btn btn-sm" type="button" id="cloudUploadBtn">⬆ Upload file…</button>
           <button class="btn btn-sm" type="button" id="cloudMkdirBtn">＋ New folder</button>
           <button class="btn btn-ghost btn-sm" type="button" id="cloudBrowserRefreshBtn">⟳ Refresh</button>
           <span id="cloudBrowserInfo" class="cloud-muted"></span>
+          <span id="cloudClipboardInfo" class="cloud-muted" style="display:none;"></span>
+        </div>
+        <div class="cloud-explorer-head" id="cloudExplorerHead">
+          <span class="cx-name">Name</span><span class="cx-size">Size</span><span class="cx-mtime">Modified</span><span class="cx-type">Type</span>
         </div>
         <div class="cloud-transfer" id="cloudTransfer" style="display:none;">
           <div class="progress-track"><div class="progress-fill" id="cloudTransferFill"></div></div>
@@ -390,8 +401,25 @@
         </div>
       </div>
       <div id="vpnInstallBox" style="display:none; margin-top:12px;">
-        <div class="progress-track"><div class="progress-fill" id="vpnInstallFill" style="width:0%"></div></div>
-        <div class="cloud-muted" id="vpnInstallText" style="margin-top:6px;"></div>
+        <div id="vpnAdminForm">
+          <p class="t-sub" style="margin:0 0 8px;">Tailscale needs administrator rights to install. Leave the fields empty and press <b>Install</b> to approve with the Windows prompt — or, on a domain PC, type the administrator account here and the app installs with those credentials instead. The password is used once for this install and never stored.</p>
+          <div class="field">
+            <label for="vpnAdminUser">Administrator user name</label>
+            <input type="text" id="vpnAdminUser" placeholder="e.g. DOMAIN\admin" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="vpnAdminPass">Administrator password</label>
+            <input type="password" id="vpnAdminPass" placeholder="Administrator password" autocomplete="off">
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+            <button class="btn btn-primary" type="button" id="vpnAdminInstallBtn">Install</button>
+            <button class="btn btn-ghost" type="button" id="vpnAdminCancelBtn">Cancel</button>
+          </div>
+        </div>
+        <div id="vpnInstallProgress" style="display:none;">
+          <div class="progress-track"><div class="progress-fill" id="vpnInstallFill" style="width:0%"></div></div>
+          <div class="cloud-muted" id="vpnInstallText" style="margin-top:6px;"></div>
+        </div>
       </div>
       <div id="vpnLoginBox" style="display:none;">
         <p class="t-sub" id="vpnLoginHint" style="margin:0 0 6px;">Complete the sign-in in your browser, then press Refresh.</p>

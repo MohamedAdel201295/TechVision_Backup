@@ -850,54 +850,65 @@
     cloudPendingProbe = null;
   }
 
-  async function cloudConnectFlow() {
+  async function cloudConnectFlow(autoTrust) {
     if (!cloudSelected) return;
     if (!api || typeof api.cloudClientProbe !== 'function' || typeof api.cloudClientConnect !== 'function') return cloudMissing();
     var btn = $('cloudConnectBtn');
     var pass = $('cloudConnectPass');
     var password = pass ? pass.value : '';
-    // No trusted certificate yet: probe the server and ask the user to
-    // trust its fingerprint first (nothing sensitive is sent to probe).
+    var justTrusted = null; // fingerprint trusted in this very click
+    // No trusted certificate yet: probe the server first (nothing
+    // sensitive is sent to probe), then trust its fingerprint.
     if (!cloudSelected.fingerprint) {
-      if (cloudPendingProbe) {
-        // User already saw the fingerprint and pressed Trust & connect.
-        try {
-          if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
-          var saved = await api.cloudClientSave({
-            id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
-            port: cloudSelected.port, user: cloudSelected.user,
-            fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
-            accessMode: cloudClientAccess,
-          });
-          if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
-          cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
-          cloudSelected.certPem = cloudPendingProbe.certPem;
-          var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
-          await loadCloud();
-        } catch (e) {
-          toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error');
-          return;
-        } finally {
-          if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
-        }
-      } else {
+      if (!cloudPendingProbe) {
         try {
           if (btn) { btn.disabled = true; btn.textContent = 'Checking server…'; }
           var probe = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
           if (!probe || !probe.success) { toast('Cannot reach server', (probe && probe.error) || 'Check the address and port.', 'error'); return; }
           cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
-          var ft = $('cloudFingerprintText'); if (ft) ft.textContent = probe.fingerprint;
-          var fbox = $('cloudFingerprintBox'); if (fbox) fbox.style.display = '';
-          if (btn) btn.textContent = 'Trust & connect';
-          toast('Check the fingerprint', 'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
         } catch (e) {
           toast('Cannot reach server', e && e.message ? e.message : 'Check the address and port.', 'error');
+          return;
         } finally {
           // A failed probe must leave the button usable again, with its
           // normal label — otherwise it stays stuck on "Checking server…".
           if (btn) { btn.disabled = false; if (btn.textContent === 'Checking server…') btn.textContent = 'Connect'; }
         }
+        if (!autoTrust) {
+          // Manual path: show the fingerprint and wait for the user to
+          // compare it with the server screen and press Trust & connect.
+          var ft = $('cloudFingerprintText'); if (ft) ft.textContent = cloudPendingProbe.fingerprint;
+          var fbox = $('cloudFingerprintBox'); if (fbox) fbox.style.display = '';
+          if (btn) btn.textContent = 'Trust & connect';
+          toast('Check the fingerprint', 'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
+          return;
+        }
+        // Save & connect asked for one click: trust this fingerprint
+        // now and keep going to connect below. It is shown in the
+        // Connected toast and stays pinned afterwards; a changed
+        // certificate is still refused on the next connect.
+      }
+      // Trust the probed fingerprint (user pressed Trust & connect, or
+      // Save & connect is doing the whole thing in one click).
+      try {
+        if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+        var saved = await api.cloudClientSave({
+          id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
+          port: cloudSelected.port, user: cloudSelected.user,
+          fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
+          accessMode: cloudClientAccess,
+        });
+        if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
+        cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
+        cloudSelected.certPem = cloudPendingProbe.certPem;
+        justTrusted = cloudPendingProbe.fingerprint;
+        var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
+        await loadCloud();
+      } catch (e) {
+        toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error');
         return;
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
       }
     }
     // Trusted certificate: connect with the password.
@@ -926,7 +937,7 @@
       closeCloudConnect();
       cloudPath = '';
       var browser = $('cloudBrowser'); if (browser) browser.style.display = '';
-      toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).'), 'success');
+      toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).') + (justTrusted ? ' Server fingerprint ' + justTrusted.slice(0, 16) + '… trusted.' : ''));
       renderCloudHome();
       await cloudBrowse('');
     } catch (e) {
@@ -942,6 +953,8 @@
     }
     cloudConn = null;
     cloudPath = '';
+    cloudSelectedEntry = null;
+    cloudClipboard = null;
     var browser = $('cloudBrowser'); if (browser) browser.style.display = 'none';
     renderCloudHome();
   }
@@ -976,7 +989,113 @@
     }
   }
 
+  var cloudSelectedEntry = null; // { name, isDir, rel } — the one selected row
+  var cloudClipboard = null;     // { rel, name, isDir } copied on the server
+  var cloudLastEntries = [];     // entries of the folder now shown
+
+  function cloudCanWrite() { return !!(cloudConn && cloudConn.info && cloudConn.info.canWrite); }
+
+  // Explorer-style free name for a server-side copy: pasting into another
+  // folder keeps the name when it is free, pasting next to the original
+  // becomes "report - copy.pdf", then "report - copy (2).pdf".
+  function cloudCopyName(name, isDir, existing) {
+    if (existing.indexOf(name) < 0) return name;
+    var base = name, ext = '';
+    if (!isDir) { var i = name.lastIndexOf('.'); if (i > 0) { base = name.slice(0, i); ext = name.slice(i); } }
+    var cand = base + ' - copy' + ext;
+    if (existing.indexOf(cand) < 0) return cand;
+    var n = 2;
+    while (existing.indexOf(base + ' - copy (' + n + ')' + ext) >= 0) n++;
+    return base + ' - copy (' + n + ')' + ext;
+  }
+
+  function cloudFileType(name) {
+    var i = String(name || '').lastIndexOf('.');
+    if (i <= 0) return 'File';
+    var ext = name.slice(i + 1).toUpperCase();
+    return ext ? ext + ' file' : 'File';
+  }
+
+  function cloudUpdateToolbar() {
+    var sel = cloudSelectedEntry, canWrite = cloudCanWrite();
+    var dl = $('cloudDownloadBtn'); if (dl) dl.disabled = !sel || sel.isDir;
+    var cp = $('cloudCopyBtn'); if (cp) cp.disabled = !sel || !canWrite;
+    var ps = $('cloudPasteBtn'); if (ps) ps.disabled = !cloudClipboard || !canWrite;
+    var rn = $('cloudRenameBtn'); if (rn) rn.disabled = !sel || !canWrite;
+    var del = $('cloudDeleteBtn'); if (del) del.disabled = !sel || !canWrite;
+    var up = $('cloudUpBtn'); if (up) up.disabled = !cloudPath;
+    var ub = $('cloudUploadBtn'); if (ub) ub.disabled = !canWrite;
+    var mb = $('cloudMkdirBtn'); if (mb) mb.disabled = !canWrite;
+    var ci = $('cloudClipboardInfo');
+    if (ci) {
+      if (cloudClipboard) { ci.style.display = ''; ci.textContent = 'Copied: ' + cloudClipboard.name + ' — open a folder and press Paste.'; }
+      else ci.style.display = 'none';
+    }
+  }
+
+  function cloudSelectEntry(entry, rowEl) {
+    cloudSelectedEntry = entry;
+    var rows = document.querySelectorAll('#cloudFileList .cloud-row');
+    rows.forEach(function (r) { r.classList.toggle('selected', r === rowEl); });
+    cloudUpdateToolbar();
+  }
+
+  function cloudOpenEntry(entry) {
+    if (!entry) return;
+    if (entry.isDir) cloudBrowse(entry.rel);
+    else cloudDownload(entry.rel);
+  }
+
+  function cloudRenameSelected() {
+    var entry = cloudSelectedEntry;
+    if (!entry || !cloudCanWrite()) return;
+    askCloudInput('Rename', 'New name', entry.name, async function (val) {
+      if (!val || val === entry.name) return;
+      if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
+      if (!api || typeof api.cloudClientRename !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudClientRename(cloudConn.serverId, entry.rel, cloudJoin(cloudPath, val));
+        if (r && r.success) { toast('Renamed', entry.name + ' → ' + val, 'success'); await cloudBrowse(cloudPath); }
+        else toast('Rename failed', (r && r.error) || 'Could not rename.', 'error');
+      } catch (err) { toast('Rename error', err && err.message ? err.message : 'Could not rename.', 'error'); }
+    });
+  }
+
+  function cloudDeleteSelected() {
+    var entry = cloudSelectedEntry;
+    if (!entry || !cloudCanWrite()) return;
+    askConfirm('Delete "' + entry.name + '" from the server? This cannot be undone.', async function () {
+      if (!api || typeof api.cloudClientDelete !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudClientDelete(cloudConn.serverId, entry.rel);
+        if (r && r.success) { cloudSelectedEntry = null; toast('Deleted', entry.name + ' was deleted.', 'success'); await cloudBrowse(cloudPath); }
+        else toast('Delete failed', (r && r.error) || 'Could not delete.', 'error');
+      } catch (err) { toast('Delete error', err && err.message ? err.message : 'Could not delete.', 'error'); }
+    });
+  }
+
+  function cloudCopySelected() {
+    var entry = cloudSelectedEntry;
+    if (!entry || !cloudCanWrite()) return;
+    cloudClipboard = { rel: entry.rel, name: entry.name, isDir: entry.isDir };
+    toast('Copied', entry.name + ' copied — open a folder and press Paste.', 'success');
+    cloudUpdateToolbar();
+  }
+
+  async function cloudPasteClipboard() {
+    if (!cloudClipboard || !cloudCanWrite() || !cloudConn) return;
+    if (!api || typeof api.cloudClientCopy !== 'function') return cloudMissing();
+    var existing = (cloudLastEntries || []).map(function (e) { return e.name; });
+    var destName = cloudCopyName(cloudClipboard.name, cloudClipboard.isDir, existing);
+    try {
+      var r = await api.cloudClientCopy(cloudConn.serverId, cloudClipboard.rel, cloudJoin(cloudPath, destName));
+      if (r && r.success) { toast('Pasted', cloudClipboard.name + ' → ' + destName, 'success'); await cloudBrowse(cloudPath); }
+      else toast('Paste failed', (r && r.error) || 'Could not copy.', 'error');
+    } catch (err) { toast('Paste error', err && err.message ? err.message : 'Could not copy.', 'error'); }
+  }
+
   function renderCloudBrowser(entries) {
+    cloudLastEntries = entries || [];
     var crumbs = $('cloudCrumbs');
     if (crumbs) {
       crumbs.innerHTML = '';
@@ -1002,61 +1121,37 @@
     var empty = $('cloudEmptyState');
     if (!list) return;
     list.innerHTML = '';
-    if (!entries.length) { if (empty) empty.style.display = ''; return; }
-    if (empty) empty.style.display = 'none';
+    if (!entries.length) { if (empty) empty.style.display = ''; }
+    else if (empty) empty.style.display = 'none';
+    // Keep the selection when the entry is still here (e.g. after a
+    // refresh or a paste that did not touch it).
+    var prevSel = cloudSelectedEntry ? cloudSelectedEntry.name : null;
+    cloudSelectedEntry = null;
     entries.forEach(function (e) {
-      var card = document.createElement('div');
-      card.className = 'job-card';
-      var body = document.createElement('div'); body.className = 'job-body';
-      var h = document.createElement('h3'); h.className = 'job-name';
-      h.textContent = (e.isDir ? '📁 ' : '📄 ') + e.name;
-      var meta = document.createElement('div'); meta.className = 'job-meta';
-      meta.textContent = e.isDir ? 'Folder' : (formatBytes(e.size) + (e.mtime ? ' — ' + formatDate(e.mtime) : ''));
-      var acts = document.createElement('div'); acts.className = 'drawer-actions';
+      var row = document.createElement('div');
+      row.className = 'cloud-row';
+      row.setAttribute('tabindex', '0');
       var rel = cloudJoin(cloudPath, e.name);
-      if (e.isDir) {
-        var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open';
-        open.addEventListener('click', function () { cloudBrowse(rel); });
-        acts.appendChild(open);
-        h.style.cursor = 'pointer';
-        h.addEventListener('click', function () { cloudBrowse(rel); });
-      } else {
-        var dl = document.createElement('button'); dl.className = 'btn btn-sm'; dl.type = 'button'; dl.textContent = '⬇ Download';
-        dl.addEventListener('click', function () { cloudDownload(rel); });
-        acts.appendChild(dl);
-      }
-      if (cloudConn && cloudConn.info && cloudConn.info.canWrite) {
-        var ren = document.createElement('button'); ren.className = 'btn btn-sm'; ren.type = 'button'; ren.textContent = '✎ Rename';
-        ren.addEventListener('click', function () {
-          askCloudInput('Rename', 'New name', e.name, async function (val) {
-            if (!val || val === e.name) return;
-            if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
-            if (!api || typeof api.cloudClientRename !== 'function') return cloudMissing();
-            try {
-              var r = await api.cloudClientRename(cloudConn.serverId, rel, cloudJoin(cloudPath, val));
-              if (r && r.success) { toast('Renamed', e.name + ' → ' + val, 'success'); await cloudBrowse(cloudPath); }
-              else toast('Rename failed', (r && r.error) || 'Could not rename.', 'error');
-            } catch (err) { toast('Rename error', err && err.message ? err.message : 'Could not rename.', 'error'); }
-          });
-        });
-        acts.appendChild(ren);
-        var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete';
-        del.addEventListener('click', function () {
-          askConfirm('Delete "' + e.name + '" from the server? This cannot be undone.', async function () {
-            if (!api || typeof api.cloudClientDelete !== 'function') return cloudMissing();
-            try {
-              var r = await api.cloudClientDelete(cloudConn.serverId, rel);
-              if (r && r.success) { toast('Deleted', e.name + ' was deleted.', 'success'); await cloudBrowse(cloudPath); }
-              else toast('Delete failed', (r && r.error) || 'Could not delete.', 'error');
-            } catch (err) { toast('Delete error', err && err.message ? err.message : 'Could not delete.', 'error'); }
-          });
-        });
-        acts.appendChild(del);
-      }
-      body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
-      card.appendChild(body);
-      list.appendChild(card);
+      var entry = { name: e.name, isDir: !!e.isDir, rel: rel };
+      var nameEl = document.createElement('span'); nameEl.className = 'cx-name';
+      nameEl.textContent = (e.isDir ? '📁 ' : '📄 ') + e.name;
+      var sizeEl = document.createElement('span'); sizeEl.className = 'cx-size';
+      sizeEl.textContent = e.isDir ? '—' : formatBytes(e.size);
+      var mtimeEl = document.createElement('span'); mtimeEl.className = 'cx-mtime';
+      mtimeEl.textContent = e.mtime ? formatDate(e.mtime) : '—';
+      var typeEl = document.createElement('span'); typeEl.className = 'cx-type';
+      typeEl.textContent = e.isDir ? 'Folder' : cloudFileType(e.name);
+      row.appendChild(nameEl); row.appendChild(sizeEl); row.appendChild(mtimeEl); row.appendChild(typeEl);
+      row.addEventListener('click', function () { cloudSelectEntry(entry, row); });
+      row.addEventListener('dblclick', function () { cloudSelectEntry(entry, row); cloudOpenEntry(entry); });
+      row.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { cloudOpenEntry(entry); }
+        else if (ev.key === 'Delete') { cloudSelectEntry(entry, row); cloudDeleteSelected(); }
+      });
+      list.appendChild(row);
+      if (prevSel && e.name === prevSel) { cloudSelectedEntry = entry; row.classList.add('selected'); }
     });
+    cloudUpdateToolbar();
   }
 
   async function cloudDownload(relPath) {
@@ -1489,7 +1584,11 @@
     }
     if (!st.connected) {
       if (txt) txt.textContent = st.backendState === 'Stopped' ? 'Disconnected' : 'Not connected';
-      if (sub) sub.textContent = st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.';
+      // The tray app is not running: the backend sits in NoState and
+      // Connect looks dead until the app is opened. Connect opens it.
+      if (sub) sub.textContent = st.guiRunning === false
+        ? 'The Tailscale app is not running — press Connect and the app will open it for you.'
+        : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.');
       if (btn) btn.textContent = 'Connect';
       if (lb) lb.style.display = 'none';
       if (dc) dc.style.display = 'none';
@@ -1759,23 +1858,22 @@
     if (vcb) vcb.addEventListener('click', async function () {
       if (!api || typeof api.vpnSetConnected !== 'function') return vpnMissing();
       if (vpnBusy) return;
-      // Not installed yet → one click installs Tailscale, then connects.
+      // The first status read may still be in flight when the view
+      // opens — read it once before deciding between Install and
+      // Connect, or a fast click takes the wrong branch.
+      if (!vpnStatusCache) await loadVpn();
+      // Not installed yet → show the administrator step first. The user
+      // picks the Windows UAC prompt (empty fields) or types an
+      // administrator account (domain PC); the install itself starts
+      // on Install in the box below.
       if (vpnStatusCache && !vpnStatusCache.installed) {
         if (typeof api.vpnInstallConnect !== 'function' || typeof api.onVpnInstallProgress !== 'function') return vpnMissing();
-        vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Installing…';
         var ib = $('vpnInstallBox'); if (ib) ib.style.display = '';
-        var stopListen = api.onVpnInstallProgress(function (p) {
-          var f = $('vpnInstallFill'); if (f) f.style.width = Math.max(0, Math.min(100, p.pct || 0)) + '%';
-          var t = $('vpnInstallText'); if (t) t.textContent = p.text || '';
-        });
-        try {
-          var r = await api.vpnInstallConnect();
-          if (r && r.success) {
-            if (r.needsLogin) toast('VPN', 'Tailscale is installed. Sign in to Tailscale in the browser window, then press Refresh.', '');
-            else toast('VPN', 'Tailscale installed and connected.', 'success');
-          } else toast('VPN error', (r && r.error) || 'Could not install Tailscale.', 'error');
-        } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not install Tailscale.', 'error'); }
-        finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); if (r && r.success && !r.needsLogin) await pollVpnUntilConnected(); }
+        var af = $('vpnAdminForm'); if (af) af.style.display = '';
+        var ip = $('vpnInstallProgress'); if (ip) ip.style.display = 'none';
+        var au = $('vpnAdminUser'); if (au) au.value = '';
+        var ap = $('vpnAdminPass'); if (ap) ap.value = '';
+        vcb.disabled = true;
         return;
       }
       vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Working…';
@@ -1790,6 +1888,41 @@
         if (r && r.success && wantOn && !r.needsLogin) await pollVpnUntilConnected();
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the VPN connection.', 'error'); }
       finally { vpnBusy = false; }
+    });
+    var vaib = $('vpnAdminInstallBtn');
+    if (vaib) vaib.addEventListener('click', async function () {
+      if (vpnBusy) return;
+      if (typeof api.vpnInstallConnect !== 'function' || typeof api.onVpnInstallProgress !== 'function') return vpnMissing();
+      var au = $('vpnAdminUser'); var ap = $('vpnAdminPass');
+      var adminUser = au ? au.value.trim() : '';
+      var adminPass = ap ? ap.value : '';
+      // The password is used once for this install and never stored —
+      // clear the field the moment it is read.
+      if (ap) ap.value = '';
+      if ((adminUser && !adminPass) || (!adminUser && adminPass)) { toast('Administrator account', 'Type both the administrator user name and password, or leave both empty for the Windows prompt.', 'error'); return; }
+      var creds = (adminUser && adminPass) ? { user: adminUser, password: adminPass } : null;
+      vpnBusy = true;
+      var vcb2 = $('vpnConnectBtn'); if (vcb2) { vcb2.disabled = true; vcb2.textContent = 'Installing…'; }
+      var af = $('vpnAdminForm'); if (af) af.style.display = 'none';
+      var ip = $('vpnInstallProgress'); if (ip) ip.style.display = '';
+      var stopListen = api.onVpnInstallProgress(function (p) {
+        var f = $('vpnInstallFill'); if (f) f.style.width = Math.max(0, Math.min(100, p.pct || 0)) + '%';
+        var t = $('vpnInstallText'); if (t) t.textContent = p.text || '';
+      });
+      try {
+        var r = await api.vpnInstallConnect(creds);
+        if (r && r.success) {
+          if (r.needsLogin) toast('VPN', 'Tailscale is installed. Sign in to Tailscale in the browser window, then press Refresh.', '');
+          else toast('VPN', 'Tailscale installed and connected.', 'success');
+        } else toast('VPN error', (r && r.error) || 'Could not install Tailscale.', 'error');
+      } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not install Tailscale.', 'error'); }
+      finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); if (r && r.success && !r.needsLogin) await pollVpnUntilConnected(); }
+    });
+    var vacb = $('vpnAdminCancelBtn');
+    if (vacb) vacb.addEventListener('click', function () {
+      var ib = $('vpnInstallBox'); if (ib) ib.style.display = 'none';
+      var ap = $('vpnAdminPass'); if (ap) ap.value = '';
+      var vcb3 = $('vpnConnectBtn'); if (vcb3) { vcb3.disabled = false; vcb3.textContent = 'Install & connect'; }
     });
     var vrb = $('vpnRefreshBtn');
     if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
@@ -1988,13 +2121,15 @@
           var u2 = $('cloudClientUser'); if (u2) u2.value = '';
           var p2 = $('cloudClientPass'); if (p2) p2.value = '';
           await loadCloud();
-          // Save & connect: open the connect box with the password the
-          // user just typed (it is never stored), and connect at once
-          // when this server is already trusted.
+          // Save & connect, one click: open the connect box with the
+          // password the user just typed (it is never stored), and do
+          // the whole thing at once — probe, trust the fingerprint,
+          // connect. Without a password the box stays open so the user
+          // can type it and press Connect there.
           var rec = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === r.id; });
           if (rec) {
             openCloudConnect(rec, password);
-            if (rec.fingerprint && password) cloudConnectFlow();
+            if (password) cloudConnectFlow(true);
           }
         } else toast('Save failed', (r && r.error) || 'Could not save server.', 'error');
       } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error'); }
@@ -2024,6 +2159,24 @@
     });
     var cbr = $('cloudBrowserRefreshBtn');
     if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
+    // Explorer toolbar: the actions apply to the selected row.
+    var cub3 = $('cloudUpBtn');
+    if (cub3) cub3.addEventListener('click', function () { if (cloudPath) cloudBrowse(cloudParent(cloudPath)); });
+    var cbd2 = $('cloudDownloadBtn');
+    if (cbd2) cbd2.addEventListener('click', function () { if (cloudSelectedEntry && !cloudSelectedEntry.isDir) cloudDownload(cloudSelectedEntry.rel); });
+    var cbc2 = $('cloudCopyBtn');
+    if (cbc2) cbc2.addEventListener('click', function () { cloudCopySelected(); });
+    var cbp2 = $('cloudPasteBtn');
+    if (cbp2) cbp2.addEventListener('click', function () { cloudPasteClipboard(); });
+    var cbr2 = $('cloudRenameBtn');
+    if (cbr2) cbr2.addEventListener('click', function () { cloudRenameSelected(); });
+    var cbdel = $('cloudDeleteBtn');
+    if (cbdel) cbdel.addEventListener('click', function () { cloudDeleteSelected(); });
+    var cfl = $('cloudFileList');
+    if (cfl) cfl.addEventListener('keydown', function (ev) {
+      if (ev.ctrlKey && (ev.key === 'c' || ev.key === 'C')) { cloudCopySelected(); ev.preventDefault(); }
+      else if (ev.ctrlKey && (ev.key === 'v' || ev.key === 'V')) { cloudPasteClipboard(); ev.preventDefault(); }
+    });
     var cpo = $('cloudPromptOk');
     if (cpo) cpo.addEventListener('click', function () {
       var cb = cloudPromptCallback;
