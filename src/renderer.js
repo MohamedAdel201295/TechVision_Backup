@@ -1856,6 +1856,12 @@
     var st;
     try { st = await api.vpnGetStatus(); } catch (e) { st = { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
     vpnStatusCache = st || {};
+    // Status dot + Connect button styling live here, in one place:
+    // green pulsing dot while connected, grey otherwise; the button is
+    // the primary (gradient) action whenever there is something to do
+    // (connect / sign in / install) and plain for Disconnect.
+    var dot = $('vpnStatusDot'); if (dot) dot.className = 'vpn-dot' + ((st && st.connected) ? ' on' : '');
+    var cbtn = $('vpnConnectBtn'); if (cbtn) cbtn.classList.toggle('btn-primary', !(st && st.connected));
     var txt = $('vpnStatusText'), sub = $('vpnStatusSub'), btn = $('vpnConnectBtn');
     var ni = $('vpnNotInstalled'), lb = $('vpnLoginBox'), dc = $('vpnDetailsCard');
     if (!st || !st.installed) {
@@ -1924,11 +1930,13 @@
     var tn = $('vpnTailnet'); if (tn) tn.textContent = st.tailnet || '—';
     var sn = $('vpnSelfName'); if (sn) sn.textContent = st.selfName || '—';
     var tg = $('vpnSubnetToggle');
-    var advertising = (st.advertiseRoutes || []).length > 0;
+    var advertising = (st.advertiseRoutes || []).indexOf(st.lanSubnet) >= 0;
     if (tg) tg.checked = !!advertising;
     refreshVpnRoutesState();
-    var cr = $('vpnCustomRoutes'); if (cr) cr.value = (settings.vpn && settings.vpn.customRoutes) || '';
-    vpnUpdateSubnetSub();
+    var ss = $('vpnSubnetSub');
+    if (ss) ss.textContent = st.lanSubnet
+      ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
+      : 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
     var ket = $('vpnKeyExpiryToggle'); if (ket) ket.checked = vpnKeyExpiryWanted();
     var tok = $('vpnApiToken'); if (tok) tok.value = (settings.vpn && settings.vpn.apiToken) || '';
     var ocid = $('vpnOauthClientId'); if (ocid) ocid.value = (settings.vpn && settings.vpn.oauthClientId) || '';
@@ -2088,49 +2096,18 @@
   // The console button only shows when the approval is missing and
   // the API cannot do it, and the note then carries the real reason.
   var vpnRoutesLastApproveTry = 0;
-  var vpnRoutesApprovedHint = null; // {routes, at} — a successful approve
+  var vpnRoutesApprovedHint = null; // {subnet, at} — a successful approve
   // call is trusted for a minute, so the note says "approved" at once
   // instead of waiting for the control plane to show it on a re-read.
-  // The custom routes field: what this machine shares. Empty = the
-  // whole detected LAN. A /32 is one machine — the way to reach a
-  // machine on a second network that reuses the same subnet, because
-  // Tailscale sends each address to the MOST SPECIFIC route (longest
-  // mask wins), not the nearest one. This only changes what Tailscale
-  // advertises — the real LAN is never touched.
-  function vpnIsCidr(s) {
-    var m = String(s || '').match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
-    if (!m) return false;
-    for (var i = 1; i <= 4; i++) { var n = parseInt(m[i], 10); if (n < 0 || n > 255) return false; }
-    var p = parseInt(m[5], 10);
-    return p >= 8 && p <= 32;
-  }
-  function vpnCustomRoutesList() {
-    var raw = (($('vpnCustomRoutes') || {}).value || '');
-    return raw.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-  }
-  function vpnCustomRoutesBad() {
-    var list = vpnCustomRoutesList();
-    for (var i = 0; i < list.length; i++) if (!vpnIsCidr(list[i])) return list[i];
-    return null;
-  }
-  function vpnUpdateSubnetSub() {
-    var ss = $('vpnSubnetSub'); if (!ss) return;
-    var st = vpnStatusCache || {};
-    var custom = vpnCustomRoutesList();
-    if (custom.length) ss.textContent = 'Sharing only these addresses: ' + custom.join(', ') + ' — the most specific route wins, so a /32 reaches that one machine even on a network with the same subnet.';
-    else if (st.lanSubnet) ss.textContent = 'Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).';
-    else ss.textContent = 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
-  }
   async function refreshVpnRoutesState() {
     var rn = $('vpnRoutesNote');
     var ab = $('vpnApproveBtn');
     if (!rn && !ab) return;
     var st = vpnStatusCache || {};
-    var advertised = (st.advertiseRoutes || []).slice();
-    if (!advertised.length || !st.connected) { if (rn) rn.style.display = 'none'; if (ab) ab.style.display = 'none'; return; }
-    var label = advertised.join(', ');
-    var waiting = 'Advertising ' + label + ' — approve this route once in the Tailscale admin console.';
-    var approvedNote = 'Advertising ' + label + ' — approved.';
+    var advertising = (st.advertiseRoutes || []).indexOf(st.lanSubnet) >= 0;
+    if (!advertising || !st.connected) { if (rn) rn.style.display = 'none'; if (ab) ab.style.display = 'none'; return; }
+    var waiting = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.';
+    var approvedNote = 'Advertising ' + st.lanSubnet + ' — approved.';
     var showWaiting = function (text) {
       if (rn) { rn.style.display = ''; rn.textContent = text || waiting; }
       if (ab) ab.style.display = '';
@@ -2139,24 +2116,24 @@
       if (rn) { rn.style.display = ''; rn.textContent = approvedNote; }
       if (ab) ab.style.display = 'none';
     };
-    if (vpnRoutesApprovedHint && vpnRoutesApprovedHint.routes === label && Date.now() - vpnRoutesApprovedHint.at < 60000) { showApproved(); return; }
+    if (vpnRoutesApprovedHint && vpnRoutesApprovedHint.subnet === st.lanSubnet && Date.now() - vpnRoutesApprovedHint.at < 60000) { showApproved(); return; }
     var auth = vpnAuth();
     if (!auth || !api || typeof api.vpnGetRoutes !== 'function') { showWaiting(); return; }
     try {
       var r = await api.vpnGetRoutes(auth);
-      if (!r || !r.success) { showWaiting('Advertising ' + label + ' — could not read the route state: ' + ((r && r.error) || 'unknown error') + ' — approve it in the Tailscale admin console.'); return; }
-      var approved = advertised.every(function (rt) { return (r.routes || []).some(function (x) { return x.route === rt && x.enabled; }); });
+      if (!r || !r.success) { showWaiting('Advertising ' + st.lanSubnet + ' — could not read the route state: ' + ((r && r.error) || 'unknown error') + ' — approve it in the Tailscale admin console.'); return; }
+      var approved = (r.routes || []).some(function (x) { return x.route === st.lanSubnet && x.enabled; });
       if (approved) { showApproved(); return; }
       if (typeof api.vpnApproveRoutes === 'function' && Date.now() - vpnRoutesLastApproveTry > 60000) {
         vpnRoutesLastApproveTry = Date.now();
-        var ap = await api.vpnApproveRoutes(auth, advertised);
-        if (ap && ap.success) { vpnRoutesApprovedHint = { routes: label, at: Date.now() }; showApproved(); return; }
-        showWaiting('Advertising ' + label + ' — automatic approval failed: ' + ((ap && ap.error) || 'unknown error') + ' — approve it in the Tailscale admin console.');
+        var ap = await api.vpnApproveRoutes(auth, [st.lanSubnet]);
+        if (ap && ap.success) { vpnRoutesApprovedHint = { subnet: st.lanSubnet, at: Date.now() }; showApproved(); return; }
+        showWaiting('Advertising ' + st.lanSubnet + ' — automatic approval failed: ' + ((ap && ap.error) || 'unknown error') + ' — approve it in the Tailscale admin console.');
         return;
       }
-      showWaiting('Advertising ' + label + ' — waiting for approval…');
+      showWaiting('Advertising ' + st.lanSubnet + ' — waiting for approval…');
     } catch (e) {
-      showWaiting('Advertising ' + label + ' — could not reach the Tailscale API: ' + (e && e.message ? e.message : 'unknown error') + ' — approve it in the Tailscale admin console.');
+      showWaiting('Advertising ' + st.lanSubnet + ' — could not reach the Tailscale API: ' + (e && e.message ? e.message : 'unknown error') + ' — approve it in the Tailscale admin console.');
     }
   }
   async function maybeDisableVpnKeyExpiry() {
@@ -2173,6 +2150,11 @@
   var lastVpnPeersSig = null;
   function renderVpnPeers(peers) {
     var list = $('vpnPeersList'); if (!list) return;
+    var cnt = $('vpnPeersCount');
+    if (cnt) {
+      if ((peers || []).length) { cnt.style.display = ''; cnt.textContent = peers.length + (peers.length === 1 ? ' device' : ' devices'); }
+      else { cnt.style.display = 'none'; cnt.textContent = ''; }
+    }
     var sig = JSON.stringify({ peers: (peers || []).map(function (p) { return [p.ip, p.name, p.online, p.os]; }), connected: !!(vpnStatusCache && vpnStatusCache.connected), installed: !!(vpnStatusCache && vpnStatusCache.installed), needsLogin: !!(vpnStatusCache && vpnStatusCache.needsLogin) });
     if (sig === lastVpnPeersSig) return;
     lastVpnPeersSig = sig;
@@ -2190,21 +2172,21 @@
       return;
     }
     peers.forEach(function (p) {
-      var card = document.createElement('div');
-      card.className = 'job-card';
-      var body = document.createElement('div'); body.className = 'job-body';
-      var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = p.name;
-      var meta = document.createElement('div'); meta.className = 'job-meta';
+      var row = document.createElement('div');
+      row.className = 'vpn-peer';
+      var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
+      var body = document.createElement('div'); body.className = 'vpn-peer-body';
+      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name;
+      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
       meta.textContent = (p.ip || '—') + (p.os ? ' — ' + p.os : '') + ' — ' + (p.online ? 'online' : 'offline');
-      var acts = document.createElement('div'); acts.className = 'drawer-actions';
+      body.appendChild(h); body.appendChild(meta);
+      row.appendChild(d); row.appendChild(body);
       if (p.ip) {
         var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open in Cloud';
         open.addEventListener('click', function () { openCloudWithPeer(p); });
-        acts.appendChild(open);
+        row.appendChild(open);
       }
-      body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
-      card.appendChild(body);
-      list.appendChild(card);
+      list.appendChild(row);
     });
   }
 
@@ -2499,15 +2481,8 @@
     if (vst) vst.addEventListener('change', async function () {
       if (!api || typeof api.vpnSetRoutes !== 'function') return vpnMissing();
       var on = vst.checked;
-      // A typed route replaces the whole-LAN default: validate before
-      // touching Tailscale, or the toggle would flip on while nothing
-      // was advertised.
-      var routes = vpnCustomRoutesList();
-      var bad = vpnCustomRoutesBad();
-      if (on && bad) { toast('VPN error', 'Not a valid route: ' + bad + ' — use an address with a mask, e.g. 192.168.1.200/32.', 'error'); vst.checked = !on; return; }
-      if (on) await saveVpnSettings({ customRoutes: (($('vpnCustomRoutes') || {}).value || '').trim() });
       try {
-        var r = await api.vpnSetRoutes(on, vpnAuth(), routes);
+        var r = await api.vpnSetRoutes(on, vpnAuth());
         if (r && r.success) {
           // Update the cached status right away, so the view agrees
           // with the toggle without waiting for a slow `tailscale
@@ -2517,11 +2492,15 @@
           // on a re-read, which is exactly the long "waiting…" the
           // user saw).
           if (vpnStatusCache) {
-            vpnStatusCache.advertiseRoutes = on ? (r.routes || routes || []) : [];
+            var adv = vpnStatusCache.advertiseRoutes || [];
+            if (on && r.subnet && adv.indexOf(r.subnet) < 0) adv = adv.concat([r.subnet]);
+            if (!on) adv = [];
+            vpnStatusCache.advertiseRoutes = adv;
+            if (r.subnet) vpnStatusCache.lanSubnet = r.subnet;
           }
           if (on) {
             if (r.approved) {
-              vpnRoutesApprovedHint = { routes: (r.routes || routes || []).join(', '), at: Date.now() };
+              vpnRoutesApprovedHint = { subnet: r.subnet, at: Date.now() };
               toast('VPN', 'Sharing your home network — the route was approved automatically.', 'success');
             } else {
               vpnRoutesApprovedHint = null;
@@ -2532,27 +2511,10 @@
             vpnRoutesApprovedHint = null;
             toast('VPN', 'No longer sharing your home network.', 'success');
           }
-          vpnUpdateSubnetSub();
           refreshVpnRoutesState();
         } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; await loadVpn(); }
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; await loadVpn(); }
     });
-    // The custom routes field saves itself when edited, and the hint
-    // names a bad entry the moment it is typed — the toggle refuses a
-    // bad route, so the mistake is caught here, not after a flip.
-    var vcr = $('vpnCustomRoutes');
-    if (vcr) {
-      vcr.addEventListener('input', function () {
-        var bad = vpnCustomRoutesBad();
-        var hint = $('vpnCustomRoutesHint');
-        if (hint) {
-          if (bad) { hint.textContent = 'Not a valid route: ' + bad + ' — use an address with a mask, e.g. 192.168.1.200/32.'; hint.style.color = 'var(--danger)'; }
-          else { hint.textContent = 'Empty = share the whole home network above. A /32 shares one machine only — for reaching a machine on another network that uses the same subnet; Tailscale sends each address to the most specific route. This only changes what Tailscale advertises — your real network (router, DHCP, device addresses) never changes.'; hint.style.color = ''; }
-        }
-        vpnUpdateSubnetSub();
-      });
-      vcr.addEventListener('change', async function () { await saveVpnSettings({ customRoutes: (vcr.value || '').trim() }); });
-    }
     var vab2 = $('vpnApproveBtn');
     if (vab2) vab2.addEventListener('click', async function () {
       if (!api || typeof api.vpnOpenAdmin !== 'function') return vpnMissing();

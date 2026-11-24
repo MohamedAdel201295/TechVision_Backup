@@ -385,11 +385,11 @@
     </div>
   </div>
   <div id="view-vpn" style="display:none;">
-    <div class="card">
+    <div class="card vpn-hero">
       <div class="vpn-status-row">
         <div>
           <div class="t-label">Tailscale status</div>
-          <div class="vpn-status" id="vpnStatusText">Checking…</div>
+          <div class="vpn-status"><span id="vpnStatusDot" class="vpn-dot"></span><span id="vpnStatusText">Checking…</span></div>
           <div class="t-sub" id="vpnStatusSub"></div>
         </div>
         <button class="btn" type="button" id="vpnConnectBtn">Connect</button>
@@ -423,17 +423,18 @@
           <div class="cloud-muted" id="vpnInstallText" style="margin-top:6px;"></div>
         </div>
       </div>
-      <div id="vpnLoginBox" style="display:none;">
+      <div id="vpnLoginBox" class="vpn-info-box" style="display:none;">
         <p class="t-sub" id="vpnLoginHint" style="margin:0 0 6px;">Complete the sign-in in your browser, then press Refresh.</p>
         <button class="btn" type="button" id="vpnOpenAuthBtn" style="margin:2px 0 6px;">Open sign-in page</button>
         <p class="t-sub" id="vpnAuthUrl" style="word-break:break-all; margin:0;"></p>
       </div>
     </div>
-    <div class="card" id="vpnDetailsCard" style="display:none;">
+    <div class="card vpn-details" id="vpnDetailsCard" style="display:none;">
+      <div class="vpn-sec-label">Your connection</div>
       <div class="vpn-facts">
-        <div><div class="t-label">Your Tailscale IP</div><div class="vpn-fact" id="vpnSelfIp">—</div></div>
-        <div><div class="t-label">Network</div><div class="vpn-fact" id="vpnTailnet">—</div></div>
-        <div><div class="t-label">This device</div><div class="vpn-fact" id="vpnSelfName">—</div></div>
+        <div class="vpn-fact-tile"><div class="t-label">Your Tailscale IP</div><div class="vpn-fact" id="vpnSelfIp">—</div></div>
+        <div class="vpn-fact-tile"><div class="t-label">Network</div><div class="vpn-fact" id="vpnTailnet">—</div></div>
+        <div class="vpn-fact-tile"><div class="t-label">This device</div><div class="vpn-fact" id="vpnSelfName">—</div></div>
       </div>
       <details id="vpnApiCreds" class="vpn-creds-box">
         <summary class="t-label" style="cursor:pointer;">API credentials — needed for key expiry and route approval <span id="vpnApiCredsStatusWord" class="t-sub"></span></summary>
@@ -460,26 +461,27 @@
           </div>
         </div>
       </details>
-      <div class="toggle-row" style="margin-top:12px;">
+      <div class="vpn-sec-label">Sharing &amp; security</div>
+      <div class="toggle-row">
         <div><div class="t-label">Share my home network (subnet router)</div><div class="t-sub" id="vpnSubnetSub">Let devices on Tailscale reach your whole home network (printer, camera, router).</div></div>
         <label class="switch"><input type="checkbox" id="vpnSubnetToggle"><span class="slider"></span></label>
       </div>
-      <div class="field" style="margin-top:8px;">
-        <label for="vpnCustomRoutes">Share only specific addresses (optional)</label>
-        <input type="text" id="vpnCustomRoutes" placeholder="e.g. 192.168.1.200/32, 192.168.1.201/32" autocomplete="off" spellcheck="false">
-        <div class="t-sub" id="vpnCustomRoutesHint">Empty = share the whole home network above. A /32 shares one machine only — for reaching a machine on another network that uses the same subnet; Tailscale sends each address to the most specific route. This only changes what Tailscale advertises — your real network (router, DHCP, device addresses) never changes.</div>
-      </div>
-      <div class="t-sub" id="vpnRoutesNote" style="display:none;"></div>
+      <div class="t-sub vpn-note" id="vpnRoutesNote" style="display:none;"></div>
       <button class="btn btn-ghost btn-sm" type="button" id="vpnApproveBtn" style="display:none; margin-top:6px;">Open admin console to approve the route</button>
       <div class="toggle-row" style="margin-top:12px;">
         <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale asks you to sign in again after 180 days. This switch turns that off for real.</div></div>
         <label class="switch"><input type="checkbox" id="vpnKeyExpiryToggle" checked><span class="slider"></span></label>
       </div>
-      <div class="t-sub" id="vpnKeyExpiryState" style="margin-top:6px;"></div>
+      <div class="t-sub vpn-note" id="vpnKeyExpiryState" style="margin-top:6px;"></div>
     </div>
-    <div class="card">
-      <h3 style="margin:0 0 4px;font-size:16px;">Devices on your network</h3>
-      <p class="cloud-muted" style="margin:0 0 10px;">Tap "Open in Cloud" to open a device's shared folder with the Cloud client.</p>
+    <div class="card vpn-devices">
+      <div class="vpn-devices-head">
+        <div>
+          <h3 style="margin:0;font-size:16px;">Devices on your network</h3>
+          <p class="cloud-muted" style="margin:2px 0 0;">Tap "Open in Cloud" to open a device's shared folder with the Cloud client.</p>
+        </div>
+        <span id="vpnPeersCount" class="pill pill-template" style="display:none;"></span>
+      </div>
       <div id="vpnPeersList"><div class="empty-state"><div class="big">🛡️</div><h3>No devices yet</h3><p>Sign in to Tailscale and your devices will show up here.</p></div></div>
     </div>
   </div>

@@ -110,7 +110,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // TechVision VPN — Tailscale client manager (no VPN of its own)
   vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
   vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
-  vpnSetRoutes: (on, auth, routes) => ipcRenderer.invoke('vpn-set-routes', on, auth, routes),
+  vpnSetRoutes: (on, auth) => ipcRenderer.invoke('vpn-set-routes', on, auth),
   vpnInstallConnect: (adminCreds) => ipcRenderer.invoke('vpn-install-connect', adminCreds || null),
   vpnDisableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-disable-key-expiry', auth),
   vpnEnableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-enable-key-expiry', auth),

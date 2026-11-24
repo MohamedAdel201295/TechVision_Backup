@@ -12,6 +12,15 @@
   --brand-blue-dark: #0284c7;
   --brand-green: #22c55e;
   --brand-green-dark: #16a34a;
+  /* Status colors live in :root, not in the dark-theme block: the light
+     theme never defined --success / --warning / --danger / --info, so
+     in light mode every var(--success) etc. was undefined and the
+     colors silently vanished (the VPN status dot went grey on white
+     instead of green — that is how this was caught). */
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --info: #0ea5e9;
   --gradient: linear-gradient(135deg, #0ea5e9 0%, #06b6d4 48%, #22c55e 100%);
   --radius-sm: 8px;
   --radius: 12px;
@@ -560,11 +569,57 @@ body.modules-mode #appHeader { display: none !important; }
 .seg-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
 /* ---------- TechVision VPN ---------- */
-.vpn-status-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.vpn-status { font-size: 20px; font-weight: 800; margin: 2px 0; }
-.vpn-facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+/* Plain card: only the VPN view uses .card (3 times), so this is the
+   VPN page's card. Before this rule the three sections were bare divs
+   with no background, border or padding — the page looked flat. */
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 18px 20px; margin-bottom: 16px;
+  animation: fadeUp .45s ease both;
+}
+.vpn-hero { background: linear-gradient(180deg, var(--surface-2), var(--surface)); }
+.vpn-status-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.vpn-status { display: flex; align-items: center; gap: 10px; font-size: 21px; font-weight: 800; margin: 2px 0; }
+.vpn-dot { width: 12px; height: 12px; flex: 0 0 12px; border-radius: 50%; background: var(--muted-2); }
+/* The ring pulses, the dot itself stays solid green — an opacity pulse
+   (the shared pulseDot) drops to 30% and nearly vanishes on white. */
+.vpn-dot.on { background: var(--success); animation: vpnDotPulse 1.6s infinite; }
+@keyframes vpnDotPulse { 0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, .45); } 70% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); } 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); } }
+.vpn-sec-label {
+  font-size: 11px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase;
+  color: var(--muted-2); margin: 18px 0 10px;
+}
+.vpn-sec-label:first-child { margin-top: 0; }
+.vpn-facts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.vpn-fact-tile {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px 14px;
+}
+.vpn-fact-tile .t-label { font-size: 11px; margin-bottom: 3px; }
 .vpn-fact { font-size: 15px; font-weight: 700; word-break: break-all; }
 @media (max-width: 640px) { .vpn-facts { grid-template-columns: 1fr; } }
+.vpn-note {
+  margin-top: 8px; padding: 9px 12px; border-radius: 9px;
+  background: var(--surface-2); border-left: 3px solid var(--brand-blue);
+  font-size: 13px;
+}
+.vpn-info-box {
+  margin-top: 12px; padding: 12px 14px; border-radius: 12px;
+  background: var(--info-bg); border: 1px solid rgba(14, 165, 233, .35);
+}
+.vpn-devices-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.vpn-peer {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 11px 14px; margin-bottom: 8px;
+  transition: border-color var(--transition), transform var(--transition);
+}
+.vpn-peer:hover { border-color: rgba(14, 165, 233, .4); transform: translateY(-1px); }
+.vpn-peer-dot { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--muted-2); }
+.vpn-peer-dot.on { background: var(--success); }
+.vpn-peer-body { flex: 1; min-width: 0; }
+.vpn-peer-name { font-size: 15px; font-weight: 700; margin: 0; }
+.vpn-peer-meta { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
 
 /* Cloud file browser — Windows Explorer style: one clean list with
    columns, click to select, double-click to open. */

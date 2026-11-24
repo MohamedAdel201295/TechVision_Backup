@@ -59,16 +59,6 @@ function isCidr(s) {
   const p = parseInt(m[5], 10);
   return p >= 8 && p <= 30;
 }
-// A user-typed route is not a LAN subnet: a /32 is exactly one machine
-// (the whole point of the custom-routes field), so the ceiling is 32.
-function isRouteCidr(s) {
-  if (typeof s !== 'string') return false;
-  const m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
-  if (!m) return false;
-  for (let i = 1; i <= 4; i++) { const n = parseInt(m[i], 10); if (n < 0 || n > 255) return false; }
-  const p = parseInt(m[5], 10);
-  return p >= 8 && p <= 32;
-}
 
 /* First non-internal IPv4 interface -> its network as CIDR, e.g. 192.168.1.0/24. */
 const VIRTUAL_IFACE_RE = /docker|veth|vmware|virtual|vbox|tailscale|wintun|wsl|hyper-v|tap|tun|br-/i;
@@ -280,42 +270,27 @@ async function setConnected(on, timeoutMs, onAuthUrl) {
   return { success: true, needsLogin: !!url, authUrl: url };
 }
 
-async function setSubnetRouter(on, auth, customRoutes) {
-  // Custom routes REPLACE the whole-LAN default: the user types exactly
-  // which addresses this machine shares (e.g. one host on a second
-  // network that reuses the same subnet — 192.168.1.200/32). Empty
-  // means the whole detected LAN, as before. This only changes what
-  // Tailscale advertises to the tailnet — the real LAN (router, DHCP,
-  // device addresses) is never touched.
-  const wanted = Array.isArray(customRoutes) ? customRoutes.map(function (r) { return String(r || '').trim(); }).filter(Boolean) : [];
-  let routes;
-  if (on && wanted.length) {
-    const bad = wanted.find(function (r) { return !isRouteCidr(r); });
-    if (bad) return { success: false, error: 'Not a valid route: ' + bad + ' — use an address with a mask, e.g. 192.168.1.200/32.' };
-    routes = wanted;
-  } else {
-    const subnet = lanSubnet();
-    if (on && !subnet) return { success: false, error: 'Could not find your home network address.' };
-    if (on && !isCidr(subnet)) return { success: false, error: 'Invalid network address.' };
-    routes = on ? [subnet] : [];
-  }
-  const args = on ? ['up', '--advertise-routes=' + routes.join(',')] : ['up', '--advertise-routes='];
+async function setSubnetRouter(on, auth) {
+  const subnet = lanSubnet();
+  if (on && !subnet) return { success: false, error: 'Could not find your home network address.' };
+  if (on && !isCidr(subnet)) return { success: false, error: 'Invalid network address.' };
+  const args = on ? ['up', '--advertise-routes=' + subnet] : ['up', '--advertise-routes='];
   const r = await runCli(args, 60000);
   if (r.notFound) return { success: false, error: 'Tailscale is not installed on this computer.' };
   if (r.timedOut) return { success: false, error: 'Tailscale did not answer in time. Try again.' };
   if (r.code !== 0) return { success: false, error: 'Could not change the subnet router setting.' };
-  if (!on) return { success: true, subnet: null, routes: [], approved: false };
+  if (!on) return { success: true, subnet: null, approved: false };
   // Advertising alone does nothing — approve the routes through the API
   // when a credential is saved (OAuth client needs the devices:routes
   // scope; an API token inherits the user's access). Without one, the
   // caller falls back to the admin console button.
   const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
   if ((a.clientId && a.clientSecret) || (a.apiToken && String(a.apiToken).trim())) {
-    const ap = await approveRoutes(auth, routes);
-    if (ap.success) return { success: true, subnet: routes.join(', '), routes, approved: true };
-    return { success: true, subnet: routes.join(', '), routes, approved: false, approveError: ap.error };
+    const ap = await approveRoutes(auth, [subnet]);
+    if (ap.success) return { success: true, subnet, approved: true };
+    return { success: true, subnet, approved: false, approveError: ap.error };
   }
-  return { success: true, subnet: routes.join(', '), routes, approved: false };
+  return { success: true, subnet, approved: false };
 }
 
 /* ---------- Tailscale API: key expiry (the real integration) ----------
@@ -557,7 +532,7 @@ async function disableKeyExpiry(auth) {
 }
 
 module.exports = {
-  getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr, isRouteCidr,
+  getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
   disableKeyExpiry, enableKeyExpiry, getKeyExpiryState, verifyApiAuth, disableKeyExpiryViaApi, exchangeOAuthToken, getDeviceRoutes, approveRoutes, pickLanSubnet, tailnetFromDns, buildInstallScript,
   parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,

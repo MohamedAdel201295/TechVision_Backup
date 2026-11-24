@@ -2064,8 +2064,8 @@ ipcMain.handle('vpn-set-connected', async (event, on) => {
   }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
 });
-ipcMain.handle('vpn-set-routes', async (event, on, auth, routes) => {
-  try { return await vpn.setSubnetRouter(!!on, auth, routes); }
+ipcMain.handle('vpn-set-routes', async (event, on, auth) => {
+  try { return await vpn.setSubnetRouter(!!on, auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
 ipcMain.handle('vpn-get-routes', async (event, auth) => {
