@@ -399,8 +399,9 @@ async function apiCallWithAuth(apiPath, auth, opts) {
   return { ok: r.ok, status: r.status, body: r.body, error: r.error, via: first.via };
 }
 
-function authRefusedError(via, status) {
-  if (via === 'oauth') return 'Tailscale API refused the OAuth client (HTTP ' + status + '). Check the client ID and secret, and that the client has the Devices (devices:core) scope.';
+function authRefusedError(via, status, scope) {
+  const need = scope || 'devices:core';
+  if (via === 'oauth') return 'Tailscale API refused the OAuth client (HTTP ' + status + '). Check the client ID and secret, and that the client has the ' + need + ' scope.';
   return 'Tailscale API refused the token (HTTP ' + status + '). Check the API access token in the VPN settings.';
 }
 
@@ -441,7 +442,7 @@ async function getDeviceRoutes(auth) {
   if (!id) return { success: false, error };
   const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/routes', auth, { method: 'GET' });
   if (!r.ok) {
-    if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
+    if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status, 'devices:routes') };
     return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
   }
   const routes = Array.isArray((r.body || {}).routes) ? r.body.routes : [];
@@ -453,7 +454,7 @@ async function approveRoutes(auth, routes) {
   if (!id) return { success: false, error };
   const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/routes', auth, { method: 'POST', body: { routes: routes || [] } });
   if (r.ok) return { success: true, via: 'api' };
-  if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
+  if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status, 'devices:routes') };
   return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
 }
 

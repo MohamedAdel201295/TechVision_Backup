@@ -113,6 +113,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   vpnEnableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-enable-key-expiry', auth),
   vpnKeyExpiryState: (auth) => ipcRenderer.invoke('vpn-key-expiry-state', auth),
   vpnGetRoutes: (auth) => ipcRenderer.invoke('vpn-get-routes', auth),
+  vpnApproveRoutes: (auth, routes) => ipcRenderer.invoke('vpn-approve-routes', auth, routes),
   vpnOpenKeysPage: () => ipcRenderer.invoke('vpn-open-keys-page'),
   vpnOpenOauthPage: () => ipcRenderer.invoke('vpn-open-oauth-page'),
   onVpnInstallProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('vpn-install-progress', h); return () => ipcRenderer.removeListener('vpn-install-progress', h); },

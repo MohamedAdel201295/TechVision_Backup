@@ -2000,6 +2000,10 @@ ipcMain.handle('vpn-get-routes', async (event, auth) => {
   try { return await vpn.getDeviceRoutes(auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read routes.' }; }
 });
+ipcMain.handle('vpn-approve-routes', async (event, auth, routes) => {
+  try { return await vpn.approveRoutes(auth, routes); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not approve routes.' }; }
+});
 ipcMain.handle('vpn-disable-key-expiry', async (event, auth) => {
   try { return await vpn.disableKeyExpiry(auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }

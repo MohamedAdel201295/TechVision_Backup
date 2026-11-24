@@ -1834,9 +1834,12 @@
     var el = $('vpnKeyExpiryState');
     if (!el) return;
     var auth = vpnAuth();
-    if (!auth) { el.textContent = 'Key expiry state: unknown — open “API credentials” below and save an OAuth client or a token.'; return; }
+    if (!auth) { el.textContent = 'Key expiry state: unknown — open “API credentials” above and save an OAuth client or a token.'; return; }
     if (!api || typeof api.vpnKeyExpiryState !== 'function') return;
-    el.textContent = 'Key expiry state: checking…';
+    // Never flash "checking…" over a state that is already shown: the
+    // view re-reads every 15 seconds, and the line used to blink to
+    // "checking…" and back on every poll. Only show it on first load.
+    if (!el.textContent) el.textContent = 'Key expiry state: checking…';
     try {
       var r = await api.vpnKeyExpiryState(auth);
       if (r && r.success) {
@@ -1871,9 +1874,16 @@
     }
   }
   // The real route state from the API: advertising + approved, or
-  // advertising and still waiting. The console button only shows when
-  // the route is waiting — with a credential saved the toggle approves
-  // it itself and the button never appears.
+  // advertising and still waiting. The toggle is a real switch like
+  // the key-expiry one: when the route is advertising but not
+  // approved yet and a credential is saved, the app approves it
+  // itself — so a toggle that was turned on before the credential
+  // existed still ends up approved without touching the console.
+  // At most one approval attempt a minute, so a refused API (e.g. a
+  // missing scope) does not hammer the API on every 15-second poll.
+  // The console button only shows when the approval is missing and
+  // the API cannot do it, and the note then carries the real reason.
+  var vpnRoutesLastApproveTry = 0;
   async function refreshVpnRoutesState() {
     var rn = $('vpnRoutesNote');
     var ab = $('vpnApproveBtn');
@@ -1882,20 +1892,32 @@
     var advertising = (st.advertiseRoutes || []).indexOf(st.lanSubnet) >= 0;
     if (!advertising || !st.connected) { if (rn) rn.style.display = 'none'; if (ab) ab.style.display = 'none'; return; }
     var waiting = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.';
-    var auth = vpnAuth();
-    if (!auth || !api || typeof api.vpnGetRoutes !== 'function') {
-      if (rn) { rn.style.display = ''; rn.textContent = waiting; }
+    var approvedNote = 'Advertising ' + st.lanSubnet + ' — approved.';
+    var showWaiting = function (text) {
+      if (rn) { rn.style.display = ''; rn.textContent = text || waiting; }
       if (ab) ab.style.display = '';
-      return;
-    }
+    };
+    var showApproved = function () {
+      if (rn) { rn.style.display = ''; rn.textContent = approvedNote; }
+      if (ab) ab.style.display = 'none';
+    };
+    var auth = vpnAuth();
+    if (!auth || !api || typeof api.vpnGetRoutes !== 'function') { showWaiting(); return; }
     try {
       var r = await api.vpnGetRoutes(auth);
-      var approved = !!(r && r.success && (r.routes || []).some(function (x) { return x.route === st.lanSubnet && x.enabled; }));
-      if (rn) { rn.style.display = ''; rn.textContent = approved ? ('Advertising ' + st.lanSubnet + ' — approved.') : ('Advertising ' + st.lanSubnet + ' — waiting for approval…'); }
-      if (ab) ab.style.display = approved ? 'none' : '';
+      if (!r || !r.success) { showWaiting('Advertising ' + st.lanSubnet + ' — could not read the route state: ' + ((r && r.error) || 'unknown error') + ' — approve it in the Tailscale admin console.'); return; }
+      var approved = (r.routes || []).some(function (x) { return x.route === st.lanSubnet && x.enabled; });
+      if (approved) { showApproved(); return; }
+      if (typeof api.vpnApproveRoutes === 'function' && Date.now() - vpnRoutesLastApproveTry > 60000) {
+        vpnRoutesLastApproveTry = Date.now();
+        var ap = await api.vpnApproveRoutes(auth, [st.lanSubnet]);
+        if (ap && ap.success) { showApproved(); return; }
+        showWaiting('Advertising ' + st.lanSubnet + ' — automatic approval failed: ' + ((ap && ap.error) || 'unknown error') + ' — approve it in the Tailscale admin console.');
+        return;
+      }
+      showWaiting('Advertising ' + st.lanSubnet + ' — waiting for approval…');
     } catch (e) {
-      if (rn) { rn.style.display = ''; rn.textContent = waiting; }
-      if (ab) ab.style.display = '';
+      showWaiting('Advertising ' + st.lanSubnet + ' — could not reach the Tailscale API: ' + (e && e.message ? e.message : 'unknown error') + ' — approve it in the Tailscale admin console.');
     }
   }
   async function maybeDisableVpnKeyExpiry() {
