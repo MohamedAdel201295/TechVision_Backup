@@ -322,6 +322,7 @@
     if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
     if (vpnView) vpnView.style.display = name === 'vpn' ? '' : 'none';
     if (modulesView) modulesView.style.display = name === 'modules' ? '' : 'none';
+    var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
     document.body.classList.toggle('modules-mode', name === 'modules');
     var bb = $('backBar'); if (bb) bb.style.display = name === 'modules' ? 'none' : '';
     var hdr = $('appHeader'); if (hdr) hdr.style.display = name === 'modules' ? 'none' : '';
@@ -814,19 +815,45 @@
       var body = document.createElement('div'); body.className = 'job-body';
       var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = srv.name;
       var meta = document.createElement('div'); meta.className = 'job-meta';
-      meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet');
+      meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet') + (srv.hasPassword ? ' — password saved on this device' : '');
       var acts = document.createElement('div'); acts.className = 'drawer-actions';
-      var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open';
-      open.addEventListener('click', function () { openCloudConnect(srv); });
+      // Already connected to this server: say so instead of offering
+      // Connect again — Disconnect lives in the browser toolbar below.
+      if (cloudConn && cloudConn.serverId === srv.id) {
+        var badge = document.createElement('span'); badge.className = 'cloud-connected-badge'; badge.textContent = '● Connected';
+        acts.appendChild(badge);
+      } else {
+        // One click when the password is saved on this device: connect
+        // straight in (the main process uses the stored password). Without
+        // one, the connect box opens and asks for it.
+        var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = (srv.hasPassword && srv.fingerprint) ? 'Connect' : 'Open';
+        open.addEventListener('click', function () {
+          if (srv.hasPassword && srv.fingerprint) cloudConnectSaved(srv);
+          else openCloudConnect(srv);
+        });
+        acts.appendChild(open);
+      }
+      var forget = null;
+      if (srv.hasPassword) {
+        forget = document.createElement('button'); forget.className = 'btn btn-ghost btn-sm'; forget.type = 'button'; forget.textContent = '🔑 Forget password';
+        forget.addEventListener('click', async function () {
+          if (!api || typeof api.cloudClientForgetPassword !== 'function') return cloudMissing();
+          try { var r = await api.cloudClientForgetPassword(srv.id); if (r && r.success) { toast('Cloud', 'Saved password forgotten — you will type it next time.', 'success'); await loadCloud(); } else toast('Forget failed', (r && r.error) || 'Could not forget the password.', 'error'); }
+          catch (e) { toast('Forget error', e && e.message ? e.message : 'Could not forget the password.', 'error'); }
+        });
+      }
       var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Remove';
       del.addEventListener('click', function () {
         askConfirm('Remove server "' + srv.name + '" from the list?', async function () {
           if (!api || typeof api.cloudClientRemove !== 'function') return cloudMissing();
-          try { await api.cloudClientRemove(srv.id); await loadCloud(); }
+          try {
+            if (cloudConn && cloudConn.serverId === srv.id) await cloudDisconnect();
+            await api.cloudClientRemove(srv.id); await loadCloud();
+          }
           catch (e) { toast('Remove error', e && e.message ? e.message : 'Could not remove server.', 'error'); }
         });
       });
-      acts.appendChild(open); acts.appendChild(del);
+      if (forget) acts.appendChild(forget); acts.appendChild(del);
       body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
       card.appendChild(body);
       list.appendChild(card);
@@ -850,58 +877,80 @@
     cloudPendingProbe = null;
   }
 
-  async function cloudConnectFlow() {
+  // One click on a saved server: the password is already on this device
+  // (the main process uses the stored one), so go straight in — no box.
+  async function cloudConnectSaved(srv) {
+    cloudSelected = srv;
+    cloudPendingProbe = null;
+    await cloudConnectFlow(true, null);
+  }
+
+  // passwordOverride: undefined = read the connect box (the usual path);
+  // null = use the password saved on this device (one-click reconnect).
+  async function cloudConnectFlow(autoTrust, passwordOverride) {
     if (!cloudSelected) return;
     if (!api || typeof api.cloudClientProbe !== 'function' || typeof api.cloudClientConnect !== 'function') return cloudMissing();
     var btn = $('cloudConnectBtn');
     var pass = $('cloudConnectPass');
-    var password = pass ? pass.value : '';
-    // No trusted certificate yet: probe the server and ask the user to
-    // trust its fingerprint first (nothing sensitive is sent to probe).
+    var password = passwordOverride !== undefined ? (passwordOverride || '') : (pass ? pass.value : '');
+    var justTrusted = null; // fingerprint trusted in this very click
+    // No trusted certificate yet: probe the server first (nothing
+    // sensitive is sent to probe), then trust its fingerprint.
     if (!cloudSelected.fingerprint) {
-      if (cloudPendingProbe) {
-        // User already saw the fingerprint and pressed Trust & connect.
-        try {
-          if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
-          var saved = await api.cloudClientSave({
-            id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
-            port: cloudSelected.port, user: cloudSelected.user,
-            fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
-            accessMode: cloudClientAccess,
-          });
-          if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
-          cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
-          cloudSelected.certPem = cloudPendingProbe.certPem;
-          var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
-          await loadCloud();
-        } catch (e) {
-          toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error');
-          return;
-        } finally {
-          if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
-        }
-      } else {
+      if (!cloudPendingProbe) {
         try {
           if (btn) { btn.disabled = true; btn.textContent = 'Checking server…'; }
           var probe = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
           if (!probe || !probe.success) { toast('Cannot reach server', (probe && probe.error) || 'Check the address and port.', 'error'); return; }
           cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
-          var ft = $('cloudFingerprintText'); if (ft) ft.textContent = probe.fingerprint;
-          var fbox = $('cloudFingerprintBox'); if (fbox) fbox.style.display = '';
-          if (btn) btn.textContent = 'Trust & connect';
-          toast('Check the fingerprint', 'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
         } catch (e) {
           toast('Cannot reach server', e && e.message ? e.message : 'Check the address and port.', 'error');
+          return;
         } finally {
           // A failed probe must leave the button usable again, with its
           // normal label — otherwise it stays stuck on "Checking server…".
           if (btn) { btn.disabled = false; if (btn.textContent === 'Checking server…') btn.textContent = 'Connect'; }
         }
+        if (!autoTrust) {
+          // Manual path: show the fingerprint and wait for the user to
+          // compare it with the server screen and press Trust & connect.
+          var ft = $('cloudFingerprintText'); if (ft) ft.textContent = cloudPendingProbe.fingerprint;
+          var fbox = $('cloudFingerprintBox'); if (fbox) fbox.style.display = '';
+          if (btn) btn.textContent = 'Trust & connect';
+          toast('Check the fingerprint', 'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
+          return;
+        }
+        // Save & connect asked for one click: trust this fingerprint
+        // now and keep going to connect below. It is shown in the
+        // Connected toast and stays pinned afterwards; a changed
+        // certificate is still refused on the next connect.
+      }
+      // Trust the probed fingerprint (user pressed Trust & connect, or
+      // Save & connect is doing the whole thing in one click).
+      try {
+        if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+        var saved = await api.cloudClientSave({
+          id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
+          port: cloudSelected.port, user: cloudSelected.user,
+          fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
+          accessMode: cloudClientAccess,
+        });
+        if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
+        cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
+        cloudSelected.certPem = cloudPendingProbe.certPem;
+        justTrusted = cloudPendingProbe.fingerprint;
+        var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
+        await loadCloud();
+      } catch (e) {
+        toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error');
         return;
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
       }
     }
-    // Trusted certificate: connect with the password.
-    if (!password) { toast('Password needed', 'Enter the password for user ' + (cloudSelected.user || '') + '.', 'error'); return; }
+    // Trusted certificate: connect with the password — typed in the box,
+    // or the one saved on this device when this is a one-click reconnect.
+    if (!password && !cloudSelected.hasPassword) { toast('Password needed', 'Enter the password for user ' + (cloudSelected.user || '') + '.', 'error'); return; }
     try {
       if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
       var certPem = cloudSelected.certPem;
@@ -917,7 +966,7 @@
       }
       var r = await api.cloudClientConnect({
         serverId: cloudSelected.id, host: cloudSelected.host, port: cloudSelected.port,
-        certPem: certPem, user: cloudSelected.user, password: password,
+        certPem: certPem, user: cloudSelected.user, password: password || null,
       });
       if (!r || !r.success) { toast('Connection failed', (r && r.error) || 'Wrong user name or password.', 'error'); return; }
       // Keep the server name: closeCloudConnect() clears cloudSelected.
@@ -926,9 +975,14 @@
       closeCloudConnect();
       cloudPath = '';
       var browser = $('cloudBrowser'); if (browser) browser.style.display = '';
-      toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).'), 'success');
+      toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).') + (justTrusted ? ' Server fingerprint ' + justTrusted.slice(0, 16) + '… trusted.' : ''));
       renderCloudHome();
+      // Re-read the config: a typed password was just saved on this
+      // device, so the server card must now show Connect + Forget
+      // without waiting for the user to navigate away and back.
+      await loadCloud();
       await cloudBrowse('');
+      cloudStartPoller();
     } catch (e) {
       toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
     } finally {
@@ -937,13 +991,138 @@
   }
 
   async function cloudDisconnect() {
+    cloudHideContextMenu();
     if (cloudConn && api && typeof api.cloudClientDisconnect === 'function') {
       try { await api.cloudClientDisconnect(cloudConn.serverId); } catch (e) {}
     }
+    cloudStopPoller();
+    cloudLinkDown = false;
+    cloudReloginTried = false;
+    cloudSetConnBanner(false);
     cloudConn = null;
     cloudPath = '';
+    cloudSelectedEntry = null;
+    cloudClipboard = null;
     var browser = $('cloudBrowser'); if (browser) browser.style.display = 'none';
     renderCloudHome();
+    // The server card must go back to Connect/Open instead of keeping
+    // its "Connected" badge.
+    renderCloudClientList();
+  }
+
+  /* ---------- Cloud client auto-refresh ----------
+     While connected, the file list is re-read every 10 seconds, so a
+     file added on the server (or a server that goes down) shows up on
+     its own — no manual Refresh, no disconnect + Save & connect.
+     - List succeeds and the folder changed: re-render (the selection
+       is kept by name, like a manual refresh).
+     - Server unreachable: the browser shows "Disconnected — retrying"
+       and the poller keeps trying; the moment the server answers, the
+       list comes back on its own.
+     - Session dead (the server was stopped — stopping clears sessions):
+       sign in again automatically with the password saved on this
+       device. Exactly one attempt per incident: a wrong saved password
+       must not hammer the server into its login lockout. Without a
+       saved password the client disconnects and says so. */
+  var cloudPollTimer = null;
+  var cloudPollBusy = false;
+  var cloudLinkDown = false;
+  var cloudReloginTried = false;
+  var cloudLastSig = '';
+  function cloudStartPoller() {
+    cloudStopPoller();
+    cloudPollTimer = setInterval(cloudPollTick, 10000);
+  }
+  function cloudStopPoller() {
+    if (cloudPollTimer) { clearInterval(cloudPollTimer); cloudPollTimer = null; }
+  }
+  function cloudEntriesSig(entries) {
+    return (entries || []).map(function (e) { return e.name + '|' + (e.isDir ? 'd' : 'f') + '|' + (e.size || 0) + '|' + (e.mtime || ''); }).join('\n');
+  }
+  function cloudSetConnBanner(show, text) {
+    var b = $('cloudConnBanner');
+    if (!b) return;
+    if (show) { b.style.display = ''; b.textContent = text || ''; }
+    else b.style.display = 'none';
+  }
+  async function cloudPollTick() {
+    if (!cloudConn || cloudPollBusy || cloudTransferBusy) return;
+    if (cloudPanel !== 'client') return; // only while the client panel is open
+    if (!api || typeof api.cloudClientList !== 'function') return;
+    cloudPollBusy = true;
+    try {
+      var r = await api.cloudClientList(cloudConn.serverId, cloudPath);
+      if (r && r.success) {
+        if (cloudLinkDown) { cloudLinkDown = false; cloudSetConnBanner(false); cloudReloginTried = false; toast('Reconnected', 'The server is reachable again.', 'success'); renderCloudHome(); }
+        if ((r.path || '') === cloudPath && cloudEntriesSig(r.entries || []) !== cloudLastSig) renderCloudBrowser(r.entries || []);
+        return;
+      }
+      if (r && r.code === 'auth') { await cloudPollRelogin(); return; }
+      if (r && r.code === 'unreachable') {
+        if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+        return;
+      }
+      // Any other error (e.g. the folder was deleted on the server):
+      // leave the view alone — a manual browse will surface it.
+    } catch (e) {
+      if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+    } finally { cloudPollBusy = false; }
+  }
+  async function cloudPollRelogin() {
+    if (cloudReloginTried) return;
+    cloudReloginTried = true;
+    var srv = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === cloudConn.serverId; });
+    if (!srv || !srv.hasPassword) {
+      // No saved password: nothing automatic to do — disconnect and
+      // say so instead of looping on a dead session.
+      toast('Session expired', 'The server was restarted or the session ended. Press Connect on the server to sign in again.', 'error');
+      await cloudDisconnect();
+      return;
+    }
+    try {
+      // The renderer never holds the certificate itself — re-probe for
+      // it (the fingerprint must still match the trusted one).
+      var certPem = srv.certPem || null;
+      if (!certPem) {
+        var p = await api.cloudClientProbe(srv.host, srv.port);
+        if (!p || !p.success) {
+          cloudReloginTried = false;
+          if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+          return;
+        }
+        if (p.fingerprint !== srv.fingerprint) {
+          toast('Certificate changed', 'The server certificate does not match the trusted fingerprint. Remove the server and add it again.', 'error');
+          await cloudDisconnect();
+          return;
+        }
+        certPem = p.certPem;
+      }
+      var r = await api.cloudClientConnect({
+        serverId: srv.id, host: srv.host, port: srv.port,
+        certPem: certPem, user: srv.user, password: null,
+      });
+      if (r && r.success) {
+        cloudConn = { serverId: srv.id, info: r.info, name: srv.name };
+        cloudLinkDown = false;
+        cloudSetConnBanner(false);
+        cloudReloginTried = false;
+        toast('Reconnected', 'Signed in again automatically.', 'success');
+        renderCloudHome();
+        await cloudBrowse(cloudPath);
+        return;
+      }
+      if (r && /Cannot reach the server|did not answer in time/i.test(r.error || '')) {
+        // The server is down, not the password: keep retrying the list,
+        // and allow one fresh login attempt once it answers again.
+        cloudReloginTried = false;
+        if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+        return;
+      }
+      toast('Session expired', 'Could not sign in again automatically: ' + ((r && r.error) || 'unknown error') + ' — press Connect on the server to sign in again.', 'error');
+      await cloudDisconnect();
+    } catch (e) {
+      if (!cloudLinkDown) { cloudLinkDown = true; cloudSetConnBanner(true, 'Disconnected — the server is not reachable. Retrying automatically…'); cloudUpdateToolbar(); }
+    }
   }
 
   function cloudJoin(base, name) { return base ? base + '/' + name : name; }
@@ -965,6 +1144,7 @@
 
   async function cloudBrowse(relPath) {
     if (!cloudConn) return;
+    if (cloudLinkDown) return; // the banner already says why; the poller clears this
     if (!api || typeof api.cloudClientList !== 'function') return cloudMissing();
     try {
       var r = await api.cloudClientList(cloudConn.serverId, relPath || '');
@@ -976,7 +1156,265 @@
     }
   }
 
+  var cloudSelectedEntry = null; // { name, isDir, rel } — the one selected row
+  var cloudClipboard = null;     // { rel, name, isDir } copied on the server
+  var cloudLastEntries = [];     // entries of the folder now shown
+
+  function cloudCanWrite() { return !!(cloudConn && cloudConn.info && cloudConn.info.canWrite); }
+
+  // Explorer-style free name for a server-side copy: pasting into another
+  // folder keeps the name when it is free, pasting next to the original
+  // becomes "report - copy.pdf", then "report - copy (2).pdf".
+  function cloudCopyName(name, isDir, existing) {
+    if (existing.indexOf(name) < 0) return name;
+    var base = name, ext = '';
+    if (!isDir) { var i = name.lastIndexOf('.'); if (i > 0) { base = name.slice(0, i); ext = name.slice(i); } }
+    var cand = base + ' - copy' + ext;
+    if (existing.indexOf(cand) < 0) return cand;
+    var n = 2;
+    while (existing.indexOf(base + ' - copy (' + n + ')' + ext) >= 0) n++;
+    return base + ' - copy (' + n + ')' + ext;
+  }
+
+  function cloudFileType(name) {
+    var i = String(name || '').lastIndexOf('.');
+    if (i <= 0) return 'File';
+    var ext = name.slice(i + 1).toUpperCase();
+    return ext ? ext + ' file' : 'File';
+  }
+
+  // Files copied in Windows Explorer also count for Paste: the check is
+  // cheap (one local clipboard read) and cached for 2 seconds, so the
+  // toolbar does not hammer it on every render.
+  var cloudSysClipCache = { at: 0, has: false, count: 0 };
+  async function cloudRefreshSysClip() {
+    if (Date.now() - cloudSysClipCache.at < 2000) return cloudSysClipCache.has;
+    cloudSysClipCache.at = Date.now();
+    try {
+      var f = (api && typeof api.cloudClipboardFiles === 'function') ? await api.cloudClipboardFiles() : [];
+      cloudSysClipCache.has = Array.isArray(f) && f.length > 0;
+      cloudSysClipCache.count = Array.isArray(f) ? f.length : 0;
+    } catch (e) { cloudSysClipCache.has = false; cloudSysClipCache.count = 0; }
+    return cloudSysClipCache.has;
+  }
+
+  function cloudUpdateToolbar() {
+    var sel = cloudSelectedEntry, canWrite = cloudCanWrite() && !cloudLinkDown;
+    var dl = $('cloudDownloadBtn'); if (dl) dl.disabled = !sel || sel.isDir || cloudLinkDown;
+    var cp = $('cloudCopyBtn'); if (cp) cp.disabled = !sel || !canWrite;
+    var ps = $('cloudPasteBtn'); if (ps) ps.disabled = (!cloudClipboard && !cloudSysClipCache.has) || !canWrite;
+    var rn = $('cloudRenameBtn'); if (rn) rn.disabled = !sel || !canWrite;
+    var del = $('cloudDeleteBtn'); if (del) del.disabled = !sel || !canWrite;
+    var up = $('cloudUpBtn'); if (up) up.disabled = !cloudPath || cloudLinkDown;
+    var ub = $('cloudUploadBtn'); if (ub) ub.disabled = !canWrite;
+    var mb = $('cloudMkdirBtn'); if (mb) mb.disabled = !canWrite;
+    var ci = $('cloudClipboardInfo');
+    if (ci) {
+      if (cloudClipboard) { ci.style.display = ''; ci.textContent = 'Copied: ' + cloudClipboard.name + ' — open a folder and press Paste.'; }
+      else if (cloudSysClipCache.has) { ci.style.display = ''; ci.textContent = 'Windows clipboard: ' + cloudSysClipCache.count + ' item(s) copied — press Paste to upload here.'; }
+      else ci.style.display = 'none';
+    }
+    // Re-check the Windows clipboard in the background: Paste lights up
+    // on its own when the user copies a file in Explorer.
+    if (canWrite && !cloudClipboard) {
+      cloudRefreshSysClip().then(function (has) {
+        if (!has || cloudClipboard) return;
+        var ps2 = $('cloudPasteBtn'); if (ps2) ps2.disabled = false;
+        var ci2 = $('cloudClipboardInfo');
+        if (ci2) { ci2.style.display = ''; ci2.textContent = 'Windows clipboard: ' + cloudSysClipCache.count + ' item(s) copied — press Paste to upload here.'; }
+      });
+    }
+  }
+
+  function cloudSelectEntry(entry, rowEl) {
+    cloudSelectedEntry = entry;
+    var rows = document.querySelectorAll('#cloudFileList .cloud-row');
+    rows.forEach(function (r) { r.classList.toggle('selected', r === rowEl); });
+    cloudUpdateToolbar();
+  }
+
+  function cloudOpenEntry(entry) {
+    if (!entry) return;
+    if (entry.isDir) cloudBrowse(entry.rel);
+    else cloudOpenFile(entry);
+  }
+
+  function cloudRenameSelected() {
+    var entry = cloudSelectedEntry;
+    if (!entry || !cloudCanWrite()) return;
+    askCloudInput('Rename', 'New name', entry.name, async function (val) {
+      if (!val || val === entry.name) return;
+      if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
+      if (!api || typeof api.cloudClientRename !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudClientRename(cloudConn.serverId, entry.rel, cloudJoin(cloudPath, val));
+        if (r && r.success) { toast('Renamed', entry.name + ' → ' + val, 'success'); await cloudBrowse(cloudPath); }
+        else toast('Rename failed', (r && r.error) || 'Could not rename.', 'error');
+      } catch (err) { toast('Rename error', err && err.message ? err.message : 'Could not rename.', 'error'); }
+    });
+  }
+
+  // New folder in a folder: the current one, or the folder the user
+  // right-clicked.
+  function cloudNewFolder(targetRel) {
+    var target = (typeof targetRel === 'string') ? targetRel : cloudPath;
+    if (!cloudConn || !cloudCanWrite()) return;
+    askCloudInput('New folder', 'Folder name', '', async function (val) {
+      if (!val) return;
+      if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
+      if (!api || typeof api.cloudClientMkdir !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudClientMkdir(cloudConn.serverId, cloudJoin(target, val));
+        if (r && r.success) { toast('Folder created', val, 'success'); await cloudBrowse(target); }
+        else toast('Create failed', (r && r.error) || 'Could not create folder.', 'error');
+      } catch (e) { toast('Create error', e && e.message ? e.message : 'Could not create folder.', 'error'); }
+    });
+  }
+
+  function cloudDeleteSelected() {
+    var entry = cloudSelectedEntry;
+    if (!entry || !cloudCanWrite()) return;
+    askConfirm('Delete "' + entry.name + '" from the server? This cannot be undone.', async function () {
+      if (!api || typeof api.cloudClientDelete !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudClientDelete(cloudConn.serverId, entry.rel);
+        if (r && r.success) { cloudSelectedEntry = null; toast('Deleted', entry.name + ' was deleted.', 'success'); await cloudBrowse(cloudPath); }
+        else toast('Delete failed', (r && r.error) || 'Could not delete.', 'error');
+      } catch (err) { toast('Delete error', err && err.message ? err.message : 'Could not delete.', 'error'); }
+    });
+  }
+
+  function cloudCopySelected() {
+    var entry = cloudSelectedEntry;
+    if (!entry || !cloudCanWrite()) return;
+    cloudClipboard = { rel: entry.rel, name: entry.name, isDir: entry.isDir };
+    toast('Copied', entry.name + ' copied — open a folder and press Paste.', 'success');
+    cloudUpdateToolbar();
+  }
+
+  // Paste into a folder: the current one, or the folder the user
+  // right-clicked. First the copy made inside this browser (server-side
+  // /api/copy), then files copied in Windows Explorer (uploaded here).
+  async function cloudPasteClipboard(targetRel) {
+    var target = (typeof targetRel === 'string') ? targetRel : cloudPath;
+    if (!cloudConn || !cloudCanWrite()) return;
+    if (cloudClipboard) {
+      if (!api || typeof api.cloudClientCopy !== 'function') return cloudMissing();
+      var existing = (cloudLastEntries || []).map(function (e) { return e.name; });
+      if (target !== cloudPath) {
+        try {
+          var lr = await api.cloudClientList(cloudConn.serverId, target);
+          if (lr && lr.success) existing = (lr.entries || []).map(function (e) { return e.name; });
+        } catch (e) {}
+      }
+      var destName = cloudCopyName(cloudClipboard.name, cloudClipboard.isDir, existing);
+      try {
+        var r = await api.cloudClientCopy(cloudConn.serverId, cloudClipboard.rel, cloudJoin(target, destName));
+        if (r && r.success) { toast('Pasted', cloudClipboard.name + ' → ' + destName, 'success'); await cloudBrowse(target); }
+        else toast('Paste failed', (r && r.error) || 'Could not copy.', 'error');
+      } catch (err) { toast('Paste error', err && err.message ? err.message : 'Could not copy.', 'error'); }
+      return;
+    }
+    var files = [];
+    try { if (api && typeof api.cloudClipboardFiles === 'function') files = await api.cloudClipboardFiles() || []; } catch (e) {}
+    if (files.length) { await cloudUploadClipboardFiles(files, target); return; }
+    toast('Nothing to paste', 'Copy a file first — from this folder, or from Windows Explorer.', '');
+  }
+
+  async function cloudUploadClipboardFiles(files, target) {
+    if (!cloudConn || cloudTransferBusy) return;
+    if (!api || typeof api.cloudClientUploadFiles !== 'function') return cloudMissing();
+    try {
+      cloudTransferBusy = true;
+      showCloudTransfer('Uploading ' + files.length + ' item(s)…', 0);
+      var r = await api.cloudClientUploadFiles(cloudConn.serverId, files, target || '');
+      hideCloudTransfer();
+      if (r && r.success) {
+        var failed = (r.failed || []).length;
+        toast(failed ? 'Uploaded with errors' : 'Uploaded', (r.uploaded || 0) + ' item(s) uploaded' + (failed ? ' — ' + failed + ' failed: ' + (r.failed || []).slice(0, 3).map(function (f) { return f.path; }).join(', ') : '') + '.', failed ? 'error' : 'success');
+        await cloudBrowse(target || '');
+      } else toast('Upload failed', (r && r.error) || 'Could not upload.', 'error');
+    } catch (e) {
+      hideCloudTransfer();
+      toast('Upload error', e && e.message ? e.message : 'Could not upload.', 'error');
+    } finally {
+      cloudTransferBusy = false;
+    }
+  }
+
+  // Open a file the way Windows would: music plays, pictures open, a
+  // game runs — the app downloads a copy to the temp folder and hands
+  // it to the OS. Folders are entered, as before.
+  async function cloudOpenFile(entry) {
+    if (!entry) return;
+    if (entry.isDir) { cloudBrowse(entry.rel); return; }
+    if (!cloudConn || cloudTransferBusy) return;
+    if (!api || typeof api.cloudClientOpen !== 'function') return cloudMissing();
+    try {
+      cloudTransferBusy = true;
+      showCloudTransfer('Opening ' + entry.name + '…', 0);
+      var r = await api.cloudClientOpen(cloudConn.serverId, entry.rel);
+      hideCloudTransfer();
+      if (!r || !r.success) toast('Could not open', (r && r.error) || 'The file could not be opened.', 'error');
+    } catch (e) {
+      hideCloudTransfer();
+      toast('Open error', e && e.message ? e.message : 'Could not open the file.', 'error');
+    } finally {
+      cloudTransferBusy = false;
+    }
+  }
+
+  /* ---------- Right-click menu (Windows Explorer style) ---------- */
+  function cloudHideContextMenu() {
+    var m = $('cloudContextMenu'); if (m) { m.style.display = 'none'; m.innerHTML = ''; }
+  }
+  function cloudContextItem(menu, label, disabled, onClick) {
+    var b = document.createElement('button');
+    b.className = 'cloud-context-item'; b.type = 'button'; b.textContent = label;
+    b.disabled = !!disabled;
+    b.addEventListener('click', function () { cloudHideContextMenu(); if (onClick) onClick(); });
+    menu.appendChild(b);
+    return b;
+  }
+  function cloudContextSep(menu) {
+    var s = document.createElement('div'); s.className = 'cloud-context-sep'; menu.appendChild(s);
+  }
+  async function cloudShowContextMenu(x, y, entry) {
+    var menu = $('cloudContextMenu');
+    if (!menu || !cloudConn) return;
+    var canWrite = cloudCanWrite() && !cloudLinkDown;
+    var hasInternal = !!cloudClipboard;
+    var hasSys = false;
+    if (canWrite && !hasInternal) hasSys = await cloudRefreshSysClip();
+    menu.innerHTML = '';
+    var targetDir = entry && entry.isDir ? entry.rel : cloudPath;
+    if (entry) {
+      cloudContextItem(menu, 'Open', false, function () { cloudOpenEntry(entry); });
+      if (!entry.isDir) cloudContextItem(menu, 'Download', cloudLinkDown, function () { cloudDownload(entry.rel); });
+      cloudContextSep(menu);
+      cloudContextItem(menu, 'Copy', !canWrite, function () { cloudCopySelected(); });
+      cloudContextItem(menu, entry.isDir ? 'Paste into "' + entry.name + '"' : 'Paste here', !canWrite || (!hasInternal && !hasSys), function () { cloudPasteClipboard(targetDir); });
+      cloudContextSep(menu);
+      cloudContextItem(menu, 'Rename', !canWrite, function () { cloudRenameSelected(); });
+      cloudContextItem(menu, 'Delete', !canWrite, function () { cloudDeleteSelected(); });
+      cloudContextSep(menu);
+    } else {
+      cloudContextItem(menu, 'Paste here', !canWrite || (!hasInternal && !hasSys), function () { cloudPasteClipboard(targetDir); });
+      cloudContextSep(menu);
+    }
+    cloudContextItem(menu, entry && entry.isDir ? 'New folder in "' + entry.name + '"' : 'New folder', !canWrite, function () { cloudNewFolder(targetDir); });
+    cloudContextItem(menu, 'Refresh', cloudLinkDown, function () { cloudBrowse(cloudPath); });
+    menu.style.display = '';
+    menu.style.left = '0px'; menu.style.top = '0px';
+    var w = menu.offsetWidth, h = menu.offsetHeight;
+    menu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 4)) + 'px';
+    menu.style.top = Math.max(4, Math.min(y, window.innerHeight - h - 4)) + 'px';
+  }
+
   function renderCloudBrowser(entries) {
+    cloudHideContextMenu();
+    cloudLastEntries = entries || [];
+    cloudLastSig = cloudEntriesSig(entries || []);
     var crumbs = $('cloudCrumbs');
     if (crumbs) {
       crumbs.innerHTML = '';
@@ -1002,61 +1440,38 @@
     var empty = $('cloudEmptyState');
     if (!list) return;
     list.innerHTML = '';
-    if (!entries.length) { if (empty) empty.style.display = ''; return; }
-    if (empty) empty.style.display = 'none';
+    if (!entries.length) { if (empty) empty.style.display = ''; }
+    else if (empty) empty.style.display = 'none';
+    // Keep the selection when the entry is still here (e.g. after a
+    // refresh or a paste that did not touch it).
+    var prevSel = cloudSelectedEntry ? cloudSelectedEntry.name : null;
+    cloudSelectedEntry = null;
     entries.forEach(function (e) {
-      var card = document.createElement('div');
-      card.className = 'job-card';
-      var body = document.createElement('div'); body.className = 'job-body';
-      var h = document.createElement('h3'); h.className = 'job-name';
-      h.textContent = (e.isDir ? '📁 ' : '📄 ') + e.name;
-      var meta = document.createElement('div'); meta.className = 'job-meta';
-      meta.textContent = e.isDir ? 'Folder' : (formatBytes(e.size) + (e.mtime ? ' — ' + formatDate(e.mtime) : ''));
-      var acts = document.createElement('div'); acts.className = 'drawer-actions';
+      var row = document.createElement('div');
+      row.className = 'cloud-row';
+      row.setAttribute('tabindex', '0');
       var rel = cloudJoin(cloudPath, e.name);
-      if (e.isDir) {
-        var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open';
-        open.addEventListener('click', function () { cloudBrowse(rel); });
-        acts.appendChild(open);
-        h.style.cursor = 'pointer';
-        h.addEventListener('click', function () { cloudBrowse(rel); });
-      } else {
-        var dl = document.createElement('button'); dl.className = 'btn btn-sm'; dl.type = 'button'; dl.textContent = '⬇ Download';
-        dl.addEventListener('click', function () { cloudDownload(rel); });
-        acts.appendChild(dl);
-      }
-      if (cloudConn && cloudConn.info && cloudConn.info.canWrite) {
-        var ren = document.createElement('button'); ren.className = 'btn btn-sm'; ren.type = 'button'; ren.textContent = '✎ Rename';
-        ren.addEventListener('click', function () {
-          askCloudInput('Rename', 'New name', e.name, async function (val) {
-            if (!val || val === e.name) return;
-            if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
-            if (!api || typeof api.cloudClientRename !== 'function') return cloudMissing();
-            try {
-              var r = await api.cloudClientRename(cloudConn.serverId, rel, cloudJoin(cloudPath, val));
-              if (r && r.success) { toast('Renamed', e.name + ' → ' + val, 'success'); await cloudBrowse(cloudPath); }
-              else toast('Rename failed', (r && r.error) || 'Could not rename.', 'error');
-            } catch (err) { toast('Rename error', err && err.message ? err.message : 'Could not rename.', 'error'); }
-          });
-        });
-        acts.appendChild(ren);
-        var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete';
-        del.addEventListener('click', function () {
-          askConfirm('Delete "' + e.name + '" from the server? This cannot be undone.', async function () {
-            if (!api || typeof api.cloudClientDelete !== 'function') return cloudMissing();
-            try {
-              var r = await api.cloudClientDelete(cloudConn.serverId, rel);
-              if (r && r.success) { toast('Deleted', e.name + ' was deleted.', 'success'); await cloudBrowse(cloudPath); }
-              else toast('Delete failed', (r && r.error) || 'Could not delete.', 'error');
-            } catch (err) { toast('Delete error', err && err.message ? err.message : 'Could not delete.', 'error'); }
-          });
-        });
-        acts.appendChild(del);
-      }
-      body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
-      card.appendChild(body);
-      list.appendChild(card);
+      var entry = { name: e.name, isDir: !!e.isDir, rel: rel };
+      row.cloudEntry = entry;
+      var nameEl = document.createElement('span'); nameEl.className = 'cx-name';
+      nameEl.textContent = (e.isDir ? '📁 ' : '📄 ') + e.name;
+      var sizeEl = document.createElement('span'); sizeEl.className = 'cx-size';
+      sizeEl.textContent = e.isDir ? '—' : formatBytes(e.size);
+      var mtimeEl = document.createElement('span'); mtimeEl.className = 'cx-mtime';
+      mtimeEl.textContent = e.mtime ? formatDate(e.mtime) : '—';
+      var typeEl = document.createElement('span'); typeEl.className = 'cx-type';
+      typeEl.textContent = e.isDir ? 'Folder' : cloudFileType(e.name);
+      row.appendChild(nameEl); row.appendChild(sizeEl); row.appendChild(mtimeEl); row.appendChild(typeEl);
+      row.addEventListener('click', function () { cloudSelectEntry(entry, row); });
+      row.addEventListener('dblclick', function () { cloudSelectEntry(entry, row); cloudOpenEntry(entry); });
+      row.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') { cloudOpenEntry(entry); }
+        else if (ev.key === 'Delete') { cloudSelectEntry(entry, row); cloudDeleteSelected(); }
+      });
+      list.appendChild(row);
+      if (prevSel && e.name === prevSel) { cloudSelectedEntry = entry; row.classList.add('selected'); }
     });
+    cloudUpdateToolbar();
   }
 
   async function cloudDownload(relPath) {
@@ -1441,6 +1856,12 @@
     var st;
     try { st = await api.vpnGetStatus(); } catch (e) { st = { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
     vpnStatusCache = st || {};
+    // Status dot + Connect button styling live here, in one place:
+    // green pulsing dot while connected, grey otherwise; the button is
+    // the primary (gradient) action whenever there is something to do
+    // (connect / sign in / install) and plain for Disconnect.
+    var dot = $('vpnStatusDot'); if (dot) dot.className = 'vpn-dot' + ((st && st.connected) ? ' on' : '');
+    var cbtn = $('vpnConnectBtn'); if (cbtn) cbtn.classList.toggle('btn-primary', !(st && st.connected));
     var txt = $('vpnStatusText'), sub = $('vpnStatusSub'), btn = $('vpnConnectBtn');
     var ni = $('vpnNotInstalled'), lb = $('vpnLoginBox'), dc = $('vpnDetailsCard');
     if (!st || !st.installed) {
@@ -1489,7 +1910,11 @@
     }
     if (!st.connected) {
       if (txt) txt.textContent = st.backendState === 'Stopped' ? 'Disconnected' : 'Not connected';
-      if (sub) sub.textContent = st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.';
+      // The tray app is not running: the backend sits in NoState and
+      // Connect looks dead until the app is opened. Connect opens it.
+      if (sub) sub.textContent = st.guiRunning === false
+        ? 'The Tailscale app is not running — press Connect and the app will open it for you.'
+        : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.');
       if (btn) btn.textContent = 'Connect';
       if (lb) lb.style.display = 'none';
       if (dc) dc.style.display = 'none';
@@ -1507,22 +1932,21 @@
     var tg = $('vpnSubnetToggle');
     var advertising = (st.advertiseRoutes || []).indexOf(st.lanSubnet) >= 0;
     if (tg) tg.checked = !!advertising;
-    var rn = $('vpnRoutesNote');
-    if (rn) {
-      if (advertising) { rn.style.display = ''; rn.textContent = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.'; }
-      else rn.style.display = 'none';
-    }
-    var ab = $('vpnApproveBtn');
-    if (ab) ab.style.display = advertising ? '' : 'none';
+    refreshVpnRoutesState();
     var ss = $('vpnSubnetSub');
     if (ss) ss.textContent = st.lanSubnet
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
       : 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
     var ket = $('vpnKeyExpiryToggle'); if (ket) ket.checked = vpnKeyExpiryWanted();
+    var tok = $('vpnApiToken'); if (tok) tok.value = (settings.vpn && settings.vpn.apiToken) || '';
+    var ocid = $('vpnOauthClientId'); if (ocid) ocid.value = (settings.vpn && settings.vpn.oauthClientId) || '';
+    var osec = $('vpnOauthClientSecret'); if (osec) osec.value = (settings.vpn && settings.vpn.oauthClientSecret) || '';
     renderVpnPeers(st.peers || []);
     // First sign-in (or first view while connected): turn off the 180-day
     // key expiry automatically, so the device never asks to sign in again.
     maybeDisableVpnKeyExpiry();
+    refreshVpnKeyExpiryState();
+    refreshVpnApiCredsStatus(false);
   }
 
   // `tailscale up` can return before the daemon reports itself Running, so
@@ -1542,6 +1966,14 @@
   function vpnKeyExpiryWanted() {
     return !(settings.vpn && settings.vpn.autoDisableKeyExpiry === false);
   }
+  // The API credential for key expiry: OAuth client first (never
+  // expires), API token second. null = nothing saved yet.
+  function vpnAuth() {
+    var v = (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {};
+    if (v.oauthClientId && v.oauthClientSecret) return { clientId: v.oauthClientId, clientSecret: v.oauthClientSecret };
+    if (v.apiToken && String(v.apiToken).trim()) return { apiToken: v.apiToken };
+    return null;
+  }
   async function saveVpnSettings(patch) {
     var v = Object.assign({}, (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {}, patch);
     try {
@@ -1553,17 +1985,155 @@
   async function disableVpnKeyExpiry(quiet) {
     if (!api || typeof api.vpnDisableKeyExpiry !== 'function') return false;
     try {
-      var r = await api.vpnDisableKeyExpiry();
+      var r = await api.vpnDisableKeyExpiry(vpnAuth());
       if (r && r.success) {
         await saveVpnSettings({ keyExpiryDisabled: true });
         if (!quiet) toast('VPN', 'Key expiry is off — this device will stay connected, no more sign-ins.', 'success');
+        refreshVpnKeyExpiryState();
         return true;
       }
-      if (!quiet) toast('VPN', 'Could not turn off key expiry automatically. You can turn it off in the Tailscale admin console (Machines → this device → Disable key expiry).', 'error');
+      // Show the real reason, not the old generic sentence: the failure
+      // used to be invisible (the CLI flag does not exist), which is
+      // exactly why the toggle looked on while nothing had happened.
+      if (!quiet) toast('VPN', 'Could not turn off key expiry automatically: ' + ((r && r.error) || 'unknown error') + ' — you can also turn it off in the Tailscale admin console (Machines → this device → Disable key expiry).', 'error');
       return false;
     } catch (e) {
       if (!quiet) toast('VPN error', e && e.message ? e.message : 'Could not turn off key expiry.', 'error');
       return false;
+    }
+  }
+  // The real key-expiry state from the Tailscale API — the toggle is a
+  // real switch, and this line is its confirmation: it shows what the
+  // API says, and the toggle is set to match it.
+  async function refreshVpnKeyExpiryState() {
+    var el = $('vpnKeyExpiryState');
+    if (!el) return;
+    var auth = vpnAuth();
+    if (!auth) { el.textContent = 'Key expiry state: unknown — open “API credentials” above and save an OAuth client or a token.'; return; }
+    if (!api || typeof api.vpnKeyExpiryState !== 'function') return;
+    // Never flash "checking…" over a state that is already shown: the
+    // view re-reads every 15 seconds, and the line used to blink to
+    // "checking…" and back on every poll. Only show it on first load.
+    if (!el.textContent) el.textContent = 'Key expiry state: checking…';
+    try {
+      var r = await api.vpnKeyExpiryState(auth);
+      if (r && r.success) {
+        var ket = $('vpnKeyExpiryToggle');
+        if (ket) ket.checked = !!r.disabled;
+        el.textContent = r.disabled
+          ? 'Key expiry: OFF — this device stays connected, no more sign-ins.'
+          : 'Key expiry: ON — the device will ask to sign in again when the key expires' + (r.expires ? ' (' + r.expires + ')' : '') + '.';
+        if (r.disabled) await saveVpnSettings({ keyExpiryDisabled: true, autoDisableKeyExpiry: true });
+        else await saveVpnSettings({ keyExpiryDisabled: false });
+      } else {
+        el.textContent = 'Key expiry state: unknown — ' + ((r && r.error) || 'could not read it.');
+      }
+    } catch (e) { el.textContent = 'Key expiry state: unknown — ' + (e && e.message ? e.message : 'could not read it.'); }
+  }
+  // "Saved" says nothing about whether the credential actually works,
+  // so the credentials box carries a word of its own — Connected or
+  // Disconnected — visible in the summary even while the box is
+  // collapsed, with the full reason inside. Verified on load (at most
+  // once a minute) and right after every save.
+  var vpnApiCredsLastVerify = 0;
+  var vpnApiCredsVerifying = false;
+  async function refreshVpnApiCredsStatus(force) {
+    var word = $('vpnApiCredsStatusWord');
+    var line = $('vpnApiCredsStatus');
+    if (!word && !line) return;
+    var setWord = function (text, cls) { if (word) { word.textContent = text; word.className = 't-sub ' + (cls || ''); } };
+    var setLine = function (text, cls) { if (line) { line.textContent = text; line.className = 't-sub ' + (cls || ''); } };
+    var auth = vpnAuth();
+    if (!auth) { setWord('· Not saved', ''); setLine('No credentials saved yet — save an OAuth client or a token below, and this line will say whether it works.'); return; }
+    if (!force && Date.now() - vpnApiCredsLastVerify < 60000) return;
+    if (vpnApiCredsVerifying) return;
+    if (!api || typeof api.vpnVerifyApi !== 'function') return;
+    vpnApiCredsVerifying = true;
+    setWord('· Verifying…', '');
+    setLine('Verifying the credentials with the Tailscale API…');
+    try {
+      var r = await api.vpnVerifyApi(auth);
+      vpnApiCredsLastVerify = Date.now();
+      if (r && r.valid) {
+        var via = r.via === 'oauth' ? 'OAuth client' : (r.via === 'token' ? 'API token' : 'credentials');
+        setWord('· Connected', 'vpn-creds-ok');
+        setLine('Connected — the ' + via + ' works with the Tailscale API.');
+      } else {
+        setWord('· Disconnected', 'vpn-creds-bad');
+        setLine('Disconnected — ' + ((r && r.error) || 'the credentials did not work.'));
+      }
+    } catch (e) {
+      setWord('· Disconnected', 'vpn-creds-bad');
+      setLine('Disconnected — ' + (e && e.message ? e.message : 'could not check the credentials.'));
+    } finally { vpnApiCredsVerifying = false; }
+  }
+  // Turn key expiry back ON through the API (the toggle flipped off).
+  async function enableVpnKeyExpiry() {
+    if (!api || typeof api.vpnEnableKeyExpiry !== 'function') return false;
+    try {
+      var r = await api.vpnEnableKeyExpiry(vpnAuth());
+      if (r && r.success) {
+        await saveVpnSettings({ keyExpiryDisabled: false });
+        toast('VPN', 'Key expiry is on again — the device will ask to sign in again when the key expires.', 'success');
+        refreshVpnKeyExpiryState();
+        return true;
+      }
+      toast('VPN', 'Could not turn key expiry back on: ' + ((r && r.error) || 'unknown error'), 'error');
+      return false;
+    } catch (e) {
+      toast('VPN error', e && e.message ? e.message : 'Could not turn key expiry back on.', 'error');
+      return false;
+    }
+  }
+  // The real route state from the API: advertising + approved, or
+  // advertising and still waiting. The toggle is a real switch like
+  // the key-expiry one: when the route is advertising but not
+  // approved yet and a credential is saved, the app approves it
+  // itself — so a toggle that was turned on before the credential
+  // existed still ends up approved without touching the console.
+  // At most one approval attempt a minute, so a refused API (e.g. a
+  // missing scope) does not hammer the API on every 15-second poll.
+  // The console button only shows when the approval is missing and
+  // the API cannot do it, and the note then carries the real reason.
+  var vpnRoutesLastApproveTry = 0;
+  var vpnRoutesApprovedHint = null; // {subnet, at} — a successful approve
+  // call is trusted for a minute, so the note says "approved" at once
+  // instead of waiting for the control plane to show it on a re-read.
+  async function refreshVpnRoutesState() {
+    var rn = $('vpnRoutesNote');
+    var ab = $('vpnApproveBtn');
+    if (!rn && !ab) return;
+    var st = vpnStatusCache || {};
+    var advertising = (st.advertiseRoutes || []).indexOf(st.lanSubnet) >= 0;
+    if (!advertising || !st.connected) { if (rn) rn.style.display = 'none'; if (ab) ab.style.display = 'none'; return; }
+    var waiting = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.';
+    var approvedNote = 'Advertising ' + st.lanSubnet + ' — approved.';
+    var showWaiting = function (text) {
+      if (rn) { rn.style.display = ''; rn.textContent = text || waiting; }
+      if (ab) ab.style.display = '';
+    };
+    var showApproved = function () {
+      if (rn) { rn.style.display = ''; rn.textContent = approvedNote; }
+      if (ab) ab.style.display = 'none';
+    };
+    if (vpnRoutesApprovedHint && vpnRoutesApprovedHint.subnet === st.lanSubnet && Date.now() - vpnRoutesApprovedHint.at < 60000) { showApproved(); return; }
+    var auth = vpnAuth();
+    if (!auth || !api || typeof api.vpnGetRoutes !== 'function') { showWaiting(); return; }
+    try {
+      var r = await api.vpnGetRoutes(auth);
+      if (!r || !r.success) { showWaiting('Advertising ' + st.lanSubnet + ' — could not read the route state: ' + ((r && r.error) || 'unknown error') + ' — approve it in the Tailscale admin console.'); return; }
+      var approved = (r.routes || []).some(function (x) { return x.route === st.lanSubnet && x.enabled; });
+      if (approved) { showApproved(); return; }
+      if (typeof api.vpnApproveRoutes === 'function' && Date.now() - vpnRoutesLastApproveTry > 60000) {
+        vpnRoutesLastApproveTry = Date.now();
+        var ap = await api.vpnApproveRoutes(auth, [st.lanSubnet]);
+        if (ap && ap.success) { vpnRoutesApprovedHint = { subnet: st.lanSubnet, at: Date.now() }; showApproved(); return; }
+        showWaiting('Advertising ' + st.lanSubnet + ' — automatic approval failed: ' + ((ap && ap.error) || 'unknown error') + ' — approve it in the Tailscale admin console.');
+        return;
+      }
+      showWaiting('Advertising ' + st.lanSubnet + ' — waiting for approval…');
+    } catch (e) {
+      showWaiting('Advertising ' + st.lanSubnet + ' — could not reach the Tailscale API: ' + (e && e.message ? e.message : 'unknown error') + ' — approve it in the Tailscale admin console.');
     }
   }
   async function maybeDisableVpnKeyExpiry() {
@@ -1580,6 +2150,11 @@
   var lastVpnPeersSig = null;
   function renderVpnPeers(peers) {
     var list = $('vpnPeersList'); if (!list) return;
+    var cnt = $('vpnPeersCount');
+    if (cnt) {
+      if ((peers || []).length) { cnt.style.display = ''; cnt.textContent = peers.length + (peers.length === 1 ? ' device' : ' devices'); }
+      else { cnt.style.display = 'none'; cnt.textContent = ''; }
+    }
     var sig = JSON.stringify({ peers: (peers || []).map(function (p) { return [p.ip, p.name, p.online, p.os]; }), connected: !!(vpnStatusCache && vpnStatusCache.connected), installed: !!(vpnStatusCache && vpnStatusCache.installed), needsLogin: !!(vpnStatusCache && vpnStatusCache.needsLogin) });
     if (sig === lastVpnPeersSig) return;
     lastVpnPeersSig = sig;
@@ -1597,21 +2172,21 @@
       return;
     }
     peers.forEach(function (p) {
-      var card = document.createElement('div');
-      card.className = 'job-card';
-      var body = document.createElement('div'); body.className = 'job-body';
-      var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = p.name;
-      var meta = document.createElement('div'); meta.className = 'job-meta';
+      var row = document.createElement('div');
+      row.className = 'vpn-peer';
+      var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
+      var body = document.createElement('div'); body.className = 'vpn-peer-body';
+      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name;
+      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
       meta.textContent = (p.ip || '—') + (p.os ? ' — ' + p.os : '') + ' — ' + (p.online ? 'online' : 'offline');
-      var acts = document.createElement('div'); acts.className = 'drawer-actions';
+      body.appendChild(h); body.appendChild(meta);
+      row.appendChild(d); row.appendChild(body);
       if (p.ip) {
         var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open in Cloud';
         open.addEventListener('click', function () { openCloudWithPeer(p); });
-        acts.appendChild(open);
+        row.appendChild(open);
       }
-      body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
-      card.appendChild(body);
-      list.appendChild(card);
+      list.appendChild(row);
     });
   }
 
@@ -1759,23 +2334,22 @@
     if (vcb) vcb.addEventListener('click', async function () {
       if (!api || typeof api.vpnSetConnected !== 'function') return vpnMissing();
       if (vpnBusy) return;
-      // Not installed yet → one click installs Tailscale, then connects.
+      // The first status read may still be in flight when the view
+      // opens — read it once before deciding between Install and
+      // Connect, or a fast click takes the wrong branch.
+      if (!vpnStatusCache) await loadVpn();
+      // Not installed yet → show the administrator step first. The user
+      // picks the Windows UAC prompt (empty fields) or types an
+      // administrator account (domain PC); the install itself starts
+      // on Install in the box below.
       if (vpnStatusCache && !vpnStatusCache.installed) {
         if (typeof api.vpnInstallConnect !== 'function' || typeof api.onVpnInstallProgress !== 'function') return vpnMissing();
-        vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Installing…';
         var ib = $('vpnInstallBox'); if (ib) ib.style.display = '';
-        var stopListen = api.onVpnInstallProgress(function (p) {
-          var f = $('vpnInstallFill'); if (f) f.style.width = Math.max(0, Math.min(100, p.pct || 0)) + '%';
-          var t = $('vpnInstallText'); if (t) t.textContent = p.text || '';
-        });
-        try {
-          var r = await api.vpnInstallConnect();
-          if (r && r.success) {
-            if (r.needsLogin) toast('VPN', 'Tailscale is installed. Sign in to Tailscale in the browser window, then press Refresh.', '');
-            else toast('VPN', 'Tailscale installed and connected.', 'success');
-          } else toast('VPN error', (r && r.error) || 'Could not install Tailscale.', 'error');
-        } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not install Tailscale.', 'error'); }
-        finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); if (r && r.success && !r.needsLogin) await pollVpnUntilConnected(); }
+        var af = $('vpnAdminForm'); if (af) af.style.display = '';
+        var ip = $('vpnInstallProgress'); if (ip) ip.style.display = 'none';
+        var au = $('vpnAdminUser'); if (au) au.value = '';
+        var ap = $('vpnAdminPass'); if (ap) ap.value = '';
+        vcb.disabled = true;
         return;
       }
       vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Working…';
@@ -1791,7 +2365,42 @@
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the VPN connection.', 'error'); }
       finally { vpnBusy = false; }
     });
-    var vrb = $('vpnRefreshBtn');
+    var vaib = $('vpnAdminInstallBtn');
+    if (vaib) vaib.addEventListener('click', async function () {
+      if (vpnBusy) return;
+      if (typeof api.vpnInstallConnect !== 'function' || typeof api.onVpnInstallProgress !== 'function') return vpnMissing();
+      var au = $('vpnAdminUser'); var ap = $('vpnAdminPass');
+      var adminUser = au ? au.value.trim() : '';
+      var adminPass = ap ? ap.value : '';
+      // The password is used once for this install and never stored —
+      // clear the field the moment it is read.
+      if (ap) ap.value = '';
+      if ((adminUser && !adminPass) || (!adminUser && adminPass)) { toast('Administrator account', 'Type both the administrator user name and password, or leave both empty for the Windows prompt.', 'error'); return; }
+      var creds = (adminUser && adminPass) ? { user: adminUser, password: adminPass } : null;
+      vpnBusy = true;
+      var vcb2 = $('vpnConnectBtn'); if (vcb2) { vcb2.disabled = true; vcb2.textContent = 'Installing…'; }
+      var af = $('vpnAdminForm'); if (af) af.style.display = 'none';
+      var ip = $('vpnInstallProgress'); if (ip) ip.style.display = '';
+      var stopListen = api.onVpnInstallProgress(function (p) {
+        var f = $('vpnInstallFill'); if (f) f.style.width = Math.max(0, Math.min(100, p.pct || 0)) + '%';
+        var t = $('vpnInstallText'); if (t) t.textContent = p.text || '';
+      });
+      try {
+        var r = await api.vpnInstallConnect(creds);
+        if (r && r.success) {
+          if (r.needsLogin) toast('VPN', 'Tailscale is installed. Sign in to Tailscale in the browser window, then press Refresh.', '');
+          else toast('VPN', 'Tailscale installed and connected.', 'success');
+        } else toast('VPN error', (r && r.error) || 'Could not install Tailscale.', 'error');
+      } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not install Tailscale.', 'error'); }
+      finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); if (r && r.success && !r.needsLogin) await pollVpnUntilConnected(); }
+    });
+    var vacb = $('vpnAdminCancelBtn');
+    if (vacb) vacb.addEventListener('click', function () {
+      var ib = $('vpnInstallBox'); if (ib) ib.style.display = 'none';
+      var ap = $('vpnAdminPass'); if (ap) ap.value = '';
+      var vcb3 = $('vpnConnectBtn'); if (vcb3) { vcb3.disabled = false; vcb3.textContent = 'Install & connect'; }
+    });
+    var vrb = $('vpnTopRefreshBtn');
     if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
     // Peers appear on their own: while the VPN view is open, or the Cloud
     // client panel is open in Tailscale mode, re-read Tailscale status
@@ -1821,32 +2430,90 @@
     if (vrc) vrc.addEventListener('click', function () { loadVpn(); });
     var vke = $('vpnKeyExpiryToggle');
     if (vke) vke.addEventListener('change', async function () {
-      await saveVpnSettings({ autoDisableKeyExpiry: vke.checked });
-      if (vke.checked) { vpnKeyExpiryAttempted = false; maybeDisableVpnKeyExpiry(); }
+      var wantOff = vke.checked; // ON = key expiry OFF (stay connected forever)
+      await saveVpnSettings({ autoDisableKeyExpiry: wantOff });
+      var ok = wantOff ? await disableVpnKeyExpiry(false) : await enableVpnKeyExpiry();
+      if (!ok) {
+        // The switch must never lie: if the API said no, snap it back
+        // to where it was, and open the credentials so the user can see
+        // what is missing.
+        vke.checked = !wantOff;
+        await saveVpnSettings({ autoDisableKeyExpiry: !wantOff });
+        if (!vpnAuth()) { var d = $('vpnApiCreds'); if (d) d.open = true; }
+      }
+      refreshVpnKeyExpiryState();
     });
-    var vkb = $('vpnKeyExpiryBtn');
-    if (vkb) vkb.addEventListener('click', async function () {
-      if (vpnBusy) return;
-      vpnBusy = true; vkb.disabled = true;
-      try { await disableVpnKeyExpiry(false); }
-      finally { vpnBusy = false; vkb.disabled = false; }
+    var vts = $('vpnApiTokenSaveBtn');
+    if (vts) vts.addEventListener('click', async function () {
+      var inp = $('vpnApiToken');
+      var token = inp ? inp.value.trim() : '';
+      await saveVpnSettings({ apiToken: token });
+      toast('VPN', token ? 'API token saved.' : 'API token removed.', 'success');
+      var d0 = $('vpnApiCreds'); if (d0) d0.open = true;
+      refreshVpnApiCredsStatus(true);
+      refreshVpnKeyExpiryState();
+      refreshVpnRoutesState();
+    });
+    var vos = $('vpnOauthSaveBtn');
+    if (vos) vos.addEventListener('click', async function () {
+      var idInp = $('vpnOauthClientId');
+      var secInp = $('vpnOauthClientSecret');
+      var id = idInp ? idInp.value.trim() : '';
+      var sec = secInp ? secInp.value.trim() : '';
+      await saveVpnSettings({ oauthClientId: id, oauthClientSecret: sec });
+      toast('VPN', (id && sec) ? 'OAuth client saved.' : 'OAuth client removed.', 'success');
+      var d1 = $('vpnApiCreds'); if (d1) d1.open = true;
+      refreshVpnApiCredsStatus(true);
+      refreshVpnKeyExpiryState();
+      refreshVpnRoutesState();
+    });
+    var voo = $('vpnOauthOpenBtn');
+    if (voo) voo.addEventListener('click', async function () {
+      if (!api || typeof api.vpnOpenOauthPage !== 'function') return vpnMissing();
+      await api.vpnOpenOauthPage();
+    });
+    var vto = $('vpnApiTokenOpenBtn');
+    if (vto) vto.addEventListener('click', async function () {
+      if (!api || typeof api.vpnOpenKeysPage !== 'function') return vpnMissing();
+      await api.vpnOpenKeysPage();
     });
     var vst = $('vpnSubnetToggle');
     if (vst) vst.addEventListener('change', async function () {
       if (!api || typeof api.vpnSetRoutes !== 'function') return vpnMissing();
       var on = vst.checked;
       try {
-        var r = await api.vpnSetRoutes(on);
+        var r = await api.vpnSetRoutes(on, vpnAuth());
         if (r && r.success) {
-          // Advertising alone does nothing — the route only works after
-          // it is approved in the Tailscale admin console, which the app
-          // cannot do itself. Open the console right away so the approval
-          // is one click away instead of a step the user has to find.
-          if (on && typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
-          toast('VPN', on ? 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' : 'No longer sharing your home network.', 'success');
-        } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
-        await loadVpn();
-      } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
+          // Update the cached status right away, so the view agrees
+          // with the toggle without waiting for a slow `tailscale
+          // status` re-read — and trust the approve call itself: the
+          // note must say "approved" now, not after the next 15-second
+          // poll (the control plane can take a few seconds to show it
+          // on a re-read, which is exactly the long "waiting…" the
+          // user saw).
+          if (vpnStatusCache) {
+            var adv = vpnStatusCache.advertiseRoutes || [];
+            if (on && r.subnet && adv.indexOf(r.subnet) < 0) adv = adv.concat([r.subnet]);
+            if (!on) adv = [];
+            vpnStatusCache.advertiseRoutes = adv;
+            if (r.subnet) vpnStatusCache.lanSubnet = r.subnet;
+          }
+          if (on) {
+            if (r.approved) {
+              vpnRoutesApprovedHint = { subnet: r.subnet, at: Date.now() };
+              toast('VPN', 'Sharing your home network — the route was approved automatically.', 'success');
+            } else {
+              vpnRoutesApprovedHint = null;
+              if (typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
+              toast('VPN', 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' + (r.approveError ? ' The automatic approval failed: ' + r.approveError : ''), 'success');
+            }
+          } else {
+            vpnRoutesApprovedHint = null;
+            toast('VPN', 'No longer sharing your home network.', 'success');
+          }
+          refreshVpnRoutesState();
+        } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; await loadVpn(); }
+      } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; await loadVpn(); }
     });
     var vab2 = $('vpnApproveBtn');
     if (vab2) vab2.addEventListener('click', async function () {
@@ -1873,7 +2540,7 @@
         toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error');
       }
     });
-    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); } });
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); cloudHideContextMenu(); } });
 
     document.querySelectorAll('#logsTabs .log-tab').forEach(function (btn) {
       btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
@@ -1988,13 +2655,15 @@
           var u2 = $('cloudClientUser'); if (u2) u2.value = '';
           var p2 = $('cloudClientPass'); if (p2) p2.value = '';
           await loadCloud();
-          // Save & connect: open the connect box with the password the
-          // user just typed (it is never stored), and connect at once
-          // when this server is already trusted.
+          // Save & connect, one click: open the connect box with the
+          // password the user just typed (it is never stored), and do
+          // the whole thing at once — probe, trust the fingerprint,
+          // connect. Without a password the box stays open so the user
+          // can type it and press Connect there.
           var rec = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === r.id; });
           if (rec) {
             openCloudConnect(rec, password);
-            if (rec.fingerprint && password) cloudConnectFlow();
+            if (password) cloudConnectFlow(true);
           }
         } else toast('Save failed', (r && r.error) || 'Could not save server.', 'error');
       } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error'); }
@@ -2010,20 +2679,40 @@
     var cub2 = $('cloudUploadBtn');
     if (cub2) cub2.addEventListener('click', function () { cloudUpload(); });
     var cmb = $('cloudMkdirBtn');
-    if (cmb) cmb.addEventListener('click', function () {
-      askCloudInput('New folder', 'Folder name', '', async function (val) {
-        if (!val) return;
-        if (!isSingleCloudName(val)) { toast('Invalid name', 'Use a plain name without / \\ or special characters.', 'error'); return; }
-        if (!api || typeof api.cloudClientMkdir !== 'function') return cloudMissing();
-        try {
-          var r = await api.cloudClientMkdir(cloudConn.serverId, cloudJoin(cloudPath, val));
-          if (r && r.success) { toast('Folder created', val, 'success'); await cloudBrowse(cloudPath); }
-          else toast('Create failed', (r && r.error) || 'Could not create folder.', 'error');
-        } catch (e) { toast('Create error', e && e.message ? e.message : 'Could not create folder.', 'error'); }
-      });
-    });
+    if (cmb) cmb.addEventListener('click', function () { cloudNewFolder(cloudPath); });
     var cbr = $('cloudBrowserRefreshBtn');
     if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
+    // Explorer toolbar: the actions apply to the selected row.
+    var cub3 = $('cloudUpBtn');
+    if (cub3) cub3.addEventListener('click', function () { if (cloudPath) cloudBrowse(cloudParent(cloudPath)); });
+    var cbd2 = $('cloudDownloadBtn');
+    if (cbd2) cbd2.addEventListener('click', function () { if (cloudSelectedEntry && !cloudSelectedEntry.isDir) cloudDownload(cloudSelectedEntry.rel); });
+    var cbc2 = $('cloudCopyBtn');
+    if (cbc2) cbc2.addEventListener('click', function () { cloudCopySelected(); });
+    var cbp2 = $('cloudPasteBtn');
+    if (cbp2) cbp2.addEventListener('click', function () { cloudPasteClipboard(); });
+    var cbr2 = $('cloudRenameBtn');
+    if (cbr2) cbr2.addEventListener('click', function () { cloudRenameSelected(); });
+    var cbdel = $('cloudDeleteBtn');
+    if (cbdel) cbdel.addEventListener('click', function () { cloudDeleteSelected(); });
+    var cfl = $('cloudFileList');
+    if (cfl) cfl.addEventListener('keydown', function (ev) {
+      if (ev.ctrlKey && (ev.key === 'c' || ev.key === 'C')) { cloudCopySelected(); ev.preventDefault(); }
+      else if (ev.ctrlKey && (ev.key === 'v' || ev.key === 'V')) { cloudPasteClipboard(); ev.preventDefault(); }
+    });
+    // Right-click in the file list: the Windows menu (Open, Copy, Paste,
+    // Rename, Delete, New folder). A right-click selects the row first.
+    if (cfl) cfl.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      var row = ev.target && ev.target.closest ? ev.target.closest('.cloud-row') : null;
+      var entry = row && row.cloudEntry ? row.cloudEntry : null;
+      if (entry) cloudSelectEntry(entry, row);
+      cloudShowContextMenu(ev.clientX, ev.clientY, entry);
+    });
+    document.addEventListener('click', function (ev) {
+      var m = $('cloudContextMenu');
+      if (m && m.style.display !== 'none' && !m.contains(ev.target)) cloudHideContextMenu();
+    }, true);
     var cpo = $('cloudPromptOk');
     if (cpo) cpo.addEventListener('click', function () {
       var cb = cloudPromptCallback;

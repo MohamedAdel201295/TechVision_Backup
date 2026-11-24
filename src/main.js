@@ -4,6 +4,7 @@
  */
 
 const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
+const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
@@ -1702,7 +1703,7 @@ ipcMain.handle('cloud-get-config', async () => {
       fingerprint: cfg.server.cert ? cfg.server.cert.fingerprint : null,
       accessMode: cfg.server.accessMode === 'tailscale' ? 'tailscale' : 'normal',
     },
-    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, accessMode: c.accessMode === 'tailscale' ? 'tailscale' : 'normal' })),
+    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: c.accessMode === 'tailscale' ? 'tailscale' : 'normal' })),
   };
 });
 
@@ -1795,7 +1796,14 @@ ipcMain.handle('cloud-user-set-password', async (event, name, password) => {
   }
 });
 
-// Saved servers (client side). Passwords are never stored here.
+// Saved servers (client side). The password for a server IS stored on
+// this device, in cloud.json next to the server record — the user asked
+// for one-click reconnect instead of typing it every time (same choice
+// as the SMTP password in settings.json). It never leaves main: the
+// renderer only sees hasPassword, and connect uses the stored password
+// when none is typed. Remove it any time with "Forget saved password"
+// on the server card; changing the password on the server just means
+// the next connect asks for the new one.
 ipcMain.handle('cloud-client-save', async (event, s) => {
   try {
     const cfg = getCloudConfig();
@@ -1815,7 +1823,7 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     const accessMode = s.accessMode === 'tailscale' ? 'tailscale'
       : s.accessMode === 'normal' ? 'normal'
       : (existing && existing.accessMode === 'tailscale' ? 'tailscale' : 'normal');
-    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode };
+    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode, password: (s.password && String(s.password)) || (existing && existing.password) || null };
     if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
     else cfg.clients.push(rec);
     saveCloudConfig();
@@ -1823,6 +1831,15 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
+});
+
+ipcMain.handle('cloud-client-forget-password', async (event, id) => {
+  const cfg = getCloudConfig();
+  const rec = (cfg.clients || []).find((c) => c.id === id);
+  if (!rec) return { success: false, error: 'Server not found.' };
+  rec.password = null;
+  saveCloudConfig();
+  return { success: true };
 });
 
 ipcMain.handle('cloud-client-remove', async (event, id) => {
@@ -1845,9 +1862,17 @@ ipcMain.handle('cloud-client-probe', async (event, host, port) => {
 
 ipcMain.handle('cloud-client-connect', async (event, opts) => {
   try {
-    const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, opts.password);
+    // No password typed: use the one saved for this server, so a
+    // reconnect is one click. A password the user types wins, and a
+    // successful login with it remembers it for next time.
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === opts.serverId);
+    const password = (opts.password && String(opts.password)) || (rec && rec.password) || '';
+    if (!password) return { success: false, error: 'Password needed — enter the password for user ' + (opts.user || '') + '.' };
+    const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, password);
     const info = await cloudClient.info(conn);
     cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
+    if (rec && opts.password && String(opts.password)) { rec.password = String(opts.password); saveCloudConfig(); }
     return { success: true, info };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
@@ -1865,12 +1890,18 @@ ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
 
 ipcMain.handle('cloud-client-list', async (event, serverId, relPath) => {
   const conn = cloudSessions.get(serverId);
-  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  if (!conn) return { success: false, error: 'Not connected to this server.', code: 'auth' };
   try {
     const r = await cloudClient.list(conn, relPath || '');
     return { success: true, path: r.path, entries: r.entries };
   } catch (e) {
-    return { success: false, error: e && e.message ? e.message : String(e) };
+    const msg = e && e.message ? e.message : String(e);
+    // The auto-refresh poller needs to tell "server gone" from
+    // "session dead" from "something else", without parsing toasts.
+    const code = /Not signed in/i.test(msg) ? 'auth'
+      : /Cannot reach the server|did not answer in time|ECONNREFUSED|ENOTFOUND|socket hang up|certificate/i.test(msg) ? 'unreachable'
+      : 'other';
+    return { success: false, error: msg, code };
   }
 });
 
@@ -1930,6 +1961,84 @@ ipcMain.handle('cloud-client-rename', async (event, serverId, from, to) => {
   catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
 });
 
+ipcMain.handle('cloud-client-copy', async (event, serverId, from, to) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try { await cloudClient.copy(conn, from, to); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : String(e) }; }
+});
+
+// Files the user copied in Windows Explorer: the clipboard holds them
+// as a "FileNameW" list of local paths. The renderer asks for that list
+// when pasting, so a copy in Explorer can land on the server.
+ipcMain.handle('cloud-clipboard-files', async () => {
+  try {
+    const buf = require('electron').clipboard.readBuffer('FileNameW');
+    return cloudClient.parseClipboardFiles(buf);
+  } catch (e) { return []; }
+});
+
+// Upload local paths (files and folders) into a remote folder — the
+// other half of pasting from Windows Explorer.
+ipcMain.handle('cloud-client-upload-files', async (event, serverId, localPaths, remoteDir) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  try {
+    const r = await cloudClient.uploadPaths(conn, localPaths || [], remoteDir || '', (name, sent, total) => {
+      try {
+        if (event.sender && !event.sender.isDestroyed()) {
+          event.sender.send('cloud-progress', { kind: 'upload', pct: total ? Math.min(99, 99 * sent / total) : 0, done: sent, total, name });
+        }
+      } catch (e) {}
+    });
+    return { success: true, uploaded: r.uploaded, failed: r.failed || [] };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open a server file with the app Windows would use for it: download a
+// copy into the temp folder and hand it to the OS (music plays, pictures
+// open, a game runs). The copy lives in the temp folder, so editing it
+// does NOT write back to the server — that needs the file mounted as a
+// real drive, which is a separate feature.
+ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return { success: false, error: 'Not connected to this server.' };
+  const tmpRoot = path.join(os.tmpdir(), 'TechVision-Cloud');
+  try { fs.mkdirSync(tmpRoot, { recursive: true }); } catch (e) {}
+  // Best-effort cleanup of opened copies older than 7 days, so the temp
+  // folder does not grow forever. Never fails the open.
+  try {
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    for (const f of fs.readdirSync(tmpRoot)) {
+      try {
+        const p = path.join(tmpRoot, f);
+        const st = fs.statSync(p);
+        if (st.isFile() && st.mtimeMs < cutoff) fs.unlinkSync(p);
+      } catch (e) {}
+    }
+  } catch (e) {}
+  // The tag keeps two same-named files from different server folders
+  // from overwriting each other in the temp folder.
+  const tag = require('crypto').createHash('sha1').update(String(relPath)).digest('hex').slice(0, 8);
+  const dest = path.join(tmpRoot, tag + '-' + path.basename(relPath));
+  try {
+    await cloudClient.download(conn, relPath, dest, (done, total) => {
+      try {
+        if (event.sender && !event.sender.isDestroyed()) {
+          event.sender.send('cloud-progress', { kind: 'download', pct: total ? Math.min(99, 99 * done / total) : 0, done, total, name: path.basename(relPath) });
+        }
+      } catch (e) {}
+    });
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+  const err = await require('electron').shell.openPath(dest);
+  if (err) return { success: false, error: 'Downloaded to ' + dest + ' but Windows could not open it: ' + err, dest };
+  return { success: true, dest };
+});
+
 // ---------- TechVision VPN (Tailscale client manager) ----------
 // The module only shells out to the Tailscale CLI that is already
 // installed on the machine; it implements no VPN of its own.
@@ -1955,21 +2064,45 @@ ipcMain.handle('vpn-set-connected', async (event, on) => {
   }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
 });
-ipcMain.handle('vpn-set-routes', async (event, on) => {
-  try { return await vpn.setSubnetRouter(!!on); }
+ipcMain.handle('vpn-set-routes', async (event, on, auth) => {
+  try { return await vpn.setSubnetRouter(!!on, auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
-ipcMain.handle('vpn-disable-key-expiry', async () => {
-  try { return await vpn.disableKeyExpiry(); }
+ipcMain.handle('vpn-get-routes', async (event, auth) => {
+  try { return await vpn.getDeviceRoutes(auth); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read routes.' }; }
+});
+ipcMain.handle('vpn-approve-routes', async (event, auth, routes) => {
+  try { return await vpn.approveRoutes(auth, routes); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not approve routes.' }; }
+});
+ipcMain.handle('vpn-disable-key-expiry', async (event, auth) => {
+  try { return await vpn.disableKeyExpiry(auth); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }
 });
-ipcMain.handle('vpn-install-connect', async (event) => {
+ipcMain.handle('vpn-enable-key-expiry', async (event, auth) => {
+  try { return await vpn.enableKeyExpiry(auth); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not enable key expiry.' }; }
+});
+ipcMain.handle('vpn-key-expiry-state', async (event, auth) => {
+  try { return await vpn.getKeyExpiryState(auth); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read key expiry state.' }; }
+});
+ipcMain.handle('vpn-verify-api', async (event, auth) => {
+  try { return await vpn.verifyApiAuth(auth); }
+  catch (e) { return { valid: false, error: e && e.message ? e.message : 'Could not check the credentials.' }; }
+});
+ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
   try {
     let openedUrl = null;
     const openOnce = (url) => { if (openedUrl === url) return; openedUrl = url; openLoginUrl(url); };
+    // Administrator credentials, if the user typed them: used once for
+    // this install, never stored, never logged.
+    const creds = (adminCreds && typeof adminCreds === 'object' && adminCreds.user && adminCreds.password)
+      ? { user: String(adminCreds.user), password: String(adminCreds.password) } : null;
     const r = await vpn.installAndConnect((p) => {
       try { if (!event.sender.isDestroyed()) event.sender.send('vpn-install-progress', p); } catch (e) {}
-    }, (url) => openOnce(url));
+    }, (url) => openOnce(url), creds);
     if (r && r.authUrl) openOnce(r.authUrl);
     return r;
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install Tailscale.' }; }
@@ -1998,6 +2131,14 @@ ipcMain.handle('vpn-open-auth-url', async (event, url) => {
 ipcMain.handle('vpn-open-admin', async () => {
   try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/machines'); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the admin console.' }; }
+});
+ipcMain.handle('vpn-open-keys-page', async () => {
+  try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/settings/keys'); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the Keys page.' }; }
+});
+ipcMain.handle('vpn-open-oauth-page', async () => {
+  try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/settings/oauth'); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the OAuth clients page.' }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {

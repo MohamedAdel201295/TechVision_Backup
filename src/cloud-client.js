@@ -134,6 +134,10 @@ async function rename(conn, from, to) {
   return doJson(conn, 'POST', '/api/rename', { from, to });
 }
 
+async function copy(conn, from, to) {
+  return doJson(conn, 'POST', '/api/copy', { from, to });
+}
+
 function download(conn, relPath, destPath, onProgress) {
   return new Promise((resolve, reject) => {
     let done = false;
@@ -243,4 +247,69 @@ function upload(conn, localPath, remoteDir, onProgress) {
   });
 }
 
-module.exports = { probeServer, login, logout, info, list, mkdir, remove, rename, download, upload, fingerprintOfDer, derToPem };
+function joinRemote(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return a.replace(/\/+$/, '') + '/' + b;
+}
+
+/* Upload a list of local paths (files and folders, e.g. copied in
+   Windows Explorer) into a remote folder. Folders are walked
+   recursively; each file keeps its relative path under the folder.
+   Returns { uploaded, failed: [{ path, error }] } — one bad file never
+   stops the rest. */
+async function uploadPaths(conn, localPaths, remoteDir, onProgress) {
+  const out = { uploaded: 0, failed: [] };
+  // One listing per destination folder, so a file that already exists
+  // on the server is skipped (never silently overwritten) instead of
+  // replacing it.
+  const dirListings = new Map();
+  async function existingNames(destDir) {
+    if (dirListings.has(destDir)) return dirListings.get(destDir);
+    let names = new Set();
+    try { const r = await list(conn, destDir); names = new Set((r.entries || []).map((e) => e.name)); }
+    catch (e) { /* an unreadable folder is treated as empty */ }
+    dirListings.set(destDir, names);
+    return names;
+  }
+  const walk = async (localPath, destDir) => {
+    let st;
+    try { st = fs.statSync(localPath); } catch (e) { out.failed.push({ path: localPath, error: e.message }); return; }
+    if (st.isFile()) {
+      const names = await existingNames(destDir);
+      const base = path.basename(localPath);
+      if (names.has(base)) { out.failed.push({ path: localPath, error: 'already exists on the server — skipped' }); return; }
+      try {
+        await upload(conn, localPath, destDir, (sent, total) => { if (typeof onProgress === 'function') { try { onProgress(base, sent, total); } catch (e) {} } });
+        out.uploaded++;
+        names.add(base);
+      } catch (e) { out.failed.push({ path: localPath, error: e.message }); }
+      return;
+    }
+    if (st.isDirectory()) {
+      // The upload endpoint refuses a destination folder that does not
+      // exist yet, so create the remote folder first.
+      const here = joinRemote(destDir, path.basename(localPath));
+      try { await mkdir(conn, here); } catch (e) { out.failed.push({ path: localPath, error: e.message }); return; }
+      let kids;
+      try { kids = fs.readdirSync(localPath); } catch (e) { out.failed.push({ path: localPath, error: e.message }); return; }
+      if (!kids.length) { out.uploaded++; return; } // an empty folder still counts as copied
+      for (const kid of kids) await walk(path.join(localPath, kid), here);
+      return;
+    }
+    out.failed.push({ path: localPath, error: 'Not a file or folder.' });
+  };
+  for (const p of localPaths || []) await walk(p, remoteDir || '');
+  return out;
+}
+
+/* Parse the Windows clipboard file list ("FileNameW"): a sequence of
+   UTF-16LE null-terminated paths, terminated by an extra null. Returns
+   the local paths (drive-letter or UNC) the user copied in Explorer. */
+function parseClipboardFiles(buf) {
+  if (!buf || !buf.length) return [];
+  const text = buf.toString('utf16le');
+  return text.split('\0').map((s) => s.trim()).filter((s) => s && (/^[A-Za-z]:[\\/]/.test(s) || s.startsWith('\\\\')));
+}
+
+module.exports = { probeServer, login, logout, info, list, mkdir, remove, rename, copy, download, upload, uploadPaths, parseClipboardFiles, fingerprintOfDer, derToPem };

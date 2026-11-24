@@ -498,7 +498,7 @@ class CloudServer {
       return;
     }
 
-    if (req.method === 'POST' && (pathname === '/api/mkdir' || pathname === '/api/delete' || pathname === '/api/rename')) {
+    if (req.method === 'POST' && (pathname === '/api/mkdir' || pathname === '/api/delete' || pathname === '/api/rename' || pathname === '/api/copy')) {
       if (!session.canWrite) { this._sendJson(res, 403, { error: 'This user is read-only.' }); return; }
       let body;
       try { body = await this._readJsonBody(req); }
@@ -513,9 +513,27 @@ class CloudServer {
           this._sendJson(res, 200, { ok: true });
           return;
         }
-        // The shared folder itself can never be deleted or moved:
-        // deleting it would brick the user until an admin fixes it.
+        // The shared folder itself can never be deleted, moved or
+        // copied: deleting it would brick the user until an admin
+        // fixes it.
         const realRoot = this._realRoot(session.root);
+        // copy (duplicate): file or folder, to a path that must not
+        // exist yet — the client picks a free "name - copy" name.
+        // Never the shared folder itself, never a folder into itself.
+        if (pathname === '/api/copy') {
+          const from = this._jail(session.root, body.from || '');
+          const to = this._jail(session.root, body.to || '');
+          if (from === null || to === null || !fs.existsSync(from)) throw new Error('Bad path.');
+          if (realRoot !== null && from === realRoot) throw new Error('Cannot copy the shared folder itself.');
+          if (to === from || to.startsWith(from + path.sep)) throw new Error('Cannot copy a folder into itself.');
+          if (fs.existsSync(to)) throw new Error('A file or folder with that name already exists.');
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          fs.cpSync(from, to, { recursive: true, force: false, errorOnExist: true });
+          this._audit(ip, session.user, 'copy', (body.from || '') + ' -> ' + (body.to || ''));
+          this._sendJson(res, 200, { ok: true });
+          return;
+        }
+        // delete
         if (pathname === '/api/delete') {
           const target = this._jail(session.root, body.path || '');
           if (target === null || !fs.existsSync(target)) throw new Error('Not found.');

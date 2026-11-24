@@ -12,7 +12,7 @@
  * computed locally from os.networkInterfaces() and validated as a CIDR
  * — never free text from the renderer. Every call has a timeout.
  */
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -20,6 +20,7 @@ const https = require('https');
 const http = require('http');
 
 const WIN_CLI = 'C:\\Program Files\\Tailscale\\tailscale.exe';
+const WIN_GUI = 'C:\\Program Files\\Tailscale\\tailscale-ipn.exe';
 const MSI_URL = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi';
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 
@@ -120,7 +121,7 @@ function tailnetFromDns(dnsName) {
 async function getStatus() {
   const r = await runCli(['status', '--json'], 10000);
   if (r.notFound) return { installed: false, connected: false, error: 'Tailscale is not installed on this computer.' };
-  if (r.timedOut) return { installed: true, connected: false, error: 'Tailscale did not answer in time. Is the Tailscale service running?' };
+  if (r.timedOut) return { installed: true, connected: false, guiRunning: await guiRunning(), error: 'Tailscale did not answer in time. Is the Tailscale service running?' };
   let j = null;
   try { j = JSON.parse(r.stdout); } catch (e) { /* fall through */ }
   if (!j) return { installed: true, connected: false, error: 'Could not read Tailscale status.' };
@@ -153,10 +154,12 @@ async function getStatus() {
     installed: true,
     connected,
     backendState: backend,
+    guiRunning: await guiRunning(),
     needsLogin: backend === 'NeedsLogin',
     authUrl: j.AuthURL || null,
     selfName: self.HostName || null,
     selfIp,
+    deviceId: self.ID || null, // the node ID the Tailscale API needs
     tailnet: tailnetFromDns(self.DNSName),
     peers,
     advertiseRoutes,
@@ -172,7 +175,71 @@ function extractLoginUrl(text) {
   return m ? m[0] : null;
 }
 
+/* The Tailscale tray app (tailscale-ipn.exe) is a separate per-user
+   process from the Windows service, and the service alone is NOT
+   enough: with no GUI process running, the backend sits in NoState
+   and never connects — `tailscale up` can even report success while
+   the view stays stuck on "Not connected", and the tray icon is
+   nowhere to be seen. The installer runs with TS_NOLAUNCH=true, so
+   after our one-click install the GUI never starts on its own.
+   Relaunching the GUI needs no admin rights. */
+function parseTasklistOutput(text) {
+  return /(^|\r?\n)\s*tailscale-ipn\.exe\s/i.test(String(text || ''));
+}
+
+function guiRunning() {
+  if (process.platform !== 'win32') return Promise.resolve(true);
+  return new Promise((resolve) => {
+    execFile('tasklist', ['/FI', 'IMAGENAME eq tailscale-ipn.exe', '/NH'], { timeout: 10000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(false);
+      resolve(parseTasklistOutput(stdout || ''));
+    });
+  });
+}
+
+function launchGui() {
+  if (process.platform !== 'win32') return Promise.resolve(false);
+  if (!fs.existsSync(WIN_GUI)) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(WIN_GUI, [], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.on('error', () => resolve(false));
+      child.unref();
+      resolve(true);
+    } catch (e) { resolve(false); }
+  });
+}
+
+// The backend state without the debug-prefs call: light enough to poll
+// while waiting for the GUI to pull the backend out of NoState.
+async function backendState() {
+  const r = await runCli(['status', '--json'], 10000);
+  if (r.notFound || r.timedOut) return null;
+  try { const j = JSON.parse(r.stdout); return j.BackendState || null; }
+  catch (e) { return null; }
+}
+
+async function ensureGuiRunning() {
+  if (process.platform !== 'win32') return { running: true, launched: false };
+  if (await guiRunning()) return { running: true, launched: false };
+  const launched = await launchGui();
+  if (!launched) return { running: false, launched: false };
+  // The GUI takes a few seconds to pull the backend out of NoState.
+  for (let i = 0; i < 10; i++) {
+    const st = await backendState();
+    if (st && st !== 'NoState' && st !== 'Starting') return { running: true, launched: true };
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  return { running: true, launched: true, backendStillStarting: true };
+}
+
 async function setConnected(on, timeoutMs, onAuthUrl) {
+  cachedDeviceId = null; // the identity may have changed; re-read it once on next use
+  if (on) {
+    // Open the Tailscale app first when it is not running — otherwise
+    // the backend never leaves NoState and Connect looks dead.
+    await ensureGuiRunning();
+  }
   const args = on ? ['up'] : ['down'];
   // Fire onAuthUrl the moment the sign-in URL appears in the output —
   // `tailscale up` blocks for up to 60s waiting for the browser login,
@@ -203,7 +270,7 @@ async function setConnected(on, timeoutMs, onAuthUrl) {
   return { success: true, needsLogin: !!url, authUrl: url };
 }
 
-async function setSubnetRouter(on) {
+async function setSubnetRouter(on, auth) {
   const subnet = lanSubnet();
   if (on && !subnet) return { success: false, error: 'Could not find your home network address.' };
   if (on && !isCidr(subnet)) return { success: false, error: 'Invalid network address.' };
@@ -212,15 +279,245 @@ async function setSubnetRouter(on) {
   if (r.notFound) return { success: false, error: 'Tailscale is not installed on this computer.' };
   if (r.timedOut) return { success: false, error: 'Tailscale did not answer in time. Try again.' };
   if (r.code !== 0) return { success: false, error: 'Could not change the subnet router setting.' };
-  return { success: true, subnet: on ? subnet : null };
+  if (!on) return { success: true, subnet: null, approved: false };
+  // Advertising alone does nothing — approve the routes through the API
+  // when a credential is saved (OAuth client needs the devices:routes
+  // scope; an API token inherits the user's access). Without one, the
+  // caller falls back to the admin console button.
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if ((a.clientId && a.clientSecret) || (a.apiToken && String(a.apiToken).trim())) {
+    const ap = await approveRoutes(auth, [subnet]);
+    if (ap.success) return { success: true, subnet, approved: true };
+    return { success: true, subnet, approved: false, approveError: ap.error };
+  }
+  return { success: true, subnet, approved: false };
 }
 
-/* Disable key expiry for this device (`tailscale set --key-expiry=off`).
-   Runs on the device itself — no API token needed. The device must
-   already be connected. Tailscale normally makes the node key expire
-   after 180 days and asks for another sign-in; with expiry off the
-   device stays connected forever. Returns { success, error? }. */
-async function disableKeyExpiry() {
+/* ---------- Tailscale API: key expiry (the real integration) ----------
+ * `tailscale set --key-expiry=off` is NOT a real CLI flag — the official
+ * CLI has no way to turn off key expiry (the only nearby command is the
+ * debug-only `tailscale debug set-expire`), so that call always failed
+ * with "unknown flag" and the view hid the reason behind a generic
+ * toast. The documented route is the Tailscale API:
+ *   POST /api/v2/device/{deviceID}/key  {"keyExpiryDisabled": true}
+ * with one of two credentials, both created once by the tailnet admin
+ * in the console (the app cannot create them — only a signed-in admin
+ * can, which is the whole point of the control-plane check):
+ *   1. OAuth client (Settings -> Trust credentials -> OAuth clients,
+ *      scope devices:core) — the secret never expires; the app
+ *      exchanges it for a 1-hour access token and refreshes it itself,
+ *      so after the one-time setup nothing is ever pasted again.
+ *   2. API access token (Settings -> Keys, tskey-api-...) — simpler,
+ *      but it expires within 90 days and must be regenerated.
+ * GET /api/v2/device/{deviceID} returns the real keyExpiryDisabled
+ * flag, so the view can show the truth instead of the preference.
+ * Credentials are stored in the app settings (same as the SMTP
+ * password) and can be revoked any time from the console. */
+const TAILSCALE_API_BASE = 'https://api.tailscale.com/api/v2';
+
+let oauthTokenCache = null; // { clientId, accessToken, expiresAt }
+
+async function exchangeOAuthToken(clientId, clientSecret) {
+  const now = Date.now();
+  if (oauthTokenCache && oauthTokenCache.clientId === clientId && oauthTokenCache.expiresAt - 60000 > now) return { token: oauthTokenCache.accessToken };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const body = new URLSearchParams({ grant_type: 'client_credentials', client_id: clientId, client_secret: clientSecret });
+    const res = await fetch(TAILSCALE_API_BASE + '/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+      signal: ctrl.signal,
+    });
+    let j = null;
+    try { j = await res.json(); } catch (e) { /* fall through */ }
+    if (!res.ok || !j || !j.access_token) return { error: 'Tailscale refused the OAuth client (HTTP ' + res.status + '). Check the client ID and secret in the VPN settings.' };
+    oauthTokenCache = { clientId, accessToken: j.access_token, expiresAt: now + ((j.expires_in || 3600) * 1000) };
+    return { token: j.access_token };
+  } catch (e) {
+    return { error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+  } finally { clearTimeout(timer); }
+}
+
+/* Resolve the API credential the app should use, in order:
+   1. OAuth client (never expires, auto-refreshed) — { clientId, clientSecret }
+   2. API access token (expires within 90 days) — { apiToken } or a bare string
+   Returns { header, via } or { error, via }. */
+async function resolveApiAuth(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if (a.clientId && a.clientSecret) {
+    const ex = await exchangeOAuthToken(String(a.clientId).trim(), String(a.clientSecret).trim());
+    if (ex.error) return { error: ex.error, via: 'oauth' };
+    return { header: 'Bearer ' + ex.token, via: 'oauth' };
+  }
+  if (a.apiToken && String(a.apiToken).trim()) return { header: 'Basic ' + Buffer.from(String(a.apiToken).trim() + ':').toString('base64'), via: 'token' };
+  return { error: 'No API credential saved.', via: null };
+}
+
+async function apiFetch(apiPath, authHeader, opts) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(TAILSCALE_API_BASE + apiPath, {
+      method: (opts && opts.method) || 'GET',
+      headers: {
+        Authorization: authHeader,
+        'Content-Type': 'application/json',
+      },
+      body: opts && opts.body ? JSON.stringify(opts.body) : undefined,
+      signal: ctrl.signal,
+    });
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* empty body on success */ }
+    return { ok: res.ok, status: res.status, body };
+  } catch (e) {
+    return { ok: false, status: 0, body: null, error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+  } finally { clearTimeout(timer); }
+}
+
+/* The device ID never changes for this device, but reading it costs a
+   slow `tailscale status --json` call every time — and every API
+   operation (key expiry, routes) used to pay that cost, which is why
+   flipping the subnet toggle felt like it took forever. Read it once
+   and keep it; a connect/disconnect clears it in case the identity
+   changed. */
+let cachedDeviceId = null;
+let lastDeviceId = null; // kept even across disconnects: a stale id only
+// risks a 404 on a verify call, and a 404 still proves the credential.
+async function selfDeviceId() {
+  if (cachedDeviceId) return { id: cachedDeviceId, error: null };
+  const st = await getStatus();
+  if (!st.installed) return { id: null, error: 'Tailscale is not installed on this computer.' };
+  if (!st.connected) return { id: null, error: 'Connect to Tailscale first.' };
+  if (!st.deviceId) return { id: null, error: 'Could not find this device in Tailscale status.' };
+  cachedDeviceId = st.deviceId;
+  lastDeviceId = st.deviceId;
+  return { id: st.deviceId, error: null };
+}
+
+/* One API call with the resolved credential; on a 401 with OAuth the
+   cached token is dropped and the call is retried once with a fresh one. */
+async function apiCallWithAuth(apiPath, auth, opts) {
+  const first = await resolveApiAuth(auth);
+  if (first.error) return { ok: false, status: 0, body: null, error: first.error, via: first.via || null };
+  const r = await apiFetch(apiPath, first.header, opts);
+  if (r.status === 401 && first.via === 'oauth') {
+    oauthTokenCache = null;
+    const second = await resolveApiAuth(auth);
+    if (second.error) return { ok: false, status: 0, body: null, error: second.error, via: 'oauth' };
+    const r2 = await apiFetch(apiPath, second.header, opts);
+    return { ok: r2.ok, status: r2.status, body: r2.body, error: r2.error, via: 'oauth' };
+  }
+  return { ok: r.ok, status: r.status, body: r.body, error: r.error, via: first.via };
+}
+
+function authRefusedError(via, status, scope) {
+  const need = scope || 'devices:core';
+  if (via === 'oauth') return 'Tailscale API refused the OAuth client (HTTP ' + status + '). Check the client ID and secret, and that the client has the ' + need + ' scope.';
+  return 'Tailscale API refused the token (HTTP ' + status + '). Check the API access token in the VPN settings.';
+}
+
+/* Does the saved credential actually work? "Saved" says nothing about
+   that, so the UI shows a word instead — Connected or Disconnected.
+   Any non-401/403 answer proves the credential authenticates, so even
+   a 404 (device id unknown — e.g. never connected on this machine)
+   counts as valid; only a refused auth or a failed exchange means the
+   credential itself is wrong. Returns { valid, via?, error? }. */
+async function verifyApiAuth(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if (!a.clientId && !a.apiToken) return { valid: false, error: 'No API credentials saved.' };
+  const idRes = await selfDeviceId().catch(() => ({ id: null }));
+  const id = (idRes && idRes.id) || lastDeviceId || 'nUNKNOWN';
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id), auth, { method: 'GET' });
+  if (r.ok) return { valid: true, via: r.via };
+  if (r.status === 404) return { valid: true, via: r.via };
+  if (r.status === 401 || r.status === 403) return { valid: false, via: r.via, error: authRefusedError(r.via, r.status) };
+  return { valid: false, via: r.via || null, error: r.error || ('Tailscale API answered HTTP ' + (r.status || '?') + '.') };
+}
+
+async function disableKeyExpiryViaApi(auth) {
+  return setKeyExpiryDisabled(auth, true);
+}
+
+/* Set the key-expiry flag either way: disabled=true turns expiry off
+   (the toggle ON), disabled=false turns it back on (the toggle OFF).
+   The toggle is a real switch, not a preference — flipping it calls
+   this immediately and the state line shows what the API says. */
+async function setKeyExpiryDisabled(auth, disabled) {
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/key', auth, { method: 'POST', body: { keyExpiryDisabled: !!disabled } });
+  if (r.ok) return { success: true, via: 'api' };
+  if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
+  return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+}
+
+async function enableKeyExpiry(auth) {
+  return setKeyExpiryDisabled(auth, false);
+}
+
+/* ---------- Tailscale API: subnet route approval ----------
+ * Advertising a route (tailscale up --advertise-routes) is only half
+ * the job: the route does nothing until the tailnet admin approves it.
+ * The admin console approval is the same API call the console itself
+ * makes — POST /device/{deviceId}/routes {"routes": [...]} (scope
+ * devices:routes) — so with an OAuth client or API token saved, the
+ * app approves the route itself and the console button is not needed.
+ * Without a credential the app can only advertise, and the user still
+ * has to approve it in the console. GET /device/{deviceId}/routes
+ * returns the real state ({routes: [{route, advertised, enabled}]}),
+ * so the view can say whether the route is approved or still waiting. */
+async function getDeviceRoutes(auth) {
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/routes', auth, { method: 'GET' });
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status, 'devices:routes') };
+    return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+  }
+  const routes = Array.isArray((r.body || {}).routes) ? r.body.routes : [];
+  return { success: true, routes: routes.map((x) => ({ route: x.route, advertised: !!x.advertised, enabled: !!x.enabled })) };
+}
+
+async function approveRoutes(auth, routes) {
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id) + '/routes', auth, { method: 'POST', body: { routes: routes || [] } });
+  if (r.ok) return { success: true, via: 'api' };
+  if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status, 'devices:routes') };
+  return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+}
+
+/* The real key-expiry state of this device, from the API. Returns
+   { success, disabled, expires } — disabled is the flag itself, so it
+   stays true even though the `expires` timestamp goes stale after the
+   flag is set (Tailscale keeps the original expiry time). */
+async function getKeyExpiryState(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if (!a.clientId && !a.apiToken) return { success: false, error: 'No API credential saved.' };
+  const { id, error } = await selfDeviceId();
+  if (!id) return { success: false, error };
+  const r = await apiCallWithAuth('/device/' + encodeURIComponent(id), auth, { method: 'GET' });
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) return { success: false, error: authRefusedError(r.via, r.status) };
+    return { success: false, error: r.error || ('Tailscale API error (HTTP ' + (r.status || '?') + ').') };
+  }
+  const b = r.body || {};
+  return { success: true, disabled: b.keyExpiryDisabled === true, expires: b.expires || null };
+}
+
+/* Disable key expiry for this device. With a saved credential the
+   documented API route is used (OAuth first, then API token); without
+   one the old CLI call is kept as a fallback (it fails on current
+   Tailscale builds — there is no --key-expiry flag — but the real
+   error is now returned instead of being swallowed). Tailscale
+   normally makes the node key expire after 180 days and asks for
+   another sign-in; with expiry off the device stays connected
+   forever. Returns { success, error?, via? }. */
+async function disableKeyExpiry(auth) {
+  const a = typeof auth === 'string' ? { apiToken: auth } : (auth || {});
+  if ((a.clientId && a.clientSecret) || (a.apiToken && String(a.apiToken).trim())) return disableKeyExpiryViaApi(auth);
   const st = await getStatus();
   if (!st.installed) return { success: false, error: 'Tailscale is not installed on this computer.' };
   if (!st.connected) return { success: false, error: 'Connect to Tailscale first.' };
@@ -231,13 +528,14 @@ async function disableKeyExpiry() {
     const msg = (r.stderr || '').trim() || 'Could not disable key expiry.';
     return { success: false, error: msg };
   }
-  return { success: true };
+  return { success: true, via: 'cli' };
 }
 
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
-  disableKeyExpiry, pickLanSubnet, tailnetFromDns, buildInstallScript,
+  disableKeyExpiry, enableKeyExpiry, getKeyExpiryState, verifyApiAuth, disableKeyExpiryViaApi, exchangeOAuthToken, getDeviceRoutes, approveRoutes, pickLanSubnet, tailnetFromDns, buildInstallScript,
+  parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,
 };
 
 /* ---------- Auto-install (Windows only) ----------
@@ -342,8 +640,31 @@ function verifySignature(file) {
 /* The PowerShell that runs the MSI install elevated. Extracted so it
    is testable: $p.WaitForExit() — not Start-Process -Wait, which is
    known to return early when combined with -Verb RunAs, leaving the
-   installer still running while the app thinks it finished. */
-function buildInstallScript(msiPath) {
+   installer still running while the app thinks it finished.
+   Two ways to get administrator rights:
+   - no adminUser: -Verb RunAs, the Windows UAC prompt asks an
+     administrator to approve (the normal case).
+   - adminUser: the MSI runs as the administrator account the user
+     typed (a domain PC where the user is not an admin). The password
+     is NEVER in this script — it is fed on the install process's
+     stdin and read here into a SecureString, so it appears in no
+     file, no command line and no log. */
+function buildInstallScript(msiPath, adminUser) {
+  if (adminUser) {
+    return [
+      '$ErrorActionPreference = "Stop"',
+      'try {',
+      '  $pass = [Console]::In.ReadToEnd() -replace \'\\r?\\n$\', \'\'',
+      '  $sec = ConvertTo-SecureString $pass -AsPlainText -Force',
+      '  $cred = New-Object System.Management.Automation.PSCredential(\'' + String(adminUser).replace(/'/g, "''") + '\', $sec)',
+      '  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList \'/i\', \'"' + msiPath + '"\', \'/qn\', \'/norestart\', \'TS_NOLAUNCH=true\' -Credential $cred -PassThru',
+      '  $p.WaitForExit()',
+      '  exit $p.ExitCode',
+      '} catch {',
+      '  exit 2',
+      '}',
+    ].join('\r\n');
+  }
   return [
     '$ErrorActionPreference = "Stop"',
     'try {',
@@ -356,15 +677,20 @@ function buildInstallScript(msiPath) {
   ].join('\r\n');
 }
 
-/* Silent per-machine MSI install, elevated once via UAC.
+/* Silent per-machine MSI install, elevated once via UAC — or, when
+   adminCreds { user, password } is given (a domain PC), run as that
+   administrator account instead of the UAC prompt. The password is
+   used once, in memory only: it travels on the install process's
+   stdin, is never written to a file or a log, and is never stored.
    TS_NOLAUNCH=true stops the Tailscale tray app from popping up —
    TechVision is the UI here. Returns { success, declined?, error? }. */
-function installMsiElevated(msiPath) {
+function installMsiElevated(msiPath, adminCreds) {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') return resolve({ success: false, error: 'Automatic install is available on Windows only.' });
     const scriptPath = path.join(os.tmpdir(), 'techvision-install-tailscale.ps1');
-    fs.writeFileSync(scriptPath, buildInstallScript(msiPath), 'utf8');
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { timeout: 600000, windowsHide: true }, (err) => {
+    const hasCreds = !!(adminCreds && adminCreds.user && adminCreds.password);
+    fs.writeFileSync(scriptPath, buildInstallScript(msiPath, hasCreds ? adminCreds.user : null), 'utf8');
+    const child = execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { timeout: 600000, windowsHide: true }, (err) => {
       try { fs.unlinkSync(scriptPath); } catch (e) {}
       if (err) {
         if (err.code === 2) return resolve({ success: false, declined: true, error: 'Installation was cancelled (administrator permission was not granted).' });
@@ -372,6 +698,13 @@ function installMsiElevated(msiPath) {
       }
       resolve({ success: true });
     });
+    // Feed the administrator password on stdin only when the
+    // credential path is used; close stdin either way so the script
+    // never blocks waiting for input it will not read.
+    if (child.stdin) {
+      try { if (hasCreds) child.stdin.write(String(adminCreds.password) + '\n'); } catch (e) {}
+      try { child.stdin.end(); } catch (e) {}
+    }
   });
 }
 
@@ -389,11 +722,12 @@ async function waitForCli(timeoutMs) {
    downloading / verifying / installing / waiting / connecting.
    onAuthUrl(url) fires the moment the sign-in URL appears, so the
    browser opens without waiting for `tailscale up` to finish. */
-async function installAndConnect(progress, onAuthUrl) {
+async function installAndConnect(progress, onAuthUrl, adminCreds) {
   const emit = (phase, pct, text) => { if (progress) { try { progress({ phase, pct, text }); } catch (e) {} } };
   if (process.platform !== 'win32') {
     return { success: false, error: 'Automatic install is available on Windows only. Install Tailscale from tailscale.com/download, then press Connect.' };
   }
+  const hasCreds = !!(adminCreds && adminCreds.user && adminCreds.password);
   const st0 = await getStatus();
   if (st0.installed) return setConnected(true, undefined, onAuthUrl);
   const dir = path.join(os.tmpdir(), 'TechVision');
@@ -415,8 +749,8 @@ async function installAndConnect(progress, onAuthUrl) {
     const why = v.detail ? ' (' + v.detail + ')' : (v.status && v.status !== 'unsupported-platform' ? ' (signature status: ' + v.status + ')' : '');
     return { success: false, error: 'The downloaded installer could not be verified' + why + '. Install Tailscale manually from tailscale.com/download.' };
   }
-  emit('installing', 0, 'Installing Tailscale — Windows will ask for administrator permission once.');
-  const ins = await installMsiElevated(msi);
+  emit('installing', 0, hasCreds ? ('Installing Tailscale as ' + adminCreds.user + '…') : 'Installing Tailscale — Windows will ask for administrator permission once.');
+  const ins = await installMsiElevated(msi, hasCreds ? adminCreds : null);
   try { fs.unlinkSync(msi); } catch (e) {}
   if (!ins.success) return { success: false, error: ins.error || 'Tailscale installation failed.' };
   emit('waiting', 0, 'Waiting for Tailscale…');
