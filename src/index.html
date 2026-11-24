@@ -515,9 +515,16 @@
     <div class="card" id="wgServerCard">
       <div class="vpn-sec-label">Server — this machine is the hub</div>
       <div class="vpn-facts">
-        <div class="vpn-fact-tile"><div class="t-label">Tunnel address</div><div class="vpn-fact" id="wgServerIp">10.0.0.1</div></div>
-        <div class="vpn-fact-tile"><div class="t-label">Port</div><div class="vpn-fact" id="wgServerPort">UDP 51820</div></div>
         <div class="vpn-fact-tile"><div class="t-label">Public key</div><div class="vpn-fact" id="wgServerKey">—</div></div>
+      </div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Tunnel address &amp; port</div>
+        <div class="t-sub">This server's address inside the tunnel, and the UDP port your router forwards. Defaults: 10.0.0.1 and 51820.</div>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+          <input type="text" id="wgServerIp" placeholder="10.0.0.1" autocomplete="off" style="flex:1; min-width:140px;">
+          <input type="text" id="wgServerPort" placeholder="51820" autocomplete="off" inputmode="numeric" style="flex:1; min-width:100px;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgServerSettingsSaveBtn">Save</button>
+        </div>
       </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
         <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>

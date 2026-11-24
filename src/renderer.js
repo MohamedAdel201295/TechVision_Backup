@@ -2293,7 +2293,14 @@
     var sb = $('wgServerBtn');
     if (sb) { sb.textContent = st.serverRunning ? 'Stop server' : 'Start server'; sb.classList.toggle('btn-primary', !st.serverRunning); }
     var sk = $('wgServerKey'); if (sk) sk.textContent = (st.server && st.server.publicKey) || '—';
-    var sp = $('wgServerPort'); if (sp) sp.textContent = 'UDP ' + ((st.server && st.server.listenPort) || 51820);
+    // Editable server settings: prefill from status, never clobber
+    // typing (same guard as the endpoint input).
+    var si = $('wgServerIp');
+    if (si && document.activeElement !== si) si.value = (st.server && st.server.address) || '10.0.0.1';
+    var sp = $('wgServerPort');
+    if (sp && document.activeElement !== sp) sp.value = String((st.server && st.server.listenPort) || 51820);
+    var ph = $('wgPortHint');
+    if (ph) ph.textContent = 'On your router, forward UDP ' + ((st.server && st.server.listenPort) || 51820) + ' to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.';
     var ep = $('wgEndpoint');
     if (ep && document.activeElement !== ep) ep.value = (st.server && st.server.endpoint) || '';
     var cs = $('wgClientStatus');
@@ -3340,6 +3347,18 @@
       if (r && r.success) toast('Endpoint saved', v.trim() ? ('Clients will connect to ' + r.endpoint + '.') : 'Endpoint cleared — the public IP will be read automatically.', 'success');
       else toast('Save failed', (r && r.error) || 'Could not save the endpoint.', 'error');
     } catch (e) { toast('Save failed', e && e.message ? e.message : 'Could not save the endpoint.', 'error'); }
+    await loadWireGuard();
+  });
+  var wgSs = $('wgServerSettingsSaveBtn');
+  if (wgSs) wgSs.addEventListener('click', async function () {
+    if (!api || typeof api.wgSetServerSettings !== 'function') return wgMissing();
+    var addr = ($('wgServerIp') || {}).value || '';
+    var port = ($('wgServerPort') || {}).value || '';
+    try {
+      var r = await api.wgSetServerSettings({ address: addr, listenPort: port });
+      if (r && r.success) toast('Server settings saved', 'Tunnel address ' + r.address + ', UDP port ' + r.listenPort + (r.restarted ? ' — the running server was rebuilt with them.' : ' — they apply the next time the server starts.'), 'success');
+      else toast('Save failed', (r && r.error) || 'Could not save the server settings.', 'error');
+    } catch (e) { toast('Save failed', e && e.message ? e.message : 'Could not save the server settings.', 'error'); }
     await loadWireGuard();
   });
   var wgPa = $('wgPeerAddBtn');

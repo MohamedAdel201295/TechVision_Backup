@@ -115,7 +115,10 @@ function getWgConfig() {
   if (typeof s.privateKey !== 'string') s.privateKey = '';
   if (typeof s.publicKey !== 'string') s.publicKey = '';
   if (typeof s.address !== 'string' || !s.address) s.address = wireguard.SERVER_ADDRESS;
-  if (!s.listenPort) s.listenPort = wireguard.LISTEN_PORT;
+  // Stored as a bare IPv4 (old configs carried '10.0.0.1/24'); the
+  // builders add the /24 themselves, and the UI shows the bare IP.
+  if (s.address.indexOf('/') >= 0) s.address = s.address.split('/')[0];
+  if (!Number.isInteger(s.listenPort) || s.listenPort < 1 || s.listenPort > 65535) s.listenPort = wireguard.LISTEN_PORT;
   if (typeof s.endpoint !== 'string') s.endpoint = '';
   if (!Array.isArray(s.peers)) s.peers = [];
   if (!('client' in wgConfig)) wgConfig.client = null;
@@ -2361,6 +2364,43 @@ ipcMain.handle('wg-set-endpoint', async (event, endpoint) => {
     return { success: true, endpoint: host };
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not save the endpoint.' }; }
 });
+// Editable server settings (the server card's tunnel address + UDP
+// port inputs). Validated by wireguard.validateServerSettings —
+// bad input saves nothing. A same-/24 address change is allowed
+// anytime (peers keep their tunnel IPs); a move to another /24
+// while peers exist is refused there. The port is derived into the
+// endpoint (host:port) automatically. If the server is running and
+// anything changed, the tunnel service is rebuilt with the new
+// config — the same build + install calls wg-start-server uses —
+// so the change takes effect at once; a stopped server just picks
+// the new values up at the next start.
+ipcMain.handle('wg-set-server-settings', async (event, opts) => {
+  try {
+    const c = getWgConfig();
+    const v = wireguard.validateServerSettings(
+      { address: c.server.address, listenPort: c.server.listenPort, peerCount: (c.server.peers || []).length },
+      opts || {});
+    if (!v.ok) return { success: false, error: v.error };
+    const changed = v.address !== c.server.address || v.listenPort !== c.server.listenPort;
+    c.server.address = v.address;
+    c.server.listenPort = v.listenPort;
+    saveWgConfig();
+    let restarted = false, restartError = null;
+    if (changed) {
+      try {
+        const st = await wireguard.getStatus();
+        if (st.serverRunning) {
+          const conf = wireguard.buildServerConf({ privateKey: c.server.privateKey, address: c.server.address, listenPort: c.server.listenPort, peers: c.server.peers, extraInterfaceLines: wgObfuscationLines() });
+          const r = await wireguard.installTunnelService(wireguard.SERVER_TUNNEL, conf);
+          if (!r.success) restartError = r.error;
+          else restarted = true;
+        }
+      } catch (e) { restartError = e && e.message ? e.message : String(e); }
+    }
+    if (restartError) return { success: false, error: 'Settings saved, but the running server could not be rebuilt: ' + restartError + ' Restart the server to apply them.', address: v.address, listenPort: v.listenPort };
+    return { success: true, address: v.address, listenPort: v.listenPort, restarted };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not save the server settings.' }; }
+});
 // Add one peer by hand: the client shows its public key, the user
 // pastes it here (one paste, once). The tunnel address is allocated
 // by the app — the user never picks an IP. If the server is running,
@@ -2380,8 +2420,9 @@ async function wgAddPeerInternal(name, publicKey) {
   if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'That is not a valid WireGuard public key (44 characters, ending in =).' };
   const c = getWgConfig();
   if ((c.server.peers || []).some((p) => p.publicKey === publicKey)) return { success: false, error: 'This device is already a peer.' };
-  const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp));
-  if (!tunnelIp) return { success: false, error: 'No free tunnel address left (10.0.0.2 – 10.0.0.254 are all taken).' };
+  const subnet = wireguard.tunnelSubnetFor(c.server.address);
+  const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp), subnet);
+  if (!tunnelIp) { const b = subnet.replace(/\.0\/24$/, ''); return { success: false, error: 'No free tunnel address left (' + b + '.2 – ' + b + '.254 are all taken).' }; }
   const peer = { name, publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
   c.server.peers.push(peer);
   saveWgConfig();
@@ -2440,12 +2481,13 @@ ipcMain.handle('wg-generate-invite', async (event, opts) => {
       try { const ip = await cloudServerMod.detectPublicIP(); if (ip) { c.server.endpoint = ip; saveWgConfig(); } } catch (e) {}
     }
     if (!c.server.endpoint) return { success: false, error: 'No public address for this server yet. Type a DDNS hostname in the Server panel, or check the internet connection.' };
-    const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp));
-    if (!tunnelIp) return { success: false, error: 'No free tunnel address left (10.0.0.2 – 10.0.0.254 are all taken).' };
+    const subnet = wireguard.tunnelSubnetFor(c.server.address);
+    const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp), subnet);
+    if (!tunnelIp) { const b = subnet.replace(/\.0\/24$/, ''); return { success: false, error: 'No free tunnel address left (' + b + '.2 – ' + b + '.254 are all taken).' }; }
     const kp = await wireguard.genkeypair();
     if (!kp.success) return { success: false, error: kp.error };
-    const endpoint = c.server.endpoint + ':' + c.server.listenPort;
-    const conf = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: c.server.publicKey, endpoint, allowedIPs: wireguard.TUNNEL_SUBNET, extraInterfaceLines: wgObfuscationLines() });
+    const endpoint = wireguard.serverEndpoint(c.server.endpoint, c.server.listenPort);
+    const conf = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: c.server.publicKey, endpoint, allowedIPs: wireguard.tunnelSubnetFor(c.server.address), extraInterfaceLines: wgObfuscationLines() });
     const peer = { name, publicKey: kp.publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
     c.server.peers.push(peer);
     saveWgConfig();
@@ -2617,7 +2659,7 @@ ipcMain.handle('wg-cloudjoin-approve', async (event, opts) => {
     let extraInterfaceLines = [];
     try { extraInterfaceLines = wgObfuscationLines(); }
     catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read the obfuscation settings.' }; }
-    const endpoint = c.server.endpoint ? c.server.endpoint + ':' + c.server.listenPort : '';
+    const endpoint = wireguard.serverEndpoint(c.server.endpoint, c.server.listenPort);
     return await cloudJoin.approveJoinRequest(wgJoinStoreInstance, String((opts && opts.id) || ''), {
       serverPublicKey: c.server.publicKey,
       endpoint,
@@ -2776,14 +2818,8 @@ ipcMain.handle('wg-nat-save', async (event, input) => {
     const c = getWgConfig();
     const peer = (c.server.peers || []).find((p) => p.tunnelIp === cfg.remoteTunnelIp);
     if (!peer) return { success: false, error: 'The remote gateway (' + cfg.remoteTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save the NAT configuration.', errors: ['The remote gateway (' + cfg.remoteTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save the NAT configuration.'] };
-    const tunnelCidr = natGateway.parseCidr(wireguard.TUNNEL_SUBNET);
-    const tunnelClash = [];
-    if (cfg.mode === 'same-subnet') {
-      if (tunnelCidr && natGateway.inSubnet(cfg.farVirtIp, tunnelCidr)) tunnelClash.push('farVirtIp ' + cfg.farVirtIp + ' is inside the tunnel subnet ' + wireguard.TUNNEL_SUBNET + ' — a virtual address must be on the LAN.');
-      cfg.mappings.forEach((m, i) => {
-        if (tunnelCidr && natGateway.inSubnet(m.virt, tunnelCidr)) tunnelClash.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is inside the tunnel subnet ' + wireguard.TUNNEL_SUBNET + ' — a virtual address must be on the LAN.');
-      });
-    }
+    const tunnelSubnet = wireguard.tunnelSubnetFor(c.server.address);
+    const tunnelClash = natGateway.tunnelSubnetClashes(cfg, tunnelSubnet);
     if (tunnelClash.length > 0) return { success: false, error: tunnelClash[0], errors: tunnelClash };
     c.nat = cfg;
     saveWgConfig();

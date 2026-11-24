@@ -113,6 +113,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wgStartServer: () => ipcRenderer.invoke('wg-start-server'),
   wgStopServer: () => ipcRenderer.invoke('wg-stop-server'),
   wgSetEndpoint: (endpoint) => ipcRenderer.invoke('wg-set-endpoint', endpoint),
+  wgSetServerSettings: (opts) => ipcRenderer.invoke('wg-set-server-settings', opts),
   wgAddPeer: (opts) => ipcRenderer.invoke('wg-add-peer', opts),
   wgRemovePeer: (opts) => ipcRenderer.invoke('wg-remove-peer', opts),
   wgGenerateInvite: (opts) => ipcRenderer.invoke('wg-generate-invite', opts),

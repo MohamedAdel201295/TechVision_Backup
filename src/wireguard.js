@@ -552,17 +552,87 @@ async function removePeer(iface, publicKey) {
 }
 
 /* ---------- address allocation ---------- */
-/* Next free 10.0.0.x for a new peer, starting at .2 (.1 is the
+/* The /24 tunnel subnet for a server address: '10.8.0.1' (or
+   '10.8.0.1/24') -> '10.8.0.0/24'. The tunnel is always a /24 and
+   the server holds one address in it. Garbage falls back to the
+   default TUNNEL_SUBNET. */
+function tunnelSubnetFor(address) {
+  const ip = tunnelIpOf(address);
+  if (!ip || !isValidIpv4(ip)) return TUNNEL_SUBNET;
+  return ip.split('.').slice(0, 3).join('.') + '.0/24';
+}
+
+/* Strict IPv4: four decimal octets, no leading zeros (octal
+   ambiguity), each 0-255 — and not the all-zeros or all-ones
+   address, neither of which can be a tunnel address. */
+function isValidIpv4(s) {
+  const m = String(s || '').trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  for (let i = 1; i <= 4; i++) {
+    if (m[i].length > 1 && m[i][0] === '0') return false;
+    const n = parseInt(m[i], 10);
+    if (n < 0 || n > 255) return false;
+  }
+  if (m[1] === '0' && m[2] === '0' && m[3] === '0' && m[4] === '0') return false;
+  if (m[1] === '255' && m[2] === '255' && m[3] === '255' && m[4] === '255') return false;
+  return true;
+}
+
+/* The endpoint clients connect to: host + ':' + port, or '' when no
+   host is saved yet. One place so a listen-port change flows to
+   every consumer (invite, Cloud-join approval) the same way. */
+function serverEndpoint(host, listenPort) {
+  const h = String(host || '').trim();
+  if (!h) return '';
+  return h + ':' + listenPort;
+}
+
+/* Validates a server-settings change (the UI's editable tunnel
+   address + listen port). current: {address, listenPort, peerCount};
+   input: {address, listenPort} (strings or numbers). Returns
+   {ok:true, address, listenPort} with the address bare (no /24)
+   and the port a number, or {ok:false, error}. A move to a
+   different /24 while peers exist is refused — the peers hold
+   tunnel addresses in the old subnet and their configs would
+   break; remove them first, or stay in the current subnet. */
+function validateServerSettings(current, input) {
+  const cur = current || {};
+  const inp = input || {};
+  const rawAddress = String(inp.address == null ? '' : inp.address).trim();
+  if (!isValidIpv4(rawAddress)) return { ok: false, error: 'Tunnel address must be a valid IPv4 address, e.g. 10.0.0.1.' };
+  const rawPort = inp.listenPort;
+  let portNum;
+  if (typeof rawPort === 'number') portNum = rawPort;
+  else if (typeof rawPort === 'string' && /^\d+$/.test(rawPort.trim())) portNum = parseInt(rawPort.trim(), 10);
+  else return { ok: false, error: 'Port must be a whole number between 1 and 65535.' };
+  if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return { ok: false, error: 'Port must be a whole number between 1 and 65535.' };
+  const curSubnet = tunnelSubnetFor(cur.address);
+  const newSubnet = tunnelSubnetFor(rawAddress);
+  const peerCount = cur.peerCount || 0;
+  if (peerCount > 0 && curSubnet !== newSubnet) {
+    return { ok: false, error: 'That address is in a different subnet (' + newSubnet + ') than the current one (' + curSubnet + '). The ' + peerCount + ' device(s) already added hold tunnel addresses in ' + curSubnet + ' — remove them first, or pick an address in ' + curSubnet + '.' };
+  }
+  return { ok: true, address: rawAddress, listenPort: portNum };
+}
+
+/* Next free x.x.x.x for a new peer, starting at .2 (.1 is the
    server). Returns null when the /24 is full — 253 peers is the
-   practical cap of one server tunnel. */
-function nextTunnelIp(usedIps) {
+   practical cap of one server tunnel. The subnet defaults to
+   TUNNEL_SUBNET; callers with a moved server address pass the
+   effective subnet from tunnelSubnetFor(). */
+function nextTunnelIp(usedIps, subnet) {
+  const m = String(subnet || TUNNEL_SUBNET).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.0\/24$/);
+  const prefix = m ? m[1] + '.' + m[2] + '.' + m[3] + '.' : '10.0.0.';
   const used = new Set();
   for (const ip of usedIps || []) {
-    const m = String(ip || '').match(/^10\.0\.0\.(\d{1,3})$/);
-    if (m) used.add(parseInt(m[1], 10));
+    const s = String(ip || '');
+    if (s.indexOf(prefix) === 0) {
+      const rest = s.slice(prefix.length);
+      if (/^\d{1,3}$/.test(rest)) used.add(parseInt(rest, 10));
+    }
   }
   for (let n = 2; n <= 254; n++) {
-    if (!used.has(n)) return '10.0.0.' + n;
+    if (!used.has(n)) return prefix + n;
   }
   return null;
 }
@@ -900,6 +970,7 @@ module.exports = {
   parseWgShowDump, parseWgShowInterfaces,
   installTunnelService, uninstallTunnelService,
   setPeer, removePeer, nextTunnelIp, tunnelIpOf,
+  isValidIpv4, tunnelSubnetFor, validateServerSettings, serverEndpoint,
   buildElevatedScript, resolveWg, resolveWireguard,
   resolveAmneziaWg, resolveAmneziaWireguard,
   setTransport, getTransport, setTransportBinaries, getTransportBinaries,

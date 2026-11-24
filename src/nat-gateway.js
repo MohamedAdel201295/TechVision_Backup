@@ -244,6 +244,23 @@ function translateAddress(table, ip, direction) {
  * It never throws, so a bad stored block can be reported instead of
  * crashing the start.
  */
+/* Virtual addresses that fall inside the tunnel subnet (same-subnet
+   mode only): a virtual address must be on the LAN, never inside
+   the tunnel. The subnet is passed in — it is the EFFECTIVE tunnel
+   subnet, derived from the saved server address, not the hardcoded
+   default: a server moved to 10.8.0.1 clashes on 10.8.0.x, not on
+   10.0.0.x. Returns the list of clash messages (empty = no clash). */
+function tunnelSubnetClashes(cfg, tunnelSubnet) {
+  const out = [];
+  const tunnelCidr = parseCidr(tunnelSubnet);
+  if (!cfg || cfg.mode !== 'same-subnet' || !tunnelCidr) return out;
+  if (inSubnet(cfg.farVirtIp, tunnelCidr)) out.push('farVirtIp ' + cfg.farVirtIp + ' is inside the tunnel subnet ' + tunnelSubnet + ' — a virtual address must be on the LAN.');
+  (cfg.mappings || []).forEach((m, i) => {
+    if (inSubnet(m.virt, tunnelCidr)) out.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is inside the tunnel subnet ' + tunnelSubnet + ' — a virtual address must be on the LAN.');
+  });
+  return out;
+}
+
 function validateNatConfig(input) {
   const errors = [];
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -793,7 +810,7 @@ module.exports = {
   isValidIp, ipToInt, intToIp, parseCidr, inSubnet, isNetworkOrBroadcast,
   sameSubnet, cidrsOverlap,
   createMappingTable, addMapping, removeMapping, findByReal, findByVirt,
-  translateAddress, validateMapping, validateNatConfig, allowedIPsForPeer,
+  translateAddress, validateMapping, validateNatConfig, tunnelSubnetClashes, allowedIPsForPeer,
   buildFilter, buildHelperConfig, helperConfigLine,
   helperPath, vendorDir, detectLanInterface,
   buildSetupScript, buildTeardownScript, runElevatedScript,
