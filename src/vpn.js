@@ -244,9 +244,22 @@ function downloadFile(url, dest, onProgress) {
           if (done > MAX_DOWNLOAD_BYTES) { req.destroy(); out.destroy(); return reject(new Error('Download is larger than expected.')); }
           if (onProgress) { try { onProgress(done, total); } catch (e) {} }
         });
-        res.on('error', (e) => { out.destroy(); reject(e); });
+        res.on('error', (e) => {
+          out.destroy();
+          // A connection that dies mid-download surfaces as a bare 'aborted'
+          // / 'socket hang up' — say what actually happened while we know
+          // how many bytes were expected.
+          if (total > 0 && done < total) return reject(new Error('Download incomplete (' + done + ' of ' + total + ' bytes).'));
+          reject(e);
+        });
         out.on('error', reject);
-        out.on('finish', () => resolve({ bytes: done, total }));
+        out.on('finish', () => {
+          // A connection that ends early still fires 'finish' — a short file
+          // would then fail the signature check with no explanation. Reject
+          // it here, while we still know the expected size.
+          if (total > 0 && done !== total) return reject(new Error('Download incomplete (' + done + ' of ' + total + ' bytes).'));
+          resolve({ bytes: done, total });
+        });
         res.pipe(out);
       });
       req.on('error', reject);
@@ -256,18 +269,22 @@ function downloadFile(url, dest, onProgress) {
   });
 }
 
-/* True only when the file is signed by Tailscale and the signature is
-   valid. Windows only; false everywhere else (and on any check failure). */
+/* Verifies the installer's Authenticode signature. Resolves
+   { ok, status, subject?, detail? } — the status is the reason the check
+   failed (e.g. 'NotTrusted', 'UnknownError'), so the user sees more than
+   a bare "could not be verified". Windows only; anywhere else, or on any
+   check failure, ok is false. */
 function verifySignature(file) {
   return new Promise((resolve) => {
-    if (process.platform !== 'win32') return resolve(false);
+    if (process.platform !== 'win32') return resolve({ ok: false, status: 'unsupported-platform' });
     const ps = "(Get-AuthenticodeSignature -FilePath '" + file.replace(/'/g, "''") + "' | Select-Object Status, @{N='Subject';E={$_.SignerCertificate.Subject}} | ConvertTo-Json -Compress)";
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 30000, windowsHide: true }, (err, stdout) => {
-      if (err) return resolve(false);
+      if (err) return resolve({ ok: false, status: 'check-failed', detail: (err.message || 'PowerShell check failed').slice(0, 120) });
       try {
         const j = JSON.parse(stdout);
-        resolve(j.Status === 'Valid' && typeof j.Subject === 'string' && /Tailscale/i.test(j.Subject));
-      } catch (e) { resolve(false); }
+        const valid = j.Status === 'Valid' && typeof j.Subject === 'string' && /Tailscale/i.test(j.Subject);
+        resolve({ ok: valid, status: j.Status || 'unknown', subject: j.Subject || null });
+      } catch (e) { resolve({ ok: false, status: 'check-failed', detail: 'could not read the signature result' }); }
     });
   });
 }
@@ -340,10 +357,11 @@ async function installAndConnect(progress) {
     return { success: false, error: 'Could not download Tailscale: ' + e.message };
   }
   emit('verifying', 0, 'Verifying the installer…');
-  const ok = await verifySignature(msi);
-  if (!ok) {
+  const v = await verifySignature(msi);
+  if (!v.ok) {
     try { fs.unlinkSync(msi); } catch (e) {}
-    return { success: false, error: 'The downloaded installer could not be verified. Install Tailscale manually from tailscale.com/download.' };
+    const why = v.detail ? ' (' + v.detail + ')' : (v.status && v.status !== 'unsupported-platform' ? ' (signature status: ' + v.status + ')' : '');
+    return { success: false, error: 'The downloaded installer could not be verified' + why + '. Install Tailscale manually from tailscale.com/download.' };
   }
   emit('installing', 0, 'Installing Tailscale — Windows will ask for administrator permission once.');
   const ins = await installMsiElevated(msi);
