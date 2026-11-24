@@ -1921,11 +1921,18 @@ ipcMain.handle('vpn-get-status', async () => {
 });
 ipcMain.handle('vpn-set-connected', async (event, on) => {
   try {
-    const r = await vpn.setConnected(!!on);
-    // `tailscale up` tries to open the sign-in page itself, but on some
-    // machines no browser appears — open it from here so the user is
-    // never stuck staring at a 60-second timeout.
-    if (r && r.authUrl) openLoginUrl(r.authUrl);
+    // Open the sign-in page at most once per press, as soon as a login
+    // URL is known — never after a 60-second wait for `tailscale up`.
+    let openedUrl = null;
+    const openOnce = (url) => { if (openedUrl === url) return; openedUrl = url; openLoginUrl(url); };
+    if (on) {
+      // Fast path: the daemon usually already holds a pending login URL
+      // (getStatus reports it), so the browser can open in ~1s without
+      // waiting for `tailscale up` to print one.
+      try { const st = await vpn.getStatus(); if (st && st.needsLogin && st.authUrl) openOnce(st.authUrl); } catch (e) {}
+    }
+    const r = await vpn.setConnected(!!on, undefined, (url) => openOnce(url));
+    if (r && r.authUrl) openOnce(r.authUrl);
     return r;
   }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
@@ -1940,10 +1947,12 @@ ipcMain.handle('vpn-disable-key-expiry', async () => {
 });
 ipcMain.handle('vpn-install-connect', async (event) => {
   try {
+    let openedUrl = null;
+    const openOnce = (url) => { if (openedUrl === url) return; openedUrl = url; openLoginUrl(url); };
     const r = await vpn.installAndConnect((p) => {
       try { if (!event.sender.isDestroyed()) event.sender.send('vpn-install-progress', p); } catch (e) {}
-    });
-    if (r && r.authUrl) openLoginUrl(r.authUrl);
+    }, (url) => openOnce(url));
+    if (r && r.authUrl) openOnce(r.authUrl);
     return r;
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install Tailscale.' }; }
 });

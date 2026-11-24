@@ -30,13 +30,23 @@ function resolveCli() {
   return 'tailscale';
 }
 
-function runCli(args, timeoutMs) {
+function runCli(args, timeoutMs, onData) {
   return new Promise((resolve) => {
     const child = execFile(resolveCli(), args, { timeout: timeoutMs || 15000, windowsHide: true }, (err, stdout, stderr) => {
       if (err && err.code === 'ENOENT') return resolve({ code: -1, stdout: '', stderr: '', notFound: true });
       if (err && err.killed) return resolve({ code: -2, stdout: stdout || '', stderr: stderr || '', timedOut: true });
       resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
     });
+    // Stream output as it arrives: `tailscale up` prints the sign-in URL
+    // and then blocks for up to 60s waiting for the browser login. A
+    // caller that needs the URL (to open the browser itself) must not
+    // wait for the process to exit first — that was a 60-second delay
+    // before the browser opened on a real device.
+    if (onData) {
+      const feed = (d) => { try { onData(String(d)); } catch (e) {} };
+      if (child.stdout) child.stdout.on('data', feed);
+      if (child.stderr) child.stderr.on('data', feed);
+    }
   });
 }
 
@@ -162,9 +172,19 @@ function extractLoginUrl(text) {
   return m ? m[0] : null;
 }
 
-async function setConnected(on, timeoutMs) {
+async function setConnected(on, timeoutMs, onAuthUrl) {
   const args = on ? ['up'] : ['down'];
-  const r = await runCli(args, timeoutMs || 60000);
+  // Fire onAuthUrl the moment the sign-in URL appears in the output —
+  // `tailscale up` blocks for up to 60s waiting for the browser login,
+  // so waiting for it to exit first delays the browser by a full minute.
+  // The output is accumulated because a chunk may split the URL.
+  let streamed = '', urlSeen = null;
+  const r = await runCli(args, timeoutMs || 60000, (chunk) => {
+    if (!on || !onAuthUrl || urlSeen) return;
+    streamed += chunk;
+    const url = extractLoginUrl(streamed);
+    if (url) { urlSeen = url; onAuthUrl(url); }
+  });
   if (r.notFound) return { success: false, error: 'Tailscale is not installed on this computer.' };
   if (r.timedOut) {
     // `tailscale up` blocks while it waits for the browser sign-in — and
@@ -366,14 +386,16 @@ async function waitForCli(timeoutMs) {
 }
 
 /* Full one-click flow. progress({ phase, pct, text }) reports
-   downloading / verifying / installing / waiting / connecting. */
-async function installAndConnect(progress) {
+   downloading / verifying / installing / waiting / connecting.
+   onAuthUrl(url) fires the moment the sign-in URL appears, so the
+   browser opens without waiting for `tailscale up` to finish. */
+async function installAndConnect(progress, onAuthUrl) {
   const emit = (phase, pct, text) => { if (progress) { try { progress({ phase, pct, text }); } catch (e) {} } };
   if (process.platform !== 'win32') {
     return { success: false, error: 'Automatic install is available on Windows only. Install Tailscale from tailscale.com/download, then press Connect.' };
   }
   const st0 = await getStatus();
-  if (st0.installed) return setConnected(true);
+  if (st0.installed) return setConnected(true, undefined, onAuthUrl);
   const dir = path.join(os.tmpdir(), 'TechVision');
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
   const msi = path.join(dir, 'tailscale-setup-latest-amd64.msi');
@@ -401,5 +423,5 @@ async function installAndConnect(progress) {
   const found = await waitForCli(60000);
   if (!found) return { success: false, error: 'Tailscale was installed but the command was not found. Restart the app and try again.' };
   emit('connecting', 0, 'Connecting…');
-  return setConnected(true);
+  return setConnected(true, undefined, onAuthUrl);
 }
