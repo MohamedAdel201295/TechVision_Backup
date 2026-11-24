@@ -776,6 +776,24 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
     // new weekly job whose time had passed.
     return target;
   }
+  if (freq === 'custom') {
+    // Custom: run on the picked weekdays (schedule.days, JS day
+    // numbers 0=Sun..6=Sat) at the picked time. Scan today + the next
+    // 7 days for the first picked weekday; a picked weekday today
+    // whose time already passed is due now unless already run for it.
+    const days = Array.isArray(schedule.days) ? schedule.days.map((d) => Number(d)).filter((d) => d >= 0 && d <= 6) : [];
+    if (!days.length) return null;
+    const lastDate = lastRun ? new Date(lastRun) : null;
+    for (let i = 0; i < 8; i++) {
+      const cand = new Date(fromDate);
+      cand.setDate(cand.getDate() + i);
+      if (!days.includes(cand.getDay())) continue;
+      cand.setHours(target.getHours(), target.getMinutes(), 0, 0);
+      if (cand > fromDate) return cand;
+      if (i === 0 && (!lastDate || isNaN(lastDate) || lastDate < cand)) return cand;
+    }
+    return null;
+  }
   // A run time that already passed TODAY is due, not tomorrow — but
   // only if we have not already run for it (lastRun at/after target).
   // This is what makes a daily/monthly job actually fire, and what
@@ -1920,7 +1938,21 @@ ipcMain.handle('vpn-get-status', async () => {
   catch (e) { return { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
 });
 ipcMain.handle('vpn-set-connected', async (event, on) => {
-  try { return await vpn.setConnected(!!on); }
+  try {
+    // Open the sign-in page at most once per press, as soon as a login
+    // URL is known — never after a 60-second wait for `tailscale up`.
+    let openedUrl = null;
+    const openOnce = (url) => { if (openedUrl === url) return; openedUrl = url; openLoginUrl(url); };
+    if (on) {
+      // Fast path: the daemon usually already holds a pending login URL
+      // (getStatus reports it), so the browser can open in ~1s without
+      // waiting for `tailscale up` to print one.
+      try { const st = await vpn.getStatus(); if (st && st.needsLogin && st.authUrl) openOnce(st.authUrl); } catch (e) {}
+    }
+    const r = await vpn.setConnected(!!on, undefined, (url) => openOnce(url));
+    if (r && r.authUrl) openOnce(r.authUrl);
+    return r;
+  }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
 });
 ipcMain.handle('vpn-set-routes', async (event, on) => {
@@ -1933,14 +1965,39 @@ ipcMain.handle('vpn-disable-key-expiry', async () => {
 });
 ipcMain.handle('vpn-install-connect', async (event) => {
   try {
-    return await vpn.installAndConnect((p) => {
+    let openedUrl = null;
+    const openOnce = (url) => { if (openedUrl === url) return; openedUrl = url; openLoginUrl(url); };
+    const r = await vpn.installAndConnect((p) => {
       try { if (!event.sender.isDestroyed()) event.sender.send('vpn-install-progress', p); } catch (e) {}
-    });
+    }, (url) => openOnce(url));
+    if (r && r.authUrl) openOnce(r.authUrl);
+    return r;
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install Tailscale.' }; }
 });
 ipcMain.handle('vpn-open-download', async () => {
   try { await require('electron').shell.openExternal('https://tailscale.com/download'); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
+});
+// Opens a Tailscale sign-in link in the default browser. Only
+// login.tailscale.com URLs are ever opened from here.
+function openLoginUrl(url) {
+  try {
+    if (typeof url === 'string' && /^https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+$/.test(url)) require('electron').shell.openExternal(url);
+  } catch (e) {}
+}
+ipcMain.handle('vpn-open-auth-url', async (event, url) => {
+  try {
+    if (typeof url !== 'string' || !/^https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+$/.test(url)) return { success: false, error: 'Not a Tailscale sign-in link.' };
+    await require('electron').shell.openExternal(url);
+    return { success: true };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the sign-in page.' }; }
+});
+// Opens the Tailscale admin console (Machines page), where subnet routes
+// are approved. The app cannot approve its own route — Tailscale requires
+// the tailnet admin to do it in the console.
+ipcMain.handle('vpn-open-admin', async () => {
+  try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/machines'); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the admin console.' }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {

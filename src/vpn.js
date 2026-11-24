@@ -30,13 +30,23 @@ function resolveCli() {
   return 'tailscale';
 }
 
-function runCli(args, timeoutMs) {
+function runCli(args, timeoutMs, onData) {
   return new Promise((resolve) => {
     const child = execFile(resolveCli(), args, { timeout: timeoutMs || 15000, windowsHide: true }, (err, stdout, stderr) => {
       if (err && err.code === 'ENOENT') return resolve({ code: -1, stdout: '', stderr: '', notFound: true });
       if (err && err.killed) return resolve({ code: -2, stdout: stdout || '', stderr: stderr || '', timedOut: true });
       resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
     });
+    // Stream output as it arrives: `tailscale up` prints the sign-in URL
+    // and then blocks for up to 60s waiting for the browser login. A
+    // caller that needs the URL (to open the browser itself) must not
+    // wait for the process to exit first — that was a 60-second delay
+    // before the browser opened on a real device.
+    if (onData) {
+      const feed = (d) => { try { onData(String(d)); } catch (e) {} };
+      if (child.stdout) child.stdout.on('data', feed);
+      if (child.stderr) child.stderr.on('data', feed);
+    }
   });
 }
 
@@ -154,17 +164,42 @@ async function getStatus() {
   };
 }
 
-async function setConnected(on) {
+/* The Tailscale sign-in URL, from `tailscale up` output or a status
+   report. Only login.tailscale.com counts — never open an arbitrary URL
+   from CLI output in a browser. */
+function extractLoginUrl(text) {
+  const m = String(text || '').match(/https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+/);
+  return m ? m[0] : null;
+}
+
+async function setConnected(on, timeoutMs, onAuthUrl) {
   const args = on ? ['up'] : ['down'];
-  const r = await runCli(args, 60000);
+  // Fire onAuthUrl the moment the sign-in URL appears in the output —
+  // `tailscale up` blocks for up to 60s waiting for the browser login,
+  // so waiting for it to exit first delays the browser by a full minute.
+  // The output is accumulated because a chunk may split the URL.
+  let streamed = '', urlSeen = null;
+  const r = await runCli(args, timeoutMs || 60000, (chunk) => {
+    if (!on || !onAuthUrl || urlSeen) return;
+    streamed += chunk;
+    const url = extractLoginUrl(streamed);
+    if (url) { urlSeen = url; onAuthUrl(url); }
+  });
   if (r.notFound) return { success: false, error: 'Tailscale is not installed on this computer.' };
-  if (r.timedOut) return { success: false, error: 'Tailscale is taking a long time — if a browser sign-in window opened, complete it there, then press Refresh.' };
+  if (r.timedOut) {
+    // `tailscale up` blocks while it waits for the browser sign-in — and
+    // on some machines it never opens the browser at all. The login URL
+    // is in the output it already printed; hand it back instead of
+    // dropping it, so the app can open it itself.
+    const url = extractLoginUrl((r.stdout || '') + '\n' + (r.stderr || ''));
+    return { success: false, needsLogin: !!url, authUrl: url, error: 'Tailscale is taking a long time — if a browser sign-in window opened, complete it there, then press Refresh.' };
+  }
   const out = (r.stdout || '') + '\n' + (r.stderr || '');
   if (r.code !== 0) {
-    const url = (out.match(/https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+/) || [])[0] || null;
+    const url = extractLoginUrl(out);
     return { success: false, needsLogin: !!url, authUrl: url, error: 'Tailscale could not ' + (on ? 'connect' : 'disconnect') + '.' };
   }
-  const url = (out.match(/https:\/\/login\.tailscale\.com\/[A-Za-z0-9/?=&._-]+/) || [])[0] || null;
+  const url = extractLoginUrl(out);
   return { success: true, needsLogin: !!url, authUrl: url };
 }
 
@@ -201,7 +236,7 @@ async function disableKeyExpiry() {
 
 module.exports = {
   getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
-  installAndConnect, downloadFile, verifySignature, MSI_URL,
+  installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
   disableKeyExpiry, pickLanSubnet, tailnetFromDns, buildInstallScript,
 };
 
@@ -244,9 +279,22 @@ function downloadFile(url, dest, onProgress) {
           if (done > MAX_DOWNLOAD_BYTES) { req.destroy(); out.destroy(); return reject(new Error('Download is larger than expected.')); }
           if (onProgress) { try { onProgress(done, total); } catch (e) {} }
         });
-        res.on('error', (e) => { out.destroy(); reject(e); });
+        res.on('error', (e) => {
+          out.destroy();
+          // A connection that dies mid-download surfaces as a bare 'aborted'
+          // / 'socket hang up' — say what actually happened while we know
+          // how many bytes were expected.
+          if (total > 0 && done < total) return reject(new Error('Download incomplete (' + done + ' of ' + total + ' bytes).'));
+          reject(e);
+        });
         out.on('error', reject);
-        out.on('finish', () => resolve({ bytes: done, total }));
+        out.on('finish', () => {
+          // A connection that ends early still fires 'finish' — a short file
+          // would then fail the signature check with no explanation. Reject
+          // it here, while we still know the expected size.
+          if (total > 0 && done !== total) return reject(new Error('Download incomplete (' + done + ' of ' + total + ' bytes).'));
+          resolve({ bytes: done, total });
+        });
         res.pipe(out);
       });
       req.on('error', reject);
@@ -256,18 +304,37 @@ function downloadFile(url, dest, onProgress) {
   });
 }
 
-/* True only when the file is signed by Tailscale and the signature is
-   valid. Windows only; false everywhere else (and on any check failure). */
+/* Parses the JSON from Get-AuthenticodeSignature. Windows PowerShell 5.1's
+   ConvertTo-Json renders enums as NUMBERS (Valid = 0), while PowerShell 7
+   renders them as names — accept both, or a valid Tailscale signature is
+   misread as "unknown" (seen on a real device: the toast said
+   "signature status: unknown" for a properly signed installer). */
+function parseSignatureResult(stdout) {
+  try {
+    const j = JSON.parse(stdout);
+    const o = (j && typeof j === 'object' && !Array.isArray(j)) ? j : {};
+    const st = o.Status;
+    const statusName = typeof st === 'number' ? (st === 0 ? 'Valid' : 'Status(' + st + ')') : (st || 'unknown');
+    const subject = typeof o.Subject === 'string' ? o.Subject : null;
+    const valid = (st === 'Valid' || st === 0) && !!subject && /Tailscale/i.test(subject);
+    return { ok: valid, status: statusName, subject };
+  } catch (e) {
+    return { ok: false, status: 'check-failed', detail: 'could not read the signature result' };
+  }
+}
+
+/* Verifies the installer's Authenticode signature. Resolves
+   { ok, status, subject?, detail? } — the status is the reason the check
+   failed (e.g. 'NotTrusted', 'UnknownError'), so the user sees more than
+   a bare "could not be verified". Windows only; anywhere else, or on any
+   check failure, ok is false. */
 function verifySignature(file) {
   return new Promise((resolve) => {
-    if (process.platform !== 'win32') return resolve(false);
-    const ps = "(Get-AuthenticodeSignature -FilePath '" + file.replace(/'/g, "''") + "' | Select-Object Status, @{N='Subject';E={$_.SignerCertificate.Subject}} | ConvertTo-Json -Compress)";
+    if (process.platform !== 'win32') return resolve({ ok: false, status: 'unsupported-platform' });
+    const ps = "(Get-AuthenticodeSignature -FilePath '" + file.replace(/'/g, "''") + "' | Select-Object @{N='Status';E={$_.Status.ToString()}}, @{N='Subject';E={$_.SignerCertificate.Subject}} | ConvertTo-Json -Compress)";
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 30000, windowsHide: true }, (err, stdout) => {
-      if (err) return resolve(false);
-      try {
-        const j = JSON.parse(stdout);
-        resolve(j.Status === 'Valid' && typeof j.Subject === 'string' && /Tailscale/i.test(j.Subject));
-      } catch (e) { resolve(false); }
+      if (err) return resolve({ ok: false, status: 'check-failed', detail: (err.message || 'PowerShell check failed').slice(0, 120) });
+      resolve(parseSignatureResult(stdout));
     });
   });
 }
@@ -319,14 +386,16 @@ async function waitForCli(timeoutMs) {
 }
 
 /* Full one-click flow. progress({ phase, pct, text }) reports
-   downloading / verifying / installing / waiting / connecting. */
-async function installAndConnect(progress) {
+   downloading / verifying / installing / waiting / connecting.
+   onAuthUrl(url) fires the moment the sign-in URL appears, so the
+   browser opens without waiting for `tailscale up` to finish. */
+async function installAndConnect(progress, onAuthUrl) {
   const emit = (phase, pct, text) => { if (progress) { try { progress({ phase, pct, text }); } catch (e) {} } };
   if (process.platform !== 'win32') {
     return { success: false, error: 'Automatic install is available on Windows only. Install Tailscale from tailscale.com/download, then press Connect.' };
   }
   const st0 = await getStatus();
-  if (st0.installed) return setConnected(true);
+  if (st0.installed) return setConnected(true, undefined, onAuthUrl);
   const dir = path.join(os.tmpdir(), 'TechVision');
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
   const msi = path.join(dir, 'tailscale-setup-latest-amd64.msi');
@@ -340,10 +409,11 @@ async function installAndConnect(progress) {
     return { success: false, error: 'Could not download Tailscale: ' + e.message };
   }
   emit('verifying', 0, 'Verifying the installer…');
-  const ok = await verifySignature(msi);
-  if (!ok) {
+  const v = await verifySignature(msi);
+  if (!v.ok) {
     try { fs.unlinkSync(msi); } catch (e) {}
-    return { success: false, error: 'The downloaded installer could not be verified. Install Tailscale manually from tailscale.com/download.' };
+    const why = v.detail ? ' (' + v.detail + ')' : (v.status && v.status !== 'unsupported-platform' ? ' (signature status: ' + v.status + ')' : '');
+    return { success: false, error: 'The downloaded installer could not be verified' + why + '. Install Tailscale manually from tailscale.com/download.' };
   }
   emit('installing', 0, 'Installing Tailscale — Windows will ask for administrator permission once.');
   const ins = await installMsiElevated(msi);
@@ -353,5 +423,5 @@ async function installAndConnect(progress) {
   const found = await waitForCli(60000);
   if (!found) return { success: false, error: 'Tailscale was installed but the command was not found. Restart the app and try again.' };
   emit('connecting', 0, 'Connecting…');
-  return setConnected(true);
+  return setConnected(true, undefined, onAuthUrl);
 }

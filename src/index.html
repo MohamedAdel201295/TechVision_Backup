@@ -204,7 +204,7 @@
   </div>
   <div id="view-cloud" style="display:none;">
     <div class="view-head">
-      <div>
+      <div id="cloudViewHeadText">
         <h2 class="section-title" style="margin:0;">Cloud — your own remote drive</h2>
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Share a folder from this computer (Server) or open a shared folder on another computer (Client) — over your network or the internet, encrypted.</p>
       </div>
@@ -250,9 +250,9 @@
       <div class="field">
         <label for="cloudServerPort">Port</label>
         <input type="text" id="cloudServerPort" value="8443" autocomplete="off">
-        <div class="hint">Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.</div>
+        <div class="hint" id="cloudServerPortHint">Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.</div>
       </div>
-      <div class="field">
+      <div class="field" id="cloudServerAddrsField">
         <label>Addresses</label>
         <div id="cloudServerAddrs" class="cloud-muted">Detect your addresses to see them here.</div>
         <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn" style="margin-top:6px;">Detect my addresses</button>
@@ -267,7 +267,6 @@
       </div>
       <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
         <button class="btn btn-primary" type="button" id="cloudServerStartBtn">▶ Start server</button>
-        <button class="btn" type="button" id="cloudServerSaveBtn">Save settings</button>
       </div>
       <h3 style="margin:18px 0 4px;font-size:14px;">Users</h3>
       <p class="cloud-muted" style="margin:0 0 8px;">Each user sees only their own folder. Give a user the whole drive (D:\) or one folder (D:\HR). Passwords are stored hashed, never in plain text.</p>
@@ -327,8 +326,8 @@
       </div>
       <div class="field">
         <label for="cloudClientPass">Password</label>
-        <input type="password" id="cloudClientPass" placeholder="Password for this server" autocomplete="off">
-        <div class="hint">Asked once when you connect — it is never stored on this computer.</div>
+        <input type="password" id="cloudClientPass" placeholder="Password of this user" autocomplete="off">
+        <div class="hint">The password of the user above, as created on the server. Asked once when you connect — it is never stored on this computer.</div>
       </div>
       <button class="btn" type="button" id="cloudClientAddBtn">＋ Save &amp; connect</button>
       <div id="cloudConnectBox" style="display:none; margin-top:16px;">
@@ -341,7 +340,7 @@
         </div>
         <div class="field" style="margin-top:10px;">
           <label for="cloudConnectPass">Password</label>
-          <input type="password" id="cloudConnectPass" placeholder="Password for this server" autocomplete="off">
+          <input type="password" id="cloudConnectPass" placeholder="Password of this user" autocomplete="off">
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn btn-primary" type="button" id="cloudConnectBtn">Connect</button>
@@ -395,8 +394,8 @@
         <div class="cloud-muted" id="vpnInstallText" style="margin-top:6px;"></div>
       </div>
       <div id="vpnLoginBox" style="display:none;">
-        <p style="margin:8px 0 4px;">Sign in to Tailscale to join your private network.</p>
-        <p class="t-sub" style="margin:0 0 6px;">A browser window may have opened — complete the sign-in there, then press Refresh.</p>
+        <p class="t-sub" id="vpnLoginHint" style="margin:0 0 6px;">Complete the sign-in in your browser, then press Refresh.</p>
+        <button class="btn" type="button" id="vpnOpenAuthBtn" style="margin:2px 0 6px;">Open sign-in page</button>
         <p class="t-sub" id="vpnAuthUrl" style="word-break:break-all; margin:0;"></p>
       </div>
     </div>
@@ -411,6 +410,7 @@
         <label class="switch"><input type="checkbox" id="vpnSubnetToggle"><span class="slider"></span></label>
       </div>
       <div class="t-sub" id="vpnRoutesNote" style="display:none;"></div>
+      <button class="btn btn-ghost btn-sm" type="button" id="vpnApproveBtn" style="display:none; margin-top:6px;">Open admin console to approve the route</button>
       <div class="toggle-row" style="margin-top:12px;">
         <div><div class="t-label">Stay connected forever (disable key expiry)</div><div class="t-sub">Tailscale normally asks you to sign in again after 180 days. With this on, the app turns that off automatically right after you connect.</div></div>
         <label class="switch"><input type="checkbox" id="vpnKeyExpiryToggle" checked><span class="slider"></span></label>

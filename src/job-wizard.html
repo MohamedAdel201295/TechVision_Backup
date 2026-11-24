@@ -96,6 +96,13 @@
           <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Store the backup as a compressed .zip file.</div></div>
           <label class="switch"><input type="checkbox" id="optCompress" checked><span class="slider"></span></label>
         </div>
+        <div id="compressLevelField" style="margin:2px 0 0;">
+          <div class="radio-row">
+            <label><input type="radio" name="compressLevel" value="standard" checked> Standard <span style="color:var(--muted-2);font-size:12px;">— Deflate level 6, faster</span></label>
+            <label><input type="radio" name="compressLevel" value="advanced"> Advanced <span style="color:var(--muted-2);font-size:12px;">— Deflate level 9, smaller</span></label>
+          </div>
+          <div class="hint">The level the ZIP will actually use — Standard compresses faster, Advanced squeezes smaller.</div>
+        </div>
         <div class="toggle-row">
           <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
           <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
@@ -112,7 +119,21 @@
               <label><input type="radio" name="frequency" value="Daily" checked> Daily</label>
               <label><input type="radio" name="frequency" value="Weekly"> Weekly</label>
               <label><input type="radio" name="frequency" value="Monthly"> Monthly</label>
+              <label><input type="radio" name="frequency" value="Custom"> Custom</label>
             </div>
+          </div>
+          <div class="field" id="customDaysField" style="display:none;">
+            <label>Days</label>
+            <div class="radio-row" id="customDaysRow">
+              <label><input type="checkbox" name="customDay" value="6"> Sat</label>
+              <label><input type="checkbox" name="customDay" value="0"> Sun</label>
+              <label><input type="checkbox" name="customDay" value="1"> Mon</label>
+              <label><input type="checkbox" name="customDay" value="2"> Tue</label>
+              <label><input type="checkbox" name="customDay" value="3"> Wed</label>
+              <label><input type="checkbox" name="customDay" value="4"> Thu</label>
+              <label><input type="checkbox" name="customDay" value="5"> Fri</label>
+            </div>
+            <div class="hint">Pick the days this job runs, at the time below.</div>
           </div>
           <div class="field">
             <label for="scheduleTime">Time</label>

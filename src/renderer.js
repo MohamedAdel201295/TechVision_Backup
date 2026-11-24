@@ -493,8 +493,8 @@
   function compressionLabel(job) {
     var c = (job.compression || (job.raw && job.raw.compression) || 'standard').toLowerCase();
     if (c === 'none') return 'No compression — plain files';
-    if (c === 'advanced') return 'Advanced (max compression)';
-    return 'Standard compression';
+    if (c === 'advanced') return 'Advanced — Deflate level 9';
+    return 'Standard — Deflate level 6';
   }
   function renderJobsView() {
     var list = $('jobsList');
@@ -550,7 +550,7 @@
         card.querySelector('.job-body').appendChild(wdiv);
       }
       var sched = job.schedule || (job.raw && job.raw.schedule) || null;
-      card.querySelector('.d-schedule').textContent = sched && sched.enabled ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00') : 'Manual only';
+      card.querySelector('.d-schedule').textContent = scheduleLabel(sched) || 'Manual only';
       card.querySelector('.d-next').textContent = nextRunText(job);
       card.querySelector('.d-compress').textContent = compressionLabel(job);
       card.querySelector('.d-files').textContent = job.runs && job.runs.length ? job.files + ' files · ' + formatBytes(job.size) : '—';
@@ -605,6 +605,9 @@
   function showCloudPanel(panel) {
     cloudPanel = panel;
     var modes = $('cloudModes'); if (modes) modes.style.display = panel === 'home' ? '' : 'none';
+    // The "your own remote drive" intro belongs to the Cloud home only —
+    // inside Server/Client it is just a repeated sentence above the panel.
+    var ht = $('cloudViewHeadText'); if (ht) ht.style.display = panel === 'home' ? '' : 'none';
     var sp = $('cloudServerPanel'); if (sp) sp.style.display = panel === 'server' ? '' : 'none';
     var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
     if (panel === 'server') renderCloudServer();
@@ -630,6 +633,30 @@
      the mode only changes what the UI shows and what gets saved. */
   var cloudServerAccess = 'normal';
   var cloudClientAccess = 'normal';
+  // Serializes Cloud server saves: an auto-save triggered by a blur can
+  // otherwise race Start's own save, and two concurrent saves could both
+  // try to start the server (main's save handler applies the config —
+  // starting/stopping the server to match `enabled`).
+  var cloudServerSaveQueue = Promise.resolve();
+
+  // Server settings save themselves the moment anything changes — the
+  // old "Save settings" button was the only thing standing between a
+  // change and the config file, so it is gone. Silent on success (the
+  // status pill / Tailscale line already show the result); a toast only
+  // when the save fails. Note main's save handler also APPLIES the
+  // config: flipping "Server enabled" on starts the server, off stops it.
+  function saveCloudServerSettings() {
+    cloudServerSaveQueue = cloudServerSaveQueue.then(async function () {
+      if (!api || typeof api.cloudServerSave !== 'function') { cloudMissing(); return; }
+      try {
+        var port = parseInt(($('cloudServerPort') || {}).value, 10);
+        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess });
+        if (r && r.success) { await loadCloud(); }
+        else toast('Save failed', (r && r.error) || 'Could not save Cloud settings.', 'error');
+      } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save Cloud settings.', 'error'); }
+    });
+    return cloudServerSaveQueue;
+  }
 
   function setServerAccess(mode) {
     cloudServerAccess = mode === 'tailscale' ? 'tailscale' : 'normal';
@@ -640,6 +667,17 @@
       : 'Clients use your public static IP or DDNS + this port (forward the port in your router).';
     var ti = $('cloudTailscaleInfo'); if (ti) ti.style.display = cloudServerAccess === 'tailscale' ? '' : 'none';
     var fg = $('cloudForwardGuide'); if (fg) fg.style.display = cloudServerAccess === 'tailscale' ? 'none' : '';
+    // The port is the port the server listens on in both modes — but the
+    // "forward it in your router" note only applies to Normal mode. In
+    // Tailscale mode it was telling the user to forward a port that needs
+    // no forwarding. Same for the Addresses block: in Tailscale mode the
+    // public and LAN addresses are useless here (the Tailscale address
+    // above is the only one clients need), so hide the whole block.
+    var ph = $('cloudServerPortHint');
+    if (ph) ph.textContent = cloudServerAccess === 'tailscale'
+      ? 'The port this server listens on. Clients connect to the Tailscale address above + this port — no port forwarding needed.'
+      : 'Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.';
+    var af = $('cloudServerAddrsField'); if (af) af.style.display = cloudServerAccess === 'tailscale' ? 'none' : '';
     if (cloudServerAccess === 'tailscale') refreshCloudTailscaleIp();
   }
 
@@ -668,27 +706,37 @@
     if (cloudClientAccess === 'tailscale') populateCloudPeers();
   }
 
+  // Signature of the last peer list the picker was built from. The list
+  // is re-read on a timer while the client panel is open (see the
+  // poller in the wiring), so a device that joins later appears on its
+  // own — but rebuilding the <select> on every tick would close an open
+  // dropdown and drop the selection, so an unchanged list is left alone.
+  var lastCloudPeerSig = null;
   async function populateCloudPeers() {
     var sel = $('cloudClientPeer'); if (!sel) return;
+    if (!sel.options.length) { var chk = document.createElement('option'); chk.value = ''; chk.textContent = 'Checking Tailscale…'; sel.appendChild(chk); }
+    if (!api || typeof api.vpnGetStatus !== 'function') { sel.innerHTML = ''; var na = document.createElement('option'); na.value = ''; na.textContent = 'VPN module is not available.'; sel.appendChild(na); return; }
+    var st;
+    try { st = await api.vpnGetStatus(); }
+    catch (e) { sel.innerHTML = ''; var oe = document.createElement('option'); oe.value = ''; oe.textContent = 'Could not read Tailscale status.'; sel.appendChild(oe); return; }
+    var sig = JSON.stringify({ installed: !!st.installed, connected: !!st.connected, peers: (st.peers || []).map(function (p) { return [p.ip, p.name, p.online]; }) });
+    if (sig === lastCloudPeerSig) return;
+    lastCloudPeerSig = sig;
+    var prevValue = sel.value;
     sel.innerHTML = '';
-    var opt0 = document.createElement('option'); opt0.value = ''; opt0.textContent = 'Checking Tailscale…';
-    sel.appendChild(opt0);
-    if (!api || typeof api.vpnGetStatus !== 'function') { opt0.textContent = 'VPN module is not available.'; return; }
-    try {
-      var st = await api.vpnGetStatus();
-      sel.innerHTML = '';
-      if (!st || !st.installed) { var o1 = document.createElement('option'); o1.value = ''; o1.textContent = 'Tailscale is not installed — see the VPN module.'; sel.appendChild(o1); return; }
-      if (!st.connected) { var o2 = document.createElement('option'); o2.value = ''; o2.textContent = 'Tailscale is not connected — connect it from the VPN module.'; sel.appendChild(o2); return; }
-      var peers = st.peers || [];
-      if (!peers.length) { var o3 = document.createElement('option'); o3.value = ''; o3.textContent = 'No other devices on your Tailscale network yet.'; sel.appendChild(o3); return; }
-      var blank = document.createElement('option'); blank.value = ''; blank.textContent = 'Choose a device…'; sel.appendChild(blank);
-      peers.forEach(function (p) {
-        if (!p.ip) return;
-        var o = document.createElement('option'); o.value = p.ip; o.textContent = p.name + ' — ' + p.ip + (p.online ? '' : ' (offline)');
-        o.setAttribute('data-peer-name', p.name);
-        sel.appendChild(o);
-      });
-    } catch (e) { sel.innerHTML = ''; var oe = document.createElement('option'); oe.value = ''; oe.textContent = 'Could not read Tailscale status.'; sel.appendChild(oe); }
+    if (!st || !st.installed) { var o1 = document.createElement('option'); o1.value = ''; o1.textContent = 'Tailscale is not installed — see the VPN module.'; sel.appendChild(o1); return; }
+    if (!st.connected) { var o2 = document.createElement('option'); o2.value = ''; o2.textContent = 'Tailscale is not connected — connect it from the VPN module.'; sel.appendChild(o2); return; }
+    var peers = st.peers || [];
+    if (!peers.length) { var o3 = document.createElement('option'); o3.value = ''; o3.textContent = 'No other devices on your Tailscale network yet.'; sel.appendChild(o3); return; }
+    var blank = document.createElement('option'); blank.value = ''; blank.textContent = 'Choose a device…'; sel.appendChild(blank);
+    peers.forEach(function (p) {
+      if (!p.ip) return;
+      var o = document.createElement('option'); o.value = p.ip; o.textContent = p.name + ' — ' + p.ip + (p.online ? '' : ' (offline)');
+      o.setAttribute('data-peer-name', p.name);
+      sel.appendChild(o);
+    });
+    // A rebuild must not drop the device the user already picked.
+    if (prevValue) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevValue) { sel.value = prevValue; break; } }
   }
 
   function renderCloudServer() {
@@ -789,7 +837,7 @@
     cloudSelected = srv;
     cloudPendingProbe = null;
     var box = $('cloudConnectBox'); if (box) box.style.display = '';
-    var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name;
+    var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name + (srv.user ? ' as ' + srv.user : '');
     var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
     var pass = $('cloudConnectPass'); if (pass) pass.value = presetPassword || '';
     var btn = $('cloudConnectBtn'); if (btn) btn.textContent = 'Connect';
@@ -1085,15 +1133,38 @@
   }
 
   /* ---------- schedule display ---------- */
+  var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  function scheduleLabel(s) {
+    if (!s || !s.enabled) return null;
+    var time = s.time || '02:00';
+    if ((s.frequency || '').toLowerCase() === 'custom') {
+      var names = (Array.isArray(s.days) ? s.days : []).map(function (d) { return DAY_NAMES[d] || ''; }).filter(Boolean);
+      return 'Custom (' + (names.join(', ') || 'no days') + ') at ' + time;
+    }
+    return (s.frequency || 'Daily') + ' at ' + time;
+  }
   function nextRunText(job) {
     var s = job.schedule || (job.raw && job.raw.schedule) || null;
     if (!s || !s.enabled) return 'No schedule — manual only';
     var freq = s.frequency || 'Daily';
     var time = s.time || '02:00';
     var m = /^(\d{1,2}):(\d{2})$/.exec(time);
-    if (!m) return freq + ' at ' + time;
+    if (!m) return scheduleLabel(s);
     var next = new Date();
     next.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+    if (freq.toLowerCase() === 'custom') {
+      var days = Array.isArray(s.days) ? s.days : [];
+      var found = null;
+      for (var i = 0; i < 8; i++) {
+        var c = new Date(); c.setDate(c.getDate() + i);
+        if (days.indexOf(c.getDay()) < 0) continue;
+        c.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
+        if (c > new Date()) { found = c; break; }
+        if (i === 0) { found = c; break; } // due today
+      }
+      if (found) next = found;
+      return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
+    }
     if (freq.toLowerCase() === 'weekly') {
       if (next <= new Date()) next.setDate(next.getDate() + 7);
     } else if (freq.toLowerCase() === 'monthly') {
@@ -1101,7 +1172,7 @@
     } else if (next <= new Date()) {
       next.setDate(next.getDate() + 1);
     }
-    return freq + ' at ' + time + ' — next: ' + formatDate(next.toISOString());
+    return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
   }
 
   /* ---------- job details drawer ---------- */
@@ -1128,9 +1199,7 @@
     $('drawerDuration').textContent = formatDuration(job.duration);
     $('drawerLastRun').textContent = formatDate(job.timestamp);
     var sched = job.schedule || (job.raw && job.raw.schedule) || null;
-    $('drawerSchedule').textContent = sched && sched.enabled
-      ? (sched.frequency || 'Daily') + ' at ' + (sched.time || '02:00')
-      : 'Manual only — no schedule set';
+    $('drawerSchedule').textContent = scheduleLabel(sched) || 'Manual only — no schedule set';
     $('drawerNextRun').textContent = nextRunText(job);
     var runsBox = $('drawerRuns');
     if (runsBox) {
@@ -1362,6 +1431,7 @@
      in here: "Open in Cloud" jumps to the Cloud client with a peer's
      Tailscale IP prefilled (and the connection mode set to Tailscale). */
   var vpnStatusCache = null;
+  var vpnAuthUrlCache = null;
   var vpnBusy = false;
 
   function vpnMissing() { toast('VPN', 'The VPN bridge is not available in this build.', 'error'); }
@@ -1400,8 +1470,18 @@
       if (btn) btn.textContent = 'Sign in';
       if (lb) {
         lb.style.display = '';
+        vpnAuthUrlCache = st.authUrl || null;
         var au = $('vpnAuthUrl');
         if (au) au.textContent = st.authUrl ? ('Sign-in link: ' + st.authUrl) : '';
+        var ob = $('vpnOpenAuthBtn');
+        if (ob) ob.style.display = st.authUrl ? '' : 'none';
+        // The hint must match what is actually on screen: when the
+        // daemon has not handed us a login link yet there is no button
+        // below to point at — Sign in is the way to open the page.
+        var lh = $('vpnLoginHint');
+        if (lh) lh.textContent = st.authUrl
+          ? 'Complete the sign-in in your browser, then press Refresh. If no browser window opened, use the button below.'
+          : 'Press Sign in — the sign-in page will open in your browser. Complete it there, then press Refresh.';
       }
       if (dc) dc.style.display = 'none';
       renderVpnPeers([]);
@@ -1432,6 +1512,8 @@
       if (advertising) { rn.style.display = ''; rn.textContent = 'Advertising ' + st.lanSubnet + ' — approve this route once in the Tailscale admin console.'; }
       else rn.style.display = 'none';
     }
+    var ab = $('vpnApproveBtn');
+    if (ab) ab.style.display = advertising ? '' : 'none';
     var ss = $('vpnSubnetSub');
     if (ss) ss.textContent = st.lanSubnet
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
@@ -1441,6 +1523,18 @@
     // First sign-in (or first view while connected): turn off the 180-day
     // key expiry automatically, so the device never asks to sign in again.
     maybeDisableVpnKeyExpiry();
+  }
+
+  // `tailscale up` can return before the daemon reports itself Running, so
+  // a single status read right after connect can catch it mid-startup and
+  // freeze the view on "Not connected" after a "VPN connected." toast.
+  // Re-check a few times until the view agrees with the result.
+  async function pollVpnUntilConnected() {
+    for (var i = 0; i < 4; i++) {
+      if (vpnStatusCache && vpnStatusCache.connected) return;
+      await new Promise(function (res) { setTimeout(res, 2000); });
+      await loadVpn();
+    }
   }
 
   /* ---------- VPN key expiry (stay connected forever) ---------- */
@@ -1480,13 +1574,25 @@
     await disableVpnKeyExpiry(false);
   }
 
+  // Same idea as populateCloudPeers: the VPN view is re-read on a timer
+  // while it is open, so only rebuild the list when something actually
+  // changed (a device joining/leaving, or a state change).
+  var lastVpnPeersSig = null;
   function renderVpnPeers(peers) {
     var list = $('vpnPeersList'); if (!list) return;
+    var sig = JSON.stringify({ peers: (peers || []).map(function (p) { return [p.ip, p.name, p.online, p.os]; }), connected: !!(vpnStatusCache && vpnStatusCache.connected), installed: !!(vpnStatusCache && vpnStatusCache.installed), needsLogin: !!(vpnStatusCache && vpnStatusCache.needsLogin) });
+    if (sig === lastVpnPeersSig) return;
+    lastVpnPeersSig = sig;
     list.innerHTML = '';
     if (!peers.length) {
       var empty = document.createElement('div');
       empty.className = 'empty-state';
-      empty.innerHTML = '<div class="big">🛡️</div><h3>No devices yet</h3><p>Sign in to Tailscale and your devices will show up here.</p>';
+      // "Sign in..." is wrong once he is signed in — with no other
+      // devices on the tailnet he is simply the only one there.
+      var msg = 'Sign in to Tailscale and your devices will show up here.';
+      if (vpnStatusCache && vpnStatusCache.connected) msg = 'No other devices on your network yet — install Tailscale on another device and it will show up here.';
+      else if (vpnStatusCache && vpnStatusCache.installed && !vpnStatusCache.needsLogin) msg = 'Connect the VPN and your devices will show up here.';
+      empty.innerHTML = '<div class="big">🛡️</div><h3>No devices yet</h3><p>' + msg + '</p>';
       list.appendChild(empty);
       return;
     }
@@ -1637,7 +1743,7 @@
       btn.addEventListener('click', function () { setModule(btn.getAttribute('data-module')); });
     });
     document.querySelectorAll('#cloudServerAccessSeg .seg-btn').forEach(function (b) {
-      b.addEventListener('click', function () { setServerAccess(b.getAttribute('data-access')); });
+      b.addEventListener('click', function () { setServerAccess(b.getAttribute('data-access')); saveCloudServerSettings(); });
     });
     document.querySelectorAll('#cloudClientAccessSeg .seg-btn').forEach(function (b) {
       b.addEventListener('click', function () { setClientAccess(b.getAttribute('data-access')); });
@@ -1645,6 +1751,7 @@
     var cps = $('cloudClientPeer');
     if (cps) cps.addEventListener('change', function () {
       var host = $('cloudClientHost'); if (host && cps.value) host.value = cps.value;
+      var port = $('cloudClientPort'); if (port && cps.value && !port.value) port.value = '8443';
       var name = $('cloudClientName');
       if (name && !name.value && cps.selectedOptions && cps.selectedOptions[0]) name.value = cps.selectedOptions[0].getAttribute('data-peer-name') || '';
     });
@@ -1668,7 +1775,7 @@
             else toast('VPN', 'Tailscale installed and connected.', 'success');
           } else toast('VPN error', (r && r.error) || 'Could not install Tailscale.', 'error');
         } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not install Tailscale.', 'error'); }
-        finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); }
+        finally { if (stopListen) stopListen(); vpnBusy = false; var ib2 = $('vpnInstallBox'); if (ib2) ib2.style.display = 'none'; await loadVpn(); if (r && r.success && !r.needsLogin) await pollVpnUntilConnected(); }
         return;
       }
       vpnBusy = true; vcb.disabled = true; vcb.textContent = 'Working…';
@@ -1680,11 +1787,31 @@
           else toast('VPN', wantOn ? 'VPN connected.' : 'VPN disconnected.', 'success');
         } else toast('VPN error', (r && r.error) || 'Could not change the VPN connection.', 'error');
         await loadVpn();
+        if (r && r.success && wantOn && !r.needsLogin) await pollVpnUntilConnected();
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the VPN connection.', 'error'); }
       finally { vpnBusy = false; }
     });
     var vrb = $('vpnRefreshBtn');
     if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
+    // Peers appear on their own: while the VPN view is open, or the Cloud
+    // client panel is open in Tailscale mode, re-read Tailscale status
+    // every 15s so a device that joins shows up without re-opening the
+    // view or re-picking anything. Both renderers skip rebuilding when
+    // nothing changed, so an open dropdown or a selection is never
+    // disturbed; skipped while an install/connect is in progress.
+    setInterval(function () {
+      if (vpnBusy) return;
+      var vpnView = $('view-vpn');
+      if (vpnView && vpnView.style.display !== 'none') loadVpn();
+      var cloudView = $('view-cloud');
+      if (cloudView && cloudView.style.display !== 'none' && cloudPanel === 'client' && cloudClientAccess === 'tailscale') populateCloudPeers();
+    }, 15000);
+    var vab = $('vpnOpenAuthBtn');
+    if (vab) vab.addEventListener('click', async function () {
+      if (!vpnAuthUrlCache) return;
+      if (!api || typeof api.vpnOpenAuthUrl !== 'function') return vpnMissing();
+      await api.vpnOpenAuthUrl(vpnAuthUrlCache);
+    });
     var vdb = $('vpnDownloadBtn');
     if (vdb) vdb.addEventListener('click', async function () {
       if (!api || typeof api.vpnOpenDownload !== 'function') return vpnMissing();
@@ -1711,10 +1838,20 @@
       try {
         var r = await api.vpnSetRoutes(on);
         if (r && r.success) {
-          toast('VPN', on ? 'Sharing your home network — approve the route once in the Tailscale admin console.' : 'No longer sharing your home network.', 'success');
+          // Advertising alone does nothing — the route only works after
+          // it is approved in the Tailscale admin console, which the app
+          // cannot do itself. Open the console right away so the approval
+          // is one click away instead of a step the user has to find.
+          if (on && typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
+          toast('VPN', on ? 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' : 'No longer sharing your home network.', 'success');
         } else { toast('VPN error', (r && r.error) || 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
         await loadVpn();
       } catch (e) { toast('VPN error', e && e.message ? e.message : 'Could not change the subnet router setting.', 'error'); vst.checked = !on; }
+    });
+    var vab2 = $('vpnApproveBtn');
+    if (vab2) vab2.addEventListener('click', async function () {
+      if (!api || typeof api.vpnOpenAdmin !== 'function') return vpnMissing();
+      await api.vpnOpenAdmin();
     });
     $('drawerClose').addEventListener('click', closeDrawer);
     $('drawerBackdrop').addEventListener('click', closeDrawer);
@@ -1759,6 +1896,9 @@
     if (css) css.addEventListener('click', async function () {
       if (!api || typeof api.cloudServerStart !== 'function' || typeof api.cloudServerStop !== 'function') return cloudMissing();
       try {
+        // Let any auto-save triggered by a blur finish first, so its
+        // server start/stop cannot race the one below.
+        await cloudServerSaveQueue;
         var running = cloudCfg && cloudCfg.server && cloudCfg.server.running;
         if (running) {
           var rs = await api.cloudServerStop();
@@ -1776,16 +1916,13 @@
         else toast('Server error', (r && r.error) || 'Could not start the server.', 'error');
       } catch (e) { toast('Server error', e && e.message ? e.message : 'Could not change the server state.', 'error'); }
     });
-    var csv = $('cloudServerSaveBtn');
-    if (csv) csv.addEventListener('click', async function () {
-      if (!api || typeof api.cloudServerSave !== 'function') return cloudMissing();
-      try {
-        var port = parseInt(($('cloudServerPort') || {}).value, 10);
-        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess });
-        if (r && r.success) { toast('Cloud settings saved', 'Server settings saved.', 'success'); await loadCloud(); }
-        else toast('Save failed', (r && r.error) || 'Could not save Cloud settings.', 'error');
-      } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save Cloud settings.', 'error'); }
-    });
+    // Server settings auto-save: the enabled toggle, the port field
+    // (on change = when the user leaves the field) and the access-mode
+    // buttons all save immediately — there is no Save button anymore.
+    var cse = $('cloudServerEnabled');
+    if (cse) cse.addEventListener('change', function () { saveCloudServerSettings(); });
+    var csp = $('cloudServerPort');
+    if (csp) csp.addEventListener('change', function () { saveCloudServerSettings(); });
     var cdi = $('cloudDetectIpBtn');
     if (cdi) cdi.addEventListener('click', async function () {
       if (!api || typeof api.cloudDetectIP !== 'function') return cloudMissing();
