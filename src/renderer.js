@@ -269,12 +269,13 @@
   }
 
   /* ---------- views: Dashboard / Jobs ---------- */
-  /* ---------- modules: Backup / Cloud / VPN ----------
-     The sidebar has three top-level modules. Backup owns Dashboard, Jobs,
+  /* ---------- modules: Backup / Cloud / VPN / WireGuard ----------
+     The sidebar has four top-level modules. Backup owns Dashboard, Jobs,
      Logs, New Job and Restore; Cloud owns Server and Client; VPN is a
-     single Tailscale view. Switching modules swaps the visible nav
-     group; going back to Backup returns to the last backup view instead
-     of always resetting to Dashboard. */
+     single Tailscale view; WireGuard VPN is a single self-hosted
+     WireGuard view (server + client). Switching modules swaps the
+     visible nav group; going back to Backup returns to the last backup
+     view instead of always resetting to Dashboard. */
   var currentModule = 'backup';
   var lastBackupView = 'dashboard';
 
@@ -283,6 +284,7 @@
     var gb = $('navGroupBackup'); if (gb) gb.style.display = mod === 'backup' ? '' : 'none';
     var gc = $('navGroupCloud'); if (gc) gc.style.display = mod === 'cloud' ? '' : 'none';
     var gv = $('navGroupVpn'); if (gv) gv.style.display = mod === 'vpn' ? '' : 'none';
+    var gw = $('navGroupWireguard'); if (gw) gw.style.display = mod === 'wireguard' ? '' : 'none';
     document.querySelectorAll('.module-item').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-module') === mod); });
   }
 
@@ -291,6 +293,7 @@
     if (mod === 'backup') showView(lastBackupView || 'dashboard');
     else if (mod === 'cloud') showView('cloud');
     else if (mod === 'vpn') showView('vpn');
+    else if (mod === 'wireguard') showView('wireguard');
   }
 
   function syncCloudNav() {
@@ -315,12 +318,14 @@
   function showView(name) {
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
+    var wgView = $('view-wireguard');
     var modulesView = $('view-modules');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
     if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
     if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
     if (vpnView) vpnView.style.display = name === 'vpn' ? '' : 'none';
+    if (wgView) wgView.style.display = name === 'wireguard' ? '' : 'none';
     if (modulesView) modulesView.style.display = name === 'modules' ? '' : 'none';
     var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
     document.body.classList.toggle('modules-mode', name === 'modules');
@@ -352,6 +357,12 @@
       setBackTitle('VPN');
       setAppTitle('TechVision VPN', 'Your private network — every device, anywhere, as if it were home.');
       loadVpn();
+    }
+    if (name === 'wireguard') {
+      applyModuleUI('wireguard');
+      setBackTitle('WireGuard VPN');
+      setAppTitle('TechVision WireGuard VPN', 'Your own VPN server — no accounts, no middleman, one port on the router.');
+      loadWireGuard();
     }
   }
   function startLogsAutoRefresh() {
@@ -2199,6 +2210,130 @@
     toast('Cloud client', 'Server address set to ' + (peer.name || peer.ip) + ' over Tailscale. Add your user and password, then Save & connect.', 'success');
   }
 
+  /* ---------- TechVision WireGuard VPN (self-hosted WireGuard) ----------
+     A fourth module: this machine as a WireGuard server (hub) and as a
+     client. No coordination server, no account — the server IS this
+     machine, and the only router step is one UDP 51820 forward. The
+     UI mirrors the VPN view (status hero, facts tiles, peer rows). */
+  var wgStatusCache = null;
+  var wgBusy = false;
+  var lastWgPeersSig = null;
+
+  function wgMissing() { toast('WireGuard', 'The WireGuard bridge is not available in this build.', 'error'); }
+
+  function wgHandshakeText(ms) {
+    if (!ms) return 'never connected';
+    var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return s + 's ago';
+    var m = Math.round(s / 60);
+    if (m < 60) return m + ' min ago';
+    var h = Math.round(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.round(h / 24) + 'd ago';
+  }
+
+  async function loadWireGuard() {
+    if (!api || typeof api.wgGetStatus !== 'function') return wgMissing();
+    var st;
+    try { st = await api.wgGetStatus(); } catch (e) { st = { installed: false, serverRunning: false, clientRunning: false, error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
+    wgStatusCache = st || {};
+    var dot = $('wgStatusDot'); if (dot) dot.className = 'vpn-dot' + ((st.serverRunning || st.clientRunning) ? ' on' : '');
+    var txt = $('wgStatusText'), sub = $('wgStatusSub');
+    var ni = $('wgNotInstalled');
+    var sc = $('wgServerCard'), cc = $('wgClientCard');
+    if (!st.installed) {
+      if (txt) txt.textContent = 'Not installed';
+      if (sub) sub.textContent = 'WireGuard is not installed on this computer.';
+      if (ni) ni.style.display = '';
+      if (sc) sc.style.display = 'none';
+      if (cc) cc.style.display = 'none';
+      renderWgPeers([]);
+      return;
+    }
+    if (ni) ni.style.display = 'none';
+    if (sc) sc.style.display = '';
+    if (cc) cc.style.display = '';
+    if (st.serverRunning && st.clientRunning) {
+      if (txt) txt.textContent = 'Server running · Client connected';
+      if (sub) sub.textContent = 'This machine is a hub and a client at the same time.';
+    } else if (st.serverRunning) {
+      if (txt) txt.textContent = 'Server running';
+      if (sub) sub.textContent = 'This machine is the WireGuard hub — devices connect to it.';
+    } else if (st.clientRunning) {
+      if (txt) txt.textContent = 'Connected';
+      if (sub) sub.textContent = 'This machine is connected to a WireGuard server.';
+    } else if (st.error) {
+      if (txt) txt.textContent = 'Error';
+      if (sub) sub.textContent = st.error;
+    } else {
+      if (txt) txt.textContent = 'Off';
+      if (sub) sub.textContent = 'The server is stopped and the client is disconnected.';
+    }
+    var sb = $('wgServerBtn');
+    if (sb) { sb.textContent = st.serverRunning ? 'Stop server' : 'Start server'; sb.classList.toggle('btn-primary', !st.serverRunning); }
+    var sk = $('wgServerKey'); if (sk) sk.textContent = (st.server && st.server.publicKey) || '—';
+    var sp = $('wgServerPort'); if (sp) sp.textContent = 'UDP ' + ((st.server && st.server.listenPort) || 51820);
+    var ep = $('wgEndpoint');
+    if (ep && document.activeElement !== ep) ep.value = (st.server && st.server.endpoint) || '';
+    var cs = $('wgClientStatus');
+    if (cs) {
+      if (st.clientRunning) {
+        var c = st.client || {};
+        cs.textContent = 'Connected to ' + (c.endpoint || 'the server') + (c.tunnelIp ? (' as ' + c.tunnelIp) : '') + ' — last handshake ' + wgHandshakeText(c.latestHandshake) + ', ' + formatBytes(c.transferRx || 0) + ' down / ' + formatBytes(c.transferTx || 0) + ' up.';
+      } else if (st.client) cs.textContent = 'Not connected. A client config is saved — press Connect to use it again.';
+      else cs.textContent = 'Not connected.';
+    }
+    var cb = $('wgClientBtn');
+    if (cb) { cb.textContent = st.clientRunning ? 'Disconnect' : 'Connect'; cb.classList.toggle('btn-primary', !st.clientRunning); }
+    // Prefill the manual client fields from the saved client config —
+    // only into empty fields, so typing is never clobbered.
+    if (st.client) {
+      var ck = $('wgClientServerKey'); if (ck && !ck.value && st.client.serverPublicKey) ck.value = st.client.serverPublicKey;
+      var ce = $('wgClientEndpoint'); if (ce && !ce.value && st.client.endpoint) ce.value = st.client.endpoint;
+      var ci = $('wgClientTunnelIp'); if (ci && !ci.value && st.client.tunnelIp) ci.value = st.client.tunnelIp;
+    }
+    renderWgPeers(st.peers || []);
+  }
+
+  function renderWgPeers(peers) {
+    var list = $('wgPeerList'); if (!list) return;
+    var sig = JSON.stringify((peers || []).map(function (p) { return [p.name, p.tunnelIp, p.publicKey, p.online, p.latestHandshake, p.transferRx, p.transferTx]; }));
+    if (sig === lastWgPeersSig) return;
+    lastWgPeersSig = sig;
+    list.innerHTML = '';
+    if (!peers.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Generate an invite below and a device will show up here.</p>';
+      list.appendChild(empty);
+      return;
+    }
+    peers.forEach(function (p) {
+      var row = document.createElement('div');
+      row.className = 'vpn-peer';
+      var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
+      var body = document.createElement('div'); body.className = 'vpn-peer-body';
+      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name + ' — ' + p.tunnelIp;
+      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
+      meta.textContent = (p.online ? ('online — last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected') + ' · ' + formatBytes(p.transferRx || 0) + ' down / ' + formatBytes(p.transferTx || 0) + ' up · ' + String(p.publicKey || '').slice(0, 12) + '…';
+      body.appendChild(h); body.appendChild(meta);
+      row.appendChild(d); row.appendChild(body);
+      var rm = document.createElement('button'); rm.className = 'btn btn-ghost btn-sm'; rm.type = 'button'; rm.textContent = 'Remove';
+      rm.addEventListener('click', async function () {
+        if (!api || typeof api.wgRemovePeer !== 'function') return wgMissing();
+        rm.disabled = true;
+        try {
+          var r = await api.wgRemovePeer({ publicKey: p.publicKey });
+          if (r && r.success) toast('Peer removed', p.name + ' can no longer connect.', 'success');
+          else toast('Remove failed', (r && r.error) || 'Could not remove the peer.', 'error');
+        } catch (e) { toast('Remove failed', e && e.message ? e.message : 'Could not remove the peer.', 'error'); }
+        await loadWireGuard();
+      });
+      row.appendChild(rm);
+      list.appendChild(row);
+    });
+  }
+
   /* ---------- wiring ---------- */
   document.addEventListener('DOMContentLoaded', function () {
     var nnj = $('navNewJob'); if (nnj) nnj.addEventListener('click', function () { openJobWizard(null); });
@@ -2310,6 +2445,7 @@
         if (nav === 'logs') showView('logs');
         if (nav === 'cloud') showView('cloud');
         if (nav === 'vpn') showView('vpn');
+        if (nav === 'wireguard') showView('wireguard');
         if (nav === 'cloud-server') { setModule('cloud'); showCloudPanel('server'); }
         if (nav === 'cloud-client') { setModule('cloud'); showCloudPanel('client'); }
       });
@@ -2412,6 +2548,8 @@
       if (vpnBusy) return;
       var vpnView = $('view-vpn');
       if (vpnView && vpnView.style.display !== 'none') loadVpn();
+      var wgView = $('view-wireguard');
+      if (wgView && wgView.style.display !== 'none' && !wgBusy) loadWireGuard();
       var cloudView = $('view-cloud');
       if (cloudView && cloudView.style.display !== 'none' && cloudPanel === 'client' && cloudClientAccess === 'tailscale') populateCloudPeers();
     }, 15000);
@@ -2736,6 +2874,163 @@
         showCloudTransfer(kind + ' ' + (p.name || '') + ' — ' + Math.round(p.pct || 0) + '%', p.pct || 0);
       });
     }
+
+
+  // WireGuard view wiring — all buttons of #view-wireguard.
+  var wgRb = $('wgRefreshBtn');
+  if (wgRb) wgRb.addEventListener('click', function () { loadWireGuard(); });
+  var wgDb = $('wgDownloadBtn');
+  if (wgDb) wgDb.addEventListener('click', async function () {
+    if (!api || typeof api.wgOpenDownload !== 'function') return wgMissing();
+    await api.wgOpenDownload();
+  });
+  var wgRc = $('wgRecheckBtn');
+  if (wgRc) wgRc.addEventListener('click', function () { loadWireGuard(); });
+  var wgSb = $('wgServerBtn');
+  if (wgSb) wgSb.addEventListener('click', async function () {
+    if (!api || typeof api.wgStartServer !== 'function' || typeof api.wgStopServer !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgSb.disabled = true; wgSb.textContent = 'Working…';
+    try {
+      var running = !!(wgStatusCache && wgStatusCache.serverRunning);
+      var r = running ? await api.wgStopServer() : await api.wgStartServer();
+      if (r && r.success) toast('WireGuard', running ? 'Server stopped.' : 'Server is running.', 'success');
+      else toast('WireGuard error', (r && r.error) || 'Could not change the server state.', 'error');
+    } catch (e) { toast('WireGuard error', e && e.message ? e.message : 'Could not change the server state.', 'error'); }
+    finally { wgBusy = false; wgSb.disabled = false; await loadWireGuard(); }
+  });
+  var wgEs = $('wgEndpointSaveBtn');
+  if (wgEs) wgEs.addEventListener('click', async function () {
+    if (!api || typeof api.wgSetEndpoint !== 'function') return wgMissing();
+    var v = ($('wgEndpoint') || {}).value || '';
+    try {
+      var r = await api.wgSetEndpoint(v);
+      if (r && r.success) toast('Endpoint saved', v.trim() ? ('Clients will connect to ' + r.endpoint + '.') : 'Endpoint cleared — the public IP will be read automatically.', 'success');
+      else toast('Save failed', (r && r.error) || 'Could not save the endpoint.', 'error');
+    } catch (e) { toast('Save failed', e && e.message ? e.message : 'Could not save the endpoint.', 'error'); }
+    await loadWireGuard();
+  });
+  var wgPa = $('wgPeerAddBtn');
+  if (wgPa) wgPa.addEventListener('click', async function () {
+    if (!api || typeof api.wgAddPeer !== 'function') return wgMissing();
+    var name = ($('wgPeerName') || {}).value || '';
+    var key = ($('wgPeerKey') || {}).value || '';
+    try {
+      var r = await api.wgAddPeer({ name: name, publicKey: key });
+      if (r && r.success) {
+        toast('Peer added', r.peer.name + ' got tunnel address ' + r.peer.tunnelIp + (r.liveApplied === false && r.liveError ? ' (saved, but the running tunnel did not pick it up: ' + r.liveError + ')' : '') + '.', 'success');
+        var k = $('wgPeerKey'); if (k) k.value = '';
+        var n = $('wgPeerName'); if (n) n.value = '';
+      } else toast('Add failed', (r && r.error) || 'Could not add the peer.', 'error');
+    } catch (e) { toast('Add failed', e && e.message ? e.message : 'Could not add the peer.', 'error'); }
+    await loadWireGuard();
+  });
+  var wgIb = $('wgInviteBtn');
+  if (wgIb) wgIb.addEventListener('click', async function () {
+    if (!api || typeof api.wgGenerateInvite !== 'function') return wgMissing();
+    if (wgBusy) return;
+    var name = (($('wgInviteName') || {}).value || '').trim() || 'device';
+    wgBusy = true; wgIb.disabled = true; wgIb.textContent = 'Generating…';
+    try {
+      var r = await api.wgGenerateInvite({ name: name });
+      if (r && r.success) {
+        var box = $('wgInviteBox'); if (box) box.style.display = '';
+        var no = $('wgInviteNameOut'); if (no) no.textContent = r.name;
+        var ip = $('wgInviteIp'); if (ip) ip.textContent = r.tunnelIp;
+        var cf = $('wgInviteConf'); if (cf) cf.value = r.conf;
+        var qr = $('wgInviteQr');
+        if (qr) { if (r.qr) { qr.src = r.qr; qr.style.display = ''; } else qr.style.display = 'none'; }
+        var nin = $('wgInviteName'); if (nin) nin.value = '';
+        toast('Invite ready', r.name + ' got tunnel address ' + r.tunnelIp + '.', 'success');
+      } else toast('Invite failed', (r && r.error) || 'Could not generate an invite.', 'error');
+    } catch (e) { toast('Invite failed', e && e.message ? e.message : 'Could not generate an invite.', 'error'); }
+    finally { wgBusy = false; wgIb.disabled = false; wgIb.textContent = 'Generate invite'; await loadWireGuard(); }
+  });
+  var wgIc = $('wgInviteCopyBtn');
+  if (wgIc) wgIc.addEventListener('click', async function () {
+    var cf = $('wgInviteConf'); if (!cf || !cf.value) return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(cf.value);
+      else { cf.focus(); cf.select(); document.execCommand('copy'); }
+      toast('Copied', 'The invite config is on the clipboard.', 'success');
+    } catch (e) { toast('Copy failed', 'Select the text and copy it by hand.', 'error'); }
+  });
+  var wgIe = $('wgInviteExportBtn');
+  if (wgIe) wgIe.addEventListener('click', async function () {
+    var cf = $('wgInviteConf'); if (!cf || !cf.value) return;
+    if (!api || typeof api.showSaveDialog !== 'function' || typeof api.writeFile !== 'function') return wgMissing();
+    try {
+      var pick = await api.showSaveDialog({ defaultPath: (($('wgInviteNameOut') || {}).textContent || 'device') + '.conf', filters: [{ name: 'WireGuard config', extensions: ['conf'] }] });
+      if (pick && !pick.canceled && pick.filePath) {
+        await api.writeFile(pick.filePath, cf.value);
+        toast('Invite exported', 'Saved as ' + pick.filePath + '.', 'success');
+      }
+    } catch (e) { toast('Export failed', e && e.message ? e.message : 'Could not save the file.', 'error'); }
+  });
+  var wgCb = $('wgClientBtn');
+  if (wgCb) wgCb.addEventListener('click', async function () {
+    if (!api || typeof api.wgConnect !== 'function' || typeof api.wgDisconnect !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgCb.disabled = true; wgCb.textContent = 'Working…';
+    try {
+      if (wgStatusCache && wgStatusCache.clientRunning) {
+        var d = await api.wgDisconnect();
+        if (d && d.success) toast('WireGuard', 'Disconnected.', 'success');
+        else toast('WireGuard error', (d && d.error) || 'Could not disconnect.', 'error');
+      } else {
+        var pasted = (($('wgImportText') || {}).value || '').trim();
+        var r;
+        if (pasted) {
+          r = await api.wgConnect({ confText: pasted });
+          if (r && r.success) { var it = $('wgImportText'); if (it) it.value = ''; }
+        } else if ((($('wgClientServerKey') || {}).value || '').trim() && (($('wgClientEndpoint') || {}).value || '').trim()) {
+          r = await api.wgConnect({
+            serverPublicKey: $('wgClientServerKey').value,
+            endpoint: $('wgClientEndpoint').value,
+            tunnelIp: $('wgClientTunnelIp').value,
+            fullTunnel: $('wgFullTunnel') ? $('wgFullTunnel').checked : false,
+          });
+        } else if (wgStatusCache && wgStatusCache.client) {
+          r = await api.wgConnect({ reconnect: true });
+        } else {
+          toast('Nothing to connect with', 'Paste a config, or type the server details first.', 'error');
+          wgBusy = false; wgCb.disabled = false; await loadWireGuard();
+          return;
+        }
+        if (r && r.success) toast('WireGuard', 'Connected as ' + (r.tunnelIp || 'a client') + '.', 'success');
+        else toast('WireGuard error', (r && r.error) || 'Could not connect.', 'error');
+      }
+    } catch (e) { toast('WireGuard error', e && e.message ? e.message : 'Could not change the connection.', 'error'); }
+    finally { wgBusy = false; wgCb.disabled = false; await loadWireGuard(); }
+  });
+  var wgIm = $('wgImportBtn');
+  if (wgIm) wgIm.addEventListener('click', async function () {
+    if (!api || typeof api.showOpenDialog !== 'function' || typeof api.readFile !== 'function' || typeof api.wgImportConf !== 'function') return wgMissing();
+    try {
+      var pick = await api.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'WireGuard config', extensions: ['conf'] }] });
+      if (!pick || pick.canceled || !pick.filePaths || !pick.filePaths.length) return;
+      var text = await api.readFile(pick.filePaths[0]);
+      var r = await api.wgImportConf({ confText: text });
+      if (r && r.success) {
+        var it = $('wgImportText'); if (it) it.value = text;
+        var s = r.summary || {};
+        toast('Config imported', 'Server ' + (s.endpoint || 'unknown') + ', tunnel address ' + (s.address || 'unknown') + ' — press Connect.', 'success');
+      } else toast('Import failed', (r && r.error) || 'Could not read that config file.', 'error');
+    } catch (e) { toast('Import failed', e && e.message ? e.message : 'Could not read that config file.', 'error'); }
+  });
+  var wgIt = $('wgImportTextBtn');
+  if (wgIt) wgIt.addEventListener('click', async function () {
+    if (!api || typeof api.wgImportConf !== 'function') return wgMissing();
+    var text = (($('wgImportText') || {}).value || '').trim();
+    if (!text) { toast('Nothing to import', 'Paste a config first.', 'error'); return; }
+    try {
+      var r = await api.wgImportConf({ confText: text });
+      if (r && r.success) {
+        var s = r.summary || {};
+        toast('Config imported', 'Server ' + (s.endpoint || 'unknown') + ', tunnel address ' + (s.address || 'unknown') + ' — press Connect.', 'success');
+      } else toast('Import failed', (r && r.error) || 'Could not read that config file.', 'error');
+    } catch (e) { toast('Import failed', e && e.message ? e.message : 'Could not read that config file.', 'error'); }
+  });
 
     document.querySelectorAll('[data-module-enter]').forEach(function (card) {
       card.addEventListener('click', function () { setModule(card.getAttribute('data-module-enter')); });

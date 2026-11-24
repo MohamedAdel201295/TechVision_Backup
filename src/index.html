@@ -23,6 +23,7 @@
       <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
       <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
       <button class="module-item" type="button" data-module="vpn"><span class="ico">🛡️</span> VPN</button>
+      <button class="module-item" type="button" data-module="wireguard"><span class="ico">🔐</span> WireGuard VPN</button>
     </div>
     <div class="nav-group" id="navGroupBackup">
       <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
@@ -37,6 +38,9 @@
     </div>
     <div class="nav-group" id="navGroupVpn" style="display:none;">
       <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> VPN</button>
+    </div>
+    <div class="nav-group" id="navGroupWireguard" style="display:none;">
+      <button class="nav-item" type="button" data-nav="wireguard"><span class="ico">🔐</span> WireGuard VPN</button>
     </div>
     <div class="sidebar-foot">
       <div>TechVision Backup</div>
@@ -63,6 +67,10 @@
           <button class="module-card" type="button" data-module-enter="vpn">
             <span class="module-card-ico">🛡️</span>
             <span class="module-card-title">TechVision VPN</span>
+          </button>
+          <button class="module-card" type="button" data-module-enter="wireguard">
+            <span class="module-card-ico">🔐</span>
+            <span class="module-card-title">TechVision WireGuard VPN</span>
           </button>
         </div>
       </div>
@@ -483,6 +491,102 @@
         <span id="vpnPeersCount" class="pill pill-template" style="display:none;"></span>
       </div>
       <div id="vpnPeersList"><div class="empty-state"><div class="big">🛡️</div><h3>No devices yet</h3><p>Sign in to Tailscale and your devices will show up here.</p></div></div>
+    </div>
+  </div>
+  <div id="view-wireguard" style="display:none;">
+    <div class="card vpn-hero">
+      <div class="vpn-status-row">
+        <div>
+          <div class="t-label">WireGuard status</div>
+          <div class="vpn-status"><span id="wgStatusDot" class="vpn-dot"></span><span id="wgStatusText">Checking…</span></div>
+          <div class="t-sub" id="wgStatusSub"></div>
+        </div>
+        <button class="btn" type="button" id="wgRefreshBtn">Refresh</button>
+      </div>
+      <div id="wgNotInstalled" style="display:none;">
+        <p style="margin:8px 0 4px;">WireGuard is not installed on this computer.</p>
+        <p class="t-sub" style="margin:0 0 10px;">Download it from wireguard.com/install and install it, then press Check again. Installing a tunnel needs administrator permission once.</p>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn" type="button" id="wgDownloadBtn">Download WireGuard</button>
+          <button class="btn btn-ghost" type="button" id="wgRecheckBtn">Check again</button>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="wgServerCard">
+      <div class="vpn-sec-label">Server — this machine is the hub</div>
+      <div class="vpn-facts">
+        <div class="vpn-fact-tile"><div class="t-label">Tunnel address</div><div class="vpn-fact" id="wgServerIp">10.0.0.1</div></div>
+        <div class="vpn-fact-tile"><div class="t-label">Port</div><div class="vpn-fact" id="wgServerPort">UDP 51820</div></div>
+        <div class="vpn-fact-tile"><div class="t-label">Public key</div><div class="vpn-fact" id="wgServerKey">—</div></div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
+        <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>
+      </div>
+      <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:10px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Endpoint — the address clients connect to</div>
+        <div class="t-sub">The public IP is read automatically. If you use DDNS, type the hostname here instead.</div>
+        <div style="display:flex; gap:8px; margin-top:6px;">
+          <input type="text" id="wgEndpoint" placeholder="203.0.113.10 or myhome.ddns.net" autocomplete="off" style="flex:1;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgEndpointSaveBtn">Save</button>
+        </div>
+      </div>
+      <div class="vpn-sec-label">Devices (peers)</div>
+      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Generate an invite below and a device will show up here.</p></div></div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Add a device by hand</div>
+        <div class="t-sub">The device shows its public key — paste it here (once).</div>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+          <input type="text" id="wgPeerName" placeholder="Device name" autocomplete="off" style="flex:1; min-width:140px;">
+          <input type="text" id="wgPeerKey" placeholder="Public key (44 characters, ends with =)" autocomplete="off" style="flex:2; min-width:220px;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgPeerAddBtn">Add peer</button>
+        </div>
+      </div>
+      <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <button class="btn" type="button" id="wgInviteBtn">Generate invite</button>
+        <input type="text" id="wgInviteName" placeholder="New device name" autocomplete="off" style="flex:1; min-width:140px;">
+      </div>
+      <div id="wgInviteBox" style="display:none; margin-top:12px;">
+        <div class="t-label">Invite for <span id="wgInviteNameOut"></span> — tunnel address <span id="wgInviteIp"></span></div>
+        <div class="t-sub">Scan the QR code with the device's camera, or copy the config below. The server already holds this device's key — nothing has to travel back.</div>
+        <div style="display:flex; gap:16px; margin-top:8px; flex-wrap:wrap; align-items:flex-start;">
+          <img id="wgInviteQr" alt="Invite QR code" style="display:none; width:180px; height:180px; border:1px solid var(--border); border-radius:12px; background:#fff; padding:6px;">
+          <div style="flex:1; min-width:240px;">
+            <textarea id="wgInviteConf" readonly rows="8" class="wg-conf" style="width:100%;"></textarea>
+            <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+              <button class="btn btn-ghost btn-sm" type="button" id="wgInviteCopyBtn">Copy config</button>
+              <button class="btn btn-ghost btn-sm" type="button" id="wgInviteExportBtn">Export .conf file</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="wgClientCard">
+      <div class="vpn-sec-label">Client — connect to a server</div>
+      <div class="t-sub" id="wgClientStatus">Not connected.</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+        <button class="btn btn-primary" type="button" id="wgClientBtn">Connect</button>
+        <button class="btn btn-ghost" type="button" id="wgImportBtn">Import .conf file</button>
+      </div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Or paste a config</div>
+        <textarea id="wgImportText" rows="5" class="wg-conf" placeholder="Paste a WireGuard .conf here…" style="width:100%;"></textarea>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgImportTextBtn">Import pasted config</button>
+        </div>
+      </div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Or type the server by hand</div>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+          <input type="text" id="wgClientServerKey" placeholder="Server public key" autocomplete="off" style="flex:2; min-width:220px;">
+          <input type="text" id="wgClientEndpoint" placeholder="host:51820" autocomplete="off" style="flex:1; min-width:160px;">
+          <input type="text" id="wgClientTunnelIp" placeholder="Your tunnel address, e.g. 10.0.0.2" autocomplete="off" style="flex:1; min-width:160px;">
+        </div>
+        <label style="display:flex; gap:8px; align-items:flex-start; margin-top:8px; cursor:pointer;">
+          <input type="checkbox" id="wgFullTunnel" style="margin-top:3px;">
+          <span class="t-sub">Route <b>all</b> traffic through the tunnel (full tunnel). Only the tunnel subnet goes through it otherwise. If the server goes down while this is on, this machine loses its internet too.</span>
+        </label>
+      </div>
     </div>
   </div>
   </main>

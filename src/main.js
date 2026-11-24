@@ -15,6 +15,7 @@ const driveResolver = require('./drive-resolver.js');
 const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
 const vpn = require('./vpn.js');
+const wireguard = require('./wireguard.js');
 // How long a due scheduled job waits for a missing removable drive
 // before it is recorded as failed (and emailed about): 2 hours.
 const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
@@ -65,6 +66,78 @@ function getCloudServer() {
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
+
+// ---------- TechVision WireGuard VPN ----------
+// Config file: <userData>/.techvision/wireguard.json — { server, client }.
+// Private keys are stored PLAINTEXT here — the same deliberate
+// precedent as the Cloud server TLS key in cloud.json: the tunnel
+// service must start at boot with nobody logged in and no vault
+// unlocked, and a vault-stored key would block exactly that. See
+// wireguard.js for the full reasoning.
+let wgConfig = null;
+function wgConfigPath() {
+  return path.join(app.getPath('userData'), '.techvision', 'wireguard.json');
+}
+function getWgConfig() {
+  if (wgConfig) return wgConfig;
+  try {
+    const p = wgConfigPath();
+    if (fs.existsSync(p)) wgConfig = JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch (e) { wgConfig = null; }
+  if (!wgConfig || typeof wgConfig !== 'object') wgConfig = {};
+  if (!wgConfig.server || typeof wgConfig.server !== 'object') wgConfig.server = {};
+  const s = wgConfig.server;
+  if (typeof s.privateKey !== 'string') s.privateKey = '';
+  if (typeof s.publicKey !== 'string') s.publicKey = '';
+  if (typeof s.address !== 'string' || !s.address) s.address = wireguard.SERVER_ADDRESS;
+  if (!s.listenPort) s.listenPort = wireguard.LISTEN_PORT;
+  if (typeof s.endpoint !== 'string') s.endpoint = '';
+  if (!Array.isArray(s.peers)) s.peers = [];
+  if (!('client' in wgConfig)) wgConfig.client = null;
+  if (!('transport' in wgConfig) || typeof wgConfig.transport !== 'object' || !wgConfig.transport) wgConfig.transport = {};
+  /* Phase 2 prep (core requirement 2026-11-24): a saved transport
+     override — e.g. an AmneziaWG binary once the obfuscation method is
+     chosen — is applied to the wrapper here at startup. Empty object
+     = stock wireguard.exe, i.e. Phase 1 behavior unchanged. */
+  wireguard.setTransportBinaries(wgConfig.transport);
+  return wgConfig;
+}
+function saveWgConfig() {
+  try {
+    const dir = path.join(app.getPath('userData'), '.techvision');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmp = wgConfigPath() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(getWgConfig(), null, 2));
+    fs.renameSync(tmp, wgConfigPath());
+  } catch (e) { console.error('[Main] Could not save WireGuard config:', e.message); }
+}
+// The stored peer list joined with live handshake/transfer data from
+// `wg show` (matched by public key). Live data is best-effort: a peer
+// that never connected simply shows online:false.
+function wgPeersWithLive(livePeers) {
+  const live = {};
+  for (const p of livePeers || []) live[p.publicKey] = p;
+  return (getWgConfig().server.peers || []).map((p) => {
+    const l = live[p.publicKey] || null;
+    return Object.assign({}, p, l ? {
+      endpoint: l.endpoint,
+      latestHandshake: l.latestHandshake ? l.latestHandshake.getTime() : null,
+      transferRx: l.transferRx, transferTx: l.transferTx,
+      online: !!l.latestHandshake,
+    } : { online: false, latestHandshake: null, transferRx: 0, transferTx: 0 });
+  });
+}
+// The config as the renderer may see it: private keys stripped. The
+// only exception is an invite config text, which is built and returned
+// by wg-generate-invite itself (the invite IS that peer's key).
+function wgPublicConfig() {
+  const c = getWgConfig();
+  const server = Object.assign({}, c.server);
+  delete server.privateKey;
+  const client = c.client ? Object.assign({}, c.client) : null;
+  if (client) delete client.privateKey;
+  return { server, client };
+}
 
 const isDevelopment = !app.isPackaged;
 
@@ -2139,6 +2212,256 @@ ipcMain.handle('vpn-open-keys-page', async () => {
 ipcMain.handle('vpn-open-oauth-page', async () => {
   try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/settings/oauth'); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the OAuth clients page.' }; }
+});
+
+// ---------- TechVision WireGuard VPN (self-hosted WireGuard) ----------
+// The module only shells out to the WireGuard CLI that is already
+// installed on the machine; it implements no VPN protocol of its own.
+// Live state comes from `wg show`; stored state (keys, peers, client
+// config) comes from wireguard.json. Cloud join is Phase 2 — not here.
+ipcMain.handle('wg-get-status', async () => {
+  try {
+    const st = await wireguard.getStatus();
+    const c = getWgConfig();
+    const liveServerPeers = (st.server && Array.isArray(st.server.peers)) ? st.server.peers : [];
+    const liveClientPeer = (st.client && Array.isArray(st.client.peers) && st.client.peers[0]) || null;
+    const pub = wgPublicConfig();
+    return Object.assign({}, st, {
+      server: st.server ? Object.assign({}, pub.server, { publicKey: c.server.publicKey || st.server.publicKey, listenPort: c.server.listenPort, address: c.server.address }) : null,
+      client: c.client ? Object.assign({}, pub.client, liveClientPeer ? {
+        latestHandshake: liveClientPeer.latestHandshake ? liveClientPeer.latestHandshake.getTime() : null,
+        transferRx: liveClientPeer.transferRx, transferTx: liveClientPeer.transferTx,
+        endpoint: liveClientPeer.endpoint, online: !!liveClientPeer.latestHandshake,
+      } : { online: false, latestHandshake: null, transferRx: 0, transferTx: 0 }) : null,
+      peers: wgPeersWithLive(liveServerPeers),
+    });
+  } catch (e) { return { installed: false, serverRunning: false, clientRunning: false, server: null, client: null, peers: [], error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
+});
+ipcMain.handle('wg-list-peers', async () => {
+  try {
+    const st = await wireguard.getStatus();
+    const liveServerPeers = (st.server && Array.isArray(st.server.peers)) ? st.server.peers : [];
+    return { success: true, peers: wgPeersWithLive(liveServerPeers), serverRunning: !!st.serverRunning };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not list WireGuard peers.' }; }
+});
+ipcMain.handle('wg-start-server', async () => {
+  try {
+    const c = getWgConfig();
+    if (!c.server.privateKey || !wireguard.isWgKey(c.server.privateKey)) {
+      const kp = await wireguard.genkeypair();
+      if (!kp.success) return { success: false, error: kp.error };
+      c.server.privateKey = kp.privateKey;
+      c.server.publicKey = kp.publicKey;
+      saveWgConfig();
+    }
+    if (!c.server.endpoint) {
+      // The endpoint clients must reach: the public IP, read the same
+      // way the Cloud module reads it. Null means no public IPv4 was
+      // found (CGNAT) — the UI then says a VPS is needed instead of
+      // showing a wrong address.
+      try { const ip = await cloudServerMod.detectPublicIP(); if (ip) { c.server.endpoint = ip; saveWgConfig(); } } catch (e) {}
+    }
+    const conf = wireguard.buildServerConf({ privateKey: c.server.privateKey, address: c.server.address, listenPort: c.server.listenPort, peers: c.server.peers });
+    const r = await wireguard.installTunnelService(wireguard.SERVER_TUNNEL, conf);
+    if (!r.success) return { success: false, error: r.error, declined: !!r.declined };
+    return { success: true, publicKey: c.server.publicKey, endpoint: c.server.endpoint || null, listenPort: c.server.listenPort };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not start the WireGuard server.' }; }
+});
+ipcMain.handle('wg-stop-server', async () => {
+  try { return await wireguard.uninstallTunnelService(wireguard.SERVER_TUNNEL); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not stop the WireGuard server.' }; }
+});
+ipcMain.handle('wg-set-endpoint', async (event, endpoint) => {
+  try {
+    const host = String(endpoint || '').trim();
+    if (!host) { getWgConfig().server.endpoint = ''; saveWgConfig(); return { success: true, endpoint: '' }; }
+    if (!/^[A-Za-z0-9.-]+$/.test(host) || host.length > 253) return { success: false, error: 'Endpoint must be a hostname or an IP address, e.g. myhome.ddns.net or 203.0.113.10.' };
+    getWgConfig().server.endpoint = host;
+    saveWgConfig();
+    return { success: true, endpoint: host };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not save the endpoint.' }; }
+});
+// Add one peer by hand: the client shows its public key, the user
+// pastes it here (one paste, once). The tunnel address is allocated
+// by the app — the user never picks an IP. If the server is running,
+// the peer is applied live with `wg set`; otherwise it lands in the
+// config and applies at the next start.
+ipcMain.handle('wg-add-peer', async (event, opts) => {
+  try {
+    const name = String((opts && opts.name) || '').trim().replace(/[\r\n]/g, ' ');
+    const publicKey = String((opts && opts.publicKey) || '').trim();
+    if (!name) return { success: false, error: 'Give the device a name first.' };
+    if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'That is not a valid WireGuard public key (44 characters, ending in =).' };
+    const c = getWgConfig();
+    if ((c.server.peers || []).some((p) => p.publicKey === publicKey)) return { success: false, error: 'This device is already a peer.' };
+    const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp));
+    if (!tunnelIp) return { success: false, error: 'No free tunnel address left (10.0.0.2 – 10.0.0.254 are all taken).' };
+    const peer = { name, publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
+    c.server.peers.push(peer);
+    saveWgConfig();
+    let liveApplied = false, liveError = null;
+    try {
+      const st = await wireguard.getStatus();
+      if (st.serverRunning) {
+        const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, publicKey, peer.allowedIPs);
+        liveApplied = !!r.success;
+        if (!r.success) liveError = r.error;
+      }
+    } catch (e) { liveError = e && e.message ? e.message : String(e); }
+    return { success: true, peer, liveApplied, liveError };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not add the peer.' }; }
+});
+ipcMain.handle('wg-remove-peer', async (event, opts) => {
+  try {
+    const publicKey = String((opts && opts.publicKey) || '').trim();
+    if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'Not a valid WireGuard public key.' };
+    const c = getWgConfig();
+    const before = (c.server.peers || []).length;
+    c.server.peers = (c.server.peers || []).filter((p) => p.publicKey !== publicKey);
+    if (c.server.peers.length === before) return { success: false, error: 'No such peer.' };
+    saveWgConfig();
+    let liveApplied = false, liveError = null;
+    try {
+      const st = await wireguard.getStatus();
+      if (st.serverRunning) {
+        const r = await wireguard.removePeer(wireguard.SERVER_TUNNEL, publicKey);
+        liveApplied = !!r.success;
+        if (!r.success) liveError = r.error;
+      }
+    } catch (e) { liveError = e && e.message ? e.message : String(e); }
+    return { success: true, liveApplied, liveError };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not remove the peer.' }; }
+});
+// Generate a client invite: the server creates the client's keypair
+// and config, so the server already holds that client's public key —
+// nothing has to travel back. The peer is added to the server config
+// (and applied live when the server is running) and the full .conf
+// comes back for the QR code, the copy box and the export file. The
+// QR is rendered with the `qrcode` package when it is installed;
+// without it the invite still works as text + file (qr: null).
+ipcMain.handle('wg-generate-invite', async (event, opts) => {
+  try {
+    const name = String((opts && opts.name) || '').trim().replace(/[\r\n]/g, ' ') || 'device';
+    const c = getWgConfig();
+    if (!c.server.privateKey || !wireguard.isWgKey(c.server.privateKey) || !wireguard.isWgKey(c.server.publicKey)) return { success: false, error: 'Start the server first — it needs a keypair before it can invite anyone.' };
+    if (!c.server.endpoint) {
+      try { const ip = await cloudServerMod.detectPublicIP(); if (ip) { c.server.endpoint = ip; saveWgConfig(); } } catch (e) {}
+    }
+    if (!c.server.endpoint) return { success: false, error: 'No public address for this server yet. Type a DDNS hostname in the Server panel, or check the internet connection.' };
+    const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp));
+    if (!tunnelIp) return { success: false, error: 'No free tunnel address left (10.0.0.2 – 10.0.0.254 are all taken).' };
+    const kp = await wireguard.genkeypair();
+    if (!kp.success) return { success: false, error: kp.error };
+    const endpoint = c.server.endpoint + ':' + c.server.listenPort;
+    const conf = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: c.server.publicKey, endpoint, allowedIPs: wireguard.TUNNEL_SUBNET });
+    const peer = { name, publicKey: kp.publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
+    c.server.peers.push(peer);
+    saveWgConfig();
+    let liveApplied = false, liveError = null;
+    try {
+      const st = await wireguard.getStatus();
+      if (st.serverRunning) {
+        const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, peer.publicKey, peer.allowedIPs);
+        liveApplied = !!r.success;
+        if (!r.success) liveError = r.error;
+      }
+    } catch (e) { liveError = e && e.message ? e.message : String(e); }
+    let qr = null;
+    try {
+      const QRCode = require('qrcode');
+      qr = await QRCode.toDataURL(conf, { errorCorrectionLevel: 'M', margin: 1, width: 256 });
+    } catch (e) { qr = null; }
+    return { success: true, conf, qr, tunnelIp, name, publicKey: kp.publicKey, liveApplied, liveError };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not generate an invite.' }; }
+});
+// Import a .conf file (or pasted text): parse it and show what it
+// holds. No side effects — wg-connect does the installing.
+ipcMain.handle('wg-import-conf', async (event, opts) => {
+  try {
+    const confText = String((opts && opts.confText) || '');
+    if (!confText.trim()) return { success: false, error: 'Nothing to import.' };
+    const parsed = wireguard.parseConf(confText);
+    let publicKey = null;
+    if (parsed.interface.privateKey) {
+      const p = await wireguard.pubkey(parsed.interface.privateKey);
+      if (p.success) publicKey = p.key;
+    }
+    const serverPeer = parsed.peers[0] || {};
+    return {
+      success: true,
+      summary: {
+        address: parsed.interface.address || null,
+        publicKey,
+        serverPublicKey: serverPeer.publicKey || null,
+        endpoint: serverPeer.endpoint || null,
+        allowedIPs: serverPeer.allowedIPs || null,
+      },
+    };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read that config file.' }; }
+});
+// Connect this machine as a client. Two forms:
+//  - { confText }: an imported .conf (invite, file, or paste) —
+//    installed as-is, metadata stored from the parse.
+//  - { serverPublicKey, endpoint, tunnelIp, fullTunnel }: typed by
+//    hand — the app generates this machine's keypair and builds the
+//    config. The tunnel address is the one the server assigned (it
+//    is in the invite); the app never invents one.
+ipcMain.handle('wg-connect', async (event, opts) => {
+  try {
+    const o = opts || {};
+    let confText = null;
+    let meta = {};
+    // Reconnect with the stored client config (one click — the private
+    // key never leaves main, so the renderer cannot rebuild it).
+    if (o.reconnect) {
+      const stored = getWgConfig().client;
+      if (!stored || !wireguard.isWgKey(stored.privateKey) || !wireguard.isWgKey(stored.serverPublicKey)) return { success: false, error: 'No saved client config to reconnect with.' };
+      confText = wireguard.buildClientConf({ privateKey: stored.privateKey, address: (stored.tunnelIp || '10.0.0.2') + '/32', serverPublicKey: stored.serverPublicKey, endpoint: stored.endpoint, allowedIPs: stored.allowedIPs || wireguard.TUNNEL_SUBNET });
+      meta = stored;
+    } else if (o.confText && String(o.confText).trim()) {
+      const parsed = wireguard.parseConf(String(o.confText));
+      if (!parsed.interface.privateKey) return { success: false, error: 'That config has no private key — it cannot connect.' };
+      if (!parsed.peers[0] || !parsed.peers[0].publicKey) return { success: false, error: 'That config has no server to connect to.' };
+      confText = String(o.confText);
+      const p = await wireguard.pubkey(parsed.interface.privateKey);
+      meta = {
+        privateKey: parsed.interface.privateKey,
+        publicKey: p.success ? p.key : null,
+        serverPublicKey: parsed.peers[0].publicKey,
+        endpoint: parsed.peers[0].endpoint || '',
+        tunnelIp: wireguard.tunnelIpOf(parsed.interface.address) || '',
+        allowedIPs: parsed.peers[0].allowedIPs || wireguard.TUNNEL_SUBNET,
+      };
+    } else {
+      if (!wireguard.isWgKey(o.serverPublicKey)) return { success: false, error: 'That is not a valid server public key.' };
+      if (!o.endpoint || !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(String(o.endpoint).trim())) return { success: false, error: 'Endpoint must be host:port, e.g. myhome.ddns.net:51820.' };
+      const tunnelIp = wireguard.tunnelIpOf(o.tunnelIp) || '';
+      if (!tunnelIp) return { success: false, error: 'Type the tunnel address the server gave you (from the invite, e.g. 10.0.0.2).' };
+      const kp = await wireguard.genkeypair();
+      if (!kp.success) return { success: false, error: kp.error };
+      const allowedIPs = o.fullTunnel ? '0.0.0.0/0, ::/0' : wireguard.TUNNEL_SUBNET;
+      confText = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: String(o.serverPublicKey).trim(), endpoint: String(o.endpoint).trim(), allowedIPs });
+      meta = { privateKey: kp.privateKey, publicKey: kp.publicKey, serverPublicKey: String(o.serverPublicKey).trim(), endpoint: String(o.endpoint).trim(), tunnelIp, allowedIPs };
+    }
+    const c = getWgConfig();
+    try {
+      const st = await wireguard.getStatus();
+      if (st.clientRunning) await wireguard.uninstallTunnelService(wireguard.CLIENT_TUNNEL);
+    } catch (e) { /* installing over it is attempted below anyway */ }
+    const r = await wireguard.installTunnelService(wireguard.CLIENT_TUNNEL, confText);
+    if (!r.success) return { success: false, error: r.error, declined: !!r.declined };
+    c.client = Object.assign({ createdAt: new Date().toISOString() }, meta);
+    saveWgConfig();
+    return { success: true, tunnelIp: meta.tunnelIp, endpoint: meta.endpoint };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not connect.' }; }
+});
+ipcMain.handle('wg-disconnect', async () => {
+  try { return await wireguard.uninstallTunnelService(wireguard.CLIENT_TUNNEL); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disconnect.' }; }
+});
+ipcMain.handle('wg-open-download', async () => {
+  try { await require('electron').shell.openExternal(wireguard.WG_DOWNLOAD_URL); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {
