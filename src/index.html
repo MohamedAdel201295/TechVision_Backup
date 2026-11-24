@@ -9,7 +9,7 @@
 </head>
 <body data-theme="dark">
 <div class="app">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="brand">
       <img src="assets/TechVision_Logo.png" alt="TechVision logo" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
       <div style="display:none; width:38px; height:38px; border-radius:9px; background:linear-gradient(135deg,#0ea5e9,#22c55e); color:#fff; align-items:center; justify-content:center; font-weight:800; font-size:20px;">V</div>
@@ -18,12 +18,22 @@
         <div class="brand-sub">Backup</div>
       </div>
     </div>
-    <div class="nav-label">Menu</div>
-    <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
-    <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
-    <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
-    <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> New Job</button>
-    <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
+    <div id="moduleSwitcher">
+      <div class="nav-label">Modules</div>
+      <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
+      <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
+    </div>
+    <div class="nav-group" id="navGroupBackup">
+      <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
+      <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
+      <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
+      <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> New Job</button>
+      <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
+    </div>
+    <div class="nav-group" id="navGroupCloud" style="display:none;">
+      <button class="nav-item" type="button" data-nav="cloud-server"><span class="ico">🖥️</span> Server</button>
+      <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
+    </div>
     <div class="sidebar-foot">
       <div>TechVision Backup</div>
       <div>Powered by TechVision</div>
@@ -31,10 +41,32 @@
     </div>
   </aside>
   <main class="main">
-    <header class="topbar">
+    <div class="view modules-view" id="view-modules" style="display:none;">
+      <div class="modules-hero">
+        <div class="modules-brand">
+          <img src="assets/TechVision_Logo.png" alt="TechVision logo" onerror="this.style.display='none'">
+          <span>TechVision</span>
+        </div>
+        <div class="modules-grid">
+          <button class="module-card" type="button" data-module-enter="backup">
+            <span class="module-card-ico">💾</span>
+            <span class="module-card-title">TechVision Backup</span>
+          </button>
+          <button class="module-card" type="button" data-module-enter="cloud">
+            <span class="module-card-ico">☁</span>
+            <span class="module-card-title">TechVision Cloud</span>
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="backbar" id="backBar" style="display:none;">
+      <button class="back-btn" type="button" id="topBackBtn">‹ Back</button>
+      <span class="backbar-title" id="backBarTitle">Backup</span>
+    </div>
+    <header class="topbar" id="appHeader">
       <div>
-        <h1>TechVision Backup</h1>
-        <p>Your data, protected — full and incremental backups, fast streaming restore.</p>
+        <h1 id="appTitle">TechVision Backup</h1>
+        <p id="appSubtitle">Your data, protected — full and incremental backups, fast streaming restore.</p>
       </div>
       <div class="topbar-actions">
         <button class="icon-btn" type="button" id="themeToggle" title="Toggle dark / light theme" aria-label="Toggle theme">🌙</button>
@@ -162,6 +194,150 @@
       <p id="logsEmptyText">No runs match this tab.</p>
     </div>
   </div>
+  <div id="view-cloud" style="display:none;">
+    <div class="view-head">
+      <div>
+        <h2 class="section-title" style="margin:0;">Cloud — your own remote drive</h2>
+        <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Share a folder from this computer (Server) or open a shared folder on another computer (Client) — over your network or the internet, encrypted.</p>
+      </div>
+      <button class="btn btn-ghost" type="button" id="cloudRefreshBtn">⟳ Refresh</button>
+    </div>
+    <div class="cloud-modes" id="cloudModes">
+      <button class="cloud-mode-card" type="button" id="cloudModeServer">
+        <div class="cloud-mode-ico">🖥️</div>
+        <div class="cloud-mode-title">Server</div>
+        <div class="cloud-mode-sub">Share a folder from this computer so other devices can open it.</div>
+        <div class="cloud-mode-status" id="cloudServerModeStatus">Stopped</div>
+      </button>
+      <button class="cloud-mode-card" type="button" id="cloudModeClient">
+        <div class="cloud-mode-ico">💻</div>
+        <div class="cloud-mode-title">Client</div>
+        <div class="cloud-mode-sub">Open a shared folder on another computer and work with its files.</div>
+        <div class="cloud-mode-status" id="cloudClientModeStatus">Not connected</div>
+      </button>
+    </div>
+    <div id="cloudServerPanel" style="display:none;">
+      <h3 style="margin:14px 0 4px;font-size:16px;">Server — share a folder</h3>
+      <div class="cloud-status-row">
+        <span class="pill pill-pending" id="cloudServerPill">Stopped</span>
+        <span id="cloudServerInfo" class="cloud-muted">Not running</span>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Server enabled</div><div class="t-sub">Start serving when the app starts (it stays alive in the tray).</div></div>
+        <label class="switch"><input type="checkbox" id="cloudServerEnabled"><span class="slider"></span></label>
+      </div>
+      <div class="field">
+        <label for="cloudServerPort">Port</label>
+        <input type="text" id="cloudServerPort" value="8443" autocomplete="off">
+        <div class="hint">Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.</div>
+      </div>
+      <div class="field">
+        <label>Addresses</label>
+        <div id="cloudServerAddrs" class="cloud-muted">Detect your addresses to see them here.</div>
+        <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn" style="margin-top:6px;">Detect my addresses</button>
+      </div>
+      <div class="settings-guide">
+        <div class="settings-guide-title">To reach this server from outside</div>
+        <ul>
+          <li>Router: forward TCP port <b id="cloudGuidePort">8443</b> to this computer's LAN address.</li>
+          <li>From outside, clients use your public static IP + this port.</li>
+          <li>From the same network, clients use the LAN address + this port.</li>
+        </ul>
+      </div>
+      <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
+        <button class="btn btn-primary" type="button" id="cloudServerStartBtn">▶ Start server</button>
+        <button class="btn" type="button" id="cloudServerSaveBtn">Save settings</button>
+      </div>
+      <h3 style="margin:18px 0 4px;font-size:14px;">Users</h3>
+      <p class="cloud-muted" style="margin:0 0 8px;">Each user sees only their own folder. Give a user the whole drive (D:\) or one folder (D:\HR). Passwords are stored hashed, never in plain text.</p>
+      <div id="cloudUsersList" class="job-list"></div>
+      <div class="field">
+        <label for="cloudUserName">User name</label>
+        <input type="text" id="cloudUserName" placeholder="e.g. admin or HR" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="cloudUserPass">Password (at least 12 characters)</label>
+        <input type="password" id="cloudUserPass" placeholder="Strong password" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="cloudUserRoot">Folder this user can see</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="cloudUserRoot" placeholder="D:\ or D:\HR" autocomplete="off" style="flex:1;">
+          <button class="btn" type="button" id="cloudUserBrowseBtn">Browse…</button>
+        </div>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Can write</div><div class="t-sub">Upload, delete and rename. Off = read-only.</div></div>
+        <label class="switch"><input type="checkbox" id="cloudUserCanWrite" checked><span class="slider"></span></label>
+      </div>
+      <button class="btn" type="button" id="cloudUserAddBtn">＋ Add user</button>
+    </div>
+    <div id="cloudClientPanel" style="display:none;">
+      <h3 style="margin:14px 0 4px;font-size:16px;">Client — open a shared folder</h3>
+      <div id="cloudServersList" class="job-list"></div>
+      <div class="field">
+        <label for="cloudClientName">Name</label>
+        <input type="text" id="cloudClientName" placeholder="e.g. Home server" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="cloudClientHost">Server address (public IP, LAN IP or hostname)</label>
+        <input type="text" id="cloudClientHost" placeholder="203.0.113.10" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="cloudClientPort">Port</label>
+        <input type="text" id="cloudClientPort" value="8443" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="cloudClientUser">User name</label>
+        <input type="text" id="cloudClientUser" placeholder="admin" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="cloudClientPass">Password</label>
+        <input type="password" id="cloudClientPass" placeholder="Password for this server" autocomplete="off">
+        <div class="hint">Asked once when you connect — it is never stored on this computer.</div>
+      </div>
+      <button class="btn" type="button" id="cloudClientAddBtn">＋ Save &amp; connect</button>
+      <div id="cloudConnectBox" style="display:none; margin-top:16px;">
+        <h3 style="margin:0 0 4px;font-size:14px;" id="cloudConnectTitle">Connect</h3>
+        <div id="cloudFingerprintBox" class="settings-guide" style="display:none;">
+          <div class="settings-guide-title">First time: trust this server?</div>
+          <p style="font-size:12px; margin:6px 0;">The server's certificate fingerprint is:</p>
+          <p style="font-size:12px; word-break:break-all; margin:0 0 6px;"><b id="cloudFingerprintText"></b></p>
+          <p style="font-size:12px; margin:0;">Check it against the fingerprint shown on the server, then trust it. The app will refuse any other certificate for this server afterwards.</p>
+        </div>
+        <div class="field" style="margin-top:10px;">
+          <label for="cloudConnectPass">Password</label>
+          <input type="password" id="cloudConnectPass" placeholder="Password for this server" autocomplete="off">
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn btn-primary" type="button" id="cloudConnectBtn">Connect</button>
+          <button class="btn btn-ghost" type="button" id="cloudConnectCancelBtn">Cancel</button>
+        </div>
+      </div>
+      <div id="cloudBrowser" style="display:none; margin-top:16px;">
+        <div class="cloud-browser-head">
+          <div id="cloudCrumbs" class="cloud-crumbs"></div>
+          <button class="btn btn-ghost btn-sm" type="button" id="cloudDisconnectBtn">Disconnect</button>
+        </div>
+        <div class="cloud-browser-toolbar">
+          <button class="btn btn-sm" type="button" id="cloudUploadBtn">⬆ Upload file…</button>
+          <button class="btn btn-sm" type="button" id="cloudMkdirBtn">＋ New folder</button>
+          <button class="btn btn-ghost btn-sm" type="button" id="cloudBrowserRefreshBtn">⟳ Refresh</button>
+          <span id="cloudBrowserInfo" class="cloud-muted"></span>
+        </div>
+        <div class="cloud-transfer" id="cloudTransfer" style="display:none;">
+          <div class="progress-track"><div class="progress-fill" id="cloudTransferFill"></div></div>
+          <div class="cloud-muted" id="cloudTransferText"></div>
+        </div>
+        <div id="cloudFileList" class="job-list"></div>
+        <div class="empty-state" id="cloudEmptyState" style="display:none;">
+          <div class="big">📂</div>
+          <h3>Empty folder</h3>
+          <p>Nothing here yet.</p>
+        </div>
+      </div>
+    </div>
+  </div>
   </main>
 </div>
 <div class="backdrop" id="drawerBackdrop"></div>
@@ -194,7 +370,6 @@
 <aside class="drawer" id="settingsDrawer" aria-label="Settings">
   <button class="icon-btn close-x" type="button" id="settingsClose" aria-label="Close settings">✕</button>
   <h2>Settings</h2>
-  <p style="color:var(--muted); margin:4px 0 0;">Saved with <code>window.electronAPI.saveSettings()</code>.</p>
   <div id="settingsHomeView" style="margin-top:14px;">
     <div class="toggle-row">
       <div><div class="t-label">Light theme</div><div class="t-sub">Switch between dark and light.</div></div>
@@ -322,6 +497,19 @@
   <div class="confirm-actions">
     <button class="btn btn-danger" type="button" id="confirmYes">Yes, delete all</button>
     <button class="btn" type="button" id="confirmNo">No, keep it</button>
+  </div>
+</div>
+<div class="backdrop" id="cloudPromptBackdrop"></div>
+<div class="confirm-modal" id="cloudPromptModal" role="dialog" aria-labelledby="cloudPromptTitle" style="display:none;">
+  <h3 id="cloudPromptTitle">Name</h3>
+  <p id="cloudPromptText"></p>
+  <div class="field">
+    <label for="cloudPromptInput" id="cloudPromptLabel">Name</label>
+    <input type="text" id="cloudPromptInput" autocomplete="off">
+  </div>
+  <div class="confirm-actions">
+    <button class="btn btn-primary" type="button" id="cloudPromptOk">OK</button>
+    <button class="btn btn-ghost" type="button" id="cloudPromptCancel">Cancel</button>
   </div>
 </div>
 <div class="backdrop" id="vaultBackdrop"></div>

@@ -276,6 +276,25 @@ class BackupEngine {
   }
 
   /**
+   * Real progress reporting for the UI. main.js sets engine.onProgress
+   * to forward these to the window; scheduled runs leave it unset
+   * (no-op). Payload: { pct, phase, filesDone, filesTotal, bytesDone,
+   * bytesTotal, currentFile }. Only emits when the rounded percent
+   * moves, so the IPC channel is not flooded on many-small-file jobs.
+   * Never goes backwards and never reaches 100 — the caller sets 100
+   * when the IPC reply arrives.
+   */
+  _emitProgress(pct, phase, currentFile, filesDone, filesTotal, bytesDone, bytesTotal) {
+    if (typeof this.onProgress !== 'function') return;
+    const p = Math.max(0, Math.min(99, Math.round(pct * 10) / 10));
+    if (p <= this._lastProgressPct) return;
+    this._lastProgressPct = p;
+    try {
+      this.onProgress({ pct: p, phase, currentFile: currentFile || '', filesDone, filesTotal, bytesDone, bytesTotal });
+    } catch (e) { /* progress is best-effort */ }
+  }
+
+  /**
    * Calculate SHA-256 hash of a file
    */
   calculateHash(filePath) {
@@ -310,13 +329,24 @@ class BackupEngine {
    * Copy one file into a plain-copy backup folder, keeping the same
    * relative path it had in the source. Used when compression is 'none':
    * the user wants the backup to be the same files, not a ZIP.
+   * Streamed (not copyFileSync) so a single huge file reports progress
+   * per chunk through onProgress(chunkBytes) instead of jumping 0→100.
    */
-  _copyPlainFile(file, sourceDir, destRoot) {
+  _copyPlainFile(file, sourceDir, destRoot, onProgress) {
     const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
     const dest = path.join(destRoot, relativePath);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    fs.copyFileSync(file, dest);
-    return dest;
+    return new Promise((resolve, reject) => {
+      const rs = fs.createReadStream(file);
+      const ws = fs.createWriteStream(dest);
+      rs.on('data', chunk => {
+        if (typeof onProgress === 'function') { try { onProgress(chunk.length); } catch (e) {} }
+      });
+      rs.on('error', reject);
+      ws.on('error', reject);
+      ws.on('finish', () => resolve(dest));
+      rs.pipe(ws);
+    });
   }
 
   /**
@@ -365,6 +395,19 @@ class BackupEngine {
     this.log('info', `Destination: ${plainCopy ? copyDir + ' (plain files, no ZIP)' : zipPath + (this.jobConfig.encryptionEnabled ? ' (AES-256 encrypted)' : '')}`);
 
     try {
+      // Real progress: one metric — bytes actually read from the
+      // source (plus bytes of skipped files) over total source bytes,
+      // 0→99%. The old renderer-side fake bar raced to 92% and froze
+      // there, and archiver's own 'progress' event fires only once per
+      // file, so it cannot drive a smooth bar for one huge file
+      // either. ZIP entries are therefore appended as counted read
+      // streams (paused until archiver pipes them, so no chunk can
+      // flow — and be lost — before archiver is listening).
+      this._lastProgressPct = -1;
+      let totalBytes = 0;
+      let bytesDone = 0;
+      let filesSeen = 0;
+      let currentFileName = '';
       // Create ZIP archive (skipped for plain-copy backups)
       let archive = null;
       let outputClosed = null;
@@ -393,47 +436,86 @@ class BackupEngine {
       // Collect all files
       const files = this._collectFiles(sourceDir);
       this.log('info', `Found ${files.length} files to backup`);
+      // Stable denominator for real progress: total bytes of all files.
+      for (const f of files) { try { totalBytes += fs.statSync(f).size; } catch (e) {} }
+      const emitLive = (name) => {
+        this._emitProgress(99 * bytesDone / (totalBytes || 1), plainCopy ? 'copying' : 'writing', name, filesSeen, files.length, bytesDone, totalBytes);
+      };
+      // Files that are never read (excluded, locked, failed, or not
+      // included) still count, so the bar keeps moving past them.
+      const markSkipped = (size, name) => { bytesDone += size; filesSeen++; emitLive(name); };
 
       for (const file of files) {
+        let stats = null;
+        try { stats = fs.statSync(file); } catch (e) {}
+        const fileSize = stats ? stats.size : 0;
         try {
           const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
-          
+          currentFileName = relativePath;
+
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
             result.files_skipped++;
+            markSkipped(fileSize, relativePath);
             continue;
           }
 
-          if (this.jobConfig.shouldInclude(file)) {
-            // Check if file is locked (VSS not implemented - skip locked files)
-            try {
-              // Try to access the file - will throw EACCES if locked
-              fs.accessSync(file, fs.constants.R_OK);
-            } catch (e) {
-              if (e.code === 'EACCES' || e.code === 'EPERM') {
-                // File is locked or permission denied - skip as SKIPPED-LOCKED
-                result.locked_files_skipped++;
-                result.files_skipped++;
-                this.log('warn', `[SKIPPED-LOCKED] ${relativePath}: ${e.code} - VSS deferred, use vssadmin for locked files`);
-                result.error_messages.push(`SKIPPED-LOCKED: ${relativePath}: ${e.code}`);
-                continue;
-              }
-            }
-            
-            // File is readable: copy it as-is, or add it to the ZIP
-            if (plainCopy) {
-              this._copyPlainFile(file, sourceBase, copyDir);
-            } else {
-              archive.file(file, { name: relativePath });
-            }
-            result.files_backed_up++;
-            result.total_bytes += fs.statSync(file).size;
-            this.log('info', `Backed up: ${relativePath}`);
+          if (!this.jobConfig.shouldInclude(file)) {
+            result.files_skipped++;
+            markSkipped(fileSize, relativePath);
+            continue;
           }
+
+          // Check if file is locked (VSS not implemented - skip locked files)
+          try {
+            // Try to access the file - will throw EACCES if locked
+            fs.accessSync(file, fs.constants.R_OK);
+          } catch (e) {
+            if (e.code === 'EACCES' || e.code === 'EPERM') {
+              // File is locked or permission denied - skip as SKIPPED-LOCKED
+              result.locked_files_skipped++;
+              result.files_skipped++;
+              this.log('warn', `[SKIPPED-LOCKED] ${relativePath}: ${e.code} - VSS deferred, use vssadmin for locked files`);
+              result.error_messages.push(`SKIPPED-LOCKED: ${relativePath}: ${e.code}`);
+              markSkipped(fileSize, relativePath);
+              continue;
+            }
+          }
+
+          // A file that vanished after collection must not fail the
+          // whole run: archive.file() used to warn and skip it, so do
+          // the same here instead of appending a broken stream.
+          if (!stats) {
+            result.files_failed++;
+            result.error_messages.push(`Failed to backup ${file}: file disappeared before it could be read`);
+            this.log('error', `Failed to backup ${file}: file disappeared before it could be read`);
+            markSkipped(0, relativePath);
+            continue;
+          }
+
+          // File is readable: copy it as-is, or add it to the ZIP
+          if (plainCopy) {
+            await this._copyPlainFile(file, sourceBase, copyDir, (n) => {
+              bytesDone += n;
+              emitLive(relativePath);
+            });
+          } else {
+            // Counted read stream: archiver reads the file through it
+            // while compressing, so 'data' events ARE the real work.
+            const rs = fs.createReadStream(file);
+            rs.on('data', chunk => { bytesDone += chunk.length; emitLive(relativePath); });
+            rs.pause();
+            archive.append(rs, { name: relativePath, stats });
+          }
+          result.files_backed_up++;
+          result.total_bytes += fileSize;
+          this.log('info', `Backed up: ${relativePath}`);
+          filesSeen++;
         } catch (err) {
           result.files_failed++;
           result.error_messages.push(`Failed to backup ${file}: ${err.message}`);
           this.log('error', `Failed to backup ${file}: ${err.message}`);
+          markSkipped(fileSize, file);
         }
       }
 
@@ -529,6 +611,14 @@ class BackupEngine {
       // Get previous state
       const prevState = backupState.state;
 
+      // Real progress — same scheme as full backups: bytes actually
+      // read (plus bytes of skipped files) over total source bytes.
+      this._lastProgressPct = -1;
+      let totalBytes = 0;
+      let bytesDone = 0;
+      let filesSeen = 0;
+      let currentFileName = '';
+
       // Create ZIP archive (skipped for plain-copy backups)
       let archive = null;
       let outputClosed = null;
@@ -555,19 +645,30 @@ class BackupEngine {
       // Collect current files
       const currentFiles = this._collectFiles(sourceDir);
       let filesNeedingBackup = 0;
+      for (const f of currentFiles) { try { totalBytes += fs.statSync(f).size; } catch (e) {} }
+      const emitLive = (name) => {
+        this._emitProgress(99 * bytesDone / (totalBytes || 1), plainCopyInc ? 'copying' : 'writing', name, filesSeen, currentFiles.length, bytesDone, totalBytes);
+      };
+      const markSkipped = (size, name) => { bytesDone += size; filesSeen++; emitLive(name); };
 
       for (const file of currentFiles) {
+        let stats = null;
+        try { stats = fs.statSync(file); } catch (e) {}
+        const fileSize = stats ? stats.size : 0;
         try {
           const relativePath = path.relative(sourceBaseInc, file).replace(/\\/g, '/');
-          
+          currentFileName = relativePath;
+
           if (this.jobConfig.shouldExclude(file)) {
             this.log('debug', `Excluded: ${relativePath}`);
             result.files_skipped++;
+            markSkipped(fileSize, relativePath);
             continue;
           }
 
           if (!this.jobConfig.shouldInclude(file)) {
             result.files_skipped++;
+            markSkipped(fileSize, relativePath);
             continue;
           }
 
@@ -580,6 +681,7 @@ class BackupEngine {
               result.files_skipped++;
               this.log('warn', `[SKIPPED-LOCKED] ${relativePath}: ${e.code} - VSS deferred`);
               result.error_messages.push(`SKIPPED-LOCKED: ${relativePath}: ${e.code}`);
+              markSkipped(fileSize, relativePath);
               continue;
             }
           }
@@ -590,18 +692,38 @@ class BackupEngine {
           const needsBackup = this._needsBackup(file, prevInfo, currentInfo);
 
           if (needsBackup) {
-            if (plainCopyInc) {
-              this._copyPlainFile(file, sourceBaseInc, copyDirInc);
+            // A file that vanished after collection must not fail the
+            // whole run (same guard as full backups).
+            if (!stats) {
+              result.files_failed++;
+              result.error_messages.push(`Failed to backup ${file}: file disappeared before it could be read`);
+              this.log('error', `Failed to backup ${file}: file disappeared before it could be read`);
+              markSkipped(0, relativePath);
+            } else if (plainCopyInc) {
+              await this._copyPlainFile(file, sourceBaseInc, copyDirInc, (n) => {
+                bytesDone += n;
+                emitLive(relativePath);
+              });
+              result.files_backed_up++;
+              result.total_bytes += currentInfo.size;
+              filesNeedingBackup++;
+              this.log('info', `Incremental update: ${relativePath}`);
+              filesSeen++;
             } else {
-              archive.file(file, { name: relativePath });
+              const rs = fs.createReadStream(file);
+              rs.on('data', chunk => { bytesDone += chunk.length; emitLive(relativePath); });
+              rs.pause();
+              archive.append(rs, { name: relativePath, stats });
+              result.files_backed_up++;
+              result.total_bytes += currentInfo.size;
+              filesNeedingBackup++;
+              this.log('info', `Incremental update: ${relativePath}`);
+              filesSeen++;
             }
-            result.files_backed_up++;
-            result.total_bytes += currentInfo.size;
-            filesNeedingBackup++;
-            this.log('info', `Incremental update: ${relativePath}`);
           } else {
             result.files_skipped++;
             this.log('debug', `Skipped (unchanged): ${relativePath}`);
+            markSkipped(fileSize, relativePath);
           }
 
           // Update state
@@ -610,6 +732,7 @@ class BackupEngine {
           result.files_failed++;
           result.error_messages.push(`Failed to backup ${file}: ${err.message}`);
           this.log('error', `Failed to backup ${file}: ${err.message}`);
+          markSkipped(fileSize, file);
         }
       }
 

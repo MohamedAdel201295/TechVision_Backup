@@ -75,7 +75,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
   refreshJobs: (jobs) => ipcRenderer.invoke('jobs-refresh', jobs),
 
   // Event listeners for real-time updates
-  onBackupProgress: (callback) => ipcRenderer.on('backup-progress', (event, ...args) => callback(...args)),
+  // onBackupProgress returns an unsubscribe function so a run can stop
+  // listening when it finishes (no duplicate listeners on repeat runs).
+  onBackupProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('backup-progress', h); return () => ipcRenderer.removeListener('backup-progress', h); },
+  onCloudProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('cloud-progress', h); return () => ipcRenderer.removeListener('cloud-progress', h); },
+
+  // TechVision Cloud — server
+  cloudGetConfig: () => ipcRenderer.invoke('cloud-get-config'),
+  cloudDetectIP: () => ipcRenderer.invoke('cloud-detect-ip'),
+  cloudServerSave: (cfg) => ipcRenderer.invoke('cloud-server-save', cfg),
+  cloudServerStart: () => ipcRenderer.invoke('cloud-server-start'),
+  cloudServerStop: () => ipcRenderer.invoke('cloud-server-stop'),
+  cloudUserAdd: (u) => ipcRenderer.invoke('cloud-user-add', u),
+  cloudUserRemove: (name) => ipcRenderer.invoke('cloud-user-remove', name),
+  cloudUserSetPassword: (name, password) => ipcRenderer.invoke('cloud-user-set-password', name, password),
+  // TechVision Cloud — client (passwords are never stored)
+  cloudClientSave: (s) => ipcRenderer.invoke('cloud-client-save', s),
+  cloudClientRemove: (id) => ipcRenderer.invoke('cloud-client-remove', id),
+  cloudClientProbe: (host, port) => ipcRenderer.invoke('cloud-client-probe', host, port),
+  cloudClientConnect: (opts) => ipcRenderer.invoke('cloud-client-connect', opts),
+  cloudClientDisconnect: (serverId) => ipcRenderer.invoke('cloud-client-disconnect', serverId),
+  cloudClientList: (serverId, relPath) => ipcRenderer.invoke('cloud-client-list', serverId, relPath),
+  cloudClientDownload: (serverId, relPath, destDir) => ipcRenderer.invoke('cloud-client-download', serverId, relPath, destDir),
+  cloudClientUpload: (serverId, localPath, remoteDir) => ipcRenderer.invoke('cloud-client-upload', serverId, localPath, remoteDir),
+  cloudClientMkdir: (serverId, relPath) => ipcRenderer.invoke('cloud-client-mkdir', serverId, relPath),
+  cloudClientDelete: (serverId, relPath) => ipcRenderer.invoke('cloud-client-delete', serverId, relPath),
+  cloudClientRename: (serverId, from, to) => ipcRenderer.invoke('cloud-client-rename', serverId, from, to),
   onBackupComplete: (callback) => ipcRenderer.on('backup-complete', (event, ...args) => callback(...args)),
   onJobsUpdated: (callback) => ipcRenderer.on('jobs-updated', () => callback()),
 
