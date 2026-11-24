@@ -464,6 +464,11 @@
         <div><div class="t-label">Share my home network (subnet router)</div><div class="t-sub" id="vpnSubnetSub">Let devices on Tailscale reach your whole home network (printer, camera, router).</div></div>
         <label class="switch"><input type="checkbox" id="vpnSubnetToggle"><span class="slider"></span></label>
       </div>
+      <div class="field" style="margin-top:8px;">
+        <label for="vpnCustomRoutes">Share only specific addresses (optional)</label>
+        <input type="text" id="vpnCustomRoutes" placeholder="e.g. 192.168.1.200/32, 192.168.1.201/32" autocomplete="off" spellcheck="false">
+        <div class="t-sub" id="vpnCustomRoutesHint">Empty = share the whole home network above. A /32 shares one machine only — for reaching a machine on another network that uses the same subnet; Tailscale sends each address to the most specific route. This only changes what Tailscale advertises — your real network (router, DHCP, device addresses) never changes.</div>
+      </div>
       <div class="t-sub" id="vpnRoutesNote" style="display:none;"></div>
       <button class="btn btn-ghost btn-sm" type="button" id="vpnApproveBtn" style="display:none; margin-top:6px;">Open admin console to approve the route</button>
       <div class="toggle-row" style="margin-top:12px;">
