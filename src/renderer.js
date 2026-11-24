@@ -630,6 +630,30 @@
      the mode only changes what the UI shows and what gets saved. */
   var cloudServerAccess = 'normal';
   var cloudClientAccess = 'normal';
+  // Serializes Cloud server saves: an auto-save triggered by a blur can
+  // otherwise race Start's own save, and two concurrent saves could both
+  // try to start the server (main's save handler applies the config —
+  // starting/stopping the server to match `enabled`).
+  var cloudServerSaveQueue = Promise.resolve();
+
+  // Server settings save themselves the moment anything changes — the
+  // old "Save settings" button was the only thing standing between a
+  // change and the config file, so it is gone. Silent on success (the
+  // status pill / Tailscale line already show the result); a toast only
+  // when the save fails. Note main's save handler also APPLIES the
+  // config: flipping "Server enabled" on starts the server, off stops it.
+  function saveCloudServerSettings() {
+    cloudServerSaveQueue = cloudServerSaveQueue.then(async function () {
+      if (!api || typeof api.cloudServerSave !== 'function') { cloudMissing(); return; }
+      try {
+        var port = parseInt(($('cloudServerPort') || {}).value, 10);
+        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess });
+        if (r && r.success) { await loadCloud(); }
+        else toast('Save failed', (r && r.error) || 'Could not save Cloud settings.', 'error');
+      } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save Cloud settings.', 'error'); }
+    });
+    return cloudServerSaveQueue;
+  }
 
   function setServerAccess(mode) {
     cloudServerAccess = mode === 'tailscale' ? 'tailscale' : 'normal';
@@ -1678,7 +1702,7 @@
       btn.addEventListener('click', function () { setModule(btn.getAttribute('data-module')); });
     });
     document.querySelectorAll('#cloudServerAccessSeg .seg-btn').forEach(function (b) {
-      b.addEventListener('click', function () { setServerAccess(b.getAttribute('data-access')); });
+      b.addEventListener('click', function () { setServerAccess(b.getAttribute('data-access')); saveCloudServerSettings(); });
     });
     document.querySelectorAll('#cloudClientAccessSeg .seg-btn').forEach(function (b) {
       b.addEventListener('click', function () { setClientAccess(b.getAttribute('data-access')); });
@@ -1817,6 +1841,9 @@
     if (css) css.addEventListener('click', async function () {
       if (!api || typeof api.cloudServerStart !== 'function' || typeof api.cloudServerStop !== 'function') return cloudMissing();
       try {
+        // Let any auto-save triggered by a blur finish first, so its
+        // server start/stop cannot race the one below.
+        await cloudServerSaveQueue;
         var running = cloudCfg && cloudCfg.server && cloudCfg.server.running;
         if (running) {
           var rs = await api.cloudServerStop();
@@ -1834,16 +1861,13 @@
         else toast('Server error', (r && r.error) || 'Could not start the server.', 'error');
       } catch (e) { toast('Server error', e && e.message ? e.message : 'Could not change the server state.', 'error'); }
     });
-    var csv = $('cloudServerSaveBtn');
-    if (csv) csv.addEventListener('click', async function () {
-      if (!api || typeof api.cloudServerSave !== 'function') return cloudMissing();
-      try {
-        var port = parseInt(($('cloudServerPort') || {}).value, 10);
-        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess });
-        if (r && r.success) { toast('Cloud settings saved', 'Server settings saved.', 'success'); await loadCloud(); }
-        else toast('Save failed', (r && r.error) || 'Could not save Cloud settings.', 'error');
-      } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save Cloud settings.', 'error'); }
-    });
+    // Server settings auto-save: the enabled toggle, the port field
+    // (on change = when the user leaves the field) and the access-mode
+    // buttons all save immediately — there is no Save button anymore.
+    var cse = $('cloudServerEnabled');
+    if (cse) cse.addEventListener('change', function () { saveCloudServerSettings(); });
+    var csp = $('cloudServerPort');
+    if (csp) csp.addEventListener('change', function () { saveCloudServerSettings(); });
     var cdi = $('cloudDetectIpBtn');
     if (cdi) cdi.addEventListener('click', async function () {
       if (!api || typeof api.cloudDetectIP !== 'function') return cloudMissing();
