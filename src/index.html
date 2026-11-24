@@ -250,9 +250,9 @@
       <div class="field">
         <label for="cloudServerPort">Port</label>
         <input type="text" id="cloudServerPort" value="8443" autocomplete="off">
-        <div class="hint">Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.</div>
+        <div class="hint" id="cloudServerPortHint">Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.</div>
       </div>
-      <div class="field">
+      <div class="field" id="cloudServerAddrsField">
         <label>Addresses</label>
         <div id="cloudServerAddrs" class="cloud-muted">Detect your addresses to see them here.</div>
         <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn" style="margin-top:6px;">Detect my addresses</button>

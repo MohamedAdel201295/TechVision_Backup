@@ -640,6 +640,17 @@
       : 'Clients use your public static IP or DDNS + this port (forward the port in your router).';
     var ti = $('cloudTailscaleInfo'); if (ti) ti.style.display = cloudServerAccess === 'tailscale' ? '' : 'none';
     var fg = $('cloudForwardGuide'); if (fg) fg.style.display = cloudServerAccess === 'tailscale' ? 'none' : '';
+    // The port is the port the server listens on in both modes — but the
+    // "forward it in your router" note only applies to Normal mode. In
+    // Tailscale mode it was telling the user to forward a port that needs
+    // no forwarding. Same for the Addresses block: in Tailscale mode the
+    // public and LAN addresses are useless here (the Tailscale address
+    // above is the only one clients need), so hide the whole block.
+    var ph = $('cloudServerPortHint');
+    if (ph) ph.textContent = cloudServerAccess === 'tailscale'
+      ? 'The port this server listens on. Clients connect to the Tailscale address above + this port — no port forwarding needed.'
+      : 'Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.';
+    var af = $('cloudServerAddrsField'); if (af) af.style.display = cloudServerAccess === 'tailscale' ? 'none' : '';
     if (cloudServerAccess === 'tailscale') refreshCloudTailscaleIp();
   }
 
