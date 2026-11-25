@@ -756,6 +756,7 @@
     var host = $('cloudClientHost');
     if (host) host.placeholder = cloudClientAccess === 'tailscale' ? '100.64.0.1' : cloudClientAccess === 'wireguard' ? '10.0.0.1' : '203.0.113.10';
     var pf = $('cloudClientPeerField'); if (pf) pf.style.display = cloudClientAccess === 'normal' ? 'none' : '';
+    var apb = $('cloudClientWgAddPeerBtn'); if (apb) apb.style.display = cloudClientAccess === 'wireguard' ? '' : 'none';
     var pl = $('cloudClientPeerLabel');
     if (pl) pl.textContent = cloudClientAccess === 'wireguard' ? 'Pick a device from your WireGuard tunnel' : 'Pick a device from your Tailscale network';
     var ph2 = $('cloudClientPeerHint');
@@ -2967,6 +2968,24 @@
     });
     document.querySelectorAll('#cloudClientAccessSeg .seg-btn').forEach(function (b) {
       b.addEventListener('click', function () { setClientAccess(b.getAttribute('data-access')); });
+    });
+    // Jump to the WireGuard module's Add a device form: the picker
+    // above lists tunnel devices, and when it is empty the device
+    // has to be added first — this button is the shortcut there.
+    var wgApb = $('cloudClientWgAddPeerBtn');
+    if (wgApb) wgApb.addEventListener('click', function () {
+      showView('wireguard');
+      // Focus AFTER the status load finishes: it hides the server
+      // card when the transport is not installed, and focusing
+      // before that races it (the card hides under the focus).
+      var focusKey = function () {
+        var key = $('wgPeerKey');
+        if (key) { try { key.scrollIntoView({ block: 'center' }); } catch (e) {} key.focus(); }
+      };
+      if (typeof loadWireGuard === 'function') {
+        try { var p = loadWireGuard(); if (p && typeof p.then === 'function') { p.then(focusKey); return; } } catch (e) {}
+      }
+      focusKey();
     });
     var cps = $('cloudClientPeer');
     if (cps) cps.addEventListener('change', function () {
