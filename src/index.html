@@ -86,7 +86,10 @@
       </div>
       <div class="topbar-actions">
         <button class="icon-btn" type="button" id="themeToggle" title="Toggle dark / light theme" aria-label="Toggle theme">🌙</button>
+        <button class="icon-btn" type="button" id="backupTopRefreshBtn" title="Refresh jobs" aria-label="Refresh jobs" style="display:none;">⟳</button>
+        <button class="icon-btn" type="button" id="cloudTopRefreshBtn" title="Refresh Cloud" aria-label="Refresh Cloud" style="display:none;">⟳</button>
         <button class="icon-btn" type="button" id="vpnTopRefreshBtn" title="Refresh Tailscale status" aria-label="Refresh Tailscale status" style="display:none;">⟳</button>
+        <button class="icon-btn" type="button" id="wgTopRefreshBtn" title="Refresh WireGuard status" aria-label="Refresh WireGuard status" style="display:none;">⟳</button>
         <button class="icon-btn" type="button" id="settingsBtn" title="Settings" aria-label="Settings">⚙</button>
       </div>
     </header>
@@ -113,9 +116,6 @@
         <div class="stat-sub" id="statSuccessSub">No runs yet</div>
       </div>
     </section>
-    <div class="actions-row">
-      <button class="btn btn-ghost" type="button" id="refreshBtn">⟳ Refresh</button>
-    </div>
     <section class="progress-card" id="progressCard" aria-live="polite">
       <div class="progress-head">
         <span><span class="spinner" id="progressSpinner"></span> <span id="progressTitle">Backing up…</span></span>
@@ -217,7 +217,6 @@
         <h2 class="section-title" style="margin:0;">Cloud — your own remote drive</h2>
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Share a folder from this computer (Server) or open a shared folder on another computer (Client) — over your network or the internet, encrypted.</p>
       </div>
-      <button class="btn btn-ghost" type="button" id="cloudRefreshBtn">⟳ Refresh</button>
     </div>
     <div class="cloud-modes" id="cloudModes">
       <button class="cloud-mode-card" type="button" id="cloudModeServer">
@@ -248,6 +247,7 @@
         <div class="seg" id="cloudServerAccessSeg">
           <button class="seg-btn active" type="button" data-access="normal">🌐 Normal (Internet)</button>
           <button class="seg-btn" type="button" data-access="tailscale">🛡️ Tailscale VPN</button>
+          <button class="seg-btn" type="button" data-access="wireguard">🔐 WireGuard VPN</button>
         </div>
         <div class="hint" id="cloudServerAccessHint">Clients use your public static IP or DDNS + this port (forward the port in your router).</div>
       </div>
@@ -255,6 +255,11 @@
         <label>Tailscale address of this computer</label>
         <div id="cloudTailscaleIp" class="cloud-muted">Checking Tailscale…</div>
         <div class="hint">Clients on the same Tailscale network use this address + the port. No port forwarding needed.</div>
+      </div>
+      <div class="field" id="cloudWireguardInfo" style="display:none;">
+        <label>WireGuard tunnel address of this computer</label>
+        <div id="cloudWireguardIp" class="cloud-muted">Checking WireGuard…</div>
+        <div class="hint">Clients on the same WireGuard tunnel use this address + the port. No port forwarding needed — the one UDP 51820 forward that brings the tunnel up covers everything inside it.</div>
       </div>
       <div class="field">
         <label for="cloudServerPort">Port</label>
@@ -313,13 +318,14 @@
         <div class="seg" id="cloudClientAccessSeg">
           <button class="seg-btn active" type="button" data-access="normal">🌐 Normal (Internet)</button>
           <button class="seg-btn" type="button" data-access="tailscale">🛡️ Tailscale VPN</button>
+          <button class="seg-btn" type="button" data-access="wireguard">🔐 WireGuard VPN</button>
         </div>
         <div class="hint" id="cloudClientAccessHint">Public IP, DDNS hostname or LAN IP of the server.</div>
       </div>
       <div class="field" id="cloudClientPeerField" style="display:none;">
-        <label for="cloudClientPeer">Pick a device from your Tailscale network</label>
+        <label for="cloudClientPeer" id="cloudClientPeerLabel">Pick a device from your Tailscale network</label>
         <select id="cloudClientPeer"></select>
-        <div class="hint">Both devices must be on the same Tailscale network — see the VPN module.</div>
+        <div class="hint" id="cloudClientPeerHint">Both devices must be on the same Tailscale network — see the VPN module.</div>
       </div>
       <div class="field">
         <label for="cloudClientHost">Server address (public IP, LAN IP or hostname)</label>
@@ -501,7 +507,6 @@
           <div class="t-sub" id="wgStatusSub"></div>
           <div class="t-sub" id="wgTransportLine" style="display:none;"></div>
         </div>
-        <button class="btn" type="button" id="wgRefreshBtn">Refresh</button>
       </div>
       <div id="wgNotInstalled" style="display:none;">
         <p class="t-sub" style="margin:0 0 10px;">Install it with one click — TechVision downloads the official AmneziaWG installer, checks its signature, and installs it. Installing a tunnel needs administrator permission once.</p>
@@ -528,6 +533,8 @@
       </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
         <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerExportBtn">Export server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerImportBtn">Import server</button>
       </div>
       <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:10px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
       <div style="margin-top:12px;">
@@ -613,52 +620,36 @@
     </div>
     <div class="card" id="wgNatCard">
       <div class="vpn-sec-label">Site-to-site — link two networks</div>
-      <div class="t-sub">One TechVision PC per site is the gateway: it sees its whole LAN, and any device on either network reaches any device on the other through its own gateway — no install on printers, cameras or other PCs. The gateway translates addresses where the two networks collide.</div>
+      <div class="t-sub wg-nat-intro">Add each device: name, real IP, alias IP.</div>
       <div class="t-sub vpn-note" id="wgNatStatus" style="margin-top:10px;">NAT service: stopped.</div>
       <fieldset id="wgNatFieldset" style="border:0; padding:0; margin:12px 0 0;">
         <div class="t-label">Site-to-site configuration</div>
         <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:6px;">
-          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeSame" value="same-subnet" checked> Same subnet — both networks are 192.168.1.0/24</label>
-          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeDiff" value="different-subnet"> Different subnets — e.g. 16 and 1</label>
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeSame" value="same-subnet" checked> Same subnet</label>
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeDiff" value="different-subnet"> Different subnets</label>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
-          <input type="text" id="wgNatLocalSubnet" placeholder="This network, e.g. 192.168.1.0/24" autocomplete="off" style="flex:1; min-width:160px;">
-          <input type="text" id="wgNatRemoteSubnet" placeholder="Other network, e.g. 192.168.1.0/24" autocomplete="off" style="flex:1; min-width:160px;">
+          <select id="wgNatRemotePeerPick" style="flex:1; min-width:160px;"><option value="">Pick the other gateway…</option></select>
         </div>
-        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
-          <input type="text" id="wgNatGatewayLanIp" placeholder="This PC's LAN address, e.g. 192.168.1.10" autocomplete="off" style="flex:1; min-width:160px;">
-          <input type="text" id="wgNatGatewayTunnelIp" placeholder="This gateway's tunnel address, e.g. 10.0.0.1" autocomplete="off" style="flex:1; min-width:160px;">
-        </div>
-        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
-          <input type="text" id="wgNatRemoteTunnelIp" placeholder="Other gateway's tunnel address, e.g. 10.0.0.2" autocomplete="off" style="flex:1; min-width:160px;">
-          <select id="wgNatRemotePeerPick" style="flex:1; min-width:160px;"><option value="">Pick a peer…</option></select>
-        </div>
-        <div style="margin-top:8px;">
-          <input type="text" id="wgNatInterface" placeholder="LAN interface name (optional — auto-detected when empty)" autocomplete="off" style="width:100%;">
-        </div>
-        <div id="wgNatSameOnly" style="margin-top:8px;">
-          <input type="text" id="wgNatFarVirtIp" placeholder="This gateway's virtual address on the other network, e.g. 192.168.1.201" autocomplete="off" style="width:100%;">
-          <div class="t-label" style="margin-top:10px;">Mapped devices — remote device → address it appears as here</div>
+        <div id="wgNatFormBody" style="margin-top:8px;">
+          <div class="t-label" style="margin-top:10px;">Mapped devices</div>
           <div id="wgNatMappingsRows"></div>
           <button class="btn btn-ghost btn-sm" type="button" id="wgNatAddMappingBtn" style="margin-top:6px;">+ Add mapping</button>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center;">
+            <button class="btn btn-primary btn-sm" type="button" id="wgNatSaveBtn">Save site-to-site configuration</button>
+            <span class="t-sub" id="wgNatFormError" style="color:var(--danger);"></span>
+          </div>
         </div>
-        <div class="t-sub" id="wgNatDiffHint" style="display:none; margin-top:8px;">Different subnets need no mappings — the remote addresses are real and routable, so the gateway just forwards them. Fill in the subnets above and save.</div>
-        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center;">
-          <button class="btn btn-primary btn-sm" type="button" id="wgNatSaveBtn">Save site-to-site configuration</button>
-          <span class="t-sub" id="wgNatFormError" style="color:var(--danger);"></span>
-        </div>
+        <div class="t-sub" id="wgNatRouterNote" style="display:none; margin-top:8px;">Different subnets need no configuration — pick the other gateway and press Start NAT service. Add one static route on each router so each LAN finds its gateway.</div>
       </fieldset>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+        <button class="btn btn-ghost btn-sm" type="button" id="wgNatExportBtn">Export configuration</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgNatImportBtn">Import configuration</button>
+      </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
         <button class="btn btn-primary" type="button" id="wgNatStartBtn">Start NAT service</button>
         <button class="btn btn-ghost" type="button" id="wgNatStopBtn">Stop NAT service</button>
       </div>
-      <div class="vpn-sec-label">Router step — different subnets only</div>
-      <div class="t-sub">When the two networks have <b>different</b> subnets (for example 192.168.16.0/24 and 192.168.1.0/24), add <b>one static route on each router</b> so each LAN finds its gateway. When both networks use the <b>same</b> subnet, no router change is needed at all — the gateway handles the collision itself.</div>
-      <div class="t-sub" style="margin-top:8px; font-family:monospace;">
-        On the 192.168.16.0/24 router: route 192.168.1.0/24 via this gateway PC (its 192.168.16.x address)<br>
-        On the 192.168.1.0/24 router: route 192.168.16.0/24 via the other gateway PC (its 192.168.1.x address)
-      </div>
-      <div class="t-sub" style="margin-top:8px;">Same-subnet example: a remote printer at 192.168.1.3 appears on this network as 192.168.1.203 — open, print and share it at the .203 address and the gateway translates it.</div>
     </div>
   </div>
   </main>

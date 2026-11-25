@@ -65,23 +65,23 @@ check('cidrsOverlap disjoint CIDRs', nat.cidrsOverlap(nat.parseCidr('192.168.1.0
 /* Mapping table                                                       */
 /* ------------------------------------------------------------------ */
 const table = nat.createMappingTable();
-check('addMapping accepts .3 -> .203', nat.addMapping(table, '192.168.1.3', '192.168.1.203', 'printer').ok === true);
-check('addMapping accepts .4 -> .204', nat.addMapping(table, '192.168.1.4', '192.168.1.204', 'camera').ok === true);
+check('addMapping accepts .3 -> 2.3', nat.addMapping(table, '192.168.1.3', '192.168.2.3', 'printer').ok === true);
+check('addMapping accepts .4 -> 2.4', nat.addMapping(table, '192.168.1.4', '192.168.2.4', 'camera').ok === true);
 check('addMapping rejects duplicate real', nat.addMapping(table, '192.168.1.3', '192.168.1.205', 'other').ok === false);
-check('addMapping rejects duplicate virtual', nat.addMapping(table, '192.168.1.5', '192.168.1.203', 'other').ok === false);
+check('addMapping rejects duplicate virtual', nat.addMapping(table, '192.168.1.5', '192.168.2.3', 'other').ok === false);
 check('addMapping rejects real == virt', nat.addMapping(table, '192.168.1.9', '192.168.1.9').ok === false);
 check('addMapping rejects bad real', nat.addMapping(table, '999.1.1.1', '192.168.1.206').ok === false);
 check('addMapping rejects bad virt', nat.addMapping(table, '192.168.1.6', 'not-an-ip').ok === false);
 check('table holds exactly the 2 accepted mappings', table.length === 2);
-check('findByReal finds .3', nat.findByReal(table, '192.168.1.3') && nat.findByReal(table, '192.168.1.3').virt === '192.168.1.203');
-check('findByVirt finds .204', nat.findByVirt(table, '192.168.1.204') && nat.findByVirt(table, '192.168.1.204').real === '192.168.1.4');
+check('findByReal finds .3', nat.findByReal(table, '192.168.1.3') && nat.findByReal(table, '192.168.1.3').virt === '192.168.2.3');
+check('findByVirt finds 2.4', nat.findByVirt(table, '192.168.2.4') && nat.findByVirt(table, '192.168.2.4').real === '192.168.1.4');
 check('findByReal misses unknown', nat.findByReal(table, '192.168.1.99') === null);
-check('translateAddress virt-to-real', nat.translateAddress(table, '192.168.1.203', 'virt-to-real') === '192.168.1.3');
-check('translateAddress real-to-virt', nat.translateAddress(table, '192.168.1.4', 'real-to-virt') === '192.168.1.204');
+check('translateAddress virt-to-real', nat.translateAddress(table, '192.168.2.3', 'virt-to-real') === '192.168.1.3');
+check('translateAddress real-to-virt', nat.translateAddress(table, '192.168.1.4', 'real-to-virt') === '192.168.2.4');
 check('translateAddress unknown returns null', nat.translateAddress(table, '192.168.1.99', 'virt-to-real') === null);
-check('translateAddress bad direction returns null', nat.translateAddress(table, '192.168.1.203', 'sideways') === null);
-check('removeMapping by virt works', nat.removeMapping(table, '192.168.1.204').ok === true && table.length === 1);
-check('removeMapping unknown fails', nat.removeMapping(table, '192.168.1.204').ok === false);
+check('translateAddress bad direction returns null', nat.translateAddress(table, '192.168.2.3', 'sideways') === null);
+check('removeMapping by virt works', nat.removeMapping(table, '192.168.2.4').ok === true && table.length === 1);
+check('removeMapping unknown fails', nat.removeMapping(table, '192.168.2.4').ok === false);
 check('removeMapping by real works too', nat.removeMapping(table, '192.168.1.3').ok === true && table.length === 0);
 /* Table cap: 256 mappings max, matching TVNAT_MAX_MAPPINGS. */
 const big = nat.createMappingTable();
@@ -105,9 +105,9 @@ const sameSubnetCfg = {
   remoteTunnelIp: '10.0.0.2',
   farVirtIp: '192.168.1.201',
   mappings: [
-    { real: '192.168.1.3', virt: '192.168.1.203', name: 'printer' },
-    { real: '192.168.1.4', virt: '192.168.1.204', name: 'camera' },
-    { real: '192.168.1.5', virt: '192.168.1.205', name: 'pc' },
+    { real: '192.168.1.3', virt: '192.168.2.3', name: 'printer' },
+    { real: '192.168.1.4', virt: '192.168.2.4', name: 'camera' },
+    { real: '192.168.1.5', virt: '192.168.2.5', name: 'pc' },
   ],
 };
 const diffSubnetCfg = {
@@ -123,6 +123,7 @@ const vSame = nat.validateNatConfig(sameSubnetCfg);
 check('valid same-subnet config passes', vSame.ok === true, JSON.stringify(vSame.errors));
 check('same-subnet config normalises CIDRs', vSame.config && vSame.config.localSubnet === '192.168.1.0/24' && vSame.config.remoteSubnet === '192.168.1.0/24');
 check('same-subnet config keeps 3 mappings', vSame.config && vSame.config.mappings.length === 3);
+check('same-subnet config derives the virtual subnet from the aliases', vSame.config && vSame.config.virtualSubnet === '192.168.2.0/24', JSON.stringify(vSame.config && vSame.config.virtualSubnet));
 const vDiff = nat.validateNatConfig(diffSubnetCfg);
 check('valid different-subnet config passes', vDiff.ok === true, JSON.stringify(vDiff.errors));
 check('different-subnet config drops farVirtIp', vDiff.config && vDiff.config.farVirtIp === '');
@@ -147,15 +148,19 @@ expectInvalid('rejects local subnet without CIDR', (c) => { c.localSubnet = '192
 expectInvalid('rejects same-subnet mode with different subnets', (c) => { c.remoteSubnet = '192.168.16.0/24'; }, 'same subnet');
 expectInvalid('rejects gateway LAN IP outside local subnet', (c) => { c.gatewayLanIp = '192.168.16.10'; }, 'not in the local subnet');
 expectInvalid('rejects identical tunnel IPs', (c) => { c.remoteTunnelIp = '10.0.0.1'; }, 'share one tunnel address');
-expectInvalid('rejects virtual outside local subnet', (c) => { c.mappings[0].virt = '192.168.16.203'; }, 'not in the local subnet');
+expectInvalid('rejects virtual inside the local subnet', (c) => { c.mappings[0].virt = '192.168.1.203'; c.mappings[1].virt = '192.168.1.204'; c.mappings[2].virt = '192.168.1.205'; }, 'inside your own network');
+expectInvalid('rejects virtual in a different virtual subnet than the others', (c) => { c.mappings[1].virt = '192.168.3.4'; }, 'share one virtual subnet');
+expectInvalid('rejects virtual outside any /24 with the others', (c) => { c.mappings[0].virt = '192.168.16.203'; }, 'share one virtual subnet');
 expectInvalid('rejects real outside remote subnet', (c) => { c.mappings[0].real = '192.168.16.3'; }, 'not in the remote subnet');
-expectInvalid('rejects virtual == gateway LAN IP', (c) => { c.mappings[0].virt = '192.168.1.10'; }, 'own LAN address');
-expectInvalid('rejects virtual == network address', (c) => { c.mappings[0].virt = '192.168.1.0'; }, 'network or broadcast');
-expectInvalid('rejects virtual == broadcast address', (c) => { c.mappings[0].virt = '192.168.1.255'; }, 'network or broadcast');
-expectInvalid('rejects virtual == farVirtIp', (c) => { c.mappings[0].virt = '192.168.1.201'; }, 'collides with farVirtIp');
-expectInvalid('rejects duplicate virtual', (c) => { c.mappings[1].virt = '192.168.1.203'; }, 'appears twice');
+expectInvalid('rejects virtual == virtual-subnet network address', (c) => { c.mappings[0].virt = '192.168.2.0'; }, 'network or broadcast');
+expectInvalid('rejects virtual == virtual-subnet broadcast address', (c) => { c.mappings[0].virt = '192.168.2.255'; }, 'network or broadcast');
+expectInvalid('rejects duplicate virtual', (c) => { c.mappings[1].virt = '192.168.2.3'; }, 'appears twice');
 expectInvalid('rejects duplicate real', (c) => { c.mappings[1].real = '192.168.1.3'; }, 'appears twice');
 expectInvalid('rejects real == virt in a mapping', (c) => { c.mappings[0].virt = '192.168.1.3'; }, 'are the same');
+/* A virtual inside the local subnet can never equal the gateway LAN
+   address or farVirtIp (both live in the local subnet, virtuals live
+   outside it), so those two collisions are impossible by
+   construction — no separate test for them. */
 expectInvalid('rejects empty mapping list in same-subnet', (c) => { c.mappings = []; }, 'at least one mapping');
 expectInvalid('rejects missing farVirtIp in same-subnet', (c) => { delete c.farVirtIp; }, 'farVirtIp');
 expectInvalid('rejects farVirtIp outside local subnet', (c) => { c.farVirtIp = '192.168.16.201'; }, 'farVirtIp');
@@ -183,7 +188,7 @@ check('host bits in the CIDR are masked on normalise', vNorm.ok === true && vNor
 /* ------------------------------------------------------------------ */
 const filter = nat.buildFilter(vSame.config);
 check('filter mentions every virtual address',
-  ['192.168.1.203', '192.168.1.204', '192.168.1.205'].every((ip) => filter.indexOf(ip) >= 0), filter);
+  ['192.168.2.3', '192.168.2.4', '192.168.2.5'].every((ip) => filter.indexOf(ip) >= 0), filter);
 check('filter mentions farVirtIp + gateway tunnel IP', filter.indexOf('192.168.1.201') >= 0 && filter.indexOf('10.0.0.1') >= 0);
 check('filter mentions remote tunnel IP as source', filter.indexOf('ip.SrcAddr == 10.0.0.2') >= 0);
 check('filter is IPv4-only', filter.indexOf(' and ip') >= 0);
@@ -193,7 +198,7 @@ check('helper config type is config', hc.type === 'config');
 check('helper config carries both tunnel IPs', hc.gwTunnelIp === '10.0.0.1' && hc.remoteTunnelIp === '10.0.0.2');
 check('helper config carries farVirtIp', hc.farVirtIp === '192.168.1.201');
 check('helper config carries the filter', hc.filter === filter);
-check('helper config carries 3 mappings', hc.mappings.length === 3 && hc.mappings[0].real === '192.168.1.3' && hc.mappings[0].virt === '192.168.1.203');
+check('helper config carries 3 mappings', hc.mappings.length === 3 && hc.mappings[0].real === '192.168.1.3' && hc.mappings[0].virt === '192.168.2.3');
 const line = nat.helperConfigLine(vSame.config);
 let lineBack = null;
 try { lineBack = JSON.parse(line); } catch (e) {}
@@ -221,10 +226,10 @@ check('allowedIPsForPeer same-subnet: tunnel /32 plus every mapped real /32',
 check('allowedIPsForPeer different-subnet: tunnel /32 plus the remote subnet CIDR',
   nat.allowedIPsForPeer(vDiff.config) === '10.0.0.2/32, 192.168.1.0/24', nat.allowedIPsForPeer(vDiff.config));
 check('allowedIPsForPeer dedupes a real address equal to the tunnel /32',
-  nat.allowedIPsForPeer(Object.assign({}, vSame.config, { mappings: [{ real: '10.0.0.2', virt: '192.168.1.203', name: '' }] })) === '10.0.0.2/32');
+  nat.allowedIPsForPeer(Object.assign({}, vSame.config, { mappings: [{ real: '10.0.0.2', virt: '192.168.2.3', name: '' }] })) === '10.0.0.2/32');
 check('allowedIPsForPeer null on a bad remote tunnel IP', nat.allowedIPsForPeer(Object.assign({}, vSame.config, { remoteTunnelIp: 'nope' })) === null);
 check('allowedIPsForPeer null on an unknown mode', nat.allowedIPsForPeer(Object.assign({}, vSame.config, { mode: 'nope' })) === null);
-check('allowedIPsForPeer null on a bad mapping', nat.allowedIPsForPeer(Object.assign({}, vSame.config, { mappings: [{ real: '999.1.1.1', virt: '192.168.1.203', name: '' }] })) === null);
+check('allowedIPsForPeer null on a bad mapping', nat.allowedIPsForPeer(Object.assign({}, vSame.config, { mappings: [{ real: '999.1.1.1', virt: '192.168.2.3', name: '' }] })) === null);
 check('allowedIPsForPeer null on a bad remote subnet (different-subnet)', nat.allowedIPsForPeer(Object.assign({}, vDiff.config, { remoteSubnet: 'junk' })) === null);
 
 /* ------------------------------------------------------------------ */
@@ -242,17 +247,21 @@ check('detectLanInterface honours an explicit interfaceName',
 check('detectLanInterface returns null when no adapter matches',
   nat.detectLanInterface(vSame.config, { 'Wi-Fi': [{ address: '10.9.9.9', family: 'IPv4', internal: false }] }) === null);
 const setup = nat.buildSetupScript(vSame.config, 'Ethernet');
-check('setup script adds each virtual as a secondary IP',
-  ['192.168.1.203', '192.168.1.204', '192.168.1.205'].every((ip) => setup.indexOf('add address name=$iface ' + ip) >= 0), setup);
+check('setup script does NOT add mapping virtuals as secondary IPs (the route reaches them, not ARP)',
+  ['192.168.2.3', '192.168.2.4', '192.168.2.5'].every((ip) => setup.indexOf('add address name=$iface ' + ip) < 0), setup);
+check('setup script adds the persistent route for the virtual subnet',
+  setup.indexOf('route add -p 192.168.2.0 mask 255.255.255.0 192.168.1.10') >= 0, setup);
 check('setup script adds farVirtIp too', setup.indexOf('add address name=$iface 192.168.1.201') >= 0);
 check('setup script uses skipassource (never source from a virtual)', setup.indexOf('skipassource=true') >= 0);
 check('setup script uses the /24 mask', setup.indexOf('255.255.255.0') >= 0);
 check('setup script enables forwarding', setup.indexOf('forwarding=enabled') >= 0);
 check('setup script targets the named interface', setup.indexOf('$iface = "Ethernet"') >= 0);
 const teardown = nat.buildTeardownScript(vSame.config, 'Ethernet');
-check('teardown removes each virtual address',
-  ['192.168.1.203', '192.168.1.204', '192.168.1.205'].every((ip) => teardown.indexOf('delete address name=$iface ' + ip) >= 0));
+check('teardown does NOT delete mapping virtuals (they were never added)',
+  ['192.168.2.3', '192.168.2.4', '192.168.2.5'].every((ip) => teardown.indexOf('delete address name=$iface ' + ip) < 0));
 check('teardown removes farVirtIp', teardown.indexOf('delete address name=$iface 192.168.1.201') >= 0);
+check('teardown deletes the auto-route for the virtual subnet',
+  teardown.indexOf('route delete 192.168.2.0') >= 0, teardown);
 check('teardown disables forwarding again', teardown.indexOf('forwarding=disabled') >= 0);
 check('teardown tolerates already-gone addresses (try/catch)', teardown.indexOf('try { netsh') >= 0);
 let threw = false;
@@ -335,7 +344,7 @@ async function serviceTests() {
   check('helper receives exactly one JSON config line on stdin',
     cfgLine && cfgLine.type === 'config' && cfgLine.mappings.length === 3, written.slice(0, 120));
   check('helper config line carries the WinDivert filter',
-    cfgLine && typeof cfgLine.filter === 'string' && cfgLine.filter.indexOf('192.168.1.203') >= 0);
+    cfgLine && typeof cfgLine.filter === 'string' && cfgLine.filter.indexOf('192.168.2.3') >= 0);
   check('helper is spawned with the vendor dir on PATH (WinDivert.dll resolves)',
     stubs.calls.spawn.length === 1 && String(stubs.calls.spawn[0].opts.env.PATH).indexOf('WinDivert-2.2.2-A') >= 0);
   check('elevated setup ran before the helper started', stubs.calls.elevated.length === 1 && stubs.calls.elevated[0].indexOf('forwarding=enabled') >= 0);
@@ -387,6 +396,27 @@ async function serviceTests() {
   check('different-subnet stop leaves it stopped', svc2.status().running === false);
   check('different-subnet stop restores the peer routes',
     hooks2.calls.restore.length === 1 && hooks2.calls.restore[0].previousAllowedIPs === '10.0.0.2/32');
+
+  /* Remote side of a same-subnet pair (remote: true, no mappings):
+     the helper still spawns — for the return path it only needs
+     farVirtIp + the tunnel IPs, never the mapping table. */
+  const stubsR = makeStubs();
+  const hooksR = makeHooks(stubsR);
+  const svcR = nat.createNatService(stubsR);
+  const remoteCmdR = nat.buildRemoteStartCommand({ mode: 'same-subnet', localSubnet: '192.168.1.0/24', gatewayLanIp: '192.168.1.10', gatewayTunnelIp: '10.0.0.1', farVirtIpProposal: '192.168.1.201' });
+  const remoteCfgR = nat.buildRemoteNatConfig(remoteCmdR, { address: '192.168.1.20', subnet: '192.168.1.0/24', tunnelIp: '10.0.0.2' }, '192.168.1.201');
+  const pR = svcR.start(remoteCfgR, hooksR);
+  await new Promise((r) => setImmediate(r));
+  stubsR.child.stdout.emit('data', '{"type":"ready","filter":"x","mappings":0}\n');
+  const startedR = await pR;
+  check('remote-side start (no mappings) succeeds and spawns the helper',
+    startedR.success === true && startedR.mode === 'same-subnet' && startedR.helperPid === 1234, JSON.stringify(startedR));
+  check('remote-side start applies only the tunnel /32 for the peer',
+    hooksR.calls.apply.length === 1 && hooksR.calls.apply[0].allowedIPs === '10.0.0.1/32', JSON.stringify(hooksR.calls.apply));
+  check('remote-side setup adds farVirtIp but no virtual-subnet route',
+    stubsR.calls.elevated.length === 1 && stubsR.calls.elevated[0].indexOf('192.168.1.201') >= 0 && stubsR.calls.elevated[0].indexOf('route add -p') < 0, stubsR.calls.elevated[0]);
+  await svcR.stop();
+  check('remote-side stop leaves it stopped', svcR.status().running === false);
 
   /* No peer-route hooks: start is refused before any side effect —
      a gateway that cannot extend the peer's AllowedIPs would
@@ -489,7 +519,104 @@ async function serviceTests() {
   check('stats line via _handleHelperLine updates counters', svc10.status().stats.packets === 5);
 }
 
-serviceTests().then(() => {
+
+/* ------------------------------------------------------------------ */
+/* New helpers for the simplified form + auto-route + remote start     */
+/* ------------------------------------------------------------------ */
+check('virtualSubnetFromMappings derives 192.168.2.0/24 from the fixture',
+  nat.virtualSubnetFromMappings(vSame.config.mappings) === '192.168.2.0/24');
+check('virtualSubnetFromMappings is null for no mappings',
+  nat.virtualSubnetFromMappings([]) === null);
+check('virtualSubnetFromMappings is null for mixed virtual subnets',
+  nat.virtualSubnetFromMappings([{ real: '192.168.1.3', virt: '192.168.2.3' }, { real: '192.168.1.4', virt: '192.168.3.4' }]) === null);
+check('cidr24Of 192.168.2.3 is 192.168.2.0/24', nat.cidr24Of('192.168.2.3') === '192.168.2.0/24');
+check('cidr24Of rejects a bad address', nat.cidr24Of('nope') === null);
+check('netmaskToPrefix 255.255.255.0 is 24', nat.netmaskToPrefix('255.255.255.0') === 24);
+check('netmaskToPrefix 255.255.0.0 is 16', nat.netmaskToPrefix('255.255.0.0') === 16);
+check('netmaskToPrefix rejects a non-contiguous mask', nat.netmaskToPrefix('255.0.255.0') === null);
+const lanAddr = nat.detectLanAddress(fakeIfs, ['10.0.0.0/24']);
+check('detectLanAddress finds the LAN address, skipping the tunnel subnet',
+  lanAddr && lanAddr.address === '192.168.1.10' && lanAddr.subnet === '192.168.1.0/24' && lanAddr.interfaceName === 'Ethernet', JSON.stringify(lanAddr));
+check('detectLanAddress skips tunnel addresses themselves',
+  nat.detectLanAddress({ wg: [{ address: '10.0.0.1', family: 'IPv4', internal: false }] }, ['10.0.0.0/24']) === null);
+check('detectLanAddress returns null when only tunnel addresses exist',
+  nat.detectLanAddress({ wg: [{ address: '10.0.0.5', family: 'IPv4', internal: false }] }, ['10.0.0.0/24']) === null);
+check('detectLanAddress returns null when nothing is non-internal',
+  nat.detectLanAddress({ Loopback: [{ address: '127.0.0.1', family: 'IPv4', internal: true }] }, []) === null);
+check('buildRouteAddCommand is the exact persistent route',
+  nat.buildRouteAddCommand(vSame.config) === 'route add -p 192.168.2.0 mask 255.255.255.0 192.168.1.10', nat.buildRouteAddCommand(vSame.config));
+check('buildRouteDeleteCommand is the exact delete',
+  nat.buildRouteDeleteCommand(vSame.config) === 'route delete 192.168.2.0');
+check('buildRouteAddCommand is null with no virtual subnet',
+  nat.buildRouteAddCommand({ mode: 'same-subnet', mappings: [], gatewayLanIp: '192.168.1.10' }) === null);
+check('buildRouteAddCommand is null in different-subnet mode', nat.buildRouteAddCommand(vDiff.config) === null);
+const remoteCmd = nat.buildRemoteStartCommand({ mode: 'same-subnet', localSubnet: '192.168.1.0/24', gatewayLanIp: '192.168.1.10', gatewayTunnelIp: '10.0.0.1', farVirtIpProposal: '192.168.1.201' });
+check('remote start command carries type + mode + farVirtIp',
+  remoteCmd.type === 'nat-start' && remoteCmd.mode === 'same-subnet' && remoteCmd.farVirtIp === '192.168.1.201' && remoteCmd.localSubnet === '192.168.1.0/24' && remoteCmd.initiatorTunnelIp === '10.0.0.1');
+check('remote start command carries the initiator tunnel IP', remoteCmd.initiatorTunnelIp === '10.0.0.1');
+const remoteCfg = nat.buildRemoteNatConfig(remoteCmd, { address: '192.168.1.20', subnet: '192.168.1.0/24', tunnelIp: '10.0.0.2' }, '192.168.1.201');
+check('remote config is built from the command + own LAN, no mappings',
+  remoteCfg.mode === 'same-subnet' && remoteCfg.localSubnet === '192.168.1.0/24' && remoteCfg.remoteSubnet === '192.168.1.0/24' &&
+  remoteCfg.gatewayLanIp === '192.168.1.20' && remoteCfg.gatewayTunnelIp === '10.0.0.2' && remoteCfg.remoteTunnelIp === '10.0.0.1' &&
+  remoteCfg.farVirtIp === '192.168.1.201' && Array.isArray(remoteCfg.mappings) && remoteCfg.mappings.length === 0 && remoteCfg.remote === true);
+check('remote config validates (empty table is allowed for the remote side)', nat.validateNatConfig(remoteCfg).ok === true, JSON.stringify(nat.validateNatConfig(remoteCfg).errors));
+check('remote config keeps the remote flag when normalised', nat.validateNatConfig(remoteCfg).config.remote === true);
+check('a non-remote config with no mappings is still rejected',
+  nat.validateNatConfig(Object.assign({}, sameSubnetCfg, { mappings: [] })).ok === false);
+const diffCmd = nat.buildRemoteStartCommand({ mode: 'different-subnet', localSubnet: '192.168.16.0/24', gatewayLanIp: '192.168.16.10', gatewayTunnelIp: '10.0.0.1' });
+const diffRemoteCfg = nat.buildRemoteNatConfig(diffCmd, { address: '192.168.1.20', subnet: '192.168.1.0/24', tunnelIp: '10.0.0.2' }, '');
+check('different-subnet remote config carries the initiator subnet as remoteSubnet',
+  diffRemoteCfg.mode === 'different-subnet' && diffRemoteCfg.localSubnet === '192.168.1.0/24' && diffRemoteCfg.remoteSubnet === '192.168.16.0/24' && diffRemoteCfg.farVirtIp === '');
+check('different-subnet remote config validates', nat.validateNatConfig(diffRemoteCfg).ok === true);
+
+async function helperTests() {
+  const alwaysFree = async () => true;
+  const picked = await nat.pickFreeAddress('192.168.1.0/24', ['192.168.1.10'], fakeIfs, alwaysFree);
+  check('pickFreeAddress picks .254 first (top of the .200-.254 range)', picked === '192.168.1.254', String(picked));
+  const taken254 = async (ip) => ip !== '192.168.1.254';
+  check('pickFreeAddress skips a taken .254', (await nat.pickFreeAddress('192.168.1.0/24', [], fakeIfs, taken254)) === '192.168.1.253');
+  const neverFree = async () => false;
+  check('pickFreeAddress returns null when nothing is free', (await nat.pickFreeAddress('192.168.1.0/24', [], fakeIfs, neverFree)) === null);
+  check('pickFreeAddress skips interface addresses', (await nat.pickFreeAddress('192.168.1.0/24', [], fakeIfs, async (ip) => ip !== '192.168.1.10')) !== '192.168.1.10');
+  /* Non-/24 subnets: the picker is not /24-only — a /30 has two
+     usable hosts, a /25 scans from the top. (The sandbox LAN is a
+     /30, so this is what the auto-detect path meets there.) */
+  check('pickFreeAddress on a /30 returns the only spare host', (await nat.pickFreeAddress('198.19.0.0/30', ['198.19.0.2'], [], alwaysFree)) === '198.19.0.1');
+  check('pickFreeAddress on a /30 returns null when both hosts are used', (await nat.pickFreeAddress('198.19.0.0/30', ['198.19.0.1', '198.19.0.2'], [], alwaysFree)) === null);
+  check('pickFreeAddress on a /25 scans from the top', (await nat.pickFreeAddress('192.168.1.0/25', [], [], alwaysFree)) === '192.168.1.126');
+  check('pickFreeAddress on a /32 returns null (no host)', (await nat.pickFreeAddress('192.168.1.5/32', [], [], alwaysFree)) === null);
+  /* A mapping real may not sit at farVirtIp: the remote device and
+     the gateway's own virtual identity would be indistinguishable. */
+  const realIsFar = { ...sameSubnetCfg, mappings: [{ name: 'srv', real: '192.168.1.201', virt: '192.168.2.3' }] };
+  const vRealFar = nat.validateNatConfig(realIsFar);
+  check('mapping real equal to farVirtIp is refused', vRealFar.ok === false && vRealFar.errors.some((e) => e.includes('farVirtIp')), JSON.stringify(vRealFar.errors));
+  const adjFree = await nat.adjustFarVirtIp('192.168.1.201', '192.168.1.0/24', alwaysFree);
+  check('adjustFarVirtIp keeps a free proposal', adjFree && adjFree.farVirtIp === '192.168.1.201' && adjFree.adjusted === false);
+  const taken201 = async (ip) => ip !== '192.168.1.201';
+  const adjTaken = await nat.adjustFarVirtIp('192.168.1.201', '192.168.1.0/24', taken201);
+  check('adjustFarVirtIp picks a fresh address when the proposal is taken',
+    adjTaken && adjTaken.farVirtIp === '192.168.1.254' && adjTaken.adjusted === true, JSON.stringify(adjTaken));
+  check('adjustFarVirtIp returns null when nothing is free',
+    (await nat.adjustFarVirtIp('192.168.1.201', '192.168.1.0/24', neverFree)) === null);
+  /* isIpFreeOnLan with stub deps (Linux path: interfaces + ARP table,
+     no ping — the ping runs on win32 only). */
+  const arpDeps = {
+    platform: 'win32',
+    networkInterfaces: () => fakeIfs,
+    execFile: (cmd, args, opts, cb) => { cb(null, 'Interface: 192.168.1.10 --- 0x3\n  192.168.1.50        aa-bb-cc-dd-ee-ff     dynamic\n', ''); },
+  };
+  check('isIpFreeOnLan: an interface address is not free', (await nat.isIpFreeOnLan('192.168.1.10', arpDeps)) === false);
+  check('isIpFreeOnLan: an address in the ARP table is not free', (await nat.isIpFreeOnLan('192.168.1.50', arpDeps)) === false);
+  check('isIpFreeOnLan: an address nowhere is free', (await nat.isIpFreeOnLan('192.168.1.201', arpDeps)) === true);
+  const arpFailDeps = {
+    platform: 'win32',
+    networkInterfaces: () => fakeIfs,
+    execFile: (cmd, args, opts, cb) => { cb(new Error('arp failed'), '', ''); },
+  };
+  check('isIpFreeOnLan: an ARP failure is treated as no match', (await nat.isIpFreeOnLan('192.168.1.201', arpFailDeps)) === true);
+}
+
+helperTests().then(() => serviceTests()).then(() => {
   console.log('---');
   console.log('test-nat: ' + pass + ' passed, ' + fail + ' failed');
   if (fail > 0) { console.log('failures: ' + failures.join(' | ')); process.exit(1); }

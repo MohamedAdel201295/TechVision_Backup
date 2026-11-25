@@ -562,6 +562,15 @@ function tunnelSubnetFor(address) {
   return ip.split('.').slice(0, 3).join('.') + '.0/24';
 }
 
+/* The tunnel address the server holds in a /24 tunnel subnet:
+   '10.0.0.0/24' -> '10.0.0.1'. The app's convention (see
+   nextTunnelIp: peers start at .2 because .1 is the server). A
+   client gateway uses this to find its server's tunnel address. */
+function serverTunnelIpFor(subnet) {
+  const m = String(subnet || '').match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.0\/24$/);
+  return m ? m[1] + '.' + m[2] + '.' + m[3] + '.1' : null;
+}
+
 /* Strict IPv4: four decimal octets, no leading zeros (octal
    ambiguity), each 0-255 — and not the all-zeros or all-ones
    address, neither of which can be a tunnel address. */
@@ -585,6 +594,53 @@ function serverEndpoint(host, listenPort) {
   const h = String(host || '').trim();
   if (!h) return '';
   return h + ':' + listenPort;
+}
+
+/* A hostname or IPv4 address for the endpoint / server export:
+   letters, digits, dots and dashes only, at most 253 chars. */
+function isValidEndpointHost(host) {
+  const h = String(host || '').trim();
+  return h.length > 0 && h.length <= 253 && /^[A-Za-z0-9.-]+$/.test(h);
+}
+
+/* Server export (the server card's Export button): the whole server
+   identity a fresh install needs, and nothing it must not carry.
+   { endpoint (public IP or DNS), port, tunnelAddress } — the server
+   PUBLIC KEY is deliberately NOT exported: it is regenerated when
+   the program is reinstalled, so an exported key would be stale
+   and misleading. The private key is never exported either. */
+function buildServerExport(server) {
+  const s = server || {};
+  return {
+    version: 1,
+    kind: 'techvision-server',
+    endpoint: String(s.endpoint || '').trim(),
+    port: Number.isInteger(s.listenPort) ? s.listenPort : parseInt(s.listenPort, 10) || 51820,
+    tunnelAddress: String(s.address || '').trim(),
+  };
+}
+
+/* Validate an imported server file. Returns { ok, endpoint, port,
+   tunnelAddress } or { ok: false, error }. The tunnel address and
+   port still go through validateServerSettings (so a move to
+   another /24 while peers exist is refused, exactly as in the UI);
+   the endpoint host is checked with isValidEndpointHost. A missing
+   `kind` is accepted (an old hand-written file); a wrong kind is
+   refused. */
+function validateServerImport(data, current) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { ok: false, error: 'That file is not a TechVision server export.' };
+  }
+  if (data.kind !== undefined && data.kind !== 'techvision-server') {
+    return { ok: false, error: 'That file is not a TechVision server export (kind: ' + String(data.kind) + ').' };
+  }
+  const endpoint = String(data.endpoint == null ? '' : data.endpoint).trim();
+  if (endpoint && !isValidEndpointHost(endpoint)) {
+    return { ok: false, error: 'Endpoint "' + endpoint + '" is not a valid hostname or IP address.' };
+  }
+  const v = validateServerSettings(current || {}, { address: data.tunnelAddress, listenPort: data.port });
+  if (!v.ok) return { ok: false, error: v.error };
+  return { ok: true, endpoint, port: v.listenPort, tunnelAddress: v.address };
 }
 
 /* Validates a server-settings change (the UI's editable tunnel
@@ -970,7 +1026,8 @@ module.exports = {
   parseWgShowDump, parseWgShowInterfaces,
   installTunnelService, uninstallTunnelService,
   setPeer, removePeer, nextTunnelIp, tunnelIpOf,
-  isValidIpv4, tunnelSubnetFor, validateServerSettings, serverEndpoint,
+  isValidIpv4, tunnelSubnetFor, serverTunnelIpFor, validateServerSettings, serverEndpoint,
+  isValidEndpointHost, buildServerExport, validateServerImport,
   buildElevatedScript, resolveWg, resolveWireguard,
   resolveAmneziaWg, resolveAmneziaWireguard,
   setTransport, getTransport, setTransportBinaries, getTransportBinaries,

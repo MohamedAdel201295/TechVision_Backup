@@ -20,15 +20,27 @@
  *     process runs in this mode: plain forwarding through the
  *     tunnel is done by Windows + WireGuard's AllowedIPs.
  *   - SAME subnet (both LANs 192.168.1.0/24, colliding .3/.4/.5):
- *     the remote devices are addressed by VIRTUAL addresses on
- *     this LAN (remote .3/.4/.5 appear as .203/.204/.205, 1:1).
- *     The service (a) adds each virtual address as a secondary IP
- *     on the gateway's LAN interface, so the gateway answers ARP
- *     for it, (b) enables IP forwarding, and (c) runs tvnat.exe,
+ *     the remote devices are addressed by VIRTUAL addresses in a
+ *     SEPARATE virtual subnet (e.g. remote 192.168.1.49 appears as
+ *     192.168.2.3 — the user picks the alias freely). The app adds
+ *     a persistent Windows route for the virtual subnet
+ *     (route add -p 192.168.2.0/24 via this gateway PC) when the
+ *     service starts and removes it on stop, so local PCs send
+ *     virtual-subnet traffic to the gateway instead of the router;
+ *     the gateway never answers ARP for a virtual address (a PC
+ *     never ARPs for an address outside its own subnet). The
+ *     service (a) enables IP forwarding, and (b) runs tvnat.exe,
  *     which diverts only the virtual-subnet traffic with WinDivert
  *     and rewrites it per the mapping table (see tvnat_core.h for
  *     the packet model: LAN origSrc -> virtDst becomes tunnel
  *     gwTunnel -> realDst, and replies come back the same way).
+ *     farVirtIp is the one address that still lives on the LAN:
+ *     the address the REMOTE gateway is known by on this LAN
+ *     (remote devices reply to it), added as a secondary IP so
+ *     this gateway answers ARP for it.
+ *     (Earlier design: virtual addresses inside the LAN subnet,
+ *     e.g. .203/.204/.205 with proxy ARP. Superseded 2026-11-24
+ *     by the user's separate-virtual-subnet model + auto-route.)
  *
  * Helper protocol (stdin/stdout, one JSON object per line):
  *   Node -> helper:  {"type":"config", ...}   (exactly one line,
@@ -150,6 +162,170 @@ function cidrsOverlap(a, b) {
   return inSubnet(a.network, b) || inSubnet(b.network, a);
 }
 
+/* The /24 a dotted IP sits in: '192.168.2.3' -> '192.168.2.0/24'. */
+function cidr24Of(ip) {
+  if (!isValidIp(ip)) return null;
+  const p = String(ip).split('.');
+  return p[0] + '.' + p[1] + '.' + p[2] + '.0/24';
+}
+
+/* The virtual subnet for a mapping table (same-subnet mode): the
+ * /24 every virtual address shares, e.g. '192.168.2.0/24' for
+ * aliases 192.168.2.3/192.168.2.4. Returns null when there are no
+ * mappings or no valid virtual address to derive it from. */
+function virtualSubnetFromMappings(mappings) {
+  if (!Array.isArray(mappings) || mappings.length === 0) return null;
+  let subnet = null;
+  for (const m of mappings) {
+    if (!m || !isValidIp(m.virt)) continue;
+    const s = cidr24Of(m.virt);
+    if (subnet === null) subnet = s;
+    /* The aliases must all share one /24 — a mixed table has no
+       single virtual subnet, so there is nothing to derive. */
+    else if (s !== subnet) return null;
+  }
+  return subnet;
+}
+
+/* Count the 1 bits in a dotted netmask: '255.255.255.0' -> 24.
+   A non-contiguous mask (e.g. 255.0.255.0) is not a mask at all. */
+function netmaskToPrefix(mask) {
+  if (!isValidIp(mask) && mask !== '0.0.0.0') return null;
+  const n = ipToInt(mask) >>> 0;
+  /* Contiguous: the host bits are a run of 0s at the bottom, so
+     inverting gives a run of 1s — and (x & (x + 1)) is 0 only for
+     a run of 1s. */
+  const inv = (~n) >>> 0;
+  if ((inv & (inv + 1)) !== 0) return null;
+  let bits = 0, x = n;
+  while (x) { bits += x & 1; x >>>= 1; }
+  return bits;
+}
+
+/* This gateway PC's LAN address, auto-detected from its interfaces:
+ * the first non-internal IPv4 address that is not in one of the
+ * excluded CIDRs (the tunnel subnet — the AmneziaWG adapter is an
+ * interface too, and it is not a LAN address). Returns
+ * { address, subnet, interfaceName } or null. `interfaces` is
+ * os.networkInterfaces() (injectable for tests); a missing netmask
+ * is treated as /24. */
+function detectLanAddress(interfaces, excludeCidrs) {
+  const ifs = interfaces || os.networkInterfaces();
+  const exclude = (excludeCidrs || []).map(parseCidr).filter(Boolean);
+  for (const name of Object.keys(ifs)) {
+    for (const addr of ifs[name] || []) {
+      if (!addr || addr.family !== 'IPv4' || addr.internal) continue;
+      if (!isValidIp(addr.address)) continue;
+      if (exclude.some((c) => inSubnet(addr.address, c))) continue;
+      const prefix = netmaskToPrefix(addr.netmask) ?? 24;
+      const network = intToIp(ipToInt(addr.address) & subnetMask(prefix));
+      return { address: addr.address, subnet: network + '/' + prefix, interfaceName: name };
+    }
+  }
+  return null;
+}
+
+/* Is this IP assigned to one of this machine's own interfaces?
+ * The cheap, synchronous half of "is this address free on the
+ * LAN" — the full check (ARP table + ping) is isIpFreeOnLan. */
+function isAddressInUseLocally(ip, interfaces) {
+  if (!isValidIp(ip)) return true;
+  const ifs = interfaces || os.networkInterfaces();
+  for (const name of Object.keys(ifs)) {
+    for (const addr of ifs[name] || []) {
+      if (addr && addr.family === 'IPv4' && addr.address === ip) return true;
+    }
+  }
+  return false;
+}
+
+/* First free host address in a subnet, preferring .200–.254 on a
+ * /24 (far from the DHCP pool and the colliding .3/.4/.5), then
+ * .2–.199. On any other prefix the usable hosts from the top down.
+ * Skips addresses in `used`, addresses assigned to this machine,
+ * and — when an async isFree predicate is given — anything it
+ * reports as taken on the LAN. Returns null when the subnet is
+ * full (a /30 with two hosts has no spare address at all). At most
+ * 512 probes: a probe is a ping on Windows, so an unbounded scan
+ * of a big subnet would hang the start. */
+async function pickFreeAddress(cidr, used, interfaces, isFree) {
+  const c = parseCidr(cidr);
+  if (!c) return null;
+  const usedSet = new Set(used || []);
+  const base = ipToInt(c.network);
+  const total = Math.pow(2, 32 - c.prefix);
+  const free = typeof isFree === 'function' ? isFree : async () => true;
+  const candidates = [];
+  if (c.prefix === 24) {
+    for (let n = 254; n >= 200; n--) candidates.push(n);
+    for (let n = 199; n >= 2; n--) candidates.push(n);
+  } else {
+    /* Usable hosts are network+1 .. broadcast-1, scanned from the
+       top down (offset total-2 .. 1). */
+    for (let n = total - 2; n >= 1 && candidates.length < 512; n--) candidates.push(n);
+  }
+  for (const n of candidates) {
+    const ip = intToIp(base + n);
+    if (usedSet.has(ip)) continue;
+    if (isAddressInUseLocally(ip, interfaces)) continue;
+    if (!(await free(ip))) continue;
+    return ip;
+  }
+  return null;
+}
+
+/* Is this IP free on this machine's LAN? The synchronous interface
+ * check first, then — on Windows only — the ARP table (an entry
+ * with a MAC means a device holds it) and one ping (a reply means
+ * a device holds it). On other platforms the interface check is
+ * the whole verdict (the full probe is Windows-only). `deps` is
+ * injectable for tests: { execFile, networkInterfaces, platform }. */
+async function isIpFreeOnLan(ip, deps) {
+  if (!isValidIp(ip)) return false;
+  const d = deps || {};
+  const ifs = d.networkInterfaces ? d.networkInterfaces() : os.networkInterfaces();
+  if (isAddressInUseLocally(ip, ifs)) return false;
+  if ((d.platform || process.platform) !== 'win32') return true;
+  const exec = d.execFile || execFile;
+  const run = (args) => new Promise((resolve) => {
+    try {
+      exec('cmd.exe', args, { timeout: 8000, windowsHide: true }, (err, stdout) => resolve({ err, stdout: String(stdout || '') }));
+    } catch (e) { resolve({ err: e, stdout: '' }); }
+  });
+  const arp = await run(['/c', 'arp -a']);
+  /* An ARP line for the IP with a real MAC (not "incomplete" and
+     not the broadcast ff-ff-ff-ff-ff-ff) means a device holds it. */
+  const arpHit = arp.stdout.split(/\r?\n/).some((line) => {
+    const m = line.match(/^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F-]{17})\s/);
+    return m && m[1] === ip && m[2].toLowerCase() !== 'ff-ff-ff-ff-ff-ff';
+  });
+  if (arpHit) return false;
+  const ping = await run(['/c', 'ping -n 1 -w 400 ' + ip]);
+  if (/Reply from/i.test(ping.stdout)) return false;
+  return true;
+}
+
+/* The persistent Windows route for the virtual subnet (same-subnet
+ * mode only): local PCs send virtual-subnet traffic to this gateway
+ * instead of the router. Added by the setup script when the NAT
+ * service starts, removed by the teardown script when it stops.
+ * Returns the full command string, or null when there is no
+ * virtual subnet to route (different-subnet mode, or no mappings). */
+function buildRouteAddCommand(config) {
+  if (!config || config.mode !== 'same-subnet') return null;
+  const vs = config.virtualSubnet || virtualSubnetFromMappings(config.mappings);
+  const v = parseCidr(vs);
+  if (!v || v.prefix !== 24 || !isValidIp(config.gatewayLanIp)) return null;
+  return 'route add -p ' + v.network + ' mask ' + intToIp(subnetMask(v.prefix)) + ' ' + config.gatewayLanIp;
+}
+function buildRouteDeleteCommand(config) {
+  if (!config || config.mode !== 'same-subnet') return null;
+  const vs = config.virtualSubnet || virtualSubnetFromMappings(config.mappings);
+  const v = parseCidr(vs);
+  if (!v) return null;
+  return 'route delete ' + v.network;
+}
+
 /* ------------------------------------------------------------------ */
 /* Mapping table                                                      */
 /* ------------------------------------------------------------------ */
@@ -230,14 +406,23 @@ function translateAddress(table, ip, direction) {
  *   gatewayTunnelIp: '10.0.0.1',      // this gateway's tunnel address
  *   remoteTunnelIp:  '10.0.0.2',      // the other gateway's tunnel address
  *   farVirtIp: '192.168.1.201',       // same-subnet only: the virtual
- *                                     // address this gateway is known
- *                                     // by on the REMOTE lan — i.e.
+ *                                     // address the REMOTE gateway is
+ *                                     // known by on THIS lan — i.e.
  *                                     // the address remote devices
  *                                     // reply to (see tvnat_core.h)
  *   interfaceName: 'Ethernet',        // optional; auto-detected when
  *                                     // omitted (the adapter whose
  *                                     // address is in localSubnet)
- *   mappings: [ { real, virt, name } ] // same-subnet only, >= 1
+ *   mappings: [ { real, virt, name } ] // same-subnet only, >= 1;
+ *                                     // virt lives in the VIRTUAL
+ *                                     // subnet (e.g. 192.168.2.x),
+ *                                     // a separate /24 outside both
+ *                                     // LANs — see virtualSubnet
+ *   virtualSubnet: '192.168.2.0/24', // same-subnet only, derived
+ *                                     // from the mappings (the /24
+ *                                     // every alias shares); the app
+ *                                     // adds a persistent route for
+ *                                     // it when the service starts.
  * }
  * validateNatConfig returns { ok, errors, config } — `config` is the
  * normalised copy (trimmed strings, mappings copied), or null.
@@ -303,14 +488,35 @@ function validateNatConfig(input) {
   if (mode === 'different-subnet' && mappings.length > 0) {
     errors.push('Different-subnet mode needs no mappings — the remote addresses are real and routable, so a mapping table would never be used.');
   }
+  /* The remote side of a same-subnet pair (remote: true) carries
+     no rows — the rows live on the initiating gateway only, and
+     this side's helper only needs farVirtIp + the tunnel IPs for
+     the return path (the inbound flow rewrites the source to
+     farVirtIp; it never consults the mapping table). Without the
+     flag, an empty table is a user error: same-subnet mode needs
+     at least one device row to translate. */
+  const isRemote = input.remote === true;
   if (mode === 'same-subnet') {
-    if (mappings.length === 0) errors.push('Same-subnet mode needs at least one mapping (a remote device and the virtual address it appears as).');
+    if (mappings.length === 0 && !isRemote) errors.push('Same-subnet mode needs at least one mapping (a remote device and the virtual address it appears as).');
     if (mappings.length > MAX_MAPPINGS) errors.push('Too many mappings (' + mappings.length + ' — the limit is ' + MAX_MAPPINGS + ').');
     if (!isValidIp(input.farVirtIp)) errors.push('farVirtIp "' + String(input.farVirtIp) + '" is not a valid IPv4 address — same-subnet mode needs the virtual address this gateway is known by on the remote LAN.');
     else if (local && !inSubnet(input.farVirtIp, local)) errors.push('farVirtIp ' + input.farVirtIp + ' is not in the local subnet ' + input.localSubnet + ' — it must be an address on this LAN.');
     else if (local && isNetworkOrBroadcast(input.farVirtIp, local)) errors.push('farVirtIp ' + input.farVirtIp + ' is the network or broadcast address of ' + input.localSubnet + '.');
     else if (isValidIp(input.gatewayLanIp) && input.farVirtIp === input.gatewayLanIp) errors.push('farVirtIp ' + input.farVirtIp + ' is this gateway PC\'s own LAN address.');
     const seenReal = new Set(), seenVirt = new Set();
+    /* The virtual subnet is the /24 the first alias sits in — every
+       alias must share it, and it must be a separate subnet outside
+       this LAN (a PC only routes to the gateway for an address
+       outside its own subnet; an alias inside the LAN would be
+       ARPed for directly and never reach the gateway). */
+    const virtSubnet = virtualSubnetFromMappings(mappings);
+    const virtCidr = virtSubnet ? parseCidr(virtSubnet) : null;
+    /* A mixed table has no single virtual subnet (the helper above
+       returns null for it), so the per-mapping check below cannot
+       see the mismatch — call it out directly. */
+    const virt24s = new Set();
+    mappings.forEach((m) => { if (m && isValidIp(m.virt)) virt24s.add(cidr24Of(m.virt)); });
+    if (virt24s.size > 1) errors.push('All virtual addresses must share one virtual subnet — the mappings use ' + Array.from(virt24s).join(', ') + '.');
     mappings.forEach((m, i) => {
       const err = validateMapping(m, i);
       if (err) { errors.push(err); return; }
@@ -318,10 +524,12 @@ function validateNatConfig(input) {
       if (seenVirt.has(m.virt)) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' appears twice.');
       seenReal.add(m.real); seenVirt.add(m.virt);
       if (remote && !inSubnet(m.real, remote)) errors.push('Mapping ' + (i + 1) + ': real address ' + m.real + ' is not in the remote subnet ' + input.remoteSubnet + '.');
-      if (local && !inSubnet(m.virt, local)) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is not in the local subnet ' + input.localSubnet + '.');
-      if (local && isNetworkOrBroadcast(m.virt, local)) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is the network or broadcast address of ' + input.localSubnet + '.');
+      if (local && inSubnet(m.virt, local)) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is inside your own network ' + input.localSubnet + ' — virtual addresses live in a separate subnet, e.g. 192.168.2.x, so your PCs route them to the gateway.');
+      if (virtCidr && !inSubnet(m.virt, virtCidr)) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is in ' + cidr24Of(m.virt) + ' but the other mappings use ' + virtSubnet + ' — all virtual addresses must share one subnet.');
+      if (virtCidr && isNetworkOrBroadcast(m.virt, virtCidr)) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is the network or broadcast address of ' + virtSubnet + '.');
       if (isValidIp(input.gatewayLanIp) && m.virt === input.gatewayLanIp) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' is this gateway PC\'s own LAN address — it would steal the gateway\'s own traffic.');
       if (isValidIp(input.farVirtIp) && m.virt === input.farVirtIp) errors.push('Mapping ' + (i + 1) + ': virtual address ' + m.virt + ' collides with farVirtIp — the gateway\'s own virtual address cannot also be a device.');
+      if (isValidIp(input.farVirtIp) && m.real === input.farVirtIp) errors.push('Mapping ' + (i + 1) + ': real address ' + m.real + ' is the gateway\'s virtual address (farVirtIp) — a remote device cannot sit at the address the gateway itself answers for.');
       if (isValidIp(input.gatewayTunnelIp) && (m.real === input.gatewayTunnelIp || m.virt === input.gatewayTunnelIp)) errors.push('Mapping ' + (i + 1) + ': address ' + m.real + '/' + m.virt + ' collides with the tunnel address.');
       if (isValidIp(input.remoteTunnelIp) && (m.real === input.remoteTunnelIp || m.virt === input.remoteTunnelIp)) errors.push('Mapping ' + (i + 1) + ': address ' + m.real + '/' + m.virt + ' collides with the remote tunnel address.');
     });
@@ -337,8 +545,76 @@ function validateNatConfig(input) {
     farVirtIp: mode === 'same-subnet' ? String(input.farVirtIp) : '',
     interfaceName: typeof input.interfaceName === 'string' && input.interfaceName.trim() ? input.interfaceName.trim() : '',
     mappings: mappings.map((m) => ({ real: m.real, virt: m.virt, name: typeof m.name === 'string' ? m.name : '' })),
+    virtualSubnet: mode === 'same-subnet' ? (virtualSubnetFromMappings(mappings) || '') : '',
+    remote: isRemote,
   };
   return { ok: true, errors: [], config };
+}
+
+/* ------------------------------------------------------------------ */
+/* Remote NAT auto-start — the start command over the tunnel          */
+/* ------------------------------------------------------------------ */
+
+/* The remote-start command: what the initiating gateway sends to
+ * the other gateway over the WireGuard tunnel (see src/wg-control.js
+ * for the transport). It carries only what the remote side cannot
+ * know by itself: the mode, this gateway's LAN subnet (the remote
+ * side's remoteSubnet), and the farVirtIp this gateway proposes as
+ * its source identity on the remote LAN. Everything else (the
+ * remote side's own LAN IP and subnet, its tunnel IP, its
+ * mappings) is auto-detected or empty there — the remote side
+ * needs no configuration typed by anyone. */
+function buildRemoteStartCommand(local) {
+  if (!local || typeof local !== 'object') return null;
+  return {
+    type: 'nat-start',
+    mode: local.mode,
+    farVirtIp: local.mode === 'same-subnet' ? String(local.farVirtIpProposal || '') : '',
+    localSubnet: String(local.localSubnet || ''),
+    initiatorTunnelIp: String(local.gatewayTunnelIp || ''),
+    initiatorLanIp: String(local.gatewayLanIp || ''),
+  };
+}
+
+/* The remote side's NAT config, built from the command plus its own
+ * auto-detected values (own: { address, subnet, tunnelIp }). The
+ * farVirtIp here is the verified one from the command — the address
+ * the initiating gateway is known by on THIS lan, which this
+ * gateway answers ARP for and its helper uses as the source
+ * identity for replies. Mappings stay empty: the remote side needs
+ * no rows for the return path. */
+function buildRemoteNatConfig(command, own, farVirtIp) {
+  if (!command || typeof command !== 'object' || !own || typeof own !== 'object') return null;
+  return {
+    mode: command.mode,
+    localSubnet: String(own.subnet || ''),
+    remoteSubnet: String(command.localSubnet || ''),
+    gatewayLanIp: String(own.address || ''),
+    gatewayTunnelIp: String(own.tunnelIp || ''),
+    remoteTunnelIp: String(command.initiatorTunnelIp || ''),
+    farVirtIp: command.mode === 'same-subnet' ? String(farVirtIp || '') : '',
+    interfaceName: '',
+    mappings: [],
+    remote: true,
+  };
+}
+
+/* Verify the initiator's proposed farVirtIp on the remote LAN: keep
+ * it when it is free there (isFree returns true), else pick the
+ * first free address in the same subnet and report that the
+ * proposal was adjusted. Returns { farVirtIp, adjusted } or null
+ * when nothing is free. isFree is an async predicate (ARP table +
+ * ping on Windows, a stub in tests). */
+async function adjustFarVirtIp(proposed, subnet, isFree) {
+  const c = parseCidr(subnet);
+  if (!c) return null;
+  const free = typeof isFree === 'function' ? isFree : async () => true;
+  if (isValidIp(proposed) && inSubnet(proposed, c) && !isNetworkOrBroadcast(proposed, c) && (await free(proposed))) {
+    return { farVirtIp: proposed, adjusted: false };
+  }
+  const picked = await pickFreeAddress(subnet, proposed ? [proposed] : [], undefined, free);
+  if (!picked) return null;
+  return { farVirtIp: picked, adjusted: true };
 }
 
 /* The tunnel peer's AllowedIPs while the NAT service runs. The tunnel
@@ -438,35 +714,41 @@ function detectLanInterface(config, interfaces) {
 }
 
 /* PowerShell (run elevated, -Verb RunAs) that sets the gateway up:
- * add every virtual address as a secondary IP on the LAN interface
- * (so the gateway answers ARP for it), then enable IP forwarding on
- * that interface. `netsh interface ipv4 add address` with skipassource
- * keeps Windows from ever SOURCE-addressing traffic from a virtual
- * address — the gateway only ever answers for them. Extracted so it
- * is testable without admin rights. */
+ * add farVirtIp as a secondary IP on the LAN interface (so the
+ * gateway answers ARP for it — remote devices reply to it, and the
+ * helper translates the replies back through the tunnel), add the
+ * persistent route for the virtual subnet (same-subnet mode only),
+ * then enable IP forwarding on that interface. The mapping virtuals
+ * are NOT secondary IPs: they live in a separate virtual subnet
+ * (e.g. 192.168.2.x) that PCs reach through the route — a PC never
+ * ARPs for an address outside its own subnet, so answering ARP for
+ * them would do nothing. `netsh interface ipv4 add address` with
+ * skipassource keeps Windows from ever SOURCE-addressing traffic
+ * from the virtual address — the gateway only ever answers for it.
+ * Extracted so it is testable without admin rights. */
 function buildSetupScript(config, interfaceName) {
   if (!interfaceName || typeof interfaceName !== 'string') throw new Error('No LAN interface for the NAT setup.');
   const q = (s) => '"' + String(s).replace(/"/g, '') + '"';
-  const mask = intToIp(subnetMask(parseCidr(config.localSubnet).prefix));
   const lines = [
     '$ErrorActionPreference = "Stop"',
     '$iface = ' + q(interfaceName),
   ];
-  for (const m of config.mappings) {
-    lines.push('netsh interface ipv4 add address name=$iface ' + m.virt + ' ' + mask + ' skipassource=true');
-  }
   if (config.farVirtIp) {
+    const mask = intToIp(subnetMask(parseCidr(config.localSubnet).prefix));
     lines.push('netsh interface ipv4 add address name=$iface ' + config.farVirtIp + ' ' + mask + ' skipassource=true');
   }
+  const routeAdd = buildRouteAddCommand(config);
+  if (routeAdd) lines.push(routeAdd);
   lines.push('netsh interface ipv4 set interface name=$iface forwarding=enabled');
   lines.push('exit 0');
   return lines.join('\r\n');
 }
 
-/* The matching teardown: remove the secondary IPs again and turn
- * forwarding back off. A delete of an address that is already gone
- * fails — hence the try/catch per line (a half-torn-down gateway
- * must not abort the rest of the teardown). */
+/* The matching teardown: remove the secondary IP and the persistent
+ * route again and turn forwarding back off. A delete of an address
+ * or route that is already gone fails — hence the try/catch per
+ * line (a half-torn-down gateway must not abort the rest of the
+ * teardown). */
 function buildTeardownScript(config, interfaceName) {
   if (!interfaceName || typeof interfaceName !== 'string') throw new Error('No LAN interface for the NAT teardown.');
   const q = (s) => '"' + String(s).replace(/"/g, '') + '"';
@@ -474,12 +756,11 @@ function buildTeardownScript(config, interfaceName) {
     '$ErrorActionPreference = "Continue"',
     '$iface = ' + q(interfaceName),
   ];
-  for (const m of config.mappings) {
-    lines.push('try { netsh interface ipv4 delete address name=$iface ' + m.virt + ' } catch {}');
-  }
   if (config.farVirtIp) {
     lines.push('try { netsh interface ipv4 delete address name=$iface ' + config.farVirtIp + ' } catch {}');
   }
+  const routeDel = buildRouteDeleteCommand(config);
+  if (routeDel) lines.push('try { ' + routeDel + ' } catch {}');
   lines.push('try { netsh interface ipv4 set interface name=$iface forwarding=disabled } catch {}');
   lines.push('exit 0');
   return lines.join('\r\n');
@@ -808,7 +1089,11 @@ const natService = createNatService();
 
 module.exports = {
   isValidIp, ipToInt, intToIp, parseCidr, inSubnet, isNetworkOrBroadcast,
-  sameSubnet, cidrsOverlap,
+  sameSubnet, cidrsOverlap, cidr24Of, virtualSubnetFromMappings,
+  netmaskToPrefix, detectLanAddress, isAddressInUseLocally,
+  pickFreeAddress, isIpFreeOnLan,
+  buildRouteAddCommand, buildRouteDeleteCommand,
+  buildRemoteStartCommand, buildRemoteNatConfig, adjustFarVirtIp,
   createMappingTable, addMapping, removeMapping, findByReal, findByVirt,
   translateAddress, validateMapping, validateNatConfig, tunnelSubnetClashes, allowedIPsForPeer,
   buildFilter, buildHelperConfig, helperConfigLine,
