@@ -568,10 +568,10 @@ body.modules-mode #appHeader { display: none !important; }
 .seg-btn:hover { border-color: rgba(14, 165, 233, .4); }
 .seg-btn.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
-/* ---------- TechVision VPN ---------- */
-/* Plain card: only the VPN view uses .card (3 times), so this is the
-   VPN page's card. Before this rule the three sections were bare divs
-   with no background, border or padding — the page looked flat. */
+/* ---------- TechVision Tailscale VPN ---------- */
+/* Plain card: the VPN view (3 times) and the WireGuard view use .card.
+   Before this rule the sections were bare divs with no background,
+   border or padding — the page looked flat. */
 .card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius-lg); padding: 18px 20px; margin-bottom: 16px;
@@ -620,6 +620,17 @@ body.modules-mode #appHeader { display: none !important; }
 .vpn-peer-body { flex: 1; min-width: 0; }
 .vpn-peer-name { font-size: 15px; font-weight: 700; margin: 0; }
 .vpn-peer-meta { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+
+/* ---------- TechVision WireGuard VPN ---------- */
+/* Same visual language as the VPN view (hero, facts tiles, section
+   labels, peer rows) — the WireGuard view reuses the .vpn-* layout
+   classes directly and only adds the config-text box. */
+.wg-conf {
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; resize: vertical; box-sizing: border-box;
+}
 
 /* Cloud file browser — Windows Explorer style: one clean list with
    columns, click to select, double-click to open. */

@@ -15,6 +15,9 @@ const driveResolver = require('./drive-resolver.js');
 const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
 const vpn = require('./vpn.js');
+const wireguard = require('./wireguard.js');
+const natGateway = require('./nat-gateway.js');
+const wgControl = require('./wg-control.js');
 // How long a due scheduled job waits for a missing removable drive
 // before it is recorded as failed (and emailed about): 2 hours.
 const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
@@ -65,6 +68,122 @@ function getCloudServer() {
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
+
+// ---------- TechVision WireGuard VPN ----------
+// Config file: <userData>/.techvision/wireguard.json — { server, client }.
+// Private keys are stored PLAINTEXT here — the same deliberate
+// precedent as the Cloud server TLS key in cloud.json: the tunnel
+// service must start at boot with nobody logged in and no vault
+// unlocked, and a vault-stored key would block exactly that. See
+// wireguard.js for the full reasoning.
+let wgConfig = null;
+function wgConfigPath() {
+  return path.join(app.getPath('userData'), '.techvision', 'wireguard.json');
+}
+function getWgConfig() {
+  if (wgConfig) return wgConfig;
+  try {
+    const p = wgConfigPath();
+    if (fs.existsSync(p)) wgConfig = JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch (e) { wgConfig = null; }
+  if (!wgConfig || typeof wgConfig !== 'object') wgConfig = {};
+  if (!wgConfig.server || typeof wgConfig.server !== 'object') wgConfig.server = {};
+  const s = wgConfig.server;
+  if (typeof s.privateKey !== 'string') s.privateKey = '';
+  if (typeof s.publicKey !== 'string') s.publicKey = '';
+  if (typeof s.address !== 'string' || !s.address) s.address = wireguard.SERVER_ADDRESS;
+  // Stored as a bare IPv4 (old configs carried '10.0.0.1/24'); the
+  // builders add the /24 themselves, and the UI shows the bare IP.
+  if (s.address.indexOf('/') >= 0) s.address = s.address.split('/')[0];
+  if (!Number.isInteger(s.listenPort) || s.listenPort < 1 || s.listenPort > 65535) s.listenPort = wireguard.LISTEN_PORT;
+  if (typeof s.endpoint !== 'string') s.endpoint = '';
+  if (!Array.isArray(s.peers)) s.peers = [];
+  if (!('client' in wgConfig)) wgConfig.client = null;
+  if (!('nat' in wgConfig) || typeof wgConfig.nat !== 'object' || !wgConfig.nat) wgConfig.nat = null;
+  if (!('transport' in wgConfig) || typeof wgConfig.transport !== 'object' || !wgConfig.transport) wgConfig.transport = {};
+  /* Phase 2 (core requirement 2026-11-24): AmneziaWG is the
+     transport — stock WireGuard cannot be used, it does not
+     understand the obfuscation fields and both ends must run
+     AmneziaWG. The choice lives in wireguard.json as
+     `transportName` ('amneziawg' | 'wireguard'); a fresh config
+     defaults to AmneziaWG, and an explicit 'wireguard' stays a
+     fallback the user can go back to. The per-binary `transport`
+     override below still wins when it is set (custom install path,
+     tests). */
+  if (wgConfig.transportName !== 'amneziawg' && wgConfig.transportName !== 'wireguard') wgConfig.transportName = 'amneziawg';
+  wireguard.setTransport(wgConfig.transportName);
+  wireguard.setTransportBinaries(wgConfig.transport);
+  return wgConfig;
+}
+function saveWgConfig() {
+  try {
+    const dir = path.join(app.getPath('userData'), '.techvision');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmp = wgConfigPath() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(getWgConfig(), null, 2));
+    fs.renameSync(tmp, wgConfigPath());
+  } catch (e) { console.error('[Main] Could not save WireGuard config:', e.message); }
+}
+// The stored peer list joined with live handshake/transfer data from
+// `wg show` (matched by public key). Live data is best-effort: a peer
+// that never connected simply shows online:false.
+function wgPeersWithLive(livePeers) {
+  const live = {};
+  for (const p of livePeers || []) live[p.publicKey] = p;
+  return (getWgConfig().server.peers || []).map((p) => {
+    const l = live[p.publicKey] || null;
+    return Object.assign({}, p, l ? {
+      // The live endpoint is where the peer was last seen from — it
+      // is reported separately so it never overwrites the endpoint
+      // the operator typed (the address the server dials).
+      liveEndpoint: l.endpoint,
+      latestHandshake: l.latestHandshake ? l.latestHandshake.getTime() : null,
+      transferRx: l.transferRx, transferTx: l.transferTx,
+      online: !!l.latestHandshake,
+    } : { online: false, latestHandshake: null, transferRx: 0, transferTx: 0 });
+  });
+}
+// The config as the renderer may see it: private keys stripped.
+function wgPublicConfig() {
+  const c = getWgConfig();
+  const server = Object.assign({}, c.server);
+  delete server.privateKey;
+  const client = c.client ? Object.assign({}, c.client) : null;
+  if (client) { delete client.privateKey; delete client.obfuscation; }
+  return { server, client };
+}
+/* The obfuscation set every server/client config carries, as the
+   [Interface] lines buildServerConf/buildClientConf take. Generated
+   ONCE (generateObfuscationParams) and stored in wireguard.json
+   under `obfuscation` — never regenerated silently, or every
+   existing peer breaks (S1–S4/H1–H4 must match on both ends). A
+   stored set that fails validation throws here instead of writing
+   a .conf that silently fails to connect. */
+function wgObfuscationLines() {
+  const c = getWgConfig();
+  if (!c.obfuscation || typeof c.obfuscation !== 'object') {
+    const p = wireguard.generateObfuscationParams();
+    const v = wireguard.validateObfuscationParams(p);
+    if (!v.ok) throw new Error('Could not generate the obfuscation settings: ' + v.errors.join(' '));
+    c.obfuscation = p;
+    saveWgConfig();
+    return wireguard.obfuscationParamsToLines(p);
+  }
+  return wireguard.obfuscationParamsToLines(c.obfuscation);
+}
+/* Lines for a stored client config: the set that was in effect when
+   the client connected — the server's own set for our own clients, the
+   imported set for a foreign .conf. A hand-typed foreign connect
+   has no set: injecting ours would break its handshake, so it gets
+   none and the user must import the server's .conf instead. */
+function wgLinesForObfuscation(set) {
+  if (!set || typeof set !== 'object') return undefined;
+  return wireguard.obfuscationParamsToLines(set);
+}
+function wgHasObfuscation() {
+  const c = getWgConfig();
+  return !!c.obfuscation && wireguard.validateObfuscationParams(c.obfuscation).ok;
+}
 
 const isDevelopment = !app.isPackaged;
 
@@ -732,6 +851,11 @@ app.whenReady().then(() => {
     if (getCloudConfig().server && getCloudConfig().server.enabled) {
       getCloudServer().start().catch((e) => appendAppLog('error', '[Cloud] Auto-start failed: ' + (e && e.message ? e.message : e)));
     }
+    // WireGuard control channel: if the tunnel was left running
+    // (server or client), the listener starts again so the other
+    // gateway can wake this gateway's NAT. Best-effort — a bind
+    // failure never blocks the app.
+    refreshWgControl();
   } catch (e) {}
 
   app.on('activate', () => {
@@ -1691,6 +1815,18 @@ ipcMain.handle('vault-lock', async () => {
 // ---------- TechVision Cloud ----------
 // Config + server status. Passwords and the server private key never
 // leave main; the renderer only sees public config and user names.
+/* The Cloud access mode: how the client reaches the server.
+   'normal' = the public address/DDNS + one forwarded port;
+   'tailscale' = the Tailscale IP + port, no forwarding; 'wireguard'
+   = the WireGuard tunnel address (10.0.0.x) + port, no forwarding
+   (the one UDP 51820 forward that brings the tunnel up covers
+   everything inside it). Anything else normalises to 'normal' —
+   old records that predate the modes have no field at all. */
+function cloudAccessMode(v) {
+  if (v === 'tailscale') return 'tailscale';
+  if (v === 'wireguard') return 'wireguard';
+  return 'normal';
+}
 ipcMain.handle('cloud-get-config', async () => {
   const cfg = getCloudConfig();
   const srv = getCloudServer();
@@ -1701,9 +1837,9 @@ ipcMain.handle('cloud-get-config', async () => {
       running: srv.isRunning(),
       users: srv.listUsers(),
       fingerprint: cfg.server.cert ? cfg.server.cert.fingerprint : null,
-      accessMode: cfg.server.accessMode === 'tailscale' ? 'tailscale' : 'normal',
+      accessMode: cloudAccessMode(cfg.server.accessMode),
     },
-    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: c.accessMode === 'tailscale' ? 'tailscale' : 'normal' })),
+    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: cloudAccessMode(c.accessMode) })),
   };
 });
 
@@ -1721,7 +1857,7 @@ ipcMain.handle('cloud-server-save', async (event, opts) => {
   if (!port || port < 1 || port > 65535) return { success: false, error: 'Port must be between 1 and 65535.' };
   const wasRunning = getCloudServer().isRunning();
   const portChanged = cfg.server.port !== port;
-  const accessMode = (opts && opts.accessMode === 'tailscale') ? 'tailscale' : 'normal';
+  const accessMode = cloudAccessMode(opts && opts.accessMode);
   cfg.server.enabled = !!(opts && opts.enabled);
   cfg.server.port = port;
   cfg.server.accessMode = accessMode;
@@ -1818,16 +1954,20 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     if (i < 0) i = cfg.clients.findIndex((c) => c.host === host && c.port === port && c.user === String(s.user || ''));
     const existing = i >= 0 ? cfg.clients[i] : null;
     // Keep the saved access mode when the caller did not send one
-    // (e.g. the trust flow): a Tailscale server must not silently
-    // become Normal on re-save.
-    const accessMode = s.accessMode === 'tailscale' ? 'tailscale'
-      : s.accessMode === 'normal' ? 'normal'
-      : (existing && existing.accessMode === 'tailscale' ? 'tailscale' : 'normal');
+    // (e.g. the trust flow): a Tailscale or WireGuard server must
+    // not silently become Normal on re-save.
+    const accessMode = s.accessMode ? cloudAccessMode(s.accessMode)
+      : (existing ? cloudAccessMode(existing.accessMode) : 'normal');
     const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode, password: (s.password && String(s.password)) || (existing && existing.password) || null };
     if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
     else cfg.clients.push(rec);
     saveCloudConfig();
-    return { success: true, id };
+    // Return the id the record is actually stored under: on an
+    // update-in-place that is the pre-existing id, NOT the fresh
+    // 'srv-…' id generated above — callers (connect, join) look the
+    // record up by the returned id, and a wrong one made reconnects
+    // fail with "Password needed" on every re-save.
+    return { success: true, id: rec.id };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -1860,6 +2000,38 @@ ipcMain.handle('cloud-client-probe', async (event, host, port) => {
   }
 });
 
+/* WireGuard tunnel check for a Cloud server record in 'wireguard'
+   mode: the tunnel must actually be up between the two machines
+   before any connection is attempted, or the login would wait out
+   the 15s probe timeout and fail with a network error. Server role:
+   the record's host must be a live peer (a recent handshake);
+   client role: the client must be online and the host must be the
+   server's tunnel address (.1 of the tunnel subnet). */
+async function wgTunnelToPeerCheck(host) {
+  try {
+    const st = await wireguard.getStatus();
+    const c = getWgConfig();
+    const liveServerPeers = (st.server && Array.isArray(st.server.peers)) ? st.server.peers : [];
+    const livePeer = liveServerPeers.find((p) => {
+      const cfgPeer = (c.server.peers || []).find((x) => x.publicKey === p.publicKey);
+      return cfgPeer && cfgPeer.tunnelIp === host;
+    });
+    if (livePeer) {
+      if (livePeer.latestHandshake) return { ok: true };
+      return { ok: false, error: 'The WireGuard tunnel to ' + host + ' is not up — the peer is known but has not handshaken yet. Start the server on the other machine and check it connects.' };
+    }
+    const liveClientPeer = (st.client && Array.isArray(st.client.peers) && st.client.peers[0]) || null;
+    if (c.client && c.client.tunnelIp && liveClientPeer && liveClientPeer.latestHandshake) {
+      const serverIp = wireguard.serverTunnelIpFor(wireguard.tunnelSubnetFor(c.client.tunnelIp));
+      if (host === serverIp) return { ok: true };
+      return { ok: false, error: 'The WireGuard tunnel is up, but the server address ' + host + ' is not the tunnel server (' + serverIp + '). Pick the server from the WireGuard peer list.' };
+    }
+    return { ok: false, error: 'The WireGuard tunnel is not up — connect the WireGuard client (or start the server) first, then connect to the Cloud server.' };
+  } catch (e) {
+    return { ok: false, error: 'Could not check the WireGuard tunnel: ' + (e && e.message ? e.message : String(e)) };
+  }
+}
+
 ipcMain.handle('cloud-client-connect', async (event, opts) => {
   try {
     // No password typed: use the one saved for this server, so a
@@ -1869,6 +2041,14 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     const rec = (cfg.clients || []).find((c) => c.id === opts.serverId);
     const password = (opts.password && String(opts.password)) || (rec && rec.password) || '';
     if (!password) return { success: false, error: 'Password needed — enter the password for user ' + (opts.user || '') + '.' };
+    /* WireGuard mode: the tunnel has to be up first — a down tunnel
+       fails fast here with a clear message instead of waiting out
+       the 15s probe timeout. The renderer pre-checks the same way
+       before probing an untrusted server. */
+    if (rec && cloudAccessMode(rec.accessMode) === 'wireguard') {
+      const check = await wgTunnelToPeerCheck(String(opts.host || '').trim());
+      if (!check.ok) return { success: false, error: check.error };
+    }
     const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, password);
     const info = await cloudClient.info(conn);
     cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
@@ -2039,7 +2219,7 @@ ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
   return { success: true, dest };
 });
 
-// ---------- TechVision VPN (Tailscale client manager) ----------
+// ---------- TechVision Tailscale VPN (Tailscale client manager) ----------
 // The module only shells out to the Tailscale CLI that is already
 // installed on the machine; it implements no VPN of its own.
 ipcMain.handle('vpn-get-status', async () => {
@@ -2139,6 +2319,653 @@ ipcMain.handle('vpn-open-keys-page', async () => {
 ipcMain.handle('vpn-open-oauth-page', async () => {
   try { await require('electron').shell.openExternal('https://login.tailscale.com/admin/settings/oauth'); return { success: true }; }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the OAuth clients page.' }; }
+});
+
+// ---------- TechVision WireGuard VPN (self-hosted WireGuard) ----------
+// The module shells out to the AmneziaWG CLI (awg / amneziawg.exe);
+// when it is missing, the UI offers a one-click install of the
+// official MSI (verified signature, one UAC prompt). It implements
+// no VPN protocol of its own. Live state comes from `awg show`;
+// stored state (keys, peers, client config, obfuscation set) comes
+// from wireguard.json.
+ipcMain.handle('wg-get-status', async () => {
+  try {
+    const st = await wireguard.getStatus();
+    const c = getWgConfig();
+    const liveServerPeers = (st.server && Array.isArray(st.server.peers)) ? st.server.peers : [];
+    const liveClientPeer = (st.client && Array.isArray(st.client.peers) && st.client.peers[0]) || null;
+    const pub = wgPublicConfig();
+    return Object.assign({}, st, {
+      transport: wireguard.getTransport(),
+      obfuscated: wgHasObfuscation(),
+      server: Object.assign({}, pub.server, { publicKey: c.server.publicKey || (st.server && st.server.publicKey), listenPort: c.server.listenPort, address: c.server.address }),
+      client: c.client ? Object.assign({}, pub.client, liveClientPeer ? {
+        latestHandshake: liveClientPeer.latestHandshake ? liveClientPeer.latestHandshake.getTime() : null,
+        transferRx: liveClientPeer.transferRx, transferTx: liveClientPeer.transferTx,
+        endpoint: liveClientPeer.endpoint, online: !!liveClientPeer.latestHandshake,
+      } : { online: false, latestHandshake: null, transferRx: 0, transferTx: 0 }) : null,
+      peers: wgPeersWithLive(liveServerPeers),
+      /* The server this machine connects to as a client, as a peer
+         candidate (for the NAT peer picker and the Cloud WireGuard
+         peer picker): { tunnelIp, online }. Kept separate from
+         `peers` on purpose — appending it there would render a
+         bogus removable "Server" row in DEVICES. Null when this
+         machine is not a client. */
+      tunnelServer: c.client && c.client.tunnelIp ? {
+        tunnelIp: wireguard.serverTunnelIpFor(wireguard.tunnelSubnetFor(c.client.tunnelIp)),
+        online: !!(liveClientPeer && liveClientPeer.latestHandshake),
+      } : null,
+      nat: natGateway.natService.status(),
+      /* The saved site-to-site config (wireguard.json `nat`), or
+         null when nothing has been saved yet — the NAT editor form
+         prefills from this, and Start stays disabled without it. */
+      natConfig: c.nat || null,
+    });
+  } catch (e) { return { installed: false, serverRunning: false, clientRunning: false, server: null, client: null, peers: [], error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
+});
+ipcMain.handle('wg-list-peers', async () => {
+  try {
+    const st = await wireguard.getStatus();
+    const liveServerPeers = (st.server && Array.isArray(st.server.peers)) ? st.server.peers : [];
+    return { success: true, peers: wgPeersWithLive(liveServerPeers), serverRunning: !!st.serverRunning };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not list WireGuard peers.' }; }
+});
+ipcMain.handle('wg-start-server', async () => {
+  try {
+    const c = getWgConfig();
+    if (!c.server.privateKey || !wireguard.isWgKey(c.server.privateKey)) {
+      const kp = await wireguard.genkeypair();
+      if (!kp.success) return { success: false, error: kp.error };
+      c.server.privateKey = kp.privateKey;
+      c.server.publicKey = kp.publicKey;
+      saveWgConfig();
+    }
+    if (!c.server.endpoint) {
+      // The endpoint clients must reach: the public IP, read the same
+      // way the Cloud module reads it. Null means no public IPv4 was
+      // found (CGNAT) — the UI then says a VPS is needed instead of
+      // showing a wrong address.
+      try { const ip = await cloudServerMod.detectPublicIP(); if (ip) { c.server.endpoint = ip; saveWgConfig(); } } catch (e) {}
+    }
+    const conf = wireguard.buildServerConf({ privateKey: c.server.privateKey, address: c.server.address, listenPort: c.server.listenPort, peers: c.server.peers, extraInterfaceLines: wgObfuscationLines() });
+    const r = await wireguard.installTunnelService(wireguard.SERVER_TUNNEL, conf);
+    if (!r.success) return { success: false, error: r.error, declined: !!r.declined };
+    refreshWgControl();
+    return { success: true, publicKey: c.server.publicKey, endpoint: c.server.endpoint || null, listenPort: c.server.listenPort };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not start the WireGuard server.' }; }
+});
+ipcMain.handle('wg-stop-server', async () => {
+  try { const r = await wireguard.uninstallTunnelService(wireguard.SERVER_TUNNEL); refreshWgControl(); return r; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not stop the WireGuard server.' }; }
+});
+ipcMain.handle('wg-set-endpoint', async (event, endpoint) => {
+  try {
+    const host = String(endpoint || '').trim();
+    if (!host) { getWgConfig().server.endpoint = ''; saveWgConfig(); return { success: true, endpoint: '' }; }
+    if (!wireguard.isValidEndpointHost(host)) return { success: false, error: 'Endpoint must be a hostname or an IP address, e.g. myhome.ddns.net or 203.0.113.10.' };
+    getWgConfig().server.endpoint = host;
+    saveWgConfig();
+    return { success: true, endpoint: host };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not save the endpoint.' }; }
+});
+// Editable server settings (the server card's tunnel address + UDP
+// port inputs). Validated by wireguard.validateServerSettings —
+// bad input saves nothing. A same-/24 address change is allowed
+// anytime (peers keep their tunnel IPs); a move to another /24
+// while peers exist is refused there. The port is derived into the
+// endpoint (host:port) automatically. If the server is running and
+// anything changed, the tunnel service is rebuilt with the new
+// config — the same build + install calls wg-start-server uses —
+// so the change takes effect at once; a stopped server just picks
+// the new values up at the next start.
+async function wgApplyServerSettings(opts) {
+  const c = getWgConfig();
+  const v = wireguard.validateServerSettings(
+    { address: c.server.address, listenPort: c.server.listenPort, peerCount: (c.server.peers || []).length },
+    opts || {});
+  if (!v.ok) return { success: false, error: v.error };
+  const changed = v.address !== c.server.address || v.listenPort !== c.server.listenPort;
+  c.server.address = v.address;
+  c.server.listenPort = v.listenPort;
+  saveWgConfig();
+  let restarted = false, restartError = null;
+  if (changed) {
+    try {
+      const st = await wireguard.getStatus();
+      if (st.serverRunning) {
+        const conf = wireguard.buildServerConf({ privateKey: c.server.privateKey, address: c.server.address, listenPort: c.server.listenPort, peers: c.server.peers, extraInterfaceLines: wgObfuscationLines() });
+        const r = await wireguard.installTunnelService(wireguard.SERVER_TUNNEL, conf);
+        if (!r.success) restartError = r.error;
+        else restarted = true;
+      }
+    } catch (e) { restartError = e && e.message ? e.message : String(e); }
+  }
+  if (restartError) return { success: false, error: 'Settings saved, but the running server could not be rebuilt: ' + restartError + ' Restart the server to apply them.', address: v.address, listenPort: v.listenPort };
+  if (changed) refreshWgControl();
+  return { success: true, address: v.address, listenPort: v.listenPort, restarted };
+}
+ipcMain.handle('wg-set-server-settings', async (event, opts) => {
+  try { return await wgApplyServerSettings(opts); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not save the server settings.' }; }
+});
+/* Import/export, JSON files through the system file dialog.
+   Server export is the connection detail only — endpoint host,
+   port, tunnel address — and deliberately NOT the public key: the
+   key is regenerated when the program is reinstalled, so an
+   exported key would be wrong on the new machine. Server import
+   validates with validateServerSettings (including the
+   cross-subnet-change-with-peers refusal) and applies through the
+   same path as the settings form. NAT export/import carries the
+   full saved NAT config; import validates with validateNatConfig
+   plus the peer-exists and tunnel-clash checks a save does. */
+ipcMain.handle('wg-server-export', async () => {
+  try {
+    const c = getWgConfig();
+    const r = await dialog.showSaveDialog({ title: 'Export WireGuard server', defaultPath: 'techvision-server.json', filters: [{ name: 'JSON files', extensions: ['json'] }] });
+    if (r.canceled || !r.filePath) return { success: false, canceled: true };
+    const data = wireguard.buildServerExport(c.server);
+    fs.writeFileSync(r.filePath, JSON.stringify(data, null, 2), 'utf8');
+    return { success: true, filePath: r.filePath };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not export the server.' }; }
+});
+ipcMain.handle('wg-server-import', async () => {
+  try {
+    const r = await dialog.showOpenDialog({ title: 'Import WireGuard server', filters: [{ name: 'JSON files', extensions: ['json'] }], properties: ['openFile'] });
+    if (r.canceled || !r.filePaths || !r.filePaths[0]) return { success: false, canceled: true };
+    let data;
+    try { data = JSON.parse(fs.readFileSync(r.filePaths[0], 'utf8')); } catch (e) { return { success: false, error: 'That file is not valid JSON.' }; }
+    const c = getWgConfig();
+    const v = wireguard.validateServerImport(data, { address: c.server.address, listenPort: c.server.listenPort, peerCount: (c.server.peers || []).length });
+    if (!v.ok) return { success: false, error: v.error };
+    getWgConfig().server.endpoint = v.endpoint;
+    const r2 = await wgApplyServerSettings({ address: v.address, listenPort: v.listenPort });
+    if (!r2.success) return r2;
+    return { success: true, endpoint: v.endpoint, address: v.address, listenPort: v.listenPort, restarted: r2.restarted };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not import the server.' }; }
+});
+ipcMain.handle('wg-nat-export', async () => {
+  try {
+    const c = getWgConfig();
+    if (!c.nat) return { success: false, error: 'No site-to-site configuration saved yet — nothing to export.' };
+    const r = await dialog.showSaveDialog({ title: 'Export site-to-site configuration', defaultPath: 'techvision-site-to-site.json', filters: [{ name: 'JSON files', extensions: ['json'] }] });
+    if (r.canceled || !r.filePath) return { success: false, canceled: true };
+    fs.writeFileSync(r.filePath, JSON.stringify(Object.assign({ version: 1, kind: 'techvision-nat' }, c.nat), null, 2), 'utf8');
+    return { success: true, filePath: r.filePath };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not export the configuration.' }; }
+});
+ipcMain.handle('wg-nat-import', async () => {
+  try {
+    const r = await dialog.showOpenDialog({ title: 'Import site-to-site configuration', filters: [{ name: 'JSON files', extensions: ['json'] }], properties: ['openFile'] });
+    if (r.canceled || !r.filePaths || !r.filePaths[0]) return { success: false, canceled: true };
+    let data;
+    try { data = JSON.parse(fs.readFileSync(r.filePaths[0], 'utf8')); } catch (e) { return { success: false, error: 'That file is not valid JSON.' }; }
+    if (!data || typeof data !== 'object' || data.kind !== 'techvision-nat') return { success: false, error: 'That file is not a TechVision site-to-site configuration.' };
+    const v = natGateway.validateNatConfig(data);
+    if (!v.ok) return { success: false, error: v.errors[0], errors: v.errors };
+    const cfg = v.config;
+    const c = getWgConfig();
+    const peer = (c.server.peers || []).find((p) => p.tunnelIp === cfg.remoteTunnelIp);
+    const serverIp = wgTunnelServerIp();
+    const isClientServer = !peer && !!c.client && c.client.serverPublicKey && serverIp && serverIp === cfg.remoteTunnelIp;
+    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + cfg.remoteTunnelIp + ') is not a WireGuard peer here — add it first (with the add-peer form, or over Cloud join), then import.' };
+    const tunnelSubnet = wireguard.tunnelSubnetFor(c.server.address);
+    const clash = natGateway.tunnelSubnetClashes(cfg, tunnelSubnet);
+    if (clash.length > 0) return { success: false, error: clash[0], errors: clash };
+    c.nat = cfg;
+    saveWgConfig();
+    return { success: true, nat: cfg };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not import the configuration.' }; }
+});
+// Add one peer by hand: the client shows its public key, the user
+// pastes it here (one paste, once). The tunnel address is allocated
+// by the app — the user never picks an IP. If the server is running,
+// the peer is applied live with `wg set`; otherwise it lands in the
+// config and applies at the next start.
+// Add one peer: the single code path for adding a peer — the
+// wg-add-peer handler below and the Cloud-join approve handler both
+// call this (the join module's contract: approve MUST use the same
+// path wg-add-peer uses). Validate, allocate the next free tunnel
+// address with nextTunnelIp, push, save, and apply live with `wg set`
+// when the server is running. The tunnel address is allocated here,
+// inside this function: the join approve computes the same next free
+// address from the same peer list, and between the two there is no
+// await, so the two agree.
+async function wgAddPeerInternal(name, publicKey, endpoint) {
+  if (!name) return { success: false, error: 'Give the device a name first.' };
+  if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'That is not a valid WireGuard public key (44 characters, ending in =).' };
+  // The endpoint is optional here — the Cloud-join approval path
+  // has none (the client initiates, so the server needs no address
+  // for it). The manual form requires it (see the wg-add-peer
+  // handler below): without an endpoint the server can never start
+  // a handshake with this peer.
+  let ep = null;
+  if (endpoint !== undefined && endpoint !== null && String(endpoint).trim() !== '') {
+    ep = String(endpoint).trim();
+    if (!wireguard.isValidEndpoint(ep)) return { success: false, error: 'Endpoint must be host:port, e.g. 192.168.1.49:51820 or myhome.ddns.net:51820.' };
+  }
+  const c = getWgConfig();
+  if ((c.server.peers || []).some((p) => p.publicKey === publicKey)) return { success: false, error: 'This device is already a peer.' };
+  const subnet = wireguard.tunnelSubnetFor(c.server.address);
+  const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp), subnet);
+  if (!tunnelIp) { const b = subnet.replace(/\.0\/24$/, ''); return { success: false, error: 'No free tunnel address left (' + b + '.2 – ' + b + '.254 are all taken).' }; }
+  const peer = { name, publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', endpoint: ep, createdAt: new Date().toISOString() };
+  c.server.peers.push(peer);
+  saveWgConfig();
+  let liveApplied = false, liveError = null;
+  try {
+    const st = await wireguard.getStatus();
+    if (st.serverRunning) {
+      const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, publicKey, peer.allowedIPs, ep);
+      liveApplied = !!r.success;
+      if (!r.success) liveError = r.error;
+    }
+  } catch (e) { liveError = e && e.message ? e.message : String(e); }
+  return { success: true, peer, liveApplied, liveError };
+}
+ipcMain.handle('wg-add-peer', async (event, opts) => {
+  try {
+    // The one way to add a peer: exactly three fields — the public
+    // key, the real IP or DDNS hostname, and the port. The device
+    // name is just a label, so the endpoint host is the display
+    // name (the form has no separate name field).
+    const publicKey = String((opts && opts.publicKey) || '').trim();
+    const host = String((opts && opts.endpointHost) || '').trim();
+    const portRaw = String((opts && opts.endpointPort) || '').trim();
+    if (!host) return { success: false, error: 'Type the real IP or DDNS hostname of this device.' };
+    if (!wireguard.isValidEndpointHost(host)) return { success: false, error: 'That is not a valid IP address or hostname.' };
+    if (!portRaw) return { success: false, error: 'Type the port of this device (usually 51820).' };
+    if (!/^\d+$/.test(portRaw)) return { success: false, error: 'Port must be a number from 1 to 65535.' };
+    const port = Number(portRaw);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return { success: false, error: 'Port must be a number from 1 to 65535.' };
+    return await wgAddPeerInternal(host, publicKey, host + ':' + port);
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not add the peer.' }; }
+});
+ipcMain.handle('wg-remove-peer', async (event, opts) => {
+  try {
+    const publicKey = String((opts && opts.publicKey) || '').trim();
+    if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'Not a valid WireGuard public key.' };
+    const c = getWgConfig();
+    const before = (c.server.peers || []).length;
+    c.server.peers = (c.server.peers || []).filter((p) => p.publicKey !== publicKey);
+    if (c.server.peers.length === before) return { success: false, error: 'No such peer.' };
+    saveWgConfig();
+    let liveApplied = false, liveError = null;
+    try {
+      const st = await wireguard.getStatus();
+      if (st.serverRunning) {
+        const r = await wireguard.removePeer(wireguard.SERVER_TUNNEL, publicKey);
+        liveApplied = !!r.success;
+        if (!r.success) liveError = r.error;
+      }
+    } catch (e) { liveError = e && e.message ? e.message : String(e); }
+    return { success: true, liveApplied, liveError };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not remove the peer.' }; }
+});
+ipcMain.handle('wg-open-download', async () => {
+  // Manual fallback for the one-click install: the official
+  // AmneziaWG releases page (same MSI the installer downloads).
+  try { await require('electron').shell.openExternal(wireguard.AMNEZIAWG_RELEASES_URL); return { success: true }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
+});
+// ---------- TechVision WireGuard VPN — Cloud join ----------
+// ---------- TechVision WireGuard VPN — gateway NAT service ----------
+// One TechVision PC per site is the gateway (see src/nat-gateway.js):
+// it forwards + NATs for its whole LAN, so printers/cameras/PCs need
+// no install. The config is stored in wireguard.json under `nat`
+// (IPs and names only, no secrets). A config passed here is
+// validated and saved; with no config, the stored one is used.
+// On non-Windows the service validates the config and then fails
+// cleanly with "Windows only" — it never pretends to run.
+/* ---------- WireGuard control channel (remote NAT start) ----------
+   The two gateways talk over the tunnel (wg-control.js): when the
+   user presses Start NAT on one gateway, the other gateway's NAT
+   service starts by itself. The listener binds to the local tunnel
+   address only and starts when the tunnel comes up, stops when it
+   goes down. Best-effort: a bind failure never breaks the tunnel. */
+const wgControlServer = wgControl.createControlServer({ logger: (m) => console.error('[Main] ' + m) });
+async function wgOwnTunnelIp() {
+  try {
+    const st = await wireguard.getStatus();
+    const c = getWgConfig();
+    if (st.serverRunning) return c.server.address;
+    if (st.clientRunning && c.client && c.client.tunnelIp) return c.client.tunnelIp;
+  } catch (e) {}
+  const c = getWgConfig();
+  return c.server.address || (c.client && c.client.tunnelIp) || null;
+}
+/* The server's tunnel address from this machine's client config
+   (the .1 of the tunnel subnet — the app's convention). Null when
+   this machine is not a client. */
+function wgTunnelServerIp() {
+  const c = getWgConfig();
+  if (!c.client || !c.client.tunnelIp) return null;
+  return wireguard.serverTunnelIpFor(wireguard.tunnelSubnetFor(c.client.tunnelIp));
+}
+async function refreshWgControl() {
+  try {
+    const tunnelIp = await wgOwnTunnelIp();
+    if (!tunnelIp) { wgControlServer.stop(); return; }
+    const c = getWgConfig();
+    const r = await wgControlServer.start({
+      tunnelIp,
+      tunnelSubnet: wireguard.tunnelSubnetFor(tunnelIp),
+      peerTunnelIps: (c.server.peers || []).map((p) => p.tunnelIp).filter(Boolean),
+      handleNatStart: handleRemoteNatStart,
+    });
+    if (r && !r.success && !r.alreadyRunning) console.error('[Main] WireGuard control channel: ' + r.error);
+  } catch (e) { /* best-effort: the tunnel still works without it */ }
+}
+/* The other gateway asked this machine to start its NAT service
+   (a command over the tunnel — see wg-control.js). This side needs
+   no configuration typed by anyone: the LAN address/subnet are
+   auto-detected, the farVirtIp is verified/adjusted on this LAN,
+   and the rest comes in the command. Idempotent: an already-running
+   service answers "already running" instead of restarting. */
+async function handleRemoteNatStart(command) {
+  try {
+    if (!command || command.type !== 'nat-start') return { ok: false, error: 'Unknown command.' };
+    const mode = command.mode === 'different-subnet' ? 'different-subnet' : 'same-subnet';
+    const running = natGateway.natService.status();
+    if (running.running) {
+      const c0 = getWgConfig();
+      return { ok: true, alreadyRunning: true, mode: running.mode, farVirtIp: (c0.nat && c0.nat.farVirtIp) || '', remoteLanSubnet: (c0.nat && c0.nat.localSubnet) || '', remoteLanIp: (c0.nat && c0.nat.gatewayLanIp) || '' };
+    }
+    if (process.platform !== 'win32') return { ok: false, error: 'The gateway NAT service runs on Windows only.' };
+    const ownTunnelIp = await wgOwnTunnelIp();
+    if (!ownTunnelIp) return { ok: false, error: 'The WireGuard tunnel is not up on this computer.' };
+    const c = getWgConfig();
+    const tunnelSubnet = wireguard.tunnelSubnetFor(ownTunnelIp);
+    const own = natGateway.detectLanAddress(undefined, [tunnelSubnet]);
+    if (!own) return { ok: false, error: 'Could not detect this gateway\'s LAN address.' };
+    const initiatorIp = command.initiatorTunnelIp;
+    let farVirtIp = '';
+    if (mode === 'same-subnet') {
+      const adj = await natGateway.adjustFarVirtIp(command.farVirtIp, own.subnet, (ip) => natGateway.isIpFreeOnLan(ip));
+      if (!adj) return { ok: false, error: 'No free address in ' + own.subnet + ' for the gateway\'s virtual address.' };
+      farVirtIp = adj.farVirtIp;
+    }
+    /* Which config this side runs: if the rows were added HERE,
+       start with them (this machine owns the pair — the helper
+       translates the mapped devices); otherwise run the empty
+       remote config (remote: true) — the helper only needs
+       farVirtIp + the tunnel IPs for the return path, and the
+       rows live on the initiating gateway. Either way the
+       farVirtIp is the adjusted proposal from the command: the
+       address the initiating gateway is known by on THIS lan. */
+    let remoteCfg;
+    const savedNat = c.nat;
+    if (mode === 'same-subnet' && savedNat && savedNat.mode === 'same-subnet' && Array.isArray(savedNat.mappings) && savedNat.mappings.length > 0 && savedNat.remoteTunnelIp === initiatorIp) {
+      remoteCfg = {
+        mode: 'same-subnet',
+        localSubnet: own.subnet,
+        remoteSubnet: own.subnet,
+        gatewayLanIp: own.address,
+        gatewayTunnelIp: ownTunnelIp,
+        remoteTunnelIp: initiatorIp,
+        farVirtIp,
+        interfaceName: '',
+        mappings: savedNat.mappings,
+      };
+    } else {
+      remoteCfg = natGateway.buildRemoteNatConfig(command, { address: own.address, subnet: own.subnet, tunnelIp: ownTunnelIp }, farVirtIp);
+    }
+    const v = natGateway.validateNatConfig(remoteCfg);
+    if (!v.ok) return { ok: false, error: v.errors[0], errors: v.errors };
+    const clash = natGateway.tunnelSubnetClashes(v.config, tunnelSubnet);
+    if (clash.length > 0) return { ok: false, error: clash[0] };
+    /* The initiator must be a peer (its AllowedIPs get extended):
+       a server peer, or — when this machine is a client — the
+       server it connects to. */
+    const peer = (c.server.peers || []).find((p) => p.tunnelIp === initiatorIp);
+    const serverIp = wgTunnelServerIp();
+    const isClientServer = !peer && !!c.client && c.client.serverPublicKey && serverIp && serverIp === initiatorIp;
+    if (!peer && !isClientServer) return { ok: false, error: 'The initiating gateway (' + initiatorIp + ') is not a WireGuard peer here.' };
+    const r = await natGateway.natService.start(v.config, buildNatHooks());
+    if (!r.success) return { ok: false, error: r.error };
+    c.nat = v.config;
+    saveWgConfig();
+    return { ok: true, farVirtIp, remoteLanSubnet: own.subnet, remoteLanIp: own.address, mode };
+  } catch (e) { return { ok: false, error: e && e.message ? e.message : 'Remote NAT start failed.' }; }
+}
+/* The peer-route wiring for the NAT service (AllowedIPs): the remote
+   gateway peer's routes are extended while the service runs and put
+   back on stop. Two roles: server (the remote gateway is one of our
+   peers) and client (the remote gateway is the server this client
+   connects to — its routes live in the client config). The service
+   cannot translate without it, so a start with no resolvable peer
+   is refused rather than silently broken. */
+function buildNatHooks() {
+  const applyOne = async (remoteTunnelIp, allowedIPs, previous, forRestore) => {
+    const cc = getWgConfig();
+    const p = (cc.server.peers || []).find((x) => x.tunnelIp === remoteTunnelIp);
+    if (p) {
+      let live = null;
+      try { live = await wireguard.getStatus(); } catch (e) {}
+      if (live && live.serverRunning) {
+        const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, p.publicKey, allowedIPs);
+        if (!r.success) return { success: false, error: 'Could not extend the remote gateway peer\'s routes live: ' + (r.error || 'wireguard set failed') };
+      }
+      p.allowedIPs = allowedIPs;
+      saveWgConfig();
+      return { success: true, previousAllowedIPs: previous };
+    }
+    const serverIp = wgTunnelServerIp();
+    if (cc.client && cc.client.serverPublicKey && serverIp && serverIp === remoteTunnelIp) {
+      let live = null;
+      try { live = await wireguard.getStatus(); } catch (e) {}
+      if (live && live.clientRunning) {
+        const r = await wireguard.setPeer(wireguard.CLIENT_TUNNEL, cc.client.serverPublicKey, allowedIPs);
+        if (!r.success) return { success: false, error: 'Could not extend the server peer\'s routes live: ' + (r.error || 'wireguard set failed') };
+      }
+      cc.client.allowedIPs = allowedIPs;
+      saveWgConfig();
+      return { success: true, previousAllowedIPs: previous };
+    }
+    /* Restore is best-effort: the peer is gone, so there is nothing
+       left to put back — report success rather than failing the
+       stop. An apply to a missing peer is a real failure. */
+    if (forRestore) return { success: true };
+    return { success: false, error: 'The remote gateway peer (' + remoteTunnelIp + ') was removed.' };
+  };
+  return {
+    applyPeerAllowedIPs: async (remoteTunnelIp, allowedIPs) => {
+      const cc = getWgConfig();
+      const p = (cc.server.peers || []).find((x) => x.tunnelIp === remoteTunnelIp);
+      const previous = p ? (p.allowedIPs || (p.tunnelIp + '/32'))
+        : (cc.client ? (cc.client.allowedIPs || wireguard.TUNNEL_SUBNET) : (remoteTunnelIp + '/32'));
+      return applyOne(remoteTunnelIp, allowedIPs, previous, false);
+    },
+    restorePeerAllowedIPs: async (remoteTunnelIp, previousAllowedIPs) => {
+      return applyOne(remoteTunnelIp, previousAllowedIPs, previousAllowedIPs, true);
+    },
+  };
+}
+ipcMain.handle('wg-nat-start', async (event, opts) => {
+  try {
+    const c = getWgConfig();
+    const saved = c.nat;
+    const mode = (opts && opts.mode) || (saved && saved.mode) || 'same-subnet';
+    const peerTunnelIp = (opts && opts.peerTunnelIp) || (saved && saved.remoteTunnelIp) || null;
+    if (!peerTunnelIp) return { success: false, error: 'Pick the other gateway first — the remote gateway peer has to be set up before the NAT service can start.' };
+    /* The remote gateway peer must exist before the NAT service can
+       run: its AllowedIPs are extended with the mapped remote
+       addresses (same-subnet) or the remote subnet (different-
+       subnet), so translated packets actually enter the tunnel.
+       Checked here, before any UAC prompt or network attempt, so a
+       missing peer is a clean error instead of a half-started
+       gateway. Either role counts: a server peer, or — when this
+       machine is a client — the server it connects to. */
+    const peer = (c.server.peers || []).find((p) => p.tunnelIp === peerTunnelIp);
+    const serverIp = wgTunnelServerIp();
+    const isClientServer = !peer && !!c.client && c.client.serverPublicKey && serverIp && serverIp === peerTunnelIp;
+    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + peerTunnelIp + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then start the NAT service.' };
+    /* This gateway's own LAN, auto-detected (the tunnel subnet is
+       excluded — the AmneziaWG adapter is not a LAN address). The
+       form no longer asks for any of this: the user only adds
+       devices (name + real IP + alias IP). */
+    const ownTunnelIp = await wgOwnTunnelIp();
+    if (!ownTunnelIp) return { success: false, error: 'The WireGuard tunnel is not up on this computer — start the server or connect the client first, then start the NAT service.' };
+    const tunnelSubnet = wireguard.tunnelSubnetFor(ownTunnelIp);
+    const own = natGateway.detectLanAddress(undefined, [tunnelSubnet]);
+    if (!own) return { success: false, error: 'Could not detect this gateway PC\'s LAN address — check it is connected to the local network.' };
+    let config;
+    if (mode === 'same-subnet') {
+      /* Rows live on one side of the pair only: when this gateway
+         has none saved, it starts as the remote side (remote: true
+         — the helper only needs farVirtIp + the tunnel IPs for the
+         return path) and the other gateway runs the rows. The
+         command below wakes the other side, which starts with its
+         own rows if it has them. */
+      const hasMappings = saved && Array.isArray(saved.mappings) && saved.mappings.length > 0;
+      config = {
+        mode: 'same-subnet',
+        localSubnet: own.subnet,
+        remoteSubnet: own.subnet,
+        gatewayLanIp: own.address,
+        gatewayTunnelIp: ownTunnelIp,
+        remoteTunnelIp: peerTunnelIp,
+        farVirtIp: (saved && saved.farVirtIp) || '',
+        interfaceName: (saved && saved.interfaceName) || '',
+        mappings: hasMappings ? saved.mappings : [],
+        remote: !hasMappings,
+      };
+      /* farVirtIp (the address the remote gateway is known by on
+         this LAN): reuse the saved one while it is still free here,
+         else pick a fresh free address in the LAN. */
+      if (!config.farVirtIp || !(await natGateway.isIpFreeOnLan(config.farVirtIp))) {
+        const picked = await natGateway.pickFreeAddress(own.subnet, [own.address, ...(config.mappings || []).map((m) => m.real)], undefined, (ip) => natGateway.isIpFreeOnLan(ip));
+        if (!picked) return { success: false, error: 'No free address in ' + own.subnet + ' for the gateway\'s virtual address.' };
+        config.farVirtIp = picked;
+      }
+      const v = natGateway.validateNatConfig(config);
+      if (!v.ok) return { success: false, error: v.errors[0], errors: v.errors };
+      const clash = natGateway.tunnelSubnetClashes(v.config, tunnelSubnet);
+      if (clash.length > 0) return { success: false, error: clash[0], errors: clash };
+      config = v.config;
+    } else {
+      config = {
+        mode: 'different-subnet',
+        localSubnet: own.subnet,
+        remoteSubnet: '',
+        gatewayLanIp: own.address,
+        gatewayTunnelIp: ownTunnelIp,
+        remoteTunnelIp: peerTunnelIp,
+        farVirtIp: '',
+        interfaceName: '',
+        mappings: [],
+      };
+    }
+    /* Fail fast on a non-Windows machine, before any network
+       attempt: the service needs WinDivert and admin rights. */
+    if (process.platform !== 'win32') return { success: false, error: 'The gateway NAT service runs on Windows only (it needs WinDivert and administrator permission once). The configuration itself is valid.' };
+    /* Remote start first: the other gateway must be translating
+       too, or the return path has nowhere to go. The command
+       carries the mode, this gateway's subnet, and the farVirtIp
+       this gateway proposes as its source identity on the remote
+       LAN; the remote side verifies/adjusts it and starts with
+       zero configuration typed there. */
+    const farVirtProposal = mode === 'same-subnet' ? (await natGateway.pickFreeAddress(own.subnet, [own.address, config.farVirtIp, ...(config.mappings || []).map((m) => m.real)], undefined, (ip) => natGateway.isIpFreeOnLan(ip))) : '';
+    const command = natGateway.buildRemoteStartCommand({
+      mode, localSubnet: own.subnet, gatewayLanIp: own.address, gatewayTunnelIp: ownTunnelIp, farVirtIpProposal: farVirtProposal || '',
+    });
+    const ack = await wgControl.sendRemoteNatStart(peerTunnelIp, command);
+    if (!ack || !ack.ok) return { success: false, error: 'The other gateway did not start the NAT service: ' + ((ack && ack.error) || 'no answer') + ' Start it there by hand, or check its tunnel is up, then try again.' };
+    /* Finalise the config from the ack: the remote side reports its
+       own LAN subnet (the remote subnet in different-subnet mode;
+       in same-subnet mode it must equal this LAN, or the pair is
+       not actually on the same subnet). */
+    if (mode === 'same-subnet') {
+      if (ack.remoteLanSubnet && ack.remoteLanSubnet !== own.subnet) return { success: false, error: 'The other network is ' + ack.remoteLanSubnet + ', not ' + own.subnet + ' — the two networks are not on the same subnet. Use different-subnet mode for this pair.' };
+    } else {
+      config.remoteSubnet = ack.remoteLanSubnet || '';
+      if (!config.remoteSubnet) return { success: false, error: 'The other gateway did not report its network — try starting again.' };
+      const v = natGateway.validateNatConfig(config);
+      if (!v.ok) return { success: false, error: v.errors[0], errors: v.errors };
+      const clash = natGateway.tunnelSubnetClashes(v.config, tunnelSubnet);
+      if (clash.length > 0) return { success: false, error: clash[0], errors: clash };
+      config = v.config;
+    }
+    /* Persist the negotiated config in same-subnet mode (so the UI
+       shows it and a later start reuses the same farVirtIp). A
+       different-subnet start is ephemeral — it must not clobber
+       the saved mappings. */
+    if (mode === 'same-subnet') { c.nat = config; saveWgConfig(); }
+    const r = await natGateway.natService.start(config, buildNatHooks());
+    if (!r.success) return { success: false, error: r.error, declined: !!r.declined, remoteStarted: true };
+    return Object.assign({}, r, { remoteStarted: true, remoteNote: ack.alreadyRunning ? 'The other gateway was already running its NAT service.' : 'The other gateway started its NAT service too.' });
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not start the NAT service.' }; }
+});
+ipcMain.handle('wg-nat-stop', async () => {
+  try { return await natGateway.natService.stop(); }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not stop the NAT service.' }; }
+});
+ipcMain.handle('wg-nat-status', async () => {
+  try { return { success: true, nat: natGateway.natService.status() }; }
+  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read the NAT status.' }; }
+});
+/* Save the site-to-site config only — the NAT editor form calls
+   this; Start reads the saved config back. The form sends just
+   { mode, mappings, peerTunnelIp }: the subnets, the gateway LAN
+   address and the farVirtIp are auto-detected / auto-picked here
+   and validated with validateNatConfig, plus the remote gateway
+   must be an existing peer and no virtual address may sit inside
+   the tunnel subnet. Nothing is written unless every check passes.
+   Different-subnet mode has no form at all, so there is nothing
+   to save for it — Start builds that config from scratch. */
+ipcMain.handle('wg-nat-save', async (event, input) => {
+  try {
+    const mode = (input && input.mode) || 'same-subnet';
+    if (mode !== 'same-subnet') return { success: false, error: 'Different-subnet mode needs no configuration — just pick the other gateway and press Start NAT service.' };
+    const c = getWgConfig();
+    const peerTunnelIp = (input && (input.peerTunnelIp || input.remoteTunnelIp)) || '';
+    const peer = (c.server.peers || []).find((p) => p.tunnelIp === peerTunnelIp);
+    const serverIp = wgTunnelServerIp();
+    const isClientServer = !peer && !!c.client && c.client.serverPublicKey && serverIp && serverIp === peerTunnelIp;
+    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + (peerTunnelIp || '—') + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then save the NAT configuration.', errors: ['The remote gateway (' + (peerTunnelIp || '—') + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then save the NAT configuration.'] };
+    const ownTunnelIp = await wgOwnTunnelIp();
+    const tunnelSubnet = wireguard.tunnelSubnetFor(ownTunnelIp || c.server.address);
+    const own = natGateway.detectLanAddress(undefined, [tunnelSubnet]);
+    if (!own) return { success: false, error: 'Could not detect this gateway PC\'s LAN address — check it is connected to the local network.' };
+    const mappings = Array.isArray(input.mappings) ? input.mappings : [];
+    /* farVirtIp (the address the remote gateway is known by on
+       this LAN): reuse the saved one while it is still free here,
+       else pick a fresh free address. It is replaced by the
+       negotiated value at start time. */
+    let farVirtIp = (c.nat && c.nat.farVirtIp) || '';
+    if (!farVirtIp || !(await natGateway.isIpFreeOnLan(farVirtIp))) {
+      farVirtIp = (await natGateway.pickFreeAddress(own.subnet, [own.address, ...mappings.map((m) => m.real)], undefined, (ip) => natGateway.isIpFreeOnLan(ip))) || '';
+    }
+    const full = {
+      mode: 'same-subnet',
+      localSubnet: own.subnet,
+      remoteSubnet: own.subnet,
+      gatewayLanIp: own.address,
+      gatewayTunnelIp: ownTunnelIp || c.server.address,
+      remoteTunnelIp: peerTunnelIp,
+      farVirtIp,
+      interfaceName: '',
+      mappings,
+    };
+    const v = natGateway.validateNatConfig(full);
+    if (!v.ok) return { success: false, error: v.errors[0], errors: v.errors };
+    const clash = natGateway.tunnelSubnetClashes(v.config, tunnelSubnet);
+    if (clash.length > 0) return { success: false, error: clash[0], errors: clash };
+    c.nat = v.config;
+    saveWgConfig();
+    return { success: true, nat: v.config };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not save the NAT configuration.' }; }
+});
+// One-click AmneziaWG install: download the official MSI, verify its
+// Authenticode signature, install silently (one UAC prompt). Progress
+// mirrors vpn-install-connect: { phase, pct, text } on
+// 'wg-install-progress'. On Windows only — anywhere else the wrapper
+// refuses before fetching anything.
+ipcMain.handle('wg-install-amneziawg', async (event) => {
+  try {
+    return await wireguard.downloadAndInstallAmnezia((p) => {
+      try { if (!event.sender.isDestroyed()) event.sender.send('wg-install-progress', p); } catch (e) {}
+    });
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not install AmneziaWG.' }; }
 });
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {

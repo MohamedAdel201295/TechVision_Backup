@@ -1,6 +1,6 @@
 'use strict';
 /*
- * TechVision VPN — Tailscale client manager (main process).
+ * TechVision Tailscale VPN — Tailscale client manager (main process).
  *
  * This module does NOT implement a VPN. It manages the Tailscale CLI
  * that is already installed on the machine: status, connect/disconnect,

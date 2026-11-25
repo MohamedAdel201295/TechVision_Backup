@@ -269,12 +269,13 @@
   }
 
   /* ---------- views: Dashboard / Jobs ---------- */
-  /* ---------- modules: Backup / Cloud / VPN ----------
-     The sidebar has three top-level modules. Backup owns Dashboard, Jobs,
+  /* ---------- modules: Backup / Cloud / VPN / WireGuard ----------
+     The sidebar has four top-level modules. Backup owns Dashboard, Jobs,
      Logs, New Job and Restore; Cloud owns Server and Client; VPN is a
-     single Tailscale view. Switching modules swaps the visible nav
-     group; going back to Backup returns to the last backup view instead
-     of always resetting to Dashboard. */
+     single Tailscale view; WireGuard VPN is a single self-hosted
+     WireGuard view (server + client). Switching modules swaps the
+     visible nav group; going back to Backup returns to the last backup
+     view instead of always resetting to Dashboard. */
   var currentModule = 'backup';
   var lastBackupView = 'dashboard';
 
@@ -283,6 +284,7 @@
     var gb = $('navGroupBackup'); if (gb) gb.style.display = mod === 'backup' ? '' : 'none';
     var gc = $('navGroupCloud'); if (gc) gc.style.display = mod === 'cloud' ? '' : 'none';
     var gv = $('navGroupVpn'); if (gv) gv.style.display = mod === 'vpn' ? '' : 'none';
+    var gw = $('navGroupWireguard'); if (gw) gw.style.display = mod === 'wireguard' ? '' : 'none';
     document.querySelectorAll('.module-item').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-module') === mod); });
   }
 
@@ -291,6 +293,7 @@
     if (mod === 'backup') showView(lastBackupView || 'dashboard');
     else if (mod === 'cloud') showView('cloud');
     else if (mod === 'vpn') showView('vpn');
+    else if (mod === 'wireguard') showView('wireguard');
   }
 
   function syncCloudNav() {
@@ -315,14 +318,27 @@
   function showView(name) {
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
+    var wgView = $('view-wireguard');
     var modulesView = $('view-modules');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
     if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
     if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
     if (vpnView) vpnView.style.display = name === 'vpn' ? '' : 'none';
+    if (wgView) wgView.style.display = name === 'wireguard' ? '' : 'none';
     if (modulesView) modulesView.style.display = name === 'modules' ? '' : 'none';
+    /* One refresh per module, at the top — the same ⟳ icon-button
+       pattern as the Tailscale one, shown only while its module is
+       active. The settings gear lives in the Backup module only:
+       it is hidden in Cloud, Tailscale VPN and WireGuard, and on
+       the module chooser (the drawer itself is unchanged — basic
+       Backup settings only). */
+    var isBackup = name === 'dashboard' || name === 'jobs' || name === 'logs';
+    var gb2 = $('settingsBtn'); if (gb2) gb2.style.display = isBackup ? '' : 'none';
+    var brb = $('backupTopRefreshBtn'); if (brb) brb.style.display = isBackup ? '' : 'none';
+    var crb2 = $('cloudTopRefreshBtn'); if (crb2) crb2.style.display = name === 'cloud' ? '' : 'none';
     var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
+    var wrb = $('wgTopRefreshBtn'); if (wrb) wrb.style.display = name === 'wireguard' ? '' : 'none';
     document.body.classList.toggle('modules-mode', name === 'modules');
     var bb = $('backBar'); if (bb) bb.style.display = name === 'modules' ? 'none' : '';
     var hdr = $('appHeader'); if (hdr) hdr.style.display = name === 'modules' ? 'none' : '';
@@ -350,8 +366,14 @@
     if (name === 'vpn') {
       applyModuleUI('vpn');
       setBackTitle('VPN');
-      setAppTitle('TechVision VPN', 'Your private network — every device, anywhere, as if it were home.');
+      setAppTitle('TechVision Tailscale VPN', 'Your private network — every device, anywhere, as if it were home.');
       loadVpn();
+    }
+    if (name === 'wireguard') {
+      applyModuleUI('wireguard');
+      setBackTitle('WireGuard VPN');
+      setAppTitle('TechVision WireGuard VPN', 'Your own VPN server — no accounts, no middleman, one port on the router.');
+      loadWireGuard();
     }
   }
   function startLogsAutoRefresh() {
@@ -612,7 +634,19 @@
     var sp = $('cloudServerPanel'); if (sp) sp.style.display = panel === 'server' ? '' : 'none';
     var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
     if (panel === 'server') renderCloudServer();
-    if (panel === 'client') { renderCloudClientList(); if (cloudClientAccess === 'tailscale') populateCloudPeers(); }
+    if (panel === 'client') {
+      // Open on the kind of server the user actually has: if the
+      // current picker mode matches none of the saved servers, switch
+      // it to the first server's mode so the list is never empty
+      // while servers exist. An explicit picker click still filters
+      // strictly to the picked kind.
+      var saved = (cloudCfg && cloudCfg.clients) || [];
+      if (saved.length) {
+        var hasCurrent = saved.some(function (s) { return (s.accessMode || 'normal') === cloudClientAccess; });
+        if (!hasCurrent) setClientAccess(saved[0].accessMode || 'normal');
+      }
+      renderCloudClientList(); if (cloudClientAccess === 'tailscale') populateCloudPeers(); if (cloudClientAccess === 'wireguard') populateCloudWgPeers();
+    }
     syncCloudNav();
     setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : 'Cloud');
   }
@@ -660,26 +694,33 @@
   }
 
   function setServerAccess(mode) {
-    cloudServerAccess = mode === 'tailscale' ? 'tailscale' : 'normal';
+    cloudServerAccess = mode === 'tailscale' ? 'tailscale' : mode === 'wireguard' ? 'wireguard' : 'normal';
     document.querySelectorAll('#cloudServerAccessSeg .seg-btn').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-access') === cloudServerAccess); });
     var hint = $('cloudServerAccessHint');
     if (hint) hint.textContent = cloudServerAccess === 'tailscale'
       ? 'Clients on the same Tailscale network use the Tailscale address below + this port. No port forwarding needed.'
-      : 'Clients use your public static IP or DDNS + this port (forward the port in your router).';
+      : cloudServerAccess === 'wireguard'
+        ? 'Clients on the same WireGuard tunnel use the tunnel address below + this port. No port forwarding needed.'
+        : 'Clients use your public static IP or DDNS + this port (forward the port in your router).';
     var ti = $('cloudTailscaleInfo'); if (ti) ti.style.display = cloudServerAccess === 'tailscale' ? '' : 'none';
-    var fg = $('cloudForwardGuide'); if (fg) fg.style.display = cloudServerAccess === 'tailscale' ? 'none' : '';
-    // The port is the port the server listens on in both modes — but the
-    // "forward it in your router" note only applies to Normal mode. In
-    // Tailscale mode it was telling the user to forward a port that needs
-    // no forwarding. Same for the Addresses block: in Tailscale mode the
-    // public and LAN addresses are useless here (the Tailscale address
-    // above is the only one clients need), so hide the whole block.
+    var wi = $('cloudWireguardInfo'); if (wi) wi.style.display = cloudServerAccess === 'wireguard' ? '' : 'none';
+    var fg = $('cloudForwardGuide'); if (fg) fg.style.display = cloudServerAccess === 'normal' ? '' : 'none';
+    // The port is the port the server listens on in every mode — but
+    // the "forward it in your router" note only applies to Normal
+    // mode. In either VPN mode it was telling the user to forward a
+    // port that needs no forwarding. Same for the Addresses block:
+    // in VPN modes the public and LAN addresses are useless here
+    // (the tunnel address above is the only one clients need), so
+    // hide the whole block.
     var ph = $('cloudServerPortHint');
     if (ph) ph.textContent = cloudServerAccess === 'tailscale'
       ? 'The port this server listens on. Clients connect to the Tailscale address above + this port — no port forwarding needed.'
-      : 'Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.';
-    var af = $('cloudServerAddrsField'); if (af) af.style.display = cloudServerAccess === 'tailscale' ? 'none' : '';
+      : cloudServerAccess === 'wireguard'
+        ? 'The port this server listens on. Clients connect to the WireGuard tunnel address above + this port — no port forwarding needed.'
+        : 'Forward this TCP port in your router to this computer. Do not open DMZ — forward this one port only.';
+    var af = $('cloudServerAddrsField'); if (af) af.style.display = cloudServerAccess === 'normal' ? '' : 'none';
     if (cloudServerAccess === 'tailscale') refreshCloudTailscaleIp();
+    if (cloudServerAccess === 'wireguard') refreshCloudWireguardIp();
   }
 
   async function refreshCloudTailscaleIp() {
@@ -694,17 +735,49 @@
     } catch (e) { el.textContent = 'Could not read Tailscale status.'; }
   }
 
+  /* Same idea as refreshCloudTailscaleIp, for the WireGuard tunnel:
+     the address clients need is this computer's tunnel address —
+     the server address when this machine is the hub, or the client
+     tunnel address when it joined as a client (the Cloud server
+     listens on all interfaces, so it is reachable on the tunnel
+     interface either way). */
+  async function refreshCloudWireguardIp() {
+    var el = $('cloudWireguardIp'); if (!el) return;
+    if (!api || typeof api.wgGetStatus !== 'function') { el.textContent = 'WireGuard module is not available.'; return; }
+    el.textContent = 'Checking WireGuard…';
+    try {
+      var st = await api.wgGetStatus();
+      var addr = null;
+      if (st && st.serverRunning && st.server && st.server.address) addr = String(st.server.address).split('/')[0];
+      else if (st && st.clientRunning && st.client && st.client.tunnelIp) addr = st.client.tunnelIp;
+      if (!st || !st.installed) el.textContent = 'AmneziaWG is not installed — install it from the WireGuard module.';
+      else if (!addr) el.textContent = 'WireGuard is not connected on this computer — start the server or connect the client from the WireGuard module.';
+      else el.textContent = addr + ' — give clients this address + port ' + String((cloudCfg && cloudCfg.server && cloudCfg.server.port) || 8443) + '.';
+    } catch (e) { el.textContent = 'Could not read WireGuard status.'; }
+  }
+
   function setClientAccess(mode) {
-    cloudClientAccess = mode === 'tailscale' ? 'tailscale' : 'normal';
+    cloudClientAccess = mode === 'tailscale' ? 'tailscale' : mode === 'wireguard' ? 'wireguard' : 'normal';
     document.querySelectorAll('#cloudClientAccessSeg .seg-btn').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-access') === cloudClientAccess); });
     var hint = $('cloudClientAccessHint');
     if (hint) hint.textContent = cloudClientAccess === 'tailscale'
       ? 'Tailscale IP (100.x.x.x) of the server — pick a device below or type it.'
-      : 'Public IP, DDNS hostname or LAN IP of the server.';
+      : cloudClientAccess === 'wireguard'
+        ? 'WireGuard tunnel address (10.0.0.x) of the server — pick a device below or type it.'
+        : 'Public IP, DDNS hostname or LAN IP of the server.';
     var host = $('cloudClientHost');
-    if (host) host.placeholder = cloudClientAccess === 'tailscale' ? '100.64.0.1' : '203.0.113.10';
-    var pf = $('cloudClientPeerField'); if (pf) pf.style.display = cloudClientAccess === 'tailscale' ? '' : 'none';
+    if (host) host.placeholder = cloudClientAccess === 'tailscale' ? '100.64.0.1' : cloudClientAccess === 'wireguard' ? '10.0.0.1' : '203.0.113.10';
+    var pf = $('cloudClientPeerField'); if (pf) pf.style.display = cloudClientAccess === 'normal' ? 'none' : '';
+    var apb = $('cloudClientWgAddPeerBtn'); if (apb) apb.style.display = cloudClientAccess === 'wireguard' ? '' : 'none';
+    var pl = $('cloudClientPeerLabel');
+    if (pl) pl.textContent = cloudClientAccess === 'wireguard' ? 'Pick a device from your WireGuard tunnel' : 'Pick a device from your Tailscale network';
+    var ph2 = $('cloudClientPeerHint');
+    if (ph2) ph2.textContent = cloudClientAccess === 'wireguard'
+      ? 'Both devices must be on the same WireGuard tunnel — see the WireGuard module.'
+      : 'Both devices must be on the same Tailscale network — see the VPN module.';
     if (cloudClientAccess === 'tailscale') populateCloudPeers();
+    if (cloudClientAccess === 'wireguard') populateCloudWgPeers();
+    renderCloudClientList();
   }
 
   // Signature of the last peer list the picker was built from. The list
@@ -737,6 +810,39 @@
       sel.appendChild(o);
     });
     // A rebuild must not drop the device the user already picked.
+    if (prevValue) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevValue) { sel.value = prevValue; break; } }
+  }
+
+  /* Same idea as populateCloudPeers, for the WireGuard tunnel: the
+     picker lists the WireGuard peers (name + tunnel IP) and — when
+     this machine is a client — the server it connects to
+     (tunnelServer). Same signature guard so an open dropdown is
+     never disturbed. */
+  var lastCloudWgPeerSig = null;
+  async function populateCloudWgPeers() {
+    var sel = $('cloudClientPeer'); if (!sel) return;
+    if (!sel.options.length) { var chk = document.createElement('option'); chk.value = ''; chk.textContent = 'Checking WireGuard…'; sel.appendChild(chk); }
+    if (!api || typeof api.wgGetStatus !== 'function') { sel.innerHTML = ''; var na = document.createElement('option'); na.value = ''; na.textContent = 'WireGuard module is not available.'; sel.appendChild(na); return; }
+    var st;
+    try { st = await api.wgGetStatus(); }
+    catch (e) { sel.innerHTML = ''; var oe = document.createElement('option'); oe.value = ''; oe.textContent = 'Could not read WireGuard status.'; sel.appendChild(oe); return; }
+    var cands = (st.peers || []).map(function (p) { return [p.tunnelIp, p.name, p.online]; });
+    if (st.tunnelServer && st.tunnelServer.tunnelIp) cands.push([st.tunnelServer.tunnelIp, 'Server', st.tunnelServer.online]);
+    var sig = JSON.stringify({ installed: !!st.installed, serverRunning: !!st.serverRunning, clientRunning: !!st.clientRunning, peers: cands });
+    if (sig === lastCloudWgPeerSig) return;
+    lastCloudWgPeerSig = sig;
+    var prevValue = sel.value;
+    sel.innerHTML = '';
+    if (!st || !st.installed) { var o1 = document.createElement('option'); o1.value = ''; o1.textContent = 'AmneziaWG is not installed — see the WireGuard module.'; sel.appendChild(o1); return; }
+    if (!st.serverRunning && !st.clientRunning) { var o2 = document.createElement('option'); o2.value = ''; o2.textContent = 'WireGuard is not connected — start the server or connect the client from the WireGuard module.'; sel.appendChild(o2); return; }
+    if (!cands.length) { var o3 = document.createElement('option'); o3.value = ''; o3.textContent = 'No other devices on your WireGuard tunnel yet.'; sel.appendChild(o3); return; }
+    var blank = document.createElement('option'); blank.value = ''; blank.textContent = 'Choose a device…'; sel.appendChild(blank);
+    cands.forEach(function (c) {
+      if (!c[0]) return;
+      var o = document.createElement('option'); o.value = c[0]; o.textContent = c[1] + ' — ' + c[0] + (c[2] ? '' : ' (offline)');
+      o.setAttribute('data-peer-name', c[1]);
+      sel.appendChild(o);
+    });
     if (prevValue) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevValue) { sel.value = prevValue; break; } }
   }
 
@@ -802,11 +908,19 @@
     var list = $('cloudServersList');
     if (!list) return;
     list.innerHTML = '';
-    var servers = cloudCfg.clients || [];
+    // The list follows the Connection picker above it: pick WireGuard
+    // and the Tailscale servers hide (and vice versa) — the picker
+    // chooses which kind of server this panel is about, so a server
+    // of another kind must not sit above the form for this kind.
+    var mode = cloudClientAccess || 'normal';
+    var servers = (cloudCfg.clients || []).filter(function (srv) {
+      return (srv.accessMode || 'normal') === mode;
+    });
     if (!servers.length) {
       var empty = document.createElement('div');
       empty.className = 'empty-state'; empty.style.display = '';
-      empty.innerHTML = '<div class="big">☁️</div><h3>No servers yet</h3><p>Add the server you want to open below.</p>';
+      var label = mode === 'wireguard' ? 'No WireGuard servers yet' : mode === 'tailscale' ? 'No Tailscale servers yet' : 'No servers yet';
+      empty.innerHTML = '<div class="big">☁️</div><h3>' + label + '</h3><p>Add the server you want to open below.</p>';
       list.appendChild(empty);
     }
     servers.forEach(function (srv) {
@@ -815,7 +929,7 @@
       var body = document.createElement('div'); body.className = 'job-body';
       var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = srv.name;
       var meta = document.createElement('div'); meta.className = 'job-meta';
-      meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet') + (srv.hasPassword ? ' — password saved on this device' : '');
+      meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : srv.accessMode === 'wireguard' ? '🔐 WireGuard' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet') + (srv.hasPassword ? ' — password saved on this device' : '');
       var acts = document.createElement('div'); acts.className = 'drawer-actions';
       // Already connected to this server: say so instead of offering
       // Connect again — Disconnect lives in the browser toolbar below.
@@ -887,9 +1001,45 @@
 
   // passwordOverride: undefined = read the connect box (the usual path);
   // null = use the password saved on this device (one-click reconnect).
+  /* WireGuard tunnel pre-check for a Cloud server in 'wireguard'
+     mode — mirrors main's wgTunnelToPeerCheck: the tunnel has to be
+     up before any probe/connect, or the login would wait out the
+     15s probe timeout and fail with a network error. Server role:
+     the host must be a live peer (a recent handshake); client
+     role: the client must be online and the host must be the
+     server's tunnel address (.1 of the tunnel subnet). */
+  async function wgTunnelUpFor(host) {
+    if (!api || typeof api.wgGetStatus !== 'function') return { ok: false, error: 'WireGuard module is not available.' };
+    try {
+      var st = await api.wgGetStatus();
+      var h = String(host || '').trim();
+      var peer = (st.peers || []).find(function (p) { return p.tunnelIp === h; });
+      if (peer) {
+        if (peer.online) return { ok: true };
+        return { ok: false, error: 'The WireGuard tunnel to ' + h + ' is not up — the peer is known but has not handshaken yet. Start the server on the other machine and check it connects.' };
+      }
+      if (st.client && st.client.tunnelIp && st.client.online) {
+        var parts = String(st.client.tunnelIp).split('.');
+        var serverIp = parts.length === 4 ? (parts[0] + '.' + parts[1] + '.' + parts[2] + '.1') : '';
+        if (h === serverIp) return { ok: true };
+        return { ok: false, error: 'The WireGuard tunnel is up, but the server address ' + h + ' is not the tunnel server (' + serverIp + '). Pick the server from the WireGuard peer list.' };
+      }
+      return { ok: false, error: 'The WireGuard tunnel is not up — connect the WireGuard client (or start the server) first, then connect to the Cloud server.' };
+    } catch (e) { return { ok: false, error: 'Could not check the WireGuard tunnel: ' + (e && e.message ? e.message : String(e)) }; }
+  }
+
   async function cloudConnectFlow(autoTrust, passwordOverride) {
     if (!cloudSelected) return;
     if (!api || typeof api.cloudClientProbe !== 'function' || typeof api.cloudClientConnect !== 'function') return cloudMissing();
+    /* WireGuard mode: the tunnel has to be up before probing — a
+       down tunnel fails fast here with a clear message instead of
+       waiting out the 15s probe timeout. Main re-checks the same
+       way in cloud-client-connect for the trusted path. */
+    var wgMode = (cloudSelected.accessMode || cloudClientAccess) === 'wireguard';
+    if (wgMode) {
+      var wgCheck = await wgTunnelUpFor(cloudSelected.host);
+      if (!wgCheck.ok) { toast('WireGuard tunnel is down', wgCheck.error, 'error'); return; }
+    }
     var btn = $('cloudConnectBtn');
     var pass = $('cloudConnectPass');
     var password = passwordOverride !== undefined ? (passwordOverride || '') : (pass ? pass.value : '');
@@ -1686,7 +1836,7 @@
     setProgressButtons(false);
   }
   function setProgressButtons(disabled) {
-    ['refreshBtn'].forEach(function (id) {
+    ['backupTopRefreshBtn'].forEach(function (id) {
       var b = $(id);
       if (b) b.disabled = disabled;
     });
@@ -1839,7 +1989,7 @@
     var e = $('vaultUnlockError'); if (e) e.classList.remove('show');
   }
 
-  /* ---------- TechVision VPN (Tailscale client manager) ----------
+  /* ---------- TechVision Tailscale VPN (Tailscale client manager) ----------
      One panel per machine: status, connect/disconnect, peers, subnet
      router. There is no VPN server to build — Tailscale is a mesh and
      its coordination server is Tailscale's own. The Cloud module plugs
@@ -1917,7 +2067,22 @@
         : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.');
       if (btn) btn.textContent = 'Connect';
       if (lb) lb.style.display = 'none';
-      if (dc) dc.style.display = 'none';
+      // The settings live in this card (API credentials, key expiry,
+      // subnet sharing) — they must be reachable BEFORE connecting:
+      // the key-expiry choice and the API token are exactly what make
+      // the first connect stay connected, so hiding the card until
+      // after Connect made them unreachable when they matter most.
+      // Show it while disconnected; the live facts stay "—" until
+      // the VPN is on, and the routes note stays hidden (it only
+      // applies while advertising).
+      if (dc) dc.style.display = '';
+      var ket0 = $('vpnKeyExpiryToggle'); if (ket0) ket0.checked = vpnKeyExpiryWanted();
+      var tok0 = $('vpnApiToken'); if (tok0) tok0.value = (settings.vpn && settings.vpn.apiToken) || '';
+      var ocid0 = $('vpnOauthClientId'); if (ocid0) ocid0.value = (settings.vpn && settings.vpn.oauthClientId) || '';
+      var osec0 = $('vpnOauthClientSecret'); if (osec0) osec0.value = (settings.vpn && settings.vpn.oauthClientSecret) || '';
+      refreshVpnRoutesState();
+      refreshVpnKeyExpiryState();
+      refreshVpnApiCredsStatus(false);
       renderVpnPeers([]);
       return;
     }
@@ -2199,6 +2364,336 @@
     toast('Cloud client', 'Server address set to ' + (peer.name || peer.ip) + ' over Tailscale. Add your user and password, then Save & connect.', 'success');
   }
 
+  /* ---------- TechVision WireGuard VPN (self-hosted WireGuard) ----------
+     A fourth module: this machine as a WireGuard server (hub) and as a
+     client. No coordination server, no account — the server IS this
+     machine, and the only router step is one UDP 51820 forward. The
+     UI mirrors the VPN view (status hero, facts tiles, peer rows). */
+  var wgStatusCache = null;
+  var wgBusy = false;
+  var lastWgPeersSig = null;
+
+  function wgMissing() { toast('WireGuard', 'The WireGuard bridge is not available in this build.', 'error'); }
+
+  function wgHandshakeText(ms) {
+    if (!ms) return 'never connected';
+    var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return s + 's ago';
+    var m = Math.round(s / 60);
+    if (m < 60) return m + ' min ago';
+    var h = Math.round(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.round(h / 24) + 'd ago';
+  }
+
+  async function loadWireGuard() {
+    if (!api || typeof api.wgGetStatus !== 'function') return wgMissing();
+    var st;
+    try { st = await api.wgGetStatus(); } catch (e) { st = { installed: false, serverRunning: false, clientRunning: false, error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
+    wgStatusCache = st || {};
+    renderWgNat(st || {});
+    var dot = $('wgStatusDot'); if (dot) dot.className = 'vpn-dot' + (st.serverRunning ? ' on' : '');
+    var txt = $('wgStatusText'), sub = $('wgStatusSub');
+    var ni = $('wgNotInstalled');
+    var sc = $('wgServerCard');
+    var tl = $('wgTransportLine');
+    if (!st.installed) {
+      if (txt) txt.textContent = 'Not installed';
+      if (sub) sub.textContent = 'AmneziaWG is not installed on this computer.';
+      if (tl) tl.style.display = 'none';
+      if (ni) ni.style.display = '';
+      if (sc) sc.style.display = 'none';
+      // The early return below used to skip the button reset, so a
+      // failed Start left the button stuck on "Working…" — reset
+      // the button here too.
+      var sb0 = $('wgServerBtn'); if (sb0) { sb0.textContent = 'Start server'; sb0.classList.add('btn-primary'); }
+      renderWgPeers([]);
+      return;
+    }
+    if (ni) ni.style.display = 'none';
+    if (sc) sc.style.display = '';
+    if (tl) {
+      if (st.transport === 'amneziawg') { tl.style.display = ''; tl.textContent = st.obfuscated ? 'Transport: AmneziaWG — traffic is obfuscated, so it doesn\u2019t look like WireGuard on the network.' : 'Transport: AmneziaWG.'; }
+      else { tl.style.display = ''; tl.textContent = 'Transport: stock WireGuard (no obfuscation).'; }
+    }
+    if (st.serverRunning) {
+      if (txt) txt.textContent = 'Server running';
+      if (sub) sub.textContent = 'This machine is the AmneziaWG hub — devices connect to it.';
+    } else if (st.error) {
+      if (txt) txt.textContent = 'Error';
+      if (sub) sub.textContent = st.error;
+    } else {
+      if (txt) txt.textContent = 'Off';
+      if (sub) sub.textContent = 'The server is stopped.';
+    }
+    var sb = $('wgServerBtn');
+    if (sb) { sb.textContent = st.serverRunning ? 'Stop server' : 'Start server'; sb.classList.toggle('btn-primary', !st.serverRunning); }
+    var sk = $('wgServerKey'); if (sk) sk.textContent = (st.server && st.server.publicKey) || '—';
+    // Editable server settings: prefill from status, never clobber
+    // typing (same guard as the endpoint input).
+    var si = $('wgServerIp');
+    if (si && document.activeElement !== si) si.value = (st.server && st.server.address) || '10.0.0.1';
+    var sp = $('wgServerPort');
+    if (sp && document.activeElement !== sp) sp.value = String((st.server && st.server.listenPort) || 51820);
+    var ph = $('wgPortHint');
+    if (ph) ph.textContent = 'On your router, forward UDP ' + ((st.server && st.server.listenPort) || 51820) + ' to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.';
+    var ep = $('wgEndpoint');
+    if (ep && document.activeElement !== ep) ep.value = (st.server && st.server.endpoint) || '';
+    renderWgPeers(st.peers || []);
+  }
+
+  /* Gateway NAT service status (site-to-site): the card lives in
+     the WireGuard view next to the static-route guidance. The
+     service itself is Windows-only — on Linux the status simply
+     says stopped, and Start reports the real reason. The status
+     line also carries the saved configuration summary, and Start
+     stays disabled until a configuration has been saved. */
+  function renderWgNat(st) {
+    var ns = $('wgNatStatus'); if (!ns) return;
+    var n = (st && st.nat) || {};
+    var saved = (st && st.natConfig) || null;
+    var summary = '';
+    if (saved) {
+      summary = ' Saved: ' + (saved.mode === 'same-subnet' ? 'same-subnet' : 'different-subnet') + ', ' +
+        (saved.localSubnet || '') + ' ↔ ' + (saved.remoteSubnet || '') +
+        (saved.mode === 'same-subnet' ? (', ' + (saved.mappings ? saved.mappings.length : 0) + ' mapped device' + ((saved.mappings || []).length === 1 ? '' : 's')) : ', no mappings') + '.';
+    } else {
+      summary = ' No site-to-site configuration saved yet — add devices below and press Save.';
+    }
+    if (n.running) {
+      var s = n.stats || {};
+      ns.textContent = 'NAT service: running — ' + (n.mode || '') + ' mode' +
+        (n.mappings ? (', ' + n.mappings + ' mapped device' + (n.mappings === 1 ? '' : 's')) : '') +
+        (s.translated ? (', ' + s.translated + ' packet' + (s.translated === 1 ? '' : 's') + ' translated') : '') + '.' + summary;
+    } else {
+      ns.textContent = 'NAT service: stopped.' + (n.lastError ? (' ' + n.lastError) : '') + summary;
+    }
+    /* Start is available when the service is not running and the
+       mode has what it needs: different-subnet needs only a peer
+       picked (there is no configuration to save there); same-subnet
+       needs a saved config OR a peer — with no rows of its own this
+       gateway starts as the remote side and the other gateway runs
+       the rows. */
+    var modeNow = currentWgNatMode();
+    var peersNow = (st && st.peers) || [];
+    var hasPeer = peersNow.length > 0 || !!(st && st.tunnelServer);
+    var canStart = modeNow === 'different-subnet' ? hasPeer : (!!saved || hasPeer);
+    var startBtn = $('wgNatStartBtn'); if (startBtn) startBtn.disabled = !!n.running || !canStart;
+    var stopBtn = $('wgNatStopBtn'); if (stopBtn) stopBtn.disabled = !n.running;
+    renderWgNatForm(st);
+  }
+
+  /* The NAT mapping editor: prefill from the saved config, show or
+     hide the same-subnet blocks by mode, and never clobber the
+     user's edits — the 15s poller calls loadWireGuard, so once the
+     form is dirty it is left alone, and the mappings rows rebuild
+     only when the saved config actually changes. */
+  var wgNatFormDirty = false;
+  var lastWgNatSavedSig = null;
+  var lastWgNatMappingsSig = null;
+  var lastWgNatPeersSig = null;
+  function currentWgNatMode() {
+    var diff = $('wgNatModeDiff');
+    return (diff && diff.checked) ? 'different-subnet' : 'same-subnet';
+  }
+  function setWgNatMode(m) {
+    var same = $('wgNatModeSame'), diff = $('wgNatModeDiff');
+    if (same) same.checked = m !== 'different-subnet';
+    if (diff) diff.checked = m === 'different-subnet';
+    /* Same subnet: the mapping rows show. Different subnets: the
+       whole configuration form hides — only the mode radios, the
+       peer picker and Start/Stop remain — and the router note
+       shows instead. */
+    var fb = $('wgNatFormBody'); if (fb) fb.style.display = m === 'different-subnet' ? 'none' : '';
+    var rn = $('wgNatRouterNote'); if (rn) rn.style.display = m === 'different-subnet' ? '' : 'none';
+  }
+  function wgNatAddMappingRow(m) {
+    var box = $('wgNatMappingsRows'); if (!box) return;
+    var row = document.createElement('div');
+    row.className = 'wg-nat-map-row';
+    row.style.cssText = 'display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; align-items:center;';
+    var mk = function (cls, ph) {
+      var el = document.createElement('input');
+      el.type = 'text'; el.className = cls; el.placeholder = ph; el.autocomplete = 'off';
+      el.style.cssText = 'flex:1; min-width:130px;';
+      el.addEventListener('input', function () { wgNatFormDirty = true; });
+      return el;
+    };
+    var name = mk('wg-nat-map-name', 'Name, e.g. file server'); name.value = (m && m.name) || '';
+    var real = mk('wg-nat-map-real', 'Real IP, e.g. 192.168.1.49'); real.value = (m && m.real) || '';
+    var virt = mk('wg-nat-map-virt', 'Alias IP, e.g. 192.168.2.3'); virt.value = (m && m.virt) || '';
+    var rm = document.createElement('button');
+    rm.className = 'btn btn-ghost btn-sm'; rm.type = 'button'; rm.textContent = 'Remove';
+    rm.addEventListener('click', function () {
+      var rows = box.querySelectorAll('.wg-nat-map-row');
+      if (rows.length <= 1) { real.value = ''; virt.value = ''; name.value = ''; wgNatFormDirty = true; return; }
+      row.remove(); wgNatFormDirty = true;
+    });
+    row.appendChild(name); row.appendChild(real); row.appendChild(virt); row.appendChild(rm);
+    box.appendChild(row);
+  }
+  function wgNatRebuildMappings(list) {
+    var box = $('wgNatMappingsRows'); if (!box) return;
+    box.innerHTML = '';
+    var rows = (list && list.length) ? list : [null];
+    rows.forEach(function (m) { wgNatAddMappingRow(m); });
+  }
+  function wgNatReadMappings() {
+    var out = [];
+    document.querySelectorAll('#wgNatMappingsRows .wg-nat-map-row').forEach(function (row) {
+      var real = (row.querySelector('.wg-nat-map-real') || {}).value || '';
+      var virt = (row.querySelector('.wg-nat-map-virt') || {}).value || '';
+      var name = (row.querySelector('.wg-nat-map-name') || {}).value || '';
+      if (String(real).trim() === '' && String(virt).trim() === '' && String(name).trim() === '') return;
+      out.push({ real: String(real).trim(), virt: String(virt).trim(), name: String(name).trim() });
+    });
+    return out;
+  }
+  function renderWgNatPeerPick(peers, tunnelServer) {
+    var sel = $('wgNatRemotePeerPick'); if (!sel) return;
+    /* Candidates: the server's peers, plus the server this machine
+       connects to as a client (tunnelServer) — a gateway can be a
+       client, and its remote gateway is that server. */
+    var cands = (peers || []).map(function (p) { return { name: p.name || 'peer', tunnelIp: p.tunnelIp }; });
+    if (tunnelServer && tunnelServer.tunnelIp && !cands.some(function (c) { return c.tunnelIp === tunnelServer.tunnelIp; })) {
+      cands.push({ name: 'Server', tunnelIp: tunnelServer.tunnelIp });
+    }
+    var sig = JSON.stringify(cands.map(function (p) { return [p.name, p.tunnelIp]; }));
+    if (sig === lastWgNatPeersSig) return;
+    lastWgNatPeersSig = sig;
+    var prev = sel.value;
+    sel.innerHTML = '';
+    var o0 = document.createElement('option'); o0.value = '';
+    o0.textContent = cands.length ? 'Pick the other gateway…' : 'No peers yet — add one above first';
+    sel.appendChild(o0);
+    cands.forEach(function (p) {
+      var opt = document.createElement('option'); opt.value = p.tunnelIp;
+      opt.textContent = (p.name || 'peer') + ' — ' + p.tunnelIp;
+      sel.appendChild(opt);
+    });
+    if (prev) sel.value = prev;
+    /* Exactly one gateway to pick from: select it — the user only
+       has one other gateway, so there is nothing to choose. */
+    else if (cands.length === 1) sel.value = cands[0].tunnelIp;
+  }
+  function renderWgNatForm(st) {
+    var fs = $('wgNatFieldset'); if (!fs) return;
+    var n = (st && st.nat) || {};
+    var saved = (st && st.natConfig) || null;
+    fs.disabled = !!n.running;
+    var savedSig = JSON.stringify(saved || null);
+    if (!wgNatFormDirty && savedSig !== lastWgNatSavedSig) {
+      lastWgNatSavedSig = savedSig;
+      /* The form holds only the mode and the mapping rows now —
+         the subnets, the gateway LAN address and the far virtual
+         address are auto-detected / auto-picked in main. */
+      if (saved) {
+        setWgNatMode(saved.mode === 'different-subnet' ? 'different-subnet' : 'same-subnet');
+      } else {
+        setWgNatMode('same-subnet');
+      }
+    }
+    setWgNatMode(currentWgNatMode());
+    var mapSig = JSON.stringify((saved && saved.mode === 'same-subnet') ? (saved.mappings || []) : []);
+    if (!wgNatFormDirty && mapSig !== lastWgNatMappingsSig) {
+      lastWgNatMappingsSig = mapSig;
+      wgNatRebuildMappings(saved && saved.mappings ? saved.mappings : [null]);
+    }
+    renderWgNatPeerPick(st.peers || [], st.tunnelServer || null);
+    /* Restore the saved remote gateway into the picker (unless the
+       user changed it — the dirty flag guards that). */
+    if (!wgNatFormDirty && saved && saved.remoteTunnelIp) {
+      var sel = $('wgNatRemotePeerPick');
+      if (sel && sel.querySelector('option[value="' + saved.remoteTunnelIp + '"]')) sel.value = saved.remoteTunnelIp;
+    }
+  }
+  async function wgNatSaveForm() {
+    var errEl = $('wgNatFormError');
+    var fail = function (msg) {
+      if (errEl) errEl.textContent = msg;
+      toast('NAT configuration', msg, 'error');
+      return false;
+    };
+    if (errEl) errEl.textContent = '';
+    if (!api || typeof api.wgNatSave !== 'function') return wgMissing();
+    var mode = currentWgNatMode();
+    if (mode === 'different-subnet') return fail('Different-subnet mode needs no configuration — just pick the other gateway and press Start NAT service.');
+    /* The other gateway comes from the peer picker (auto-selected
+       when there is exactly one peer). */
+    var pick = $('wgNatRemotePeerPick');
+    var peerTunnelIp = pick ? String(pick.value || '').trim() : '';
+    if (!peerTunnelIp) return fail('Pick the other gateway first — the remote gateway peer has to be set up before the NAT service can start.');
+    /* The remote gateway must be a peer — checked here for instant
+       feedback, and again in main (the authoritative check, before
+       anything is saved). Either role counts: a server peer, or
+       the server this client connects to. */
+    var peers = (wgStatusCache && wgStatusCache.peers) || [];
+    var ts = wgStatusCache && wgStatusCache.tunnelServer;
+    var known = peers.some(function (p) { return p.tunnelIp === peerTunnelIp; }) || (ts && ts.tunnelIp === peerTunnelIp);
+    if (!known) return fail('The remote gateway (' + peerTunnelIp + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then save.');
+    /* The form sends just the mode, the mapping rows and the
+       picked peer: the subnets, the gateway LAN address and the
+       far virtual address are auto-detected / auto-picked in main,
+       which validates everything with the real CIDR math. */
+    var config = { mode: mode, mappings: wgNatReadMappings(), peerTunnelIp: peerTunnelIp };
+    var saveBtn = $('wgNatSaveBtn'); if (saveBtn) saveBtn.disabled = true;
+    try {
+      var r = await api.wgNatSave(config);
+      if (r && r.success) {
+        wgNatFormDirty = false;
+        toast('NAT configuration', 'Site-to-site configuration saved — press Start NAT service when ready.', 'success');
+        await loadWireGuard();
+      } else {
+        var msg = (r && r.errors && r.errors.length > 1) ? r.errors.join(' ') : ((r && r.error) || 'Could not save the NAT configuration.');
+        fail(msg);
+      }
+    } catch (e) { fail(e && e.message ? e.message : 'Could not save the NAT configuration.'); }
+    finally { if (saveBtn) saveBtn.disabled = false; }
+  }
+
+  function renderWgPeers(peers) {
+    var list = $('wgPeerList'); if (!list) return;
+    var sig = JSON.stringify((peers || []).map(function (p) { return [p.name, p.tunnelIp, p.publicKey, p.endpoint, p.online, p.latestHandshake, p.transferRx, p.transferTx]; }));
+    if (sig === lastWgPeersSig) return;
+    lastWgPeersSig = sig;
+    list.innerHTML = '';
+    if (!peers.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p>';
+      list.appendChild(empty);
+      return;
+    }
+    peers.forEach(function (p) {
+      var row = document.createElement('div');
+      row.className = 'vpn-peer';
+      var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
+      var body = document.createElement('div'); body.className = 'vpn-peer-body';
+      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name + ' — ' + p.tunnelIp;
+      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
+      meta.textContent = (p.online ? ('online — last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected') + ' · ' + formatBytes(p.transferRx || 0) + ' down / ' + formatBytes(p.transferTx || 0) + ' up · ' + String(p.publicKey || '').slice(0, 12) + '…' + (p.endpoint ? (' · endpoint ' + p.endpoint) : '');
+      body.appendChild(h); body.appendChild(meta);
+      row.appendChild(d); row.appendChild(body);
+      var rm = document.createElement('button'); rm.className = 'btn btn-ghost btn-sm'; rm.type = 'button'; rm.textContent = 'Remove';
+      rm.addEventListener('click', async function () {
+        if (!api || typeof api.wgRemovePeer !== 'function') return wgMissing();
+        rm.disabled = true;
+        try {
+          var r = await api.wgRemovePeer({ publicKey: p.publicKey });
+          if (r && r.success) toast('Peer removed', p.name + ' can no longer connect.', 'success');
+          else toast('Remove failed', (r && r.error) || 'Could not remove the peer.', 'error');
+        } catch (e) { toast('Remove failed', e && e.message ? e.message : 'Could not remove the peer.', 'error'); }
+        await loadWireGuard();
+      });
+      row.appendChild(rm);
+      list.appendChild(row);
+    });
+  }
+
+  /* Cloud join — server side: pending requests with Approve /
+     Reject. The list rebuilds only when it changes (sig guard), so
+     a button never disappears under the mouse on the 15s refresh. */
+
   /* ---------- wiring ---------- */
   document.addEventListener('DOMContentLoaded', function () {
     var nnj = $('navNewJob'); if (nnj) nnj.addEventListener('click', function () { openJobWizard(null); });
@@ -2207,7 +2702,8 @@
     $('emptyNewJobBtn').addEventListener('click', function () { openJobWizard(null); });
 
     $('navRestore').addEventListener('click', function () { openRestore(null); });
-    $('refreshBtn').addEventListener('click', refreshJobs);
+    var brb = $('backupTopRefreshBtn');
+    if (brb) brb.addEventListener('click', refreshJobs);
     $('searchInput').addEventListener('input', renderJobs);
     $('statusFilter').addEventListener('change', renderJobs);
     $('typeFilter').addEventListener('change', renderJobs);
@@ -2310,6 +2806,7 @@
         if (nav === 'logs') showView('logs');
         if (nav === 'cloud') showView('cloud');
         if (nav === 'vpn') showView('vpn');
+        if (nav === 'wireguard') showView('wireguard');
         if (nav === 'cloud-server') { setModule('cloud'); showCloudPanel('server'); }
         if (nav === 'cloud-client') { setModule('cloud'); showCloudPanel('client'); }
       });
@@ -2322,6 +2819,24 @@
     });
     document.querySelectorAll('#cloudClientAccessSeg .seg-btn').forEach(function (b) {
       b.addEventListener('click', function () { setClientAccess(b.getAttribute('data-access')); });
+    });
+    // Jump to the WireGuard module's Add a device form: the picker
+    // above lists tunnel devices, and when it is empty the device
+    // has to be added first — this button is the shortcut there.
+    var wgApb = $('cloudClientWgAddPeerBtn');
+    if (wgApb) wgApb.addEventListener('click', function () {
+      showView('wireguard');
+      // Focus AFTER the status load finishes: it hides the server
+      // card when the transport is not installed, and focusing
+      // before that races it (the card hides under the focus).
+      var focusKey = function () {
+        var key = $('wgPeerKey');
+        if (key) { try { key.scrollIntoView({ block: 'center' }); } catch (e) {} key.focus(); }
+      };
+      if (typeof loadWireGuard === 'function') {
+        try { var p = loadWireGuard(); if (p && typeof p.then === 'function') { p.then(focusKey); return; } } catch (e) {}
+      }
+      focusKey();
     });
     var cps = $('cloudClientPeer');
     if (cps) cps.addEventListener('change', function () {
@@ -2412,8 +2927,11 @@
       if (vpnBusy) return;
       var vpnView = $('view-vpn');
       if (vpnView && vpnView.style.display !== 'none') loadVpn();
+      var wgView = $('view-wireguard');
+      if (wgView && wgView.style.display !== 'none' && !wgBusy) loadWireGuard();
       var cloudView = $('view-cloud');
       if (cloudView && cloudView.style.display !== 'none' && cloudPanel === 'client' && cloudClientAccess === 'tailscale') populateCloudPeers();
+      if (cloudView && cloudView.style.display !== 'none' && cloudPanel === 'client' && cloudClientAccess === 'wireguard') populateCloudWgPeers();
     }, 15000);
     var vab = $('vpnOpenAuthBtn');
     if (vab) vab.addEventListener('click', async function () {
@@ -2553,7 +3071,7 @@
     if (ls) ls.addEventListener('input', renderFullLog);
 
     /* ---------- TechVision Cloud wiring ---------- */
-    var crb = $('cloudRefreshBtn');
+    var crb = $('cloudTopRefreshBtn');
     if (crb) crb.addEventListener('click', function () { loadCloud(); });
     var cms = $('cloudModeServer');
     if (cms) cms.addEventListener('click', function () { showCloudPanel('server'); });
@@ -2737,6 +3255,177 @@
       });
     }
 
+
+  // WireGuard view wiring — all buttons of #view-wireguard.
+  var wgRb = $('wgTopRefreshBtn');
+  if (wgRb) wgRb.addEventListener('click', function () { loadWireGuard(); });
+  var wgDb = $('wgDownloadBtn');
+  if (wgDb) wgDb.addEventListener('click', async function () {
+    if (!api || typeof api.wgOpenDownload !== 'function') return wgMissing();
+    await api.wgOpenDownload();
+  });
+  // One-click AmneziaWG install (the transport since Phase 2): the
+  // button shows the download/verify/install phases live, mirroring
+  // the Tailscale install button. On Linux this refuses in main
+  // before fetching anything; on Windows it is one UAC prompt.
+  var wgIb = $('wgInstallBtn');
+  if (wgIb) wgIb.addEventListener('click', async function () {
+    if (!api || typeof api.wgInstallAmneziawg !== 'function' || typeof api.onWgInstallProgress !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgIb.disabled = true; wgIb.textContent = 'Installing…';
+    var stopListen = api.onWgInstallProgress(function (p) {
+      if (!p) return;
+      if (p.phase === 'downloading' && typeof p.pct === 'number') wgIb.textContent = 'Downloading… ' + p.pct + '%';
+      else if (p.phase === 'verifying') wgIb.textContent = 'Verifying…';
+      else if (p.phase === 'installing') wgIb.textContent = 'Installing…';
+    });
+    try {
+      var r = await api.wgInstallAmneziawg();
+      if (r && r.success) toast('AmneziaWG installed', 'AmneziaWG is ready — the server and client are now available.', 'success');
+      else toast('Install failed', (r && r.error) || 'Could not install AmneziaWG.', 'error');
+    } catch (e) { toast('Install failed', e && e.message ? e.message : 'Could not install AmneziaWG.', 'error'); }
+    finally { if (stopListen) stopListen(); wgBusy = false; wgIb.disabled = false; wgIb.textContent = 'Install AmneziaWG'; await loadWireGuard(); }
+  });
+  var wgRc = $('wgRecheckBtn');
+  if (wgRc) wgRc.addEventListener('click', function () { loadWireGuard(); });
+  /* NAT mapping editor wiring: any edit marks the form dirty so the
+     poller never overwrites it; mode radios toggle the same-subnet
+     form; the peer picker marks the form dirty (the Start button
+     reads the picked peer, the Save reads it too). */
+  var wgNatFs = $('wgNatFieldset');
+  if (wgNatFs) {
+    wgNatFs.addEventListener('input', function () { wgNatFormDirty = true; });
+    wgNatFs.addEventListener('change', function () { wgNatFormDirty = true; setWgNatMode(currentWgNatMode()); });
+  }
+  var wgNatPick = $('wgNatRemotePeerPick');
+  if (wgNatPick) wgNatPick.addEventListener('change', function () { wgNatFormDirty = true; });
+  var wgNatAddMap = $('wgNatAddMappingBtn');
+  if (wgNatAddMap) wgNatAddMap.addEventListener('click', function () { wgNatAddMappingRow(null); wgNatFormDirty = true; });
+  var wgNatSave = $('wgNatSaveBtn');
+  if (wgNatSave) wgNatSave.addEventListener('click', function () { wgNatSaveForm(); });
+  var wgNatExp = $('wgNatExportBtn');
+  if (wgNatExp) wgNatExp.addEventListener('click', async function () {
+    if (!api || typeof api.wgNatExport !== 'function') return wgMissing();
+    try {
+      var r = await api.wgNatExport();
+      if (r && r.success) toast('Site-to-site', 'Configuration exported to ' + r.filePath + '.', 'success');
+      else if (r && !r.canceled) toast('Export', (r && r.error) || 'Could not export the configuration.', 'error');
+    } catch (e) { toast('Export', e && e.message ? e.message : 'Could not export the configuration.', 'error'); }
+  });
+  var wgNatImp = $('wgNatImportBtn');
+  if (wgNatImp) wgNatImp.addEventListener('click', async function () {
+    if (!api || typeof api.wgNatImport !== 'function') return wgMissing();
+    try {
+      var r2 = await api.wgNatImport();
+      if (r2 && r2.success) { wgNatFormDirty = false; toast('Site-to-site', 'Configuration imported — press Start NAT service when ready.', 'success'); await loadWireGuard(); }
+      else if (r2 && !r2.canceled) toast('Import', (r2 && r2.error) || 'Could not import the configuration.', 'error');
+    } catch (e) { toast('Import', e && e.message ? e.message : 'Could not import the configuration.', 'error'); }
+  });
+  var wgNatStart = $('wgNatStartBtn');
+  if (wgNatStart) wgNatStart.addEventListener('click', async function () {
+    if (!api || typeof api.wgNatStart !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgNatStart.disabled = true; wgNatStart.textContent = 'Starting…';
+    try {
+      /* The mode and the picked remote gateway go with the start:
+         in different-subnet mode there is no saved config at all,
+         so the picker is the only place the peer comes from. */
+      var pick2 = $('wgNatRemotePeerPick');
+      var r = await api.wgNatStart({ mode: currentWgNatMode(), peerTunnelIp: pick2 ? String(pick2.value || '').trim() : '' });
+      if (r && r.success) toast('NAT service', 'The gateway NAT service is running.' + ((r && r.remoteNote) ? ' ' + r.remoteNote : ''), 'success');
+      else toast('NAT service', (r && r.error) || 'Could not start the NAT service.', 'error');
+    } catch (e) { toast('NAT service', e && e.message ? e.message : 'Could not start the NAT service.', 'error'); }
+    finally { wgBusy = false; wgNatStart.disabled = false; wgNatStart.textContent = 'Start NAT service'; await loadWireGuard(); }
+  });
+  var wgNatStop = $('wgNatStopBtn');
+  if (wgNatStop) wgNatStop.addEventListener('click', async function () {
+    if (!api || typeof api.wgNatStop !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgNatStop.disabled = true;
+    try {
+      var r = await api.wgNatStop();
+      if (r && r.success) toast('NAT service', 'The gateway NAT service is stopped.', 'success');
+      else toast('NAT service', (r && r.error) || 'Could not stop the NAT service.', 'error');
+    } catch (e) { toast('NAT service', e && e.message ? e.message : 'Could not stop the NAT service.', 'error'); }
+    finally { wgBusy = false; wgNatStop.disabled = false; await loadWireGuard(); }
+  });
+  var wgSb = $('wgServerBtn');
+  if (wgSb) wgSb.addEventListener('click', async function () {
+    if (!api || typeof api.wgStartServer !== 'function' || typeof api.wgStopServer !== 'function') return wgMissing();
+    if (wgBusy) return;
+    wgBusy = true; wgSb.disabled = true; wgSb.textContent = 'Working…';
+    try {
+      var running = !!(wgStatusCache && wgStatusCache.serverRunning);
+      var r = running ? await api.wgStopServer() : await api.wgStartServer();
+      if (r && r.success) toast('WireGuard', running ? 'Server stopped.' : 'Server is running.', 'success');
+      else toast('WireGuard error', (r && r.error) || 'Could not change the server state.', 'error');
+    } catch (e) { toast('WireGuard error', e && e.message ? e.message : 'Could not change the server state.', 'error'); }
+    finally { wgBusy = false; wgSb.disabled = false; await loadWireGuard(); }
+  });
+  var wgEs = $('wgEndpointSaveBtn');
+  if (wgEs) wgEs.addEventListener('click', async function () {
+    if (!api || typeof api.wgSetEndpoint !== 'function') return wgMissing();
+    var v = ($('wgEndpoint') || {}).value || '';
+    try {
+      var r = await api.wgSetEndpoint(v);
+      if (r && r.success) toast('Endpoint saved', v.trim() ? ('Clients will connect to ' + r.endpoint + '.') : 'Endpoint cleared — the public IP will be read automatically.', 'success');
+      else toast('Save failed', (r && r.error) || 'Could not save the endpoint.', 'error');
+    } catch (e) { toast('Save failed', e && e.message ? e.message : 'Could not save the endpoint.', 'error'); }
+    await loadWireGuard();
+  });
+  var wgSs = $('wgServerSettingsSaveBtn');
+  if (wgSs) wgSs.addEventListener('click', async function () {
+    if (!api || typeof api.wgSetServerSettings !== 'function') return wgMissing();
+    var addr = ($('wgServerIp') || {}).value || '';
+    var port = ($('wgServerPort') || {}).value || '';
+    try {
+      var r = await api.wgSetServerSettings({ address: addr, listenPort: port });
+      if (r && r.success) toast('Server settings saved', 'Tunnel address ' + r.address + ', UDP port ' + r.listenPort + (r.restarted ? ' — the running server was rebuilt with them.' : ' — they apply the next time the server starts.'), 'success');
+      else toast('Save failed', (r && r.error) || 'Could not save the server settings.', 'error');
+    } catch (e) { toast('Save failed', e && e.message ? e.message : 'Could not save the server settings.', 'error'); }
+    await loadWireGuard();
+  });
+  /* Server export/import (JSON): the export is the connection
+     detail only — endpoint host, port, tunnel address — never the
+     public key (it is regenerated when the program is
+     reinstalled). Import validates with validateServerSettings,
+     including the cross-subnet-change-with-peers refusal. */
+  var wgSe = $('wgServerExportBtn');
+  if (wgSe) wgSe.addEventListener('click', async function () {
+    if (!api || typeof api.wgServerExport !== 'function') return wgMissing();
+    try {
+      var r2 = await api.wgServerExport();
+      if (r2 && r2.success) toast('Server exported', 'Server saved to ' + r2.filePath + ' (endpoint, port and tunnel address — no keys).', 'success');
+      else if (r2 && !r2.canceled) toast('Export', (r2 && r2.error) || 'Could not export the server.', 'error');
+    } catch (e) { toast('Export', e && e.message ? e.message : 'Could not export the server.', 'error'); }
+  });
+  var wgSi = $('wgServerImportBtn');
+  if (wgSi) wgSi.addEventListener('click', async function () {
+    if (!api || typeof api.wgServerImport !== 'function') return wgMissing();
+    try {
+      var r3 = await api.wgServerImport();
+      if (r3 && r3.success) toast('Server imported', 'Endpoint ' + r3.endpoint + ', tunnel address ' + r3.address + ', UDP port ' + r3.listenPort + (r3.restarted ? ' — the running server was rebuilt with them.' : ' — they apply the next time the server starts.'), 'success');
+      else if (r3 && !r3.canceled) toast('Import', (r3 && r3.error) || 'Could not import the server.', 'error');
+    } catch (e) { toast('Import', e && e.message ? e.message : 'Could not import the server.', 'error'); }
+    await loadWireGuard();
+  });
+  var wgPa = $('wgPeerAddBtn');
+  if (wgPa) wgPa.addEventListener('click', async function () {
+    if (!api || typeof api.wgAddPeer !== 'function') return wgMissing();
+    var key = ($('wgPeerKey') || {}).value || '';
+    var host = ($('wgPeerHost') || {}).value || '';
+    var port = ($('wgPeerPort') || {}).value || '';
+    try {
+      var r = await api.wgAddPeer({ publicKey: key, endpointHost: host, endpointPort: port });
+      if (r && r.success) {
+        toast('Peer added', r.peer.name + ' got tunnel address ' + r.peer.tunnelIp + (r.liveApplied === false && r.liveError ? ' (saved, but the running tunnel did not pick it up: ' + r.liveError + ')' : '') + '.', 'success');
+        var k = $('wgPeerKey'); if (k) k.value = '';
+        var h = $('wgPeerHost'); if (h) h.value = '';
+        var pt = $('wgPeerPort'); if (pt) pt.value = '51820';
+      } else toast('Add failed', (r && r.error) || 'Could not add the peer.', 'error');
+    } catch (e) { toast('Add failed', e && e.message ? e.message : 'Could not add the peer.', 'error'); }
+    await loadWireGuard();
+  });
     document.querySelectorAll('[data-module-enter]').forEach(function (card) {
       card.addEventListener('click', function () { setModule(card.getAttribute('data-module-enter')); });
     });

@@ -23,6 +23,7 @@
       <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
       <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
       <button class="module-item" type="button" data-module="vpn"><span class="ico">🛡️</span> VPN</button>
+      <button class="module-item" type="button" data-module="wireguard"><span class="ico">🔐</span> WireGuard VPN</button>
     </div>
     <div class="nav-group" id="navGroupBackup">
       <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
@@ -36,7 +37,10 @@
       <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
     </div>
     <div class="nav-group" id="navGroupVpn" style="display:none;">
-      <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> VPN</button>
+      <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> Tailscale VPN</button>
+    </div>
+    <div class="nav-group" id="navGroupWireguard" style="display:none;">
+      <button class="nav-item" type="button" data-nav="wireguard"><span class="ico">🔐</span> WireGuard VPN</button>
     </div>
     <div class="sidebar-foot">
       <div>TechVision Backup</div>
@@ -62,7 +66,11 @@
           </button>
           <button class="module-card" type="button" data-module-enter="vpn">
             <span class="module-card-ico">🛡️</span>
-            <span class="module-card-title">TechVision VPN</span>
+            <span class="module-card-title">TechVision Tailscale VPN</span>
+          </button>
+          <button class="module-card" type="button" data-module-enter="wireguard">
+            <span class="module-card-ico">🔐</span>
+            <span class="module-card-title">TechVision WireGuard VPN</span>
           </button>
         </div>
       </div>
@@ -78,7 +86,10 @@
       </div>
       <div class="topbar-actions">
         <button class="icon-btn" type="button" id="themeToggle" title="Toggle dark / light theme" aria-label="Toggle theme">🌙</button>
+        <button class="icon-btn" type="button" id="backupTopRefreshBtn" title="Refresh jobs" aria-label="Refresh jobs" style="display:none;">⟳</button>
+        <button class="icon-btn" type="button" id="cloudTopRefreshBtn" title="Refresh Cloud" aria-label="Refresh Cloud" style="display:none;">⟳</button>
         <button class="icon-btn" type="button" id="vpnTopRefreshBtn" title="Refresh Tailscale status" aria-label="Refresh Tailscale status" style="display:none;">⟳</button>
+        <button class="icon-btn" type="button" id="wgTopRefreshBtn" title="Refresh WireGuard status" aria-label="Refresh WireGuard status" style="display:none;">⟳</button>
         <button class="icon-btn" type="button" id="settingsBtn" title="Settings" aria-label="Settings">⚙</button>
       </div>
     </header>
@@ -105,9 +116,6 @@
         <div class="stat-sub" id="statSuccessSub">No runs yet</div>
       </div>
     </section>
-    <div class="actions-row">
-      <button class="btn btn-ghost" type="button" id="refreshBtn">⟳ Refresh</button>
-    </div>
     <section class="progress-card" id="progressCard" aria-live="polite">
       <div class="progress-head">
         <span><span class="spinner" id="progressSpinner"></span> <span id="progressTitle">Backing up…</span></span>
@@ -209,7 +217,6 @@
         <h2 class="section-title" style="margin:0;">Cloud — your own remote drive</h2>
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Share a folder from this computer (Server) or open a shared folder on another computer (Client) — over your network or the internet, encrypted.</p>
       </div>
-      <button class="btn btn-ghost" type="button" id="cloudRefreshBtn">⟳ Refresh</button>
     </div>
     <div class="cloud-modes" id="cloudModes">
       <button class="cloud-mode-card" type="button" id="cloudModeServer">
@@ -240,6 +247,7 @@
         <div class="seg" id="cloudServerAccessSeg">
           <button class="seg-btn active" type="button" data-access="normal">🌐 Normal (Internet)</button>
           <button class="seg-btn" type="button" data-access="tailscale">🛡️ Tailscale VPN</button>
+          <button class="seg-btn" type="button" data-access="wireguard">🔐 WireGuard VPN</button>
         </div>
         <div class="hint" id="cloudServerAccessHint">Clients use your public static IP or DDNS + this port (forward the port in your router).</div>
       </div>
@@ -247,6 +255,11 @@
         <label>Tailscale address of this computer</label>
         <div id="cloudTailscaleIp" class="cloud-muted">Checking Tailscale…</div>
         <div class="hint">Clients on the same Tailscale network use this address + the port. No port forwarding needed.</div>
+      </div>
+      <div class="field" id="cloudWireguardInfo" style="display:none;">
+        <label>WireGuard tunnel address of this computer</label>
+        <div id="cloudWireguardIp" class="cloud-muted">Checking WireGuard…</div>
+        <div class="hint">Clients on the same WireGuard tunnel use this address + the port. No port forwarding needed — the one UDP 51820 forward that brings the tunnel up covers everything inside it.</div>
       </div>
       <div class="field">
         <label for="cloudServerPort">Port</label>
@@ -305,13 +318,15 @@
         <div class="seg" id="cloudClientAccessSeg">
           <button class="seg-btn active" type="button" data-access="normal">🌐 Normal (Internet)</button>
           <button class="seg-btn" type="button" data-access="tailscale">🛡️ Tailscale VPN</button>
+          <button class="seg-btn" type="button" data-access="wireguard">🔐 WireGuard VPN</button>
         </div>
         <div class="hint" id="cloudClientAccessHint">Public IP, DDNS hostname or LAN IP of the server.</div>
       </div>
       <div class="field" id="cloudClientPeerField" style="display:none;">
-        <label for="cloudClientPeer">Pick a device from your Tailscale network</label>
+        <label for="cloudClientPeer" id="cloudClientPeerLabel">Pick a device from your Tailscale network</label>
         <select id="cloudClientPeer"></select>
-        <div class="hint">Both devices must be on the same Tailscale network — see the VPN module.</div>
+        <div class="hint" id="cloudClientPeerHint">Both devices must be on the same Tailscale network — see the VPN module.</div>
+        <button class="btn btn-ghost btn-sm" type="button" id="cloudClientWgAddPeerBtn" style="display:none; margin-top:6px;">Add a device in the WireGuard module</button>
       </div>
       <div class="field">
         <label for="cloudClientHost">Server address (public IP, LAN IP or hostname)</label>
@@ -395,7 +410,6 @@
         <button class="btn" type="button" id="vpnConnectBtn">Connect</button>
       </div>
       <div id="vpnNotInstalled" style="display:none;">
-        <p style="margin:8px 0 4px;">Tailscale is not installed on this computer.</p>
         <p class="t-sub" style="margin:0 0 10px;">Press <b>Install &amp; connect</b> and the app downloads Tailscale from tailscale.com, checks the installer's signature, and installs it (Windows asks for administrator permission once), then signs you in.</p>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="btn" type="button" id="vpnDownloadBtn">Download Tailscale</button>
@@ -483,6 +497,100 @@
         <span id="vpnPeersCount" class="pill pill-template" style="display:none;"></span>
       </div>
       <div id="vpnPeersList"><div class="empty-state"><div class="big">🛡️</div><h3>No devices yet</h3><p>Sign in to Tailscale and your devices will show up here.</p></div></div>
+    </div>
+  </div>
+  <div id="view-wireguard" style="display:none;">
+    <div class="card vpn-hero">
+      <div class="vpn-status-row">
+        <div>
+          <div class="t-label">AmneziaWG status</div>
+          <div class="vpn-status"><span id="wgStatusDot" class="vpn-dot"></span><span id="wgStatusText">Checking…</span></div>
+          <div class="t-sub" id="wgStatusSub"></div>
+          <div class="t-sub" id="wgTransportLine" style="display:none;"></div>
+        </div>
+      </div>
+      <div id="wgNotInstalled" style="display:none;">
+        <p class="t-sub" style="margin:0 0 10px;">Install it with one click — TechVision downloads the official AmneziaWG installer, checks its signature, and installs it. Installing a tunnel needs administrator permission once.</p>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="btn btn-primary" type="button" id="wgInstallBtn">Install AmneziaWG</button>
+          <button class="btn" type="button" id="wgDownloadBtn">Download manually</button>
+          <button class="btn btn-ghost" type="button" id="wgRecheckBtn">Check again</button>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="wgServerCard">
+      <div class="vpn-sec-label">Server — this machine is the hub</div>
+      <div class="vpn-facts">
+        <div class="vpn-fact-tile"><div class="t-label">Public key</div><div class="vpn-fact" id="wgServerKey">—</div></div>
+      </div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Tunnel address &amp; port</div>
+        <div class="t-sub">This server's address inside the tunnel, and the UDP port your router forwards. Defaults: 10.0.0.1 and 51820.</div>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+          <input type="text" id="wgServerIp" placeholder="10.0.0.1" autocomplete="off" style="flex:1; min-width:140px;">
+          <input type="text" id="wgServerPort" placeholder="51820" autocomplete="off" inputmode="numeric" style="flex:1; min-width:100px;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgServerSettingsSaveBtn">Save</button>
+        </div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
+        <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerExportBtn">Export server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerImportBtn">Import server</button>
+      </div>
+      <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:10px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Endpoint — the address clients connect to</div>
+        <div class="t-sub">The public IP is read automatically. If you use DDNS, type the hostname here instead.</div>
+        <div style="display:flex; gap:8px; margin-top:6px;">
+          <input type="text" id="wgEndpoint" placeholder="203.0.113.10 or myhome.ddns.net" autocomplete="off" style="flex:1;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgEndpointSaveBtn">Save</button>
+        </div>
+      </div>
+      <div class="vpn-sec-label">Devices (peers)</div>
+      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p></div></div>
+      <div style="margin-top:12px;">
+        <div class="t-label">Add a device</div>
+        <div class="t-sub">One way: the device's public key, its real IP or DDNS hostname, and its port. The server reaches it at that address — the other side needs nothing.</div>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
+          <input type="text" id="wgPeerKey" placeholder="Public key (44 characters, ends with =)" autocomplete="off" style="flex:2; min-width:220px;">
+          <input type="text" id="wgPeerHost" placeholder="Real IP or DDNS, e.g. 192.168.1.49" autocomplete="off" style="flex:1; min-width:160px;">
+          <input type="text" id="wgPeerPort" placeholder="Port" value="51820" inputmode="numeric" autocomplete="off" style="flex:0 0 90px; min-width:80px;">
+          <button class="btn btn-ghost btn-sm" type="button" id="wgPeerAddBtn">Add peer</button>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="wgNatCard">
+      <div class="vpn-sec-label">Site-to-site — link two networks</div>
+      <div class="t-sub wg-nat-intro">Add each device: name, real IP, alias IP.</div>
+      <div class="t-sub vpn-note" id="wgNatStatus" style="margin-top:10px;">NAT service: stopped.</div>
+      <fieldset id="wgNatFieldset" style="border:0; padding:0; margin:12px 0 0;">
+        <div class="t-label">Site-to-site configuration</div>
+        <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:6px;">
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeSame" value="same-subnet" checked> Same subnet</label>
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;"><input type="radio" name="wgNatMode" id="wgNatModeDiff" value="different-subnet"> Different subnets</label>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+          <select id="wgNatRemotePeerPick" style="flex:1; min-width:160px;"><option value="">Pick the other gateway…</option></select>
+        </div>
+        <div id="wgNatFormBody" style="margin-top:8px;">
+          <div class="t-label" style="margin-top:10px;">Mapped devices</div>
+          <div id="wgNatMappingsRows"></div>
+          <button class="btn btn-ghost btn-sm" type="button" id="wgNatAddMappingBtn" style="margin-top:6px;">+ Add mapping</button>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center;">
+            <button class="btn btn-primary btn-sm" type="button" id="wgNatSaveBtn">Save site-to-site configuration</button>
+            <span class="t-sub" id="wgNatFormError" style="color:var(--danger);"></span>
+          </div>
+        </div>
+        <div class="t-sub" id="wgNatRouterNote" style="display:none; margin-top:8px;">Different subnets need no configuration — pick the other gateway and press Start NAT service. Add one static route on each router so each LAN finds its gateway.</div>
+      </fieldset>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+        <button class="btn btn-ghost btn-sm" type="button" id="wgNatExportBtn">Export configuration</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgNatImportBtn">Import configuration</button>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
+        <button class="btn btn-primary" type="button" id="wgNatStartBtn">Start NAT service</button>
+        <button class="btn btn-ghost" type="button" id="wgNatStopBtn">Stop NAT service</button>
+      </div>
     </div>
   </div>
   </main>
