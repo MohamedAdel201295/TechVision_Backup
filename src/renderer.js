@@ -2336,7 +2336,6 @@
   var wgStatusCache = null;
   var wgBusy = false;
   var lastWgPeersSig = null;
-  var lastWgJoinReqSig = null;
 
   function wgMissing() { toast('WireGuard', 'The WireGuard bridge is not available in this build.', 'error'); }
 
@@ -2405,7 +2404,6 @@
     var ep = $('wgEndpoint');
     if (ep && document.activeElement !== ep) ep.value = (st.server && st.server.endpoint) || '';
     renderWgPeers(st.peers || []);
-    loadWgJoinRequests();
   }
 
   /* Gateway NAT service status (site-to-site): the card lives in
@@ -2659,64 +2657,6 @@
   /* Cloud join — server side: pending requests with Approve /
      Reject. The list rebuilds only when it changes (sig guard), so
      a button never disappears under the mouse on the 15s refresh. */
-  async function loadWgJoinRequests() {
-    var list = $('wgJoinList'); if (!list) return;
-    if (!api || typeof api.wgCloudJoinList !== 'function') { list.innerHTML = ''; return; }
-    var reqs = [];
-    try {
-      var r = await api.wgCloudJoinList();
-      if (r && r.success) reqs = r.requests || [];
-    } catch (e) { /* keep the previous list */ return; }
-    var sig = JSON.stringify(reqs.map(function (q) { return [q.id, q.deviceName, q.user, q.publicKey]; }));
-    if (sig === lastWgJoinReqSig) return;
-    lastWgJoinReqSig = sig;
-    list.innerHTML = '';
-    if (!reqs.length) {
-      var none = document.createElement('div');
-      none.className = 't-sub';
-      none.textContent = 'No join requests.';
-      list.appendChild(none);
-      return;
-    }
-    reqs.forEach(function (q) {
-      var row = document.createElement('div');
-      row.className = 'vpn-peer';
-      var d = document.createElement('span'); d.className = 'vpn-peer-dot';
-      var body = document.createElement('div'); body.className = 'vpn-peer-body';
-      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = q.deviceName + ' — from ' + q.user;
-      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
-      meta.textContent = 'public key ' + String(q.publicKey || '').slice(0, 12) + '… · waiting for approval';
-      body.appendChild(h); body.appendChild(meta);
-      row.appendChild(d); row.appendChild(body);
-      var ok = document.createElement('button'); ok.className = 'btn btn-primary btn-sm'; ok.type = 'button'; ok.textContent = 'Approve';
-      ok.addEventListener('click', async function () {
-        if (!api || typeof api.wgCloudJoinApprove !== 'function') return wgMissing();
-        ok.disabled = true;
-        try {
-          var ar = await api.wgCloudJoinApprove({ id: q.id });
-          if (ar && ar.success) toast('Join approved', q.deviceName + ' got tunnel address ' + (ar.approval && ar.approval.tunnelIp ? ar.approval.tunnelIp : '') + '.', 'success');
-          else toast('Approve failed', (ar && ar.error) || 'Could not approve the join request.', 'error');
-        } catch (e) { toast('Approve failed', e && e.message ? e.message : 'Could not approve the join request.', 'error'); }
-        lastWgJoinReqSig = null;
-        await loadWireGuard();
-      });
-      row.appendChild(ok);
-      var no = document.createElement('button'); no.className = 'btn btn-ghost btn-sm'; no.type = 'button'; no.textContent = 'Reject';
-      no.addEventListener('click', async function () {
-        if (!api || typeof api.wgCloudJoinReject !== 'function') return wgMissing();
-        no.disabled = true;
-        try {
-          var rr = await api.wgCloudJoinReject({ id: q.id });
-          if (rr && rr.success) toast('Join rejected', q.deviceName + ' was turned down.', 'success');
-          else toast('Reject failed', (rr && rr.error) || 'Could not reject the join request.', 'error');
-        } catch (e) { toast('Reject failed', e && e.message ? e.message : 'Could not reject the join request.', 'error'); }
-        lastWgJoinReqSig = null;
-        await loadWireGuard();
-      });
-      row.appendChild(no);
-      list.appendChild(row);
-    });
-  }
 
   /* ---------- wiring ---------- */
   document.addEventListener('DOMContentLoaded', function () {

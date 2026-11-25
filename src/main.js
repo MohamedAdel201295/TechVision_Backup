@@ -16,7 +16,6 @@ const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
 const vpn = require('./vpn.js');
 const wireguard = require('./wireguard.js');
-const cloudJoin = require('./cloud-join.js');
 const natGateway = require('./nat-gateway.js');
 const wgControl = require('./wg-control.js');
 // How long a due scheduled job waits for a missing removable drive
@@ -63,25 +62,9 @@ function getCloudServer() {
       onConfigChange: () => saveCloudConfig(),
       log: (level, message) => appendAppLog(level, message),
     });
-    // Cloud join (WireGuard, Phase 2): the /api/wg-join-* routes ride
-    // on this same Cloud server — same users, same TLS-pinned channel.
-    // Pending requests live in cloud.json at cfg.server.wgJoinRequests
-    // (configBackedStore), so they survive a server restart. start()
-    // dispatches through this._handle, so attaching here — before any
-    // start — is picked up; attaching twice is a no-op. The store is
-    // kept here so the wg-cloudjoin-* handlers below can use it.
-    try {
-      const attached = cloudJoin.attachJoinRoutes(cloudServer, {
-        store: cloudJoin.configBackedStore(getCloudConfig(), () => saveCloudConfig()),
-      });
-      if (attached && attached.store) wgJoinStoreInstance = attached.store;
-    } catch (e) { console.error('[Main] Could not attach WireGuard Cloud-join routes:', e.message); }
   }
   return cloudServer;
 }
-// The pending-request store attached to the Cloud server above (null
-// until getCloudServer() has run once).
-let wgJoinStoreInstance = null;
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
@@ -2344,8 +2327,7 @@ ipcMain.handle('vpn-open-oauth-page', async () => {
 // official MSI (verified signature, one UAC prompt). It implements
 // no VPN protocol of its own. Live state comes from `awg show`;
 // stored state (keys, peers, client config, obfuscation set) comes
-// from wireguard.json. Cloud join is wired below (wg-cloudjoin-*):
-// the join routes attach to the Cloud server in getCloudServer().
+// from wireguard.json.
 ipcMain.handle('wg-get-status', async () => {
   try {
     const st = await wireguard.getStatus();
@@ -2619,7 +2601,6 @@ ipcMain.handle('wg-remove-peer', async (event, opts) => {
     return { success: true, liveApplied, liveError };
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not remove the peer.' }; }
 });
-// Connect this machine as a client. Two forms:
 ipcMain.handle('wg-open-download', async () => {
   // Manual fallback for the one-click install: the official
   // AmneziaWG releases page (same MSI the installer downloads).
@@ -2627,49 +2608,6 @@ ipcMain.handle('wg-open-download', async () => {
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open the download page.' }; }
 });
 // ---------- TechVision WireGuard VPN — Cloud join ----------
-// The third key-exchange option (spec: "Join via Cloud"). The client
-// sends a join request through its own Cloud connection — same
-// username/password, same TLS-pinned channel, no third party — and
-// this machine, as the server, shows the request in its peer list;
-// Approve sends the server public key + endpoint + tunnel IP back
-// over the same channel, and the client connects by itself.
-// Server side (this machine is the hub): list / approve / reject.
-// The approve uses wgAddPeerInternal — the same code path wg-add-peer
-// uses — and hands the client the server's obfuscation set
-// (extraInterfaceLines), so the joined client speaks AmneziaWG with
-// the same S1–S4/H1–H4; without them its handshake would fail.
-ipcMain.handle('wg-cloudjoin-list', async () => {
-  try {
-    if (!wgJoinStoreInstance) { getCloudServer(); }
-    if (!wgJoinStoreInstance) return { success: false, error: 'Cloud join is not set up yet.' };
-    return { success: true, requests: cloudJoin.listJoinRequests(wgJoinStoreInstance) };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not list join requests.' }; }
-});
-ipcMain.handle('wg-cloudjoin-approve', async (event, opts) => {
-  try {
-    if (!wgJoinStoreInstance) { getCloudServer(); }
-    if (!wgJoinStoreInstance) return { success: false, error: 'Cloud join is not set up yet.' };
-    const c = getWgConfig();
-    let extraInterfaceLines = [];
-    try { extraInterfaceLines = wgObfuscationLines(); }
-    catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read the obfuscation settings.' }; }
-    const endpoint = wireguard.serverEndpoint(c.server.endpoint, c.server.listenPort);
-    return await cloudJoin.approveJoinRequest(wgJoinStoreInstance, String((opts && opts.id) || ''), {
-      serverPublicKey: c.server.publicKey,
-      endpoint,
-      getPeers: () => (getWgConfig().server.peers || []).slice(),
-      addPeer: (peer) => wgAddPeerInternal(peer.name, peer.publicKey),
-      extraInterfaceLines,
-    });
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not approve the join request.' }; }
-});
-ipcMain.handle('wg-cloudjoin-reject', async (event, opts) => {
-  try {
-    if (!wgJoinStoreInstance) { getCloudServer(); }
-    if (!wgJoinStoreInstance) return { success: false, error: 'Cloud join is not set up yet.' };
-    return cloudJoin.rejectJoinRequest(wgJoinStoreInstance, String((opts && opts.id) || ''));
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not reject the join request.' }; }
-});
 // ---------- TechVision WireGuard VPN — gateway NAT service ----------
 // One TechVision PC per site is the gateway (see src/nat-gateway.js):
 // it forwards + NATs for its whole LAN, so printers/cameras/PCs need
