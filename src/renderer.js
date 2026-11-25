@@ -2046,7 +2046,22 @@
         : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.');
       if (btn) btn.textContent = 'Connect';
       if (lb) lb.style.display = 'none';
-      if (dc) dc.style.display = 'none';
+      // The settings live in this card (API credentials, key expiry,
+      // subnet sharing) — they must be reachable BEFORE connecting:
+      // the key-expiry choice and the API token are exactly what make
+      // the first connect stay connected, so hiding the card until
+      // after Connect made them unreachable when they matter most.
+      // Show it while disconnected; the live facts stay "—" until
+      // the VPN is on, and the routes note stays hidden (it only
+      // applies while advertising).
+      if (dc) dc.style.display = '';
+      var ket0 = $('vpnKeyExpiryToggle'); if (ket0) ket0.checked = vpnKeyExpiryWanted();
+      var tok0 = $('vpnApiToken'); if (tok0) tok0.value = (settings.vpn && settings.vpn.apiToken) || '';
+      var ocid0 = $('vpnOauthClientId'); if (ocid0) ocid0.value = (settings.vpn && settings.vpn.oauthClientId) || '';
+      var osec0 = $('vpnOauthClientSecret'); if (osec0) osec0.value = (settings.vpn && settings.vpn.oauthClientSecret) || '';
+      refreshVpnRoutesState();
+      refreshVpnKeyExpiryState();
+      refreshVpnApiCredsStatus(false);
       renderVpnPeers([]);
       return;
     }
