@@ -80,6 +80,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // listening when it finishes (no duplicate listeners on repeat runs).
   onBackupProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('backup-progress', h); return () => ipcRenderer.removeListener('backup-progress', h); },
   onCloudProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('cloud-progress', h); return () => ipcRenderer.removeListener('cloud-progress', h); },
+  // Temp + save-back results from main (saved-back / conflict / error)
+  onCloudSaveback: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('cloud-saveback', h); return () => ipcRenderer.removeListener('cloud-saveback', h); },
 
   // TechVision Cloud — server
   cloudGetConfig: () => ipcRenderer.invoke('cloud-get-config'),
@@ -102,11 +104,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cloudClientUpload: (serverId, localPath, remoteDir) => ipcRenderer.invoke('cloud-client-upload', serverId, localPath, remoteDir),
   cloudClientUploadFiles: (serverId, localPaths, remoteDir) => ipcRenderer.invoke('cloud-client-upload-files', serverId, localPaths, remoteDir),
   cloudClientOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-client-open', serverId, relPath),
+  // TechVision Cloud — open mode + Office direct open (spec v2)
+  cloudSetOpenMode: (mode) => ipcRenderer.invoke('cloud-set-open-mode', mode),
+  cloudOfficeOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-office-open', serverId, relPath),
   cloudClipboardFiles: () => ipcRenderer.invoke('cloud-clipboard-files'),
   cloudClientMkdir: (serverId, relPath) => ipcRenderer.invoke('cloud-client-mkdir', serverId, relPath),
   cloudClientDelete: (serverId, relPath) => ipcRenderer.invoke('cloud-client-delete', serverId, relPath),
   cloudClientRename: (serverId, from, to) => ipcRenderer.invoke('cloud-client-rename', serverId, from, to),
   cloudClientCopy: (serverId, from, to) => ipcRenderer.invoke('cloud-client-copy', serverId, from, to),
+  // TechVision Cloud — Map network drive
+  cloudMapdriveStatus: () => ipcRenderer.invoke('cloud-mapdrive-status'),
+  cloudMapdriveMap: (serverId, letter, reconnect) => ipcRenderer.invoke('cloud-mapdrive-map', serverId, letter, reconnect),
+  cloudMapdriveDisconnect: (serverId) => ipcRenderer.invoke('cloud-mapdrive-disconnect', serverId),
+  cloudMapdriveOpenExplorer: (letter) => ipcRenderer.invoke('cloud-mapdrive-open-explorer', letter),
+  cloudMapdriveOpenMapped: (serverId, relPath) => ipcRenderer.invoke('cloud-mapdrive-open-mapped', serverId, relPath),
   // TechVision WireGuard VPN — self-hosted WireGuard (no coordination server)
   wgGetStatus: () => ipcRenderer.invoke('wg-get-status'),
   wgListPeers: () => ipcRenderer.invoke('wg-list-peers'),

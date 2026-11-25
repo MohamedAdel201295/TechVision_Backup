@@ -164,10 +164,16 @@
 
   /* ---------- Yes/No confirm dialog ---------- */
   var confirmCallback = null;
-  function askConfirm(message, onYes) {
+  // opts: { title, yesLabel, noLabel } — the labels are restored to
+  // the delete-all defaults when the dialog closes, so callers that
+  // do not pass opts are unaffected.
+  function askConfirm(message, onYes, opts) {
     var modal = $('confirmModal'); var back = $('confirmBackdrop');
     if (!modal) { if (window.confirm(message)) onYes(); return; }
     $('confirmText').textContent = message;
+    if (opts && opts.title) $('confirmTitle').textContent = opts.title;
+    if (opts && opts.yesLabel) $('confirmYes').textContent = opts.yesLabel;
+    if (opts && opts.noLabel) $('confirmNo').textContent = opts.noLabel;
     confirmCallback = onYes;
     modal.style.display = 'block';
     if (back) back.classList.add('show');
@@ -176,6 +182,9 @@
     var modal = $('confirmModal'); var back = $('confirmBackdrop');
     if (modal) modal.style.display = 'none';
     if (back) back.classList.remove('show');
+    $('confirmTitle').textContent = 'Are you sure?';
+    $('confirmYes').textContent = 'Yes, delete all';
+    $('confirmNo').textContent = 'No, keep it';
     confirmCallback = null;
   }
 
@@ -297,8 +306,8 @@
   }
 
   function syncCloudNav() {
-    document.querySelectorAll('[data-nav="cloud-server"], [data-nav="cloud-client"]').forEach(function (b) { b.classList.remove('active'); });
-    if (cloudPanel === 'server' || cloudPanel === 'client') {
+    document.querySelectorAll('[data-nav="cloud-server"], [data-nav="cloud-client"], [data-nav="cloud-mapdrive"]').forEach(function (b) { b.classList.remove('active'); });
+    if (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive') {
       var btn = document.querySelector('[data-nav="cloud-' + cloudPanel + '"]');
       if (btn) btn.classList.add('active');
     }
@@ -307,11 +316,11 @@
   function setBackTitle(t) { var b = $('backBarTitle'); if (b) b.textContent = t; }
   function setAppTitle(t, s) { var h = $('appTitle'); if (h) h.textContent = t; var p = $('appSubtitle'); if (p) p.textContent = s; }
 
-  /* Back from the very top: from a Server/Client panel back to the
+  /* Back from the very top: from a Server/Client/Map panel back to the
      Cloud home, from anywhere else back to the module chooser. */
   function goBack() {
     var cloudView = $('view-cloud');
-    if (cloudView && cloudView.style.display !== 'none' && (cloudPanel === 'server' || cloudPanel === 'client')) { showCloudPanel('home'); return; }
+    if (cloudView && cloudView.style.display !== 'none' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive')) { showCloudPanel('home'); return; }
     showView('modules');
   }
 
@@ -359,7 +368,7 @@
     }
     if (name === 'cloud') {
       applyModuleUI('cloud'); syncCloudNav();
-      setBackTitle(cloudPanel === 'server' ? 'Cloud — Server' : cloudPanel === 'client' ? 'Cloud — Client' : 'Cloud');
+      setBackTitle(cloudPanel === 'server' ? 'Cloud — Server' : cloudPanel === 'client' ? 'Cloud — Client' : cloudPanel === 'mapdrive' ? 'Cloud — Map network' : 'Cloud');
       setAppTitle('TechVision Cloud', 'Your own remote drive — share a folder or open one, encrypted.');
       loadCloud();
     }
@@ -601,7 +610,7 @@
 
   /* ---------- TechVision Cloud ---------- */
   var cloudCfg = null;           // last cloud-get-config result
-  var cloudPanel = 'home';       // 'home' | 'server' | 'client'
+  var cloudPanel = 'home';       // 'home' | 'server' | 'client' | 'mapdrive'
   var cloudSelected = null;      // saved server record being connected to
   var cloudPendingProbe = null;  // { fingerprint, certPem } awaiting trust
   var cloudConn = null;          // { serverId, info } while connected
@@ -617,9 +626,11 @@
     if (!api || typeof api.cloudGetConfig !== 'function') return;
     try {
       cloudCfg = await api.cloudGetConfig();
+      renderCloudOpenMode();
       renderCloudHome();
       if (cloudPanel === 'server') renderCloudServer();
       if (cloudPanel === 'client') renderCloudClientList();
+      if (cloudPanel === 'mapdrive') renderMapdrivePanel();
     } catch (e) {
       toast('Cloud', e && e.message ? e.message : 'Could not load Cloud settings.', 'error');
     }
@@ -633,7 +644,9 @@
     var ht = $('cloudViewHeadText'); if (ht) ht.style.display = panel === 'home' ? '' : 'none';
     var sp = $('cloudServerPanel'); if (sp) sp.style.display = panel === 'server' ? '' : 'none';
     var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
+    var mp = $('cloudMapPanel'); if (mp) mp.style.display = panel === 'mapdrive' ? '' : 'none';
     if (panel === 'server') renderCloudServer();
+    if (panel === 'mapdrive') renderMapdrivePanel();
     if (panel === 'client') {
       // Open on the kind of server the user actually has: if the
       // current picker mode matches none of the saved servers, switch
@@ -648,7 +661,7 @@
       renderCloudClientList(); if (cloudClientAccess === 'tailscale') populateCloudPeers(); if (cloudClientAccess === 'wireguard') populateCloudWgPeers();
     }
     syncCloudNav();
-    setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : 'Cloud');
+    setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : panel === 'mapdrive' ? 'Cloud — Map network' : 'Cloud');
   }
 
   function renderCloudHome() {
@@ -974,6 +987,150 @@
     });
   }
 
+  /* ---------- Map network drive ---------- */
+  // The letter the connected server is mapped to, if any — cached
+  // per connection so a double-click does not run `net use` every
+  // time. Invalidated on Map/Disconnect and when the connection
+  // changes. A stale cache only ever falls back to the temp open.
+  var cloudMapLetterCache = { serverId: null, letter: null, at: 0 };
+  var cloudMapCurrentLetter = null; // letter of the mapping shown in the panel, if any
+  function cloudMapInvalidateCache() { cloudMapLetterCache = { serverId: null, letter: null, at: 0 }; }
+
+  async function cloudMapLetterFor(serverId) {
+    if (!serverId || !api || typeof api.cloudMapdriveStatus !== 'function') return null;
+    if (cloudMapLetterCache.serverId === serverId && Date.now() - cloudMapLetterCache.at < 30000) return cloudMapLetterCache.letter;
+    var letter = null;
+    try {
+      var r = await api.cloudMapdriveStatus();
+      if (r && r.success) {
+        var m = (r.mappings || []).find(function (x) { return x.serverId === serverId && x.status === 'mapped'; });
+        if (m) letter = m.letter;
+      }
+    } catch (e) {}
+    cloudMapLetterCache = { serverId: serverId, letter: letter, at: Date.now() };
+    return letter;
+  }
+
+  // The Map network panel: server picker (saved servers), letter
+  // picker (free letters, Z first), Map / Disconnect / Open in
+  // Explorer, status line, reconnect checkbox. Refreshes every time
+  // the panel opens and after every Map/Disconnect.
+  async function renderMapdrivePanel() {
+    var sel = $('cloudMapServer');
+    var letterSel = $('cloudMapLetter');
+    var statusEl = $('cloudMapStatus');
+    var mapBtn = $('cloudMapBtn');
+    var disBtn = $('cloudMapDisconnectBtn');
+    var expBtn = $('cloudMapExplorerBtn');
+    var recBox = $('cloudMapReconnect');
+    var recHint = $('cloudMapReconnectHint');
+    var srvHint = $('cloudMapServerHint');
+    if (!sel || !letterSel || !statusEl) return;
+    var servers = (cloudCfg && cloudCfg.clients) || [];
+    var prevServer = sel.value;
+    sel.innerHTML = '';
+    if (!servers.length) {
+      var o0 = document.createElement('option'); o0.value = ''; o0.textContent = 'No servers yet — add one in the Client tab first.';
+      sel.appendChild(o0);
+    }
+    servers.forEach(function (srv) {
+      var o = document.createElement('option');
+      o.value = srv.id;
+      o.textContent = srv.name + ' — ' + srv.host + ':' + srv.port + ' (' + (srv.accessMode === 'tailscale' ? 'Tailscale' : srv.accessMode === 'wireguard' ? 'WireGuard' : 'Normal') + ')';
+      sel.appendChild(o);
+    });
+    if (prevServer) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevServer) { sel.value = prevServer; break; } }
+    var serverId = sel.value || (servers[0] && servers[0].id) || '';
+    if (!servers.length) {
+      cloudMapCurrentLetter = null;
+      if (mapBtn) mapBtn.disabled = true;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'No servers yet — add one in the Client tab first.';
+      return;
+    }
+    if (mapBtn) mapBtn.disabled = false;
+    var status = null;
+    try {
+      if (api && typeof api.cloudMapdriveStatus === 'function') status = await api.cloudMapdriveStatus();
+    } catch (e) { status = null; }
+    if (!status || !status.success) {
+      cloudMapCurrentLetter = null;
+      statusEl.textContent = (status && status.error) || 'Mapping a network drive is available on Windows only.';
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      return;
+    }
+    var letters = (status.freeLetters && status.freeLetters.length) ? status.freeLetters : ['Z'];
+    var prevLetter = letterSel.value;
+    letterSel.innerHTML = '';
+    letters.forEach(function (l) {
+      var o = document.createElement('option'); o.value = l; o.textContent = l + ':';
+      letterSel.appendChild(o);
+    });
+    var mapping = (status.mappings || []).find(function (x) { return x.serverId === serverId; });
+    if (mapping && mapping.status === 'mapped') {
+      // The mapped letter is in use, so it is not among the free
+      // letters — show it selected at the top so the picker and the
+      // Explorer button agree on which drive this is.
+      var mo = document.createElement('option'); mo.value = mapping.letter; mo.textContent = mapping.letter + ': — mapped';
+      letterSel.insertBefore(mo, letterSel.firstChild);
+      letterSel.value = mapping.letter;
+      cloudMapCurrentLetter = mapping.letter;
+      if (disBtn) disBtn.style.display = '';
+      if (expBtn) expBtn.style.display = '';
+      statusEl.textContent = 'Mapped: ' + mapping.letter + ': → ' + (mapping.name || mapping.host) + ' (' + mapping.host + ':' + mapping.port + ')';
+    } else if (mapping && mapping.status === 'password-needed') {
+      cloudMapCurrentLetter = null;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'Not mapped — save the server password in the Client tab first (connect once with the password, and it is saved on this device).';
+    } else if (mapping && mapping.status === 'error') {
+      cloudMapCurrentLetter = null;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'Not mapped — ' + (mapping.error || 'could not check the drive.');
+    } else {
+      cloudMapCurrentLetter = null;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'Not mapped';
+    }
+    if (prevLetter && !mapping) { for (var j = 0; j < letterSel.options.length; j++) if (letterSel.options[j].value === prevLetter) { letterSel.value = prevLetter; break; } }
+    var chosen = servers.find(function (s) { return s.id === serverId; });
+    var hasPassword = !!(chosen && chosen.hasPassword);
+    if (recBox) recBox.disabled = !hasPassword;
+    if (recHint) recHint.textContent = hasPassword
+      ? 'Maps this drive again every time the app opens.'
+      : 'Save the server password in the Client tab to reconnect automatically.';
+    if (srvHint) srvHint.textContent = hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.';
+  }
+
+  async function cloudMapDriveAction() {
+    var sel = $('cloudMapServer');
+    var letterSel = $('cloudMapLetter');
+    var recBox = $('cloudMapReconnect');
+    var serverId = sel ? sel.value : '';
+    if (!serverId) { toast('No server', 'Add a server in the Client tab first.', 'error'); return; }
+    if (!api || typeof api.cloudMapdriveMap !== 'function') return cloudMissing();
+    var statusEl = $('cloudMapStatus');
+    if (statusEl) statusEl.textContent = 'Mapping… (Windows may ask for administrator permission once, to trust the server certificate.)';
+    try {
+      var r = await api.cloudMapdriveMap(serverId, letterSel ? letterSel.value : 'Z', !!(recBox && recBox.checked));
+      if (r && r.success) {
+        toast('Drive mapped', 'The server is now drive ' + r.letter + ': — open files straight from it.', 'success');
+        cloudMapInvalidateCache();
+      } else if (r && r.error === 'password-needed') {
+        toast('Password needed', 'Save the server password in the Client tab first — connect once with the password, and it is saved on this device.', 'error');
+      } else {
+        toast('Mapping failed', (r && r.error) || 'Could not map the drive.', 'error');
+      }
+    } catch (e) {
+      toast('Mapping error', e && e.message ? e.message : 'Could not map the drive.', 'error');
+    }
+    await renderMapdrivePanel();
+  }
+
   function openCloudConnect(srv, presetPassword) {
     cloudSelected = srv;
     cloudPendingProbe = null;
@@ -1121,6 +1278,7 @@
       if (!r || !r.success) { toast('Connection failed', (r && r.error) || 'Wrong user name or password.', 'error'); return; }
       // Keep the server name: closeCloudConnect() clears cloudSelected.
       cloudConn = { serverId: cloudSelected.id, info: r.info, name: cloudSelected.name };
+      cloudMapInvalidateCache();
       if (pass) pass.value = '';
       closeCloudConnect();
       cloudPath = '';
@@ -1150,6 +1308,7 @@
     cloudReloginTried = false;
     cloudSetConnBanner(false);
     cloudConn = null;
+    cloudMapInvalidateCache();
     cloudPath = '';
     cloudSelectedEntry = null;
     cloudClipboard = null;
@@ -1253,6 +1412,7 @@
       });
       if (r && r.success) {
         cloudConn = { serverId: srv.id, info: r.info, name: srv.name };
+        cloudMapInvalidateCache();
         cloudLinkDown = false;
         cloudSetConnBanner(false);
         cloudReloginTried = false;
@@ -1492,20 +1652,96 @@
     }
   }
 
-  // Open a file the way Windows would: music plays, pictures open, a
-  // game runs — the app downloads a copy to the temp folder and hands
-  // it to the OS. Folders are entered, as before.
+  /* ---------- Open mode (spec v2) ---------- */
+  // How a double-click opens a file: 'direct' (mapped drive, then
+  // Office direct, then temp + save-back) or 'temp' (always temp +
+  // save-back). Stored in cloud.json; default direct. No mode ever
+  // creates a drive letter — a visible drive appears only via the
+  // Map button in the Map network tab.
+  function cloudOpenMode() { return (cloudCfg && cloudCfg.openMode === 'temp') ? 'temp' : 'direct'; }
+  var CLOUD_PROGRAM_EXTS = ['exe', 'msi', 'bat', 'cmd', 'com', 'scr'];
+  var CLOUD_OFFICE_EXTS = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
+  function cloudFileExt(name) {
+    var i = String(name || '').lastIndexOf('.');
+    return i <= 0 ? '' : String(name).slice(i + 1).toLowerCase();
+  }
+  // Programs / games NEVER go through temp, in either mode: a game is
+  // a whole folder of files that call each other, and temp downloads
+  // ONE file only — the game would fail to start. Only the mapped
+  // drive works for them.
+  function cloudIsProgramFile(name) { return CLOUD_PROGRAM_EXTS.indexOf(cloudFileExt(name)) >= 0; }
+  function cloudIsOfficeDoc(name) { return CLOUD_OFFICE_EXTS.indexOf(cloudFileExt(name)) >= 0; }
+  // The mode indicator: how the last file actually opened.
+  function cloudSetLastOpenMode(mode) {
+    var el = $('cloudOpenModeStatus');
+    if (!el) return;
+    el.textContent = mode === 'direct' ? 'آخر ملف: مباشر' : mode === 'temp' ? 'آخر ملف: temp' : 'آخر ملف: —';
+  }
+  function renderCloudOpenMode() {
+    var sel = $('cloudOpenModeSel');
+    if (sel) sel.value = cloudOpenMode();
+    var st = $('cloudOpenModeStatus');
+    if (st && !st.textContent) st.textContent = 'آخر ملف: —';
+  }
+  // Mapped-drive open (v1), shared by the program branch and direct
+  // mode. Returns true when the file opened from the drive.
+  async function cloudTryMappedOpen(entry) {
+    try {
+      var letter = await cloudMapLetterFor(cloudConn.serverId);
+      if (letter && api && typeof api.cloudMapdriveOpenMapped === 'function') {
+        var m = await api.cloudMapdriveOpenMapped(cloudConn.serverId, entry.rel);
+        if (m && m.success) return true;
+        // A stale cache (mapped, then unmapped outside the app) must
+        // not block the file: drop it and fall through.
+        cloudMapInvalidateCache();
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // Open a file the way Windows would: music plays, pictures open.
+  // Direct mode tries, in order: the mapped drive, then (for Office
+  // documents) the Office app straight from the server, then temp +
+  // save-back. Temp mode goes straight to temp + save-back. Any step
+  // that fails falls through AUTOMATICALLY to the next one; only when
+  // every method fails does the user see an error. Programs never go
+  // through temp: without a mapped drive they get the Map prompt.
+  // Folders are entered, as before.
   async function cloudOpenFile(entry) {
     if (!entry) return;
     if (entry.isDir) { cloudBrowse(entry.rel); return; }
     if (!cloudConn || cloudTransferBusy) return;
     if (!api || typeof api.cloudClientOpen !== 'function') return cloudMissing();
+    // Programs / games: mapped drive or nothing.
+    if (cloudIsProgramFile(entry.name)) {
+      if (await cloudTryMappedOpen(entry)) { cloudSetLastOpenMode('direct'); return; }
+      askConfirm('«' + entry.name + '» برنامج — لازم drive عشان يشتغل صح. من غير Map البرنامج مش هيشتغل (الـ temp بتنزّل ملف واحد بس، واللعبة فولدر كامل).', function () { showCloudPanel('mapdrive'); }, { title: 'الملف ده برنامج', yesLabel: 'اعمل Map', noLabel: 'إلغاء' });
+      return;
+    }
+    if (cloudOpenMode() === 'direct') {
+      // (a) Mapped drive.
+      if (await cloudTryMappedOpen(entry)) { cloudSetLastOpenMode('direct'); return; }
+      // (b) Office document: open straight from the server in
+      // Word/Excel/PowerPoint — no temp copy, saves go back.
+      if (cloudIsOfficeDoc(entry.name) && api && typeof api.cloudOfficeOpen === 'function') {
+        try {
+          var o = await api.cloudOfficeOpen(cloudConn.serverId, entry.rel);
+          if (o && o.success) { cloudSetLastOpenMode('direct'); return; }
+        } catch (e) {}
+      }
+    }
+    // (c) Temp + save-back: download once, open, and edits upload
+    // back to the server while the app is open.
     try {
       cloudTransferBusy = true;
       showCloudTransfer('Opening ' + entry.name + '…', 0);
       var r = await api.cloudClientOpen(cloudConn.serverId, entry.rel);
       hideCloudTransfer();
-      if (!r || !r.success) toast('Could not open', (r && r.error) || 'The file could not be opened.', 'error');
+      // r.dest is present exactly when the download succeeded, even
+      // when the OS open itself failed — the file still opened via
+      // temp, so the indicator says temp either way.
+      if (!r || (!r.success && !r.dest)) toast('Could not open', (r && r.error) || 'The file could not be opened.', 'error');
+      else cloudSetLastOpenMode('temp');
     } catch (e) {
       hideCloudTransfer();
       toast('Open error', e && e.message ? e.message : 'Could not open the file.', 'error');
@@ -2809,6 +3045,7 @@
         if (nav === 'wireguard') showView('wireguard');
         if (nav === 'cloud-server') { setModule('cloud'); showCloudPanel('server'); }
         if (nav === 'cloud-client') { setModule('cloud'); showCloudPanel('client'); }
+        if (nav === 'cloud-mapdrive') { setModule('cloud'); showCloudPanel('mapdrive'); }
       });
     });
     document.querySelectorAll('[data-module]').forEach(function (btn) {
@@ -3194,12 +3431,50 @@
     if (ccp) ccp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') cloudConnectFlow(); });
     var cdb = $('cloudDisconnectBtn');
     if (cdb) cdb.addEventListener('click', function () { cloudDisconnect(); });
+    var cmb2 = $('cloudMapBtn');
+    if (cmb2) cmb2.addEventListener('click', function () { cloudMapDriveAction(); });
+    var cmd = $('cloudMapDisconnectBtn');
+    if (cmd) cmd.addEventListener('click', async function () {
+      var sel = $('cloudMapServer');
+      if (!sel || !sel.value) return;
+      if (!api || typeof api.cloudMapdriveDisconnect !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudMapdriveDisconnect(sel.value);
+        if (r && r.success) { toast('Drive disconnected', 'The mapped drive was removed.', 'success'); cloudMapInvalidateCache(); }
+        else toast('Disconnect failed', (r && r.error) || 'Could not disconnect the drive.', 'error');
+      } catch (e) { toast('Disconnect error', e && e.message ? e.message : 'Could not disconnect the drive.', 'error'); }
+      await renderMapdrivePanel();
+    });
+    var cme = $('cloudMapExplorerBtn');
+    if (cme) cme.addEventListener('click', async function () {
+      if (!cloudMapCurrentLetter) return;
+      if (!api || typeof api.cloudMapdriveOpenExplorer !== 'function') return cloudMissing();
+      try {
+        var r2 = await api.cloudMapdriveOpenExplorer(cloudMapCurrentLetter);
+        if (!r2 || !r2.success) toast('Could not open Explorer', (r2 && r2.error) || 'The drive could not be opened.', 'error');
+      } catch (e) { toast('Explorer error', e && e.message ? e.message : 'The drive could not be opened.', 'error'); }
+    });
+    var cms2 = $('cloudMapServer');
+    if (cms2) cms2.addEventListener('change', function () { renderMapdrivePanel(); });
     var cub2 = $('cloudUploadBtn');
     if (cub2) cub2.addEventListener('click', function () { cloudUpload(); });
     var cmb = $('cloudMkdirBtn');
     if (cmb) cmb.addEventListener('click', function () { cloudNewFolder(cloudPath); });
     var cbr = $('cloudBrowserRefreshBtn');
     if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
+    // Open mode (spec v2): which way a double-click opens a file.
+    // The choice persists in cloud.json; no mode ever creates a
+    // drive letter.
+    var coms = $('cloudOpenModeSel');
+    if (coms) coms.addEventListener('change', async function () {
+      var next = coms.value === 'temp' ? 'temp' : 'direct';
+      if (!api || typeof api.cloudSetOpenMode !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudSetOpenMode(next);
+        if (r && r.success) { if (cloudCfg) cloudCfg.openMode = r.openMode; }
+        else { toast('Could not save the open mode', (r && r.error) || 'The choice was not saved.', 'error'); renderCloudOpenMode(); }
+      } catch (e) { toast('Could not save the open mode', e && e.message ? e.message : 'The choice was not saved.', 'error'); renderCloudOpenMode(); }
+    });
     // Explorer toolbar: the actions apply to the selected row.
     var cub3 = $('cloudUpBtn');
     if (cub3) cub3.addEventListener('click', function () { if (cloudPath) cloudBrowse(cloudParent(cloudPath)); });
@@ -3252,6 +3527,15 @@
         if (!p) return;
         var kind = p.kind === 'upload' ? 'Uploading' : 'Downloading';
         showCloudTransfer(kind + ' ' + (p.name || '') + ' — ' + Math.round(p.pct || 0) + '%', p.pct || 0);
+      });
+    }
+    // Temp + save-back results: a successful save-back stays silent
+    // (that is the point); a conflict or a failure warns the user.
+    if (api && typeof api.onCloudSaveback === 'function') {
+      api.onCloudSaveback(function (ev) {
+        if (!ev) return;
+        if (ev.kind === 'conflict') toast('Not saved back', '«' + (ev.name || '') + '» changed on the server since you opened it — your edits were NOT overwritten onto the server. They are still in the temp copy.', 'error');
+        else if (ev.kind === 'error') toast('Save-back failed', '«' + (ev.name || '') + '» could not be saved back to the server: ' + (ev.error || ''), 'error');
       });
     }
 

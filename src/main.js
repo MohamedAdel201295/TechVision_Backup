@@ -14,6 +14,8 @@ const vault = require('./vault.js');
 const driveResolver = require('./drive-resolver.js');
 const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
+const cloudMapDrive = require('./cloud-mapdrive.js');
+const cloudSavebackMod = require('./cloud-saveback.js');
 const vpn = require('./vpn.js');
 const wireguard = require('./wireguard.js');
 const natGateway = require('./nat-gateway.js');
@@ -43,6 +45,11 @@ function getCloudConfig() {
   if (!cloudConfig || typeof cloudConfig !== 'object') cloudConfig = {};
   if (!cloudConfig.server || typeof cloudConfig.server !== 'object') cloudConfig.server = cloudServerMod.defaultServerConfig();
   if (!Array.isArray(cloudConfig.clients)) cloudConfig.clients = [];
+  // Open mode: how a double-click opens a file — 'direct' (mapped
+  // drive, then Office direct, then temp + save-back) or 'temp'
+  // (always temp + save-back). The user picks it in the browser
+  // toolbar; no mode ever creates a drive letter.
+  if (cloudConfig.openMode !== 'temp' && cloudConfig.openMode !== 'direct') cloudConfig.openMode = 'direct';
   return cloudConfig;
 }
 function saveCloudConfig() {
@@ -68,6 +75,56 @@ function getCloudServer() {
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
+
+// ---------- TechVision Cloud — Map network drive ----------
+// State file: <userData>/.techvision/mapdrive.json —
+// { mappings: [{ serverId, letter, host, port, user, reconnect }] }.
+let mapdriveState = null;
+function mapdriveConfigPath() {
+  return path.join(app.getPath('userData'), '.techvision', 'mapdrive.json');
+}
+function getMapdriveState() {
+  if (mapdriveState) return mapdriveState;
+  mapdriveState = cloudMapDrive.loadState(mapdriveConfigPath());
+  return mapdriveState;
+}
+function saveMapdriveState(state) {
+  if (state) mapdriveState = state;
+  cloudMapDrive.saveState(mapdriveConfigPath(), mapdriveState);
+}
+
+// ---------- TechVision Cloud — temp + save-back ----------
+// After a server file is opened from a temp copy, watch the copy
+// while the app is open; edits upload back to the same server path.
+// Session-only: the watches live in this process, so a restart never
+// re-uploads a stale temp file. See src/cloud-saveback.js.
+async function cloudSavebackSnapshot(serverId, relPath) {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return null;
+  try {
+    const dir = String(relPath).split('/').slice(0, -1).join('/');
+    const base = path.basename(relPath);
+    const r = await cloudClient.list(conn, dir);
+    const e = (r.entries || []).find((x) => x.name === base);
+    return e ? { size: e.size, mtime: e.mtime } : null;
+  } catch (e) { return null; }
+}
+const cloudSaveback = cloudSavebackMod.createSaveback({
+  listEntry: (serverId, relPath) => cloudSavebackSnapshot(serverId, relPath),
+  uploadFile: async (serverId, relPath, localPath) => {
+    const conn = cloudSessions.get(serverId);
+    if (!conn) throw new Error('Not connected to this server.');
+    const dir = String(relPath).split('/').slice(0, -1).join('/');
+    await cloudClient.upload(conn, localPath, dir, undefined, path.basename(relPath));
+  },
+  notify: (ev) => {
+    const name = ev.name || path.basename(ev.relPath || '');
+    if (ev.kind === 'saved-back') appendAppLog('info', '[Cloud] Saved back to the server: ' + name);
+    else if (ev.kind === 'conflict') appendAppLog('warn', '[Cloud] Not overwritten — the server copy of ' + name + ' changed since the download. Your edits are still in the temp copy.');
+    else appendAppLog('error', '[Cloud] Save-back failed for ' + name + ': ' + (ev.error || ''));
+    try { if (typeof mainWindow !== 'undefined' && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('cloud-saveback', ev); } catch (e) {}
+  },
+});
 
 // ---------- TechVision WireGuard VPN ----------
 // Config file: <userData>/.techvision/wireguard.json — { server, client }.
@@ -851,6 +908,9 @@ app.whenReady().then(() => {
     if (getCloudConfig().server && getCloudConfig().server.enabled) {
       getCloudServer().start().catch((e) => appendAppLog('error', '[Cloud] Auto-start failed: ' + (e && e.message ? e.message : e)));
     }
+    // Map network drives: reconnect the ones the user asked to keep.
+    // Best-effort and silent — a missing server never blocks startup.
+    reconnectMapDrives().catch(() => {});
     // WireGuard control channel: if the tunnel was left running
     // (server or client), the listener starts again so the other
     // gateway can wake this gateway's NAT. Best-effort — a bind
@@ -1831,6 +1891,7 @@ ipcMain.handle('cloud-get-config', async () => {
   const cfg = getCloudConfig();
   const srv = getCloudServer();
   return {
+    openMode: cfg.openMode || 'direct',
     server: {
       enabled: !!cfg.server.enabled,
       port: cfg.server.port || 8443,
@@ -2065,6 +2126,9 @@ ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
     try { await cloudClient.logout(conn); } catch (e) { /* local drop is enough */ }
   }
   cloudSessions.delete(serverId);
+  // No session, no save-back: a disconnected server's temp copies
+  // stop being watched (their edits stay in the temp copy).
+  try { cloudSaveback.stop(serverId); } catch (e) {}
   return { success: true };
 });
 
@@ -2179,12 +2243,17 @@ ipcMain.handle('cloud-client-upload-files', async (event, serverId, localPaths, 
 
 // Open a server file with the app Windows would use for it: download a
 // copy into the temp folder and hand it to the OS (music plays, pictures
-// open, a game runs). The copy lives in the temp folder, so editing it
-// does NOT write back to the server — that needs the file mounted as a
-// real drive, which is a separate feature.
+// open). The copy is then WATCHED while the app is open: edits save
+// back to the same server path (temp + save-back). Programs (.exe and
+// friends) never come through here — the renderer blocks them, and
+// this guard stops any other caller too: a game is a whole folder of
+// files, and one temp file can never run it.
+const CLOUD_PROGRAM_EXTS = new Set(['exe', 'msi', 'bat', 'cmd', 'com', 'scr']);
 ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
   const conn = cloudSessions.get(serverId);
   if (!conn) return { success: false, error: 'Not connected to this server.' };
+  const openExt = String(path.basename(relPath || '')).split('.').pop().toLowerCase();
+  if (CLOUD_PROGRAM_EXTS.has(openExt)) return { success: false, error: 'program-needs-drive' };
   const tmpRoot = path.join(os.tmpdir(), 'TechVision-Cloud');
   try { fs.mkdirSync(tmpRoot, { recursive: true }); } catch (e) {}
   // Best-effort cleanup of opened copies older than 7 days, so the temp
@@ -2216,8 +2285,227 @@ ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
   }
   const err = await require('electron').shell.openPath(dest);
   if (err) return { success: false, error: 'Downloaded to ' + dest + ' but Windows could not open it: ' + err, dest };
-  return { success: true, dest };
+  // Temp + save-back: snapshot the server copy now, then watch the
+  // temp copy. A later edit uploads back silently; a server-side
+  // change since the download blocks the overwrite instead.
+  try {
+    const snap = await cloudSavebackSnapshot(serverId, relPath);
+    if (snap) cloudSaveback.watch(serverId, relPath, dest, snap);
+  } catch (e) {}
+  return { success: true, dest, mode: 'temp' };
 });
+
+// ---------- TechVision Cloud — Map network drive ----------
+ipcMain.handle('cloud-mapdrive-status', async () => {
+  try {
+    const state = getMapdriveState();
+    const cfg = getCloudConfig();
+    const free = await cloudMapDrive.listFreeLetters();
+    const out = [];
+    for (const m of state.mappings) {
+      const rec = cfg.clients.find((c) => c.id === m.serverId);
+      let status = 'not-mapped';
+      let error = null;
+      let remote = null;
+      if (!rec) { status = 'error'; error = 'This server was removed from the Client tab.'; }
+      else if (!rec.password) { status = 'password-needed'; }
+      else {
+        const st = await cloudMapDrive.getDriveStatus(m.letter);
+        if (st.success && st.mapped) {
+          status = (st.remote === cloudMapDrive.davUrl(m.host, m.port)) ? 'mapped' : 'not-mapped';
+          remote = st.remote || null;
+        } else if (!st.success) { status = 'error'; error = st.error; }
+      }
+      out.push({
+        serverId: m.serverId, letter: m.letter, host: m.host, port: m.port, user: m.user,
+        reconnect: !!m.reconnect, status, error, remote,
+        name: rec ? rec.name : m.serverId, hasPassword: !!(rec && rec.password),
+      });
+    }
+    return { success: true, mappings: out, freeLetters: free.success ? free.letters : [] };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) => {
+  try {
+    const cfg = getCloudConfig();
+    const rec = cfg.clients.find((c) => c.id === serverId);
+    if (!rec) return { success: false, error: 'Server not found.' };
+    if (!rec.password) return { success: false, error: 'password-needed' };
+    const l = String(letter || '').toUpperCase();
+    if (!/^[A-Z]$/.test(l)) return { success: false, error: 'Pick a drive letter (A–Z).' };
+    const state = getMapdriveState();
+    // One server per letter, one mapping per server: disconnect the
+    // old letter (or the old mapping on this letter) first.
+    const sameLetter = state.mappings.find((m) => m.letter === l && m.serverId !== serverId);
+    if (sameLetter) {
+      await cloudMapDrive.unmapDrive(l);
+      state.mappings = state.mappings.filter((m) => m.serverId !== sameLetter.serverId);
+    }
+    const sameServer = state.mappings.find((m) => m.serverId === serverId);
+    if (sameServer && sameServer.letter !== l) await cloudMapDrive.unmapDrive(sameServer.letter);
+    // Certificate trust (once per server, admin): the saved record
+    // holds certPem from the probe/trust flow. The fingerprint must
+    // match the saved record before anything is installed — never
+    // install any other certificate.
+    if (rec.certPem) {
+      const fp = cloudServerMod.fingerprintOfCertPem(rec.certPem);
+      if (rec.fingerprint && rec.fingerprint !== fp) {
+        return { success: false, error: 'The saved certificate does not match this server. Remove the server in the Client tab and add it again.' };
+      }
+      const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+      if (!trusted.success) return { success: false, error: trusted.error };
+      if (!trusted.trusted) {
+        const inst = await cloudMapDrive.installCert(rec.certPem);
+        if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
+      }
+    }
+    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+    if (!mapped.success) return { success: false, error: mapped.error };
+    state.mappings = state.mappings.filter((m) => m.serverId !== serverId && m.letter !== l);
+    state.mappings.push({ serverId, letter: l, host: rec.host, port: rec.port, user: rec.user, reconnect: !!reconnect });
+    saveMapdriveState(state);
+    appendAppLog('info', '[Cloud] Mapped ' + rec.host + ':' + rec.port + ' as drive ' + l + ':');
+    return { success: true, letter: l };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-mapdrive-disconnect', async (event, serverId) => {
+  try {
+    const state = getMapdriveState();
+    const m = state.mappings.find((x) => x.serverId === serverId);
+    if (!m) return { success: true, alreadyGone: true };
+    const r = await cloudMapDrive.unmapDrive(m.letter);
+    state.mappings = state.mappings.filter((x) => x.serverId !== serverId);
+    saveMapdriveState(state);
+    if (!r.success) return { success: false, error: r.error };
+    return { success: true, letter: m.letter };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-mapdrive-open-explorer', async (event, letter) => {
+  try {
+    return await cloudMapDrive.openExplorer(letter);
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open a file straight from the mapped drive: no download, no temp
+// copy. The path is joined onto the letter in cloud-mapdrive.js and
+// proven to stay under the letter root.
+ipcMain.handle('cloud-mapdrive-open-mapped', async (event, serverId, relPath) => {
+  try {
+    const state = getMapdriveState();
+    const m = state.mappings.find((x) => x.serverId === serverId);
+    if (!m) return { success: false, error: 'not-mapped' };
+    const joined = cloudMapDrive.mappedPathFor(m.letter, relPath);
+    if (!joined.success) return { success: false, error: joined.error };
+    const st = await cloudMapDrive.getDriveStatus(m.letter);
+    if (!st.success || !st.mapped) return { success: false, error: 'not-mapped' };
+    if (st.remote && st.remote !== cloudMapDrive.davUrl(m.host, m.port)) return { success: false, error: 'not-mapped' };
+    let exists = false;
+    try { exists = fs.existsSync(joined.path); } catch (e) {}
+    if (!exists) return { success: false, error: 'File not found on the mapped drive.' };
+    const err = await require('electron').shell.openPath(joined.path);
+    if (err) return { success: false, error: 'Windows could not open it: ' + err };
+    return { success: true, path: joined.path };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open mode (browser toolbar): how a double-click opens a file.
+// 'direct' = mapped drive, then Office direct, then temp + save-back;
+// 'temp' = always temp + save-back. Persisted in cloud.json.
+ipcMain.handle('cloud-set-open-mode', async (event, mode) => {
+  try {
+    const m = mode === 'temp' ? 'temp' : 'direct';
+    const cfg = getCloudConfig();
+    cfg.openMode = m;
+    saveCloudConfig();
+    return { success: true, openMode: m };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open an Office document straight from the server: ms-word:ofe|u|
+// (and friends) hand the WebDAV URL to Word/Excel/PowerPoint, which
+// opens it read-write with no temp copy; saves go back through
+// WebDAV. The server cert must be trusted first — the same one-time
+// install as the Map network tab (admin once); a decline falls
+// through to the temp open (the renderer tries the next method).
+// Returns { success: false } on any failure so the caller can fall
+// through silently — only the temp path shows an error to the user.
+ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
+  try {
+    const conn = cloudSessions.get(serverId);
+    if (!conn) return { success: false, error: 'Not connected to this server.' };
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === serverId);
+    if (!rec) return { success: false, error: 'Server not found.' };
+    const uri = cloudMapDrive.officeUriFor(rec.host, rec.port, relPath);
+    if (!uri) return { success: false, error: 'not-office' };
+    if (rec.certPem) {
+      const fp = cloudServerMod.fingerprintOfCertPem(rec.certPem);
+      if (rec.fingerprint && rec.fingerprint !== fp) {
+        return { success: false, error: 'The saved certificate does not match this server. Remove the server in the Client tab and add it again.' };
+      }
+      const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+      if (!trusted.success) return { success: false, error: trusted.error };
+      if (!trusted.trusted) {
+        const inst = await cloudMapDrive.installCert(rec.certPem);
+        if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
+      }
+    }
+    // Best-effort: seed the credentials so Office does not prompt
+    // for a login. If it fails, Office prompts once and Windows can
+    // remember it — still fine.
+    if (rec.password) { try { await cloudMapDrive.seedCredentials(rec.host, rec.port, rec.user, rec.password); } catch (e) {} }
+    const err = await require('electron').shell.openExternal(uri);
+    if (err) return { success: false, error: String(err) };
+    return { success: true, mode: 'direct' };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Reconnect at app start: only mappings the user marked "reconnect",
+// only when the password is saved, the letter is free and the server
+// answers a probe. Never installs a certificate at startup (no
+// surprise UAC prompt when the app opens) — a mapping whose cert is
+// not trusted yet simply waits for the user to map it by hand.
+async function reconnectMapDrives() {
+  try {
+    const state = getMapdriveState();
+    if (!state.mappings.length) return;
+    const cfg = getCloudConfig();
+    for (const m of state.mappings) {
+      if (!m.reconnect) continue;
+      const rec = cfg.clients.find((c) => c.id === m.serverId);
+      if (!rec || !rec.password) continue;
+      const st = await cloudMapDrive.getDriveStatus(m.letter);
+      if (st.success && st.mapped) continue;
+      let probeOk = true;
+      try { await cloudClient.probeServer(String(rec.host), parseInt(rec.port, 10)); }
+      catch (e) { probeOk = false; }
+      if (!probeOk) { appendAppLog('info', '[Cloud] Map drive ' + m.letter + ': server did not answer, skipping reconnect.'); continue; }
+      if (rec.certPem) {
+        const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+        if (trusted.success && !trusted.trusted) { appendAppLog('info', '[Cloud] Map drive ' + m.letter + ': certificate is not trusted yet, skipping reconnect.'); continue; }
+      }
+      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+      appendAppLog(r.success ? 'info' : 'error', '[Cloud] Map drive ' + m.letter + ': reconnect ' + (r.success ? 'ok' : ('failed — ' + (r.error || ''))));
+    }
+  } catch (e) {}
+}
 
 // ---------- TechVision Tailscale VPN (Tailscale client manager) ----------
 // The module only shells out to the Tailscale CLI that is already

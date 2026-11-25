@@ -35,6 +35,7 @@
     <div class="nav-group" id="navGroupCloud" style="display:none;">
       <button class="nav-item" type="button" data-nav="cloud-server"><span class="ico">🖥️</span> Server</button>
       <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
+      <button class="nav-item" type="button" data-nav="cloud-mapdrive"><span class="ico">🗺️</span> Map network</button>
     </div>
     <div class="nav-group" id="navGroupVpn" style="display:none;">
       <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> Tailscale VPN</button>
@@ -380,6 +381,13 @@
           <button class="btn btn-sm" type="button" id="cloudMkdirBtn">＋ New folder</button>
           <button class="btn btn-ghost btn-sm" type="button" id="cloudBrowserRefreshBtn">⟳ Refresh</button>
           <button class="btn btn-ghost btn-sm" type="button" id="cloudDisconnectBtn">Disconnect</button>
+          <span class="cloud-toolbar-sep"></span>
+          <label class="cloud-muted" for="cloudOpenModeSel">الفتح:</label>
+          <select id="cloudOpenModeSel" title="How files open when you double-click them">
+            <option value="direct">مباشر</option>
+            <option value="temp">temp</option>
+          </select>
+          <span id="cloudOpenModeStatus" class="cloud-muted"></span>
           <span id="cloudBrowserInfo" class="cloud-muted"></span>
           <span id="cloudClipboardInfo" class="cloud-muted" style="display:none;"></span>
         </div>
@@ -397,6 +405,29 @@
           <p>Nothing here yet.</p>
         </div>
       </div>
+    </div>
+    <div id="cloudMapPanel" style="display:none;">
+      <h3 style="margin:14px 0 4px;font-size:16px;">Map network — open a server as a drive</h3>
+      <p class="cloud-muted" style="margin:0 0 8px;">Files open directly from the drive — no download. Edits save back to the server.</p>
+      <div class="field">
+        <label for="cloudMapServer">Server</label>
+        <select id="cloudMapServer"></select>
+        <div class="hint" id="cloudMapServerHint">Pick a saved server from the Client tab.</div>
+      </div>
+      <div class="field">
+        <label for="cloudMapLetter">Drive letter</label>
+        <select id="cloudMapLetter"></select>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Reconnect when the app starts</div><div class="t-sub" id="cloudMapReconnectHint">Maps this drive again every time the app opens.</div></div>
+        <label class="switch"><input type="checkbox" id="cloudMapReconnect" checked><span class="slider"></span></label>
+      </div>
+      <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
+        <button class="btn btn-primary" type="button" id="cloudMapBtn">Map drive</button>
+        <button class="btn btn-danger" type="button" id="cloudMapDisconnectBtn" style="display:none;">Disconnect</button>
+        <button class="btn" type="button" id="cloudMapExplorerBtn" style="display:none;">Open in Explorer</button>
+      </div>
+      <div id="cloudMapStatus" class="cloud-muted">Not mapped</div>
     </div>
   </div>
   <div id="view-vpn" style="display:none;">
