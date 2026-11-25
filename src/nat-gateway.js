@@ -701,8 +701,17 @@ function vendorDir() {
  * the adapter name, or null when none can be found. `interfaces` is
  * os.networkInterfaces() (injectable for tests). */
 function detectLanInterface(config, interfaces) {
-  if (config.interfaceName) return config.interfaceName;
   const ifs = interfaces || os.networkInterfaces();
+  if (config.interfaceName) {
+    // A saved/imported interface name is only trusted when it is a
+    // real adapter on this machine. A name from an imported config
+    // must never reach the elevated PowerShell script unchecked:
+    // PowerShell evaluates $(...) inside double-quoted strings, and
+    // the setup/teardown scripts are the one place an interface name
+    // is interpolated (single-quoted there now — but defence in
+    // depth: an unknown name fails the start instead of running).
+    return Object.prototype.hasOwnProperty.call(ifs, config.interfaceName) ? config.interfaceName : null;
+  }
   const local = parseCidr(config.localSubnet);
   if (!local) return null;
   for (const name of Object.keys(ifs)) {
@@ -728,7 +737,12 @@ function detectLanInterface(config, interfaces) {
  * Extracted so it is testable without admin rights. */
 function buildSetupScript(config, interfaceName) {
   if (!interfaceName || typeof interfaceName !== 'string') throw new Error('No LAN interface for the NAT setup.');
-  const q = (s) => '"' + String(s).replace(/"/g, '') + '"';
+  // Single-quoted (literal) strings only: PowerShell evaluates
+  // $(...) and backtick escapes inside double-quoted strings, and
+  // the interface name can arrive from an imported config file —
+  // it must never sit in a double-quoted string in an elevated
+  // script. The same escaping buildElevatedScript uses.
+  const q = (s) => "'" + String(s).replace(/'/g, "''") + "'";
   const lines = [
     '$ErrorActionPreference = "Stop"',
     '$iface = ' + q(interfaceName),
@@ -751,7 +765,10 @@ function buildSetupScript(config, interfaceName) {
  * teardown). */
 function buildTeardownScript(config, interfaceName) {
   if (!interfaceName || typeof interfaceName !== 'string') throw new Error('No LAN interface for the NAT teardown.');
-  const q = (s) => '"' + String(s).replace(/"/g, '') + '"';
+  // Single-quoted (literal) strings only — same reason as
+  // buildSetupScript: the interface name can come from an imported
+  // config and must never sit in a double-quoted PowerShell string.
+  const q = (s) => "'" + String(s).replace(/'/g, "''") + "'";
   const lines = [
     '$ErrorActionPreference = "Continue"',
     '$iface = ' + q(interfaceName),

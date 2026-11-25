@@ -244,6 +244,8 @@ check('detectLanInterface finds the adapter in the local subnet',
   nat.detectLanInterface(vSame.config, fakeIfs) === 'Ethernet');
 check('detectLanInterface honours an explicit interfaceName',
   nat.detectLanInterface(Object.assign({}, vSame.config, { interfaceName: 'Wi-Fi' }), fakeIfs) === 'Wi-Fi');
+check('detectLanInterface refuses an interfaceName that is not a real adapter (imported config)',
+  nat.detectLanInterface(Object.assign({}, vSame.config, { interfaceName: '$(Start-Process calc.exe)' }), fakeIfs) === null);
 check('detectLanInterface returns null when no adapter matches',
   nat.detectLanInterface(vSame.config, { 'Wi-Fi': [{ address: '10.9.9.9', family: 'IPv4', internal: false }] }) === null);
 const setup = nat.buildSetupScript(vSame.config, 'Ethernet');
@@ -255,7 +257,13 @@ check('setup script adds farVirtIp too', setup.indexOf('add address name=$iface 
 check('setup script uses skipassource (never source from a virtual)', setup.indexOf('skipassource=true') >= 0);
 check('setup script uses the /24 mask', setup.indexOf('255.255.255.0') >= 0);
 check('setup script enables forwarding', setup.indexOf('forwarding=enabled') >= 0);
-check('setup script targets the named interface', setup.indexOf('$iface = "Ethernet"') >= 0);
+check('setup script targets the named interface', setup.indexOf("$iface = 'Ethernet'") >= 0);
+check('setup script single-quotes a hostile interface name (literal, never executed)',
+  nat.buildSetupScript(vSame.config, '$(Start-Process calc.exe)').indexOf("$iface = '$(Start-Process calc.exe)'") >= 0);
+check('setup script never puts the interface name in double quotes',
+  nat.buildSetupScript(vSame.config, '$(Start-Process calc.exe)').indexOf('"$(Start-Process') < 0);
+check('setup script escapes a single quote in the interface name instead of breaking out',
+  nat.buildSetupScript(vSame.config, "'; Start-Process calc; '").indexOf("$iface = '''; Start-Process calc; '''") >= 0);
 const teardown = nat.buildTeardownScript(vSame.config, 'Ethernet');
 check('teardown does NOT delete mapping virtuals (they were never added)',
   ['192.168.2.3', '192.168.2.4', '192.168.2.5'].every((ip) => teardown.indexOf('delete address name=$iface ' + ip) < 0));
@@ -263,6 +271,8 @@ check('teardown removes farVirtIp', teardown.indexOf('delete address name=$iface
 check('teardown deletes the auto-route for the virtual subnet',
   teardown.indexOf('route delete 192.168.2.0') >= 0, teardown);
 check('teardown disables forwarding again', teardown.indexOf('forwarding=disabled') >= 0);
+check('teardown single-quotes a hostile interface name too',
+  nat.buildTeardownScript(vSame.config, '$(Start-Process calc.exe)').indexOf("$iface = '$(Start-Process calc.exe)'") >= 0);
 check('teardown tolerates already-gone addresses (try/catch)', teardown.indexOf('try { netsh') >= 0);
 let threw = false;
 try { nat.buildSetupScript(vSame.config, ''); } catch (e) { threw = true; }

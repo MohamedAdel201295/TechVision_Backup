@@ -957,7 +957,7 @@ function buildAmneziaInstallScript(msiPath) {
   return [
     '$ErrorActionPreference = "Stop"',
     'try {',
-    '  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList \'/i\', \'"' + msiPath + '"\', \'/qn\', \'/norestart\', \'DO_NOT_LAUNCH=1\' -Verb RunAs -PassThru',
+    '  $p = Start-Process -FilePath "msiexec.exe" -ArgumentList \'/i\', \'' + msiPath.replace(/'/g, "''") + '\', \'/qn\', \'/norestart\', \'DO_NOT_LAUNCH=1\' -Verb RunAs -PassThru',
     '  $p.WaitForExit()',
     '  exit $p.ExitCode',
     '} catch {',
