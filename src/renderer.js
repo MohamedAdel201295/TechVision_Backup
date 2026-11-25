@@ -634,7 +634,19 @@
     var sp = $('cloudServerPanel'); if (sp) sp.style.display = panel === 'server' ? '' : 'none';
     var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
     if (panel === 'server') renderCloudServer();
-    if (panel === 'client') { renderCloudClientList(); if (cloudClientAccess === 'tailscale') populateCloudPeers(); if (cloudClientAccess === 'wireguard') populateCloudWgPeers(); }
+    if (panel === 'client') {
+      // Open on the kind of server the user actually has: if the
+      // current picker mode matches none of the saved servers, switch
+      // it to the first server's mode so the list is never empty
+      // while servers exist. An explicit picker click still filters
+      // strictly to the picked kind.
+      var saved = (cloudCfg && cloudCfg.clients) || [];
+      if (saved.length) {
+        var hasCurrent = saved.some(function (s) { return (s.accessMode || 'normal') === cloudClientAccess; });
+        if (!hasCurrent) setClientAccess(saved[0].accessMode || 'normal');
+      }
+      renderCloudClientList(); if (cloudClientAccess === 'tailscale') populateCloudPeers(); if (cloudClientAccess === 'wireguard') populateCloudWgPeers();
+    }
     syncCloudNav();
     setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : 'Cloud');
   }
@@ -765,6 +777,7 @@
       : 'Both devices must be on the same Tailscale network — see the VPN module.';
     if (cloudClientAccess === 'tailscale') populateCloudPeers();
     if (cloudClientAccess === 'wireguard') populateCloudWgPeers();
+    renderCloudClientList();
   }
 
   // Signature of the last peer list the picker was built from. The list
@@ -895,11 +908,19 @@
     var list = $('cloudServersList');
     if (!list) return;
     list.innerHTML = '';
-    var servers = cloudCfg.clients || [];
+    // The list follows the Connection picker above it: pick WireGuard
+    // and the Tailscale servers hide (and vice versa) — the picker
+    // chooses which kind of server this panel is about, so a server
+    // of another kind must not sit above the form for this kind.
+    var mode = cloudClientAccess || 'normal';
+    var servers = (cloudCfg.clients || []).filter(function (srv) {
+      return (srv.accessMode || 'normal') === mode;
+    });
     if (!servers.length) {
       var empty = document.createElement('div');
       empty.className = 'empty-state'; empty.style.display = '';
-      empty.innerHTML = '<div class="big">☁️</div><h3>No servers yet</h3><p>Add the server you want to open below.</p>';
+      var label = mode === 'wireguard' ? 'No WireGuard servers yet' : mode === 'tailscale' ? 'No Tailscale servers yet' : 'No servers yet';
+      empty.innerHTML = '<div class="big">☁️</div><h3>' + label + '</h3><p>Add the server you want to open below.</p>';
       list.appendChild(empty);
     }
     servers.forEach(function (srv) {
