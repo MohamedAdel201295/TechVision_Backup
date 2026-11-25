@@ -82,13 +82,6 @@ function getCloudServer() {
 // The pending-request store attached to the Cloud server above (null
 // until getCloudServer() has run once).
 let wgJoinStoreInstance = null;
-// Client-side join requests THIS machine sent: requestId ->
-// { serverId, deviceName, privateKey, createdAt }. The private key
-// lives only here, in memory, until the server approves (or the
-// request expires / the app quits — then the user simply sends a
-// fresh request). It is never written to disk and never sent to the
-// renderer.
-const wgPendingJoins = new Map();
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
@@ -168,38 +161,6 @@ function wgPeersWithLive(livePeers) {
   });
 }
 // The config as the renderer may see it: private keys stripped.
-/* This machine's WireGuard identity: one client keypair per install,
-   generated the first time the WireGuard status is read (the module
-   view opening is the earliest moment the transport binary is known
-   to exist) and kept forever after. The public key is what the
-   server operator pastes into the add-peer form — so it must exist
-   BEFORE this device ever connects, and connect/join must reuse it
-   instead of minting a fresh keypair (a fresh key at connect time
-   would not match the peer the operator already added). The private
-   key never leaves main. Returns { success, privateKey, publicKey }
-   or { success: false, error } when the transport cannot generate
-   one (not installed yet). A stored private key is never replaced. */
-async function ensureWgClientKeypair() {
-  try {
-    const c = getWgConfig();
-    const cl = c.client;
-    if (cl && wireguard.isWgKey(cl.privateKey)) {
-      if (wireguard.isWgKey(cl.publicKey)) return { success: true, privateKey: cl.privateKey, publicKey: cl.publicKey };
-      const p = await wireguard.pubkey(cl.privateKey);
-      if (p.success && wireguard.isWgKey(p.key)) {
-        cl.publicKey = p.key;
-        saveWgConfig();
-        return { success: true, privateKey: cl.privateKey, publicKey: cl.publicKey };
-      }
-      return { success: false, error: 'Could not read this device\u2019s public key — is AmneziaWG installed?' };
-    }
-    const kp = await wireguard.genkeypair();
-    if (!kp.success) return { success: false, error: kp.error || 'Could not generate a WireGuard key.' };
-    c.client = Object.assign({}, cl || {}, { privateKey: kp.privateKey, publicKey: kp.publicKey, createdAt: (cl && cl.createdAt) || new Date().toISOString() });
-    saveWgConfig();
-    return { success: true, privateKey: kp.privateKey, publicKey: kp.publicKey };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not generate a WireGuard key.' }; }
-}
 function wgPublicConfig() {
   const c = getWgConfig();
   const server = Object.assign({}, c.server);
@@ -2389,12 +2350,6 @@ ipcMain.handle('wg-get-status', async () => {
   try {
     const st = await wireguard.getStatus();
     const c = getWgConfig();
-    // Every installed device has a public key: mint the client
-    // identity on first read so the client card can show it before
-    // this device ever connects. A failure here (transport not
-    // installed yet) is not a status failure — the key just stays
-    // blank until the transport exists.
-    try { await ensureWgClientKeypair(); } catch (e) {}
     const liveServerPeers = (st.server && Array.isArray(st.server.peers)) ? st.server.peers : [];
     const liveClientPeer = (st.client && Array.isArray(st.client.peers) && st.client.peers[0]) || null;
     const pub = wgPublicConfig();
@@ -2664,108 +2619,7 @@ ipcMain.handle('wg-remove-peer', async (event, opts) => {
     return { success: true, liveApplied, liveError };
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not remove the peer.' }; }
 });
-// Import a .conf file (or pasted text): parse it and show what it
-// holds. No side effects — wg-connect does the installing.
-ipcMain.handle('wg-import-conf', async (event, opts) => {
-  try {
-    const confText = String((opts && opts.confText) || '');
-    if (!confText.trim()) return { success: false, error: 'Nothing to import.' };
-    const parsed = wireguard.parseConf(confText);
-    let publicKey = null;
-    if (parsed.interface.privateKey) {
-      const p = await wireguard.pubkey(parsed.interface.privateKey);
-      if (p.success) publicKey = p.key;
-    }
-    const serverPeer = parsed.peers[0] || {};
-    return {
-      success: true,
-      summary: {
-        address: parsed.interface.address || null,
-        publicKey,
-        serverPublicKey: serverPeer.publicKey || null,
-        endpoint: serverPeer.endpoint || null,
-        allowedIPs: serverPeer.allowedIPs || null,
-        hasObfuscation: !!wireguard.obfuscationParamsFromExtra(parsed.interface.extra),
-      },
-    };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read that config file.' }; }
-});
 // Connect this machine as a client. Two forms:
-//  - { confText }: an imported .conf (file, or paste) —
-//    installed as-is, metadata stored from the parse.
-//  - { serverPublicKey, endpoint, tunnelIp, fullTunnel }: typed by
-//    hand — the app generates this machine's keypair and builds the
-//    config. The tunnel address is the one the server assigned (the
-//    server operator tells you when they add this device); the app
-//    never invents one.
-ipcMain.handle('wg-connect', async (event, opts) => {
-  try {
-    const o = opts || {};
-    let confText = null;
-    let meta = {};
-    // Reconnect with the stored client config (one click — the private
-    // key never leaves main, so the renderer cannot rebuild it).
-    // The stored obfuscation set rides along, so a reconnect rebuilds
-    // exactly the config that connected the first time.
-    if (o.reconnect) {
-      const stored = getWgConfig().client;
-      if (!stored || !wireguard.isWgKey(stored.privateKey) || !wireguard.isWgKey(stored.serverPublicKey)) return { success: false, error: 'No saved client config to reconnect with.' };
-      confText = wireguard.buildClientConf({ privateKey: stored.privateKey, address: (stored.tunnelIp || '10.0.0.2') + '/32', serverPublicKey: stored.serverPublicKey, endpoint: stored.endpoint, allowedIPs: stored.allowedIPs || wireguard.TUNNEL_SUBNET, extraInterfaceLines: wgLinesForObfuscation(stored.obfuscation) });
-      meta = stored;
-    } else if (o.confText && String(o.confText).trim()) {
-      const parsed = wireguard.parseConf(String(o.confText));
-      if (!parsed.interface.privateKey) return { success: false, error: 'That config has no private key — it cannot connect.' };
-      if (!parsed.peers[0] || !parsed.peers[0].publicKey) return { success: false, error: 'That config has no server to connect to.' };
-      confText = String(o.confText);
-      const p = await wireguard.pubkey(parsed.interface.privateKey);
-      meta = {
-        privateKey: parsed.interface.privateKey,
-        publicKey: p.success ? p.key : null,
-        serverPublicKey: parsed.peers[0].publicKey,
-        endpoint: parsed.peers[0].endpoint || '',
-        tunnelIp: wireguard.tunnelIpOf(parsed.interface.address) || '',
-        allowedIPs: parsed.peers[0].allowedIPs || wireguard.TUNNEL_SUBNET,
-      };
-      // Keep the imported config's obfuscation set (if any) so a later
-      // reconnect rebuilds the same config — installing confText as-is
-      // already carries it this time.
-      const importedObf = wireguard.obfuscationParamsFromExtra(parsed.interface.extra);
-      if (importedObf) meta.obfuscation = importedObf;
-    } else {
-      if (!wireguard.isWgKey(o.serverPublicKey)) return { success: false, error: 'That is not a valid server public key.' };
-      if (!o.endpoint || !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(String(o.endpoint).trim())) return { success: false, error: 'Endpoint must be host:port, e.g. myhome.ddns.net:51820.' };
-      const tunnelIp = wireguard.tunnelIpOf(o.tunnelIp) || '';
-      if (!tunnelIp) return { success: false, error: 'Type the tunnel address the server operator gave you when they added this device (e.g. 10.0.0.2).' };
-      // Reuse this device's identity keypair — the public key the
-      // operator already added as a peer. Minting a fresh keypair
-      // here would not match that peer and the handshake would fail.
-      const kp = await ensureWgClientKeypair();
-      if (!kp.success) return { success: false, error: kp.error };
-      const allowedIPs = o.fullTunnel ? '0.0.0.0/0, ::/0' : wireguard.TUNNEL_SUBNET;
-      // No obfuscation lines here on purpose: this is a foreign
-      // server typed by hand, and its obfuscation set is unknown —
-      // injecting ours would break the handshake. Import the
-      // server's .conf instead (wg-import-conf keeps its set).
-      confText = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: String(o.serverPublicKey).trim(), endpoint: String(o.endpoint).trim(), allowedIPs });
-      meta = { privateKey: kp.privateKey, publicKey: kp.publicKey, serverPublicKey: String(o.serverPublicKey).trim(), endpoint: String(o.endpoint).trim(), tunnelIp, allowedIPs };
-    }
-    const c = getWgConfig();
-    try {
-      const st = await wireguard.getStatus();
-      if (st.clientRunning) await wireguard.uninstallTunnelService(wireguard.CLIENT_TUNNEL);
-    } catch (e) { /* installing over it is attempted below anyway */ }
-    const r = await wireguard.installTunnelService(wireguard.CLIENT_TUNNEL, confText);
-    if (!r.success) return { success: false, error: r.error, declined: !!r.declined };
-    c.client = Object.assign({ createdAt: new Date().toISOString() }, meta);
-    saveWgConfig();
-    refreshWgControl();
-    return { success: true, tunnelIp: meta.tunnelIp, endpoint: meta.endpoint };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not connect.' }; }
-});
-ipcMain.handle('wg-disconnect', async () => {
-  try { const r = await wireguard.uninstallTunnelService(wireguard.CLIENT_TUNNEL); refreshWgControl(); return r; }
-  catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disconnect.' }; }
-});
 ipcMain.handle('wg-open-download', async () => {
   // Manual fallback for the one-click install: the official
   // AmneziaWG releases page (same MSI the installer downloads).
@@ -2784,27 +2638,6 @@ ipcMain.handle('wg-open-download', async () => {
 // uses — and hands the client the server's obfuscation set
 // (extraInterfaceLines), so the joined client speaks AmneziaWG with
 // the same S1–S4/H1–H4; without them its handshake would fail.
-// A live Cloud session for a saved server: reuse the session the
-// Cloud view already opened, or log in with the saved password the
-// way cloud-client-connect does (one click, no typing). Only used
-// when the user SENDS a join request — polling never logs in by
-// itself (a dead session after a server restart must surface as
-// 'server-restarted' and stop, not silently re-login).
-async function wgEnsureCloudSession(serverId) {
-  const existing = cloudSessions.get(serverId);
-  if (existing && existing.token) return { success: true, conn: existing };
-  const cfg = getCloudConfig();
-  const rec = (cfg.clients || []).find((c) => c.id === serverId);
-  if (!rec) return { success: false, error: 'Cloud server not found.' };
-  if (!rec.certPem) return { success: false, error: 'Not connected to this Cloud server — open the Cloud view and connect first.' };
-  if (!rec.password) return { success: false, error: 'Not connected to this Cloud server — open the Cloud view and connect first (or save the password for one-click reconnect).' };
-  try {
-    const conn = await cloudClient.login(rec.host, parseInt(rec.port, 10), rec.certPem, rec.user, rec.password);
-    const info = await cloudClient.info(conn);
-    cloudSessions.set(serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
-    return { success: true, conn: cloudSessions.get(serverId) };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not connect to the Cloud server.' }; }
-}
 ipcMain.handle('wg-cloudjoin-list', async () => {
   try {
     if (!wgJoinStoreInstance) { getCloudServer(); }
@@ -2836,64 +2669,6 @@ ipcMain.handle('wg-cloudjoin-reject', async (event, opts) => {
     if (!wgJoinStoreInstance) return { success: false, error: 'Cloud join is not set up yet.' };
     return cloudJoin.rejectJoinRequest(wgJoinStoreInstance, String((opts && opts.id) || ''));
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not reject the join request.' }; }
-});
-ipcMain.handle('wg-cloudjoin-request', async (event, opts) => {
-  try {
-    const serverId = String((opts && opts.serverId) || '');
-    const deviceName = String((opts && opts.deviceName) || '');
-    if (!serverId) return { success: false, error: 'Pick a saved Cloud server first.' };
-    const sess = await wgEnsureCloudSession(serverId);
-    if (!sess.success) return sess;
-    // The join request carries THIS device's identity key — the same
-    // public key the client card shows — not a fresh keypair (the
-    // server would approve a key nobody can see on this device).
-    const kp = await ensureWgClientKeypair();
-    if (!kp.success) return { success: false, error: kp.error };
-    const r = await cloudJoin.submitJoinRequest(sess.conn, deviceName, { keygen: async () => kp });
-    if (!r.success) return r;
-    // The private key stays in main memory only — the renderer gets
-    // the request id, never the key.
-    wgPendingJoins.set(r.requestId, { serverId, deviceName: r.deviceName, privateKey: r.privateKey, createdAt: Date.now() });
-    return { success: true, requestId: r.requestId, deviceName: r.deviceName, status: 'pending', expiresAt: r.expiresAt || null };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not send the join request.' }; }
-});
-ipcMain.handle('wg-cloudjoin-poll', async (event, opts) => {
-  try {
-    const requestId = String((opts && opts.requestId) || '');
-    const pending = wgPendingJoins.get(requestId);
-    if (!pending) return { success: false, code: 'not-found', retryable: false, error: 'Join request not found — it may have expired, or the app was restarted. Send a new join request.' };
-    // Existing session only: a dead session must surface as
-    // 'server-restarted', never trigger a silent re-login here.
-    const conn = cloudSessions.get(pending.serverId);
-    if (!conn || !conn.token) { wgPendingJoins.delete(requestId); return { success: false, code: 'not-connected', retryable: false, error: 'Not connected to the Cloud server any more. Send the join request again.' }; }
-    const r = await cloudJoin.pollJoinStatus(conn, requestId, { privateKey: pending.privateKey });
-    if (!r.success) {
-      if (r.code === 'server-restarted' || r.code === 'expired') wgPendingJoins.delete(requestId);
-      return r;
-    }
-    if (r.status === 'approved') {
-      wgPendingJoins.delete(requestId);
-      // confText carries the private key (it is this machine's own
-      // config text) — the renderer hands it straight to wg-connect,
-      // nothing else.
-      return { success: true, status: 'approved', confText: r.confText, tunnelIp: r.tunnelIp, endpoint: r.endpoint };
-    }
-    return { success: true, status: r.status };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not check the join request.' }; }
-});
-ipcMain.handle('wg-cloudjoin-cancel', async (event, opts) => {
-  try {
-    const requestId = String((opts && opts.requestId) || '');
-    const pending = wgPendingJoins.get(requestId);
-    wgPendingJoins.delete(requestId);
-    if (pending) {
-      const conn = cloudSessions.get(pending.serverId);
-      if (conn && conn.token) {
-        try { await cloudJoin.cancelJoinRequest(conn, requestId); } catch (e) { /* local drop is enough */ }
-      }
-    }
-    return { success: true };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not cancel the join request.' }; }
 });
 // ---------- TechVision WireGuard VPN — gateway NAT service ----------
 // One TechVision PC per site is the gateway (see src/nat-gateway.js):

@@ -120,17 +120,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wgNatImport: () => ipcRenderer.invoke('wg-nat-import'),
   wgAddPeer: (opts) => ipcRenderer.invoke('wg-add-peer', opts),
   wgRemovePeer: (opts) => ipcRenderer.invoke('wg-remove-peer', opts),
-  wgImportConf: (opts) => ipcRenderer.invoke('wg-import-conf', opts),
-  wgConnect: (opts) => ipcRenderer.invoke('wg-connect', opts),
-  wgDisconnect: () => ipcRenderer.invoke('wg-disconnect'),
   wgOpenDownload: () => ipcRenderer.invoke('wg-open-download'),
-  // TechVision WireGuard VPN — Cloud join (third key-exchange option)
+  // TechVision WireGuard VPN — Cloud join, server side only (list /
+  // approve / reject join requests). The client side that sent join
+  // requests is gone with the client card.
   wgCloudJoinList: () => ipcRenderer.invoke('wg-cloudjoin-list'),
   wgCloudJoinApprove: (opts) => ipcRenderer.invoke('wg-cloudjoin-approve', opts),
   wgCloudJoinReject: (opts) => ipcRenderer.invoke('wg-cloudjoin-reject', opts),
-  wgCloudJoinRequest: (opts) => ipcRenderer.invoke('wg-cloudjoin-request', opts),
-  wgCloudJoinPoll: (opts) => ipcRenderer.invoke('wg-cloudjoin-poll', opts),
-  wgCloudJoinCancel: (opts) => ipcRenderer.invoke('wg-cloudjoin-cancel', opts),
   // TechVision WireGuard VPN — gateway NAT service (site-to-site)
   wgNatStart: (opts) => ipcRenderer.invoke('wg-nat-start', opts || null),
   wgNatStop: () => ipcRenderer.invoke('wg-nat-stop'),

@@ -565,52 +565,6 @@
       </div>
       </div>
     </div>
-    <div class="card" id="wgClientCard">
-      <div class="vpn-sec-label">Client — connect to a server</div>
-      <div class="t-sub" id="wgClientStatus">Not connected.</div>
-      <div style="margin-top:10px;">
-        <div class="t-label">Your public key — give this to the server operator</div>
-        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
-          <div class="vpn-fact" id="wgClientKey" style="flex:1; min-width:220px; word-break:break-all;">—</div>
-          <button class="btn btn-ghost btn-sm" type="button" id="wgClientKeyCopyBtn">Copy</button>
-        </div>
-        <div class="t-sub" id="wgClientKeyHint">Your public key will show here.</div>
-      </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-        <button class="btn btn-primary" type="button" id="wgClientBtn">Connect</button>
-        <button class="btn btn-ghost" type="button" id="wgImportBtn">Import .conf file</button>
-      </div>
-      <div style="margin-top:12px;">
-        <div class="t-label">Or paste a config</div>
-        <textarea id="wgImportText" rows="5" class="wg-conf" placeholder="Paste an AmneziaWG .conf here…" style="width:100%;"></textarea>
-        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <button class="btn btn-ghost btn-sm" type="button" id="wgImportTextBtn">Import pasted config</button>
-        </div>
-      </div>
-      <div style="margin-top:12px;">
-        <div class="t-label">Or type the server by hand</div>
-        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <input type="text" id="wgClientServerKey" placeholder="Server public key" autocomplete="off" style="flex:2; min-width:220px;">
-          <input type="text" id="wgClientEndpoint" placeholder="host:51820" autocomplete="off" style="flex:1; min-width:160px;">
-          <input type="text" id="wgClientTunnelIp" placeholder="Your tunnel address, e.g. 10.0.0.2" autocomplete="off" style="flex:1; min-width:160px;">
-        </div>
-        <label style="display:flex; gap:8px; align-items:flex-start; margin-top:8px; cursor:pointer;">
-          <input type="checkbox" id="wgFullTunnel" style="margin-top:3px;">
-          <span class="t-sub">Route <b>all</b> traffic through the tunnel (full tunnel). Only the tunnel subnet goes through it otherwise. If the server goes down while this is on, this machine loses its internet too.</span>
-        </label>
-      </div>
-      <div style="margin-top:12px;">
-        <div class="t-label">Or join over Cloud — no typing</div>
-        <div class="t-sub">Send a join request through a saved Cloud server. The server operator approves it there, and this machine connects by itself.</div>
-        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <select id="wgJoinServer" style="flex:1; min-width:160px;"></select>
-          <input type="text" id="wgJoinDeviceName" placeholder="This device's name, e.g. laptop" autocomplete="off" style="flex:1; min-width:140px;">
-          <button class="btn btn-ghost btn-sm" type="button" id="wgJoinSendBtn">Send join request</button>
-        </div>
-        <div class="t-sub" id="wgJoinStatus" style="margin-top:6px;"></div>
-        <button class="btn btn-ghost btn-sm" type="button" id="wgJoinCancelBtn" style="display:none; margin-top:6px;">Cancel request</button>
-      </div>
-    </div>
     <div class="card" id="wgNatCard">
       <div class="vpn-sec-label">Site-to-site — link two networks</div>
       <div class="t-sub wg-nat-intro">Add each device: name, real IP, alias IP.</div>

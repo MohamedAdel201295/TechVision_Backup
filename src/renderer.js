@@ -2336,15 +2336,7 @@
   var wgStatusCache = null;
   var wgBusy = false;
   var lastWgPeersSig = null;
-  // Cloud join (third key-exchange option): a request this machine
-  // sent is { requestId, serverId, deviceName } — the private key
-  // stays in main, so a restart loses the pending request and the
-  // user simply sends a fresh one. The poll timer runs every 5s
-  // while a request is outstanding and stops on any terminal state.
-  var wgJoinPending = null;
-  var wgJoinPollTimer = null;
   var lastWgJoinReqSig = null;
-  var lastWgJoinServersSig = null;
 
   function wgMissing() { toast('WireGuard', 'The WireGuard bridge is not available in this build.', 'error'); }
 
@@ -2365,10 +2357,10 @@
     try { st = await api.wgGetStatus(); } catch (e) { st = { installed: false, serverRunning: false, clientRunning: false, error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
     wgStatusCache = st || {};
     renderWgNat(st || {});
-    var dot = $('wgStatusDot'); if (dot) dot.className = 'vpn-dot' + ((st.serverRunning || st.clientRunning) ? ' on' : '');
+    var dot = $('wgStatusDot'); if (dot) dot.className = 'vpn-dot' + (st.serverRunning ? ' on' : '');
     var txt = $('wgStatusText'), sub = $('wgStatusSub');
     var ni = $('wgNotInstalled');
-    var sc = $('wgServerCard'), cc = $('wgClientCard');
+    var sc = $('wgServerCard');
     var tl = $('wgTransportLine');
     if (!st.installed) {
       if (txt) txt.textContent = 'Not installed';
@@ -2376,37 +2368,28 @@
       if (tl) tl.style.display = 'none';
       if (ni) ni.style.display = '';
       if (sc) sc.style.display = 'none';
-      if (cc) cc.style.display = 'none';
       // The early return below used to skip the button reset, so a
       // failed Start left the button stuck on "Working…" — reset
-      // both buttons here too.
+      // the button here too.
       var sb0 = $('wgServerBtn'); if (sb0) { sb0.textContent = 'Start server'; sb0.classList.add('btn-primary'); }
-      var cb0 = $('wgClientBtn'); if (cb0) { cb0.textContent = 'Connect'; cb0.classList.add('btn-primary'); }
       renderWgPeers([]);
       return;
     }
     if (ni) ni.style.display = 'none';
     if (sc) sc.style.display = '';
-    if (cc) cc.style.display = '';
     if (tl) {
       if (st.transport === 'amneziawg') { tl.style.display = ''; tl.textContent = st.obfuscated ? 'Transport: AmneziaWG — traffic is obfuscated, so it doesn\u2019t look like WireGuard on the network.' : 'Transport: AmneziaWG.'; }
       else { tl.style.display = ''; tl.textContent = 'Transport: stock WireGuard (no obfuscation).'; }
     }
-    if (st.serverRunning && st.clientRunning) {
-      if (txt) txt.textContent = 'Server running · Client connected';
-      if (sub) sub.textContent = 'This machine is a hub and a client at the same time.';
-    } else if (st.serverRunning) {
+    if (st.serverRunning) {
       if (txt) txt.textContent = 'Server running';
       if (sub) sub.textContent = 'This machine is the AmneziaWG hub — devices connect to it.';
-    } else if (st.clientRunning) {
-      if (txt) txt.textContent = 'Connected';
-      if (sub) sub.textContent = 'This machine is connected to an AmneziaWG server.';
     } else if (st.error) {
       if (txt) txt.textContent = 'Error';
       if (sub) sub.textContent = st.error;
     } else {
       if (txt) txt.textContent = 'Off';
-      if (sub) sub.textContent = 'The server is stopped and the client is disconnected.';
+      if (sub) sub.textContent = 'The server is stopped.';
     }
     var sb = $('wgServerBtn');
     if (sb) { sb.textContent = st.serverRunning ? 'Stop server' : 'Start server'; sb.classList.toggle('btn-primary', !st.serverRunning); }
@@ -2421,36 +2404,8 @@
     if (ph) ph.textContent = 'On your router, forward UDP ' + ((st.server && st.server.listenPort) || 51820) + ' to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.';
     var ep = $('wgEndpoint');
     if (ep && document.activeElement !== ep) ep.value = (st.server && st.server.endpoint) || '';
-    var cs = $('wgClientStatus');
-    if (cs) {
-      if (st.clientRunning) {
-        var c = st.client || {};
-        cs.textContent = 'Connected to ' + (c.endpoint || 'the server') + (c.tunnelIp ? (' as ' + c.tunnelIp) : '') + ' — last handshake ' + wgHandshakeText(c.latestHandshake) + ', ' + formatBytes(c.transferRx || 0) + ' down / ' + formatBytes(c.transferTx || 0) + ' up.';
-      } else if (st.client && st.client.serverPublicKey) cs.textContent = 'Not connected. A client config is saved — press Connect to use it again.';
-      else cs.textContent = 'Not connected.';
-    }
-    // This machine's own public key — the server operator pastes it
-    // into the add-peer form. It lives in the saved client config,
-    // so it shows even while disconnected.
-    var ck = $('wgClientKey');
-    if (ck) ck.textContent = (st.client && st.client.publicKey) || '—';
-    var ckh = $('wgClientKeyHint');
-    if (ckh) ckh.textContent = (st.client && st.client.publicKey) ? 'This key is this device\u2019s identity — the server operator pastes it into the add-peer form, with this machine\u2019s real IP or DDNS and port.' : (st.installed ? 'Your public key will show here.' : 'Install AmneziaWG and your public key will show here.');
-    var cb = $('wgClientBtn');
-    if (cb) { cb.textContent = st.clientRunning ? 'Disconnect' : 'Connect'; cb.classList.toggle('btn-primary', !st.clientRunning); }
-    // Prefill the manual client fields from the saved client config —
-    // only into empty fields, so typing is never clobbered.
-    if (st.client) {
-      var ck = $('wgClientServerKey'); if (ck && !ck.value && st.client.serverPublicKey) ck.value = st.client.serverPublicKey;
-      var ce = $('wgClientEndpoint'); if (ce && !ce.value && st.client.endpoint) ce.value = st.client.endpoint;
-      var ci = $('wgClientTunnelIp'); if (ci && !ci.value && st.client.tunnelIp) ci.value = st.client.tunnelIp;
-    }
     renderWgPeers(st.peers || []);
     loadWgJoinRequests();
-    try {
-      var ccfg = await api.cloudGetConfig();
-      renderWgJoinServers((ccfg && ccfg.clients) || []);
-    } catch (e) { /* the join server list stays as it is */ }
   }
 
   /* Gateway NAT service status (site-to-site): the card lives in
@@ -2761,86 +2716,6 @@
       row.appendChild(no);
       list.appendChild(row);
     });
-  }
-
-  /* Cloud join — client side: the saved Cloud servers this machine
-     can send a join request through. Options rebuild only when the
-     saved list changes, so the user's pick is never clobbered. */
-  function renderWgJoinServers(clients) {
-    var sel = $('wgJoinServer'); if (!sel) return;
-    var sig = JSON.stringify((clients || []).map(function (c) { return [c.id, c.name, c.host, c.port, c.user]; }));
-    if (sig === lastWgJoinServersSig) return;
-    lastWgJoinServersSig = sig;
-    var prev = sel.value;
-    sel.innerHTML = '';
-    if (!clients || !clients.length) {
-      var o = document.createElement('option'); o.value = ''; o.textContent = 'No saved Cloud server — add one in the Cloud module first';
-      sel.appendChild(o);
-      return;
-    }
-    clients.forEach(function (c) {
-      var opt = document.createElement('option');
-      opt.value = c.id;
-      opt.textContent = (c.name || c.host) + ' — ' + (c.user || '') + ' @ ' + c.host + ':' + c.port;
-      sel.appendChild(opt);
-    });
-    if (prev) sel.value = prev;
-  }
-
-  function wgJoinSetStatus(text) {
-    var s = $('wgJoinStatus'); if (s) s.textContent = text || '';
-    var cancel = $('wgJoinCancelBtn'); if (cancel) cancel.style.display = wgJoinPending ? '' : 'none';
-    var send = $('wgJoinSendBtn'); if (send) send.disabled = !!wgJoinPending;
-  }
-
-  function wgJoinStopPolling() {
-    if (wgJoinPollTimer) { clearInterval(wgJoinPollTimer); wgJoinPollTimer = null; }
-  }
-
-  function wgJoinClearPending() {
-    wgJoinStopPolling();
-    wgJoinPending = null;
-    wgJoinSetStatus('');
-  }
-
-  // One poll of the outstanding join request. Approved hands the
-  // config straight to wg-connect (the same path as a pasted config);
-  // rejected / expired / server-restarted are terminal — the timer
-  // stops and the user sends a fresh request.
-  async function wgJoinPollOnce() {
-    if (!wgJoinPending || !api || typeof api.wgCloudJoinPoll !== 'function') return;
-    var r;
-    try { r = await api.wgCloudJoinPoll({ requestId: wgJoinPending.requestId }); }
-    catch (e) { r = { success: false, error: e && e.message ? e.message : 'Could not check the join request.' }; }
-    if (!wgJoinPending) return;
-    if (r && r.success && r.status === 'approved') {
-      wgJoinClearPending();
-      try {
-        var c = await api.wgConnect({ confText: r.confText });
-        if (c && c.success) toast('WireGuard', 'Join approved — connected as ' + (c.tunnelIp || r.tunnelIp || 'a client') + '.', 'success');
-        else toast('Connect failed', (c && c.error) || 'The join was approved, but connecting failed.', 'error');
-      } catch (e) { toast('Connect failed', e && e.message ? e.message : 'The join was approved, but connecting failed.', 'error'); }
-      await loadWireGuard();
-      return;
-    }
-    if (r && r.success && r.status === 'pending') {
-      wgJoinSetStatus('Waiting for approval on the server — ' + wgJoinPending.deviceName + '…');
-      return;
-    }
-    if (r && r.success && r.status === 'rejected') {
-      wgJoinClearPending();
-      toast('Join rejected', 'The server turned down the join request.', 'error');
-      await loadWireGuard();
-      return;
-    }
-    wgJoinClearPending();
-    toast('Join request ended', (r && r.error) || 'The join request is no longer waiting.', 'error');
-    await loadWireGuard();
-  }
-
-  function wgJoinStartPolling() {
-    wgJoinStopPolling();
-    wgJoinPollTimer = setInterval(wgJoinPollOnce, 5000);
   }
 
   /* ---------- wiring ---------- */
@@ -3575,115 +3450,6 @@
     } catch (e) { toast('Add failed', e && e.message ? e.message : 'Could not add the peer.', 'error'); }
     await loadWireGuard();
   });
-  var wgCk = $('wgClientKeyCopyBtn');
-  if (wgCk) wgCk.addEventListener('click', async function () {
-    var ck = $('wgClientKey');
-    if (!ck || !ck.textContent || ck.textContent === '—') { toast('Nothing to copy', 'Your public key will show here once AmneziaWG is installed.', 'error'); return; }
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(ck.textContent);
-      else { var ta = document.createElement('textarea'); ta.value = ck.textContent; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); }
-      toast('Copied', 'Your public key is on the clipboard.', 'success');
-    } catch (e) { toast('Copy failed', 'Select the key and copy it by hand.', 'error'); }
-  });
-  var wgCb = $('wgClientBtn');
-  if (wgCb) wgCb.addEventListener('click', async function () {
-    if (!api || typeof api.wgConnect !== 'function' || typeof api.wgDisconnect !== 'function') return wgMissing();
-    if (wgBusy) return;
-    wgBusy = true; wgCb.disabled = true; wgCb.textContent = 'Working…';
-    try {
-      if (wgStatusCache && wgStatusCache.clientRunning) {
-        var d = await api.wgDisconnect();
-        if (d && d.success) toast('WireGuard', 'Disconnected.', 'success');
-        else toast('WireGuard error', (d && d.error) || 'Could not disconnect.', 'error');
-      } else {
-        var pasted = (($('wgImportText') || {}).value || '').trim();
-        var r;
-        if (pasted) {
-          r = await api.wgConnect({ confText: pasted });
-          if (r && r.success) { var it = $('wgImportText'); if (it) it.value = ''; }
-        } else if ((($('wgClientServerKey') || {}).value || '').trim() && (($('wgClientEndpoint') || {}).value || '').trim()) {
-          r = await api.wgConnect({
-            serverPublicKey: $('wgClientServerKey').value,
-            endpoint: $('wgClientEndpoint').value,
-            tunnelIp: $('wgClientTunnelIp').value,
-            fullTunnel: $('wgFullTunnel') ? $('wgFullTunnel').checked : false,
-          });
-        } else if (wgStatusCache && wgStatusCache.client) {
-          r = await api.wgConnect({ reconnect: true });
-        } else {
-          toast('Nothing to connect with', 'Paste a config, or type the server details first.', 'error');
-          wgBusy = false; wgCb.disabled = false; await loadWireGuard();
-          return;
-        }
-        if (r && r.success) toast('WireGuard', 'Connected as ' + (r.tunnelIp || 'a client') + '.', 'success');
-        else toast('WireGuard error', (r && r.error) || 'Could not connect.', 'error');
-      }
-    } catch (e) { toast('WireGuard error', e && e.message ? e.message : 'Could not change the connection.', 'error'); }
-    finally { wgBusy = false; wgCb.disabled = false; await loadWireGuard(); }
-  });
-  var wgIm = $('wgImportBtn');
-  if (wgIm) wgIm.addEventListener('click', async function () {
-    if (!api || typeof api.showOpenDialog !== 'function' || typeof api.readFile !== 'function' || typeof api.wgImportConf !== 'function') return wgMissing();
-    try {
-      var pick = await api.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'WireGuard config', extensions: ['conf'] }] });
-      if (!pick || pick.canceled || !pick.filePaths || !pick.filePaths.length) return;
-      var text = await api.readFile(pick.filePaths[0]);
-      var r = await api.wgImportConf({ confText: text });
-      if (r && r.success) {
-        var it = $('wgImportText'); if (it) it.value = text;
-        var s = r.summary || {};
-        toast('Config imported', 'Server ' + (s.endpoint || 'unknown') + ', tunnel address ' + (s.address || 'unknown') + ' — press Connect.', 'success');
-      } else toast('Import failed', (r && r.error) || 'Could not read that config file.', 'error');
-    } catch (e) { toast('Import failed', e && e.message ? e.message : 'Could not read that config file.', 'error'); }
-  });
-  var wgIt = $('wgImportTextBtn');
-  if (wgIt) wgIt.addEventListener('click', async function () {
-    if (!api || typeof api.wgImportConf !== 'function') return wgMissing();
-    var text = (($('wgImportText') || {}).value || '').trim();
-    if (!text) { toast('Nothing to import', 'Paste a config first.', 'error'); return; }
-    try {
-      var r = await api.wgImportConf({ confText: text });
-      if (r && r.success) {
-        var s = r.summary || {};
-        toast('Config imported', 'Server ' + (s.endpoint || 'unknown') + ', tunnel address ' + (s.address || 'unknown') + ' — press Connect.', 'success');
-      } else toast('Import failed', (r && r.error) || 'Could not read that config file.', 'error');
-    } catch (e) { toast('Import failed', e && e.message ? e.message : 'Could not read that config file.', 'error'); }
-  });
-  // Cloud join — client side: send a join request through a saved
-  // Cloud server, then poll every 5s until the server approves (the
-  // client connects by itself) or the request ends. One outstanding
-  // request at a time; the Send button is disabled while waiting.
-  var wgJs = $('wgJoinSendBtn');
-  if (wgJs) wgJs.addEventListener('click', async function () {
-    if (!api || typeof api.wgCloudJoinRequest !== 'function') return wgMissing();
-    if (wgJoinPending) return;
-    var serverId = ($('wgJoinServer') || {}).value || '';
-    var deviceName = (($('wgJoinDeviceName') || {}).value || '').trim();
-    if (!serverId) { toast('No Cloud server', 'Add a Cloud server in the Cloud module first.', 'error'); return; }
-    if (!deviceName) { toast('Device name needed', 'Give this device a name first.', 'error'); return; }
-    wgJs.disabled = true;
-    try {
-      var r = await api.wgCloudJoinRequest({ serverId: serverId, deviceName: deviceName });
-      if (r && r.success) {
-        wgJoinPending = { requestId: r.requestId, serverId: serverId, deviceName: r.deviceName };
-        wgJoinSetStatus('Waiting for approval on the server — ' + r.deviceName + '…');
-        wgJoinStartPolling();
-        toast('Join request sent', 'Waiting for approval on the server.', 'success');
-      } else toast('Join request failed', (r && r.error) || 'Could not send the join request.', 'error');
-    } catch (e) { toast('Join request failed', e && e.message ? e.message : 'Could not send the join request.', 'error'); }
-    finally { wgJs.disabled = !!wgJoinPending; }
-  });
-  var wgJc = $('wgJoinCancelBtn');
-  if (wgJc) wgJc.addEventListener('click', async function () {
-    if (!wgJoinPending) return;
-    var reqId = wgJoinPending.requestId;
-    wgJoinClearPending();
-    try {
-      if (api && typeof api.wgCloudJoinCancel === 'function') await api.wgCloudJoinCancel({ requestId: reqId });
-    } catch (e) { /* the local request is already dropped */ }
-    toast('Join request cancelled', 'No request is waiting any more.', 'success');
-  });
-
     document.querySelectorAll('[data-module-enter]').forEach(function (card) {
       card.addEventListener('click', function () { setModule(card.getAttribute('data-module-enter')); });
     });
