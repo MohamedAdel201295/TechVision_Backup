@@ -168,6 +168,38 @@ function wgPeersWithLive(livePeers) {
   });
 }
 // The config as the renderer may see it: private keys stripped.
+/* This machine's WireGuard identity: one client keypair per install,
+   generated the first time the WireGuard status is read (the module
+   view opening is the earliest moment the transport binary is known
+   to exist) and kept forever after. The public key is what the
+   server operator pastes into the add-peer form — so it must exist
+   BEFORE this device ever connects, and connect/join must reuse it
+   instead of minting a fresh keypair (a fresh key at connect time
+   would not match the peer the operator already added). The private
+   key never leaves main. Returns { success, privateKey, publicKey }
+   or { success: false, error } when the transport cannot generate
+   one (not installed yet). A stored private key is never replaced. */
+async function ensureWgClientKeypair() {
+  try {
+    const c = getWgConfig();
+    const cl = c.client;
+    if (cl && wireguard.isWgKey(cl.privateKey)) {
+      if (wireguard.isWgKey(cl.publicKey)) return { success: true, privateKey: cl.privateKey, publicKey: cl.publicKey };
+      const p = await wireguard.pubkey(cl.privateKey);
+      if (p.success && wireguard.isWgKey(p.key)) {
+        cl.publicKey = p.key;
+        saveWgConfig();
+        return { success: true, privateKey: cl.privateKey, publicKey: cl.publicKey };
+      }
+      return { success: false, error: 'Could not read this device\u2019s public key — is AmneziaWG installed?' };
+    }
+    const kp = await wireguard.genkeypair();
+    if (!kp.success) return { success: false, error: kp.error || 'Could not generate a WireGuard key.' };
+    c.client = Object.assign({}, cl || {}, { privateKey: kp.privateKey, publicKey: kp.publicKey, createdAt: (cl && cl.createdAt) || new Date().toISOString() });
+    saveWgConfig();
+    return { success: true, privateKey: kp.privateKey, publicKey: kp.publicKey };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not generate a WireGuard key.' }; }
+}
 function wgPublicConfig() {
   const c = getWgConfig();
   const server = Object.assign({}, c.server);
@@ -2357,6 +2389,12 @@ ipcMain.handle('wg-get-status', async () => {
   try {
     const st = await wireguard.getStatus();
     const c = getWgConfig();
+    // Every installed device has a public key: mint the client
+    // identity on first read so the client card can show it before
+    // this device ever connects. A failure here (transport not
+    // installed yet) is not a status failure — the key just stays
+    // blank until the transport exists.
+    try { await ensureWgClientKeypair(); } catch (e) {}
     const liveServerPeers = (st.server && Array.isArray(st.server.peers)) ? st.server.peers : [];
     const liveClientPeer = (st.client && Array.isArray(st.client.peers) && st.client.peers[0]) || null;
     const pub = wgPublicConfig();
@@ -2698,7 +2736,10 @@ ipcMain.handle('wg-connect', async (event, opts) => {
       if (!o.endpoint || !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(String(o.endpoint).trim())) return { success: false, error: 'Endpoint must be host:port, e.g. myhome.ddns.net:51820.' };
       const tunnelIp = wireguard.tunnelIpOf(o.tunnelIp) || '';
       if (!tunnelIp) return { success: false, error: 'Type the tunnel address the server operator gave you when they added this device (e.g. 10.0.0.2).' };
-      const kp = await wireguard.genkeypair();
+      // Reuse this device's identity keypair — the public key the
+      // operator already added as a peer. Minting a fresh keypair
+      // here would not match that peer and the handshake would fail.
+      const kp = await ensureWgClientKeypair();
       if (!kp.success) return { success: false, error: kp.error };
       const allowedIPs = o.fullTunnel ? '0.0.0.0/0, ::/0' : wireguard.TUNNEL_SUBNET;
       // No obfuscation lines here on purpose: this is a foreign
@@ -2803,7 +2844,12 @@ ipcMain.handle('wg-cloudjoin-request', async (event, opts) => {
     if (!serverId) return { success: false, error: 'Pick a saved Cloud server first.' };
     const sess = await wgEnsureCloudSession(serverId);
     if (!sess.success) return sess;
-    const r = await cloudJoin.submitJoinRequest(sess.conn, deviceName, {});
+    // The join request carries THIS device's identity key — the same
+    // public key the client card shows — not a fresh keypair (the
+    // server would approve a key nobody can see on this device).
+    const kp = await ensureWgClientKeypair();
+    if (!kp.success) return { success: false, error: kp.error };
+    const r = await cloudJoin.submitJoinRequest(sess.conn, deviceName, { keygen: async () => kp });
     if (!r.success) return r;
     // The private key stays in main memory only — the renderer gets
     // the request id, never the key.

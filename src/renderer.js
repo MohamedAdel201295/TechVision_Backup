@@ -2425,7 +2425,7 @@
       if (st.clientRunning) {
         var c = st.client || {};
         cs.textContent = 'Connected to ' + (c.endpoint || 'the server') + (c.tunnelIp ? (' as ' + c.tunnelIp) : '') + ' — last handshake ' + wgHandshakeText(c.latestHandshake) + ', ' + formatBytes(c.transferRx || 0) + ' down / ' + formatBytes(c.transferTx || 0) + ' up.';
-      } else if (st.client) cs.textContent = 'Not connected. A client config is saved — press Connect to use it again.';
+      } else if (st.client && st.client.serverPublicKey) cs.textContent = 'Not connected. A client config is saved — press Connect to use it again.';
       else cs.textContent = 'Not connected.';
     }
     // This machine's own public key — the server operator pastes it
@@ -2434,7 +2434,7 @@
     var ck = $('wgClientKey');
     if (ck) ck.textContent = (st.client && st.client.publicKey) || '—';
     var ckh = $('wgClientKeyHint');
-    if (ckh) ckh.textContent = (st.client && st.client.publicKey) ? 'The server operator pastes this key into the add-peer form, with this machine\u2019s real IP or DDNS and port.' : 'Connect once and your public key will show here.';
+    if (ckh) ckh.textContent = (st.client && st.client.publicKey) ? 'This key is this device\u2019s identity — the server operator pastes it into the add-peer form, with this machine\u2019s real IP or DDNS and port.' : (st.installed ? 'Your public key will show here.' : 'Install AmneziaWG and your public key will show here.');
     var cb = $('wgClientBtn');
     if (cb) { cb.textContent = st.clientRunning ? 'Disconnect' : 'Connect'; cb.classList.toggle('btn-primary', !st.clientRunning); }
     // Prefill the manual client fields from the saved client config —
@@ -3559,7 +3559,7 @@
   var wgCk = $('wgClientKeyCopyBtn');
   if (wgCk) wgCk.addEventListener('click', async function () {
     var ck = $('wgClientKey');
-    if (!ck || !ck.textContent || ck.textContent === '—') { toast('Nothing to copy', 'Connect once and your public key will show here.', 'error'); return; }
+    if (!ck || !ck.textContent || ck.textContent === '—') { toast('Nothing to copy', 'Your public key will show here once AmneziaWG is installed.', 'error'); return; }
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(ck.textContent);
       else { var ta = document.createElement('textarea'); ta.value = ck.textContent; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); }
