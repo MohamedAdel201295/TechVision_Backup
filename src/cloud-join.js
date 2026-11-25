@@ -331,7 +331,7 @@ async function approveJoinRequest(store, id, deps) {
   let peers = [];
   try { peers = d.getPeers() || []; } catch (e) { return { success: false, error: 'Could not read the peer list.' }; }
   // Idempotent by public key: a peer with this key already exists
-  // (approved before, or added by hand / by QR invite) — reuse its
+  // (approved before, or added by hand) — reuse its
   // tunnel IP instead of allocating a second one.
   const existingPeer = peers.find((p) => p && p.publicKey === entry.publicKey);
   let tunnelIp = existingPeer ? wireguard.tunnelIpOf(existingPeer.tunnelIp || existingPeer.allowedIPs) : null;

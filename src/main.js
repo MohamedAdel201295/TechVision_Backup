@@ -157,16 +157,17 @@ function wgPeersWithLive(livePeers) {
   return (getWgConfig().server.peers || []).map((p) => {
     const l = live[p.publicKey] || null;
     return Object.assign({}, p, l ? {
-      endpoint: l.endpoint,
+      // The live endpoint is where the peer was last seen from — it
+      // is reported separately so it never overwrites the endpoint
+      // the operator typed (the address the server dials).
+      liveEndpoint: l.endpoint,
       latestHandshake: l.latestHandshake ? l.latestHandshake.getTime() : null,
       transferRx: l.transferRx, transferTx: l.transferTx,
       online: !!l.latestHandshake,
     } : { online: false, latestHandshake: null, transferRx: 0, transferTx: 0 });
   });
 }
-// The config as the renderer may see it: private keys stripped. The
-// only exception is an invite config text, which is built and returned
-// by wg-generate-invite itself (the invite IS that peer's key).
+// The config as the renderer may see it: private keys stripped.
 function wgPublicConfig() {
   const c = getWgConfig();
   const server = Object.assign({}, c.server);
@@ -175,7 +176,7 @@ function wgPublicConfig() {
   if (client) { delete client.privateKey; delete client.obfuscation; }
   return { server, client };
 }
-/* The obfuscation set every server/invite config carries, as the
+/* The obfuscation set every server/client config carries, as the
    [Interface] lines buildServerConf/buildClientConf take. Generated
    ONCE (generateObfuscationParams) and stored in wireguard.json
    under `obfuscation` — never regenerated silently, or every
@@ -195,7 +196,7 @@ function wgObfuscationLines() {
   return wireguard.obfuscationParamsToLines(c.obfuscation);
 }
 /* Lines for a stored client config: the set that was in effect when
-   the client connected — the server's own set for our invites, the
+   the client connected — the server's own set for our own clients, the
    imported set for a foreign .conf. A hand-typed foreign connect
    has no set: injecting ours would break its handshake, so it gets
    none and the user must import the server's .conf instead. */
@@ -2531,7 +2532,7 @@ ipcMain.handle('wg-nat-import', async () => {
     const peer = (c.server.peers || []).find((p) => p.tunnelIp === cfg.remoteTunnelIp);
     const serverIp = wgTunnelServerIp();
     const isClientServer = !peer && !!c.client && c.client.serverPublicKey && serverIp && serverIp === cfg.remoteTunnelIp;
-    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + cfg.remoteTunnelIp + ') is not a WireGuard peer here — add it first (invite, Cloud join, or manual), then import.' };
+    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + cfg.remoteTunnelIp + ') is not a WireGuard peer here — add it first (with the add-peer form, or over Cloud join), then import.' };
     const tunnelSubnet = wireguard.tunnelSubnetFor(c.server.address);
     const clash = natGateway.tunnelSubnetClashes(cfg, tunnelSubnet);
     if (clash.length > 0) return { success: false, error: clash[0], errors: clash };
@@ -2554,22 +2555,32 @@ ipcMain.handle('wg-nat-import', async () => {
 // inside this function: the join approve computes the same next free
 // address from the same peer list, and between the two there is no
 // await, so the two agree.
-async function wgAddPeerInternal(name, publicKey) {
+async function wgAddPeerInternal(name, publicKey, endpoint) {
   if (!name) return { success: false, error: 'Give the device a name first.' };
   if (!wireguard.isWgKey(publicKey)) return { success: false, error: 'That is not a valid WireGuard public key (44 characters, ending in =).' };
+  // The endpoint is optional here — the Cloud-join approval path
+  // has none (the client initiates, so the server needs no address
+  // for it). The manual form requires it (see the wg-add-peer
+  // handler below): without an endpoint the server can never start
+  // a handshake with this peer.
+  let ep = null;
+  if (endpoint !== undefined && endpoint !== null && String(endpoint).trim() !== '') {
+    ep = String(endpoint).trim();
+    if (!wireguard.isValidEndpoint(ep)) return { success: false, error: 'Endpoint must be host:port, e.g. 192.168.1.49:51820 or myhome.ddns.net:51820.' };
+  }
   const c = getWgConfig();
   if ((c.server.peers || []).some((p) => p.publicKey === publicKey)) return { success: false, error: 'This device is already a peer.' };
   const subnet = wireguard.tunnelSubnetFor(c.server.address);
   const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp), subnet);
   if (!tunnelIp) { const b = subnet.replace(/\.0\/24$/, ''); return { success: false, error: 'No free tunnel address left (' + b + '.2 – ' + b + '.254 are all taken).' }; }
-  const peer = { name, publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
+  const peer = { name, publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', endpoint: ep, createdAt: new Date().toISOString() };
   c.server.peers.push(peer);
   saveWgConfig();
   let liveApplied = false, liveError = null;
   try {
     const st = await wireguard.getStatus();
     if (st.serverRunning) {
-      const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, publicKey, peer.allowedIPs);
+      const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, publicKey, peer.allowedIPs, ep);
       liveApplied = !!r.success;
       if (!r.success) liveError = r.error;
     }
@@ -2578,9 +2589,20 @@ async function wgAddPeerInternal(name, publicKey) {
 }
 ipcMain.handle('wg-add-peer', async (event, opts) => {
   try {
-    const name = String((opts && opts.name) || '').trim().replace(/[\r\n]/g, ' ');
+    // The one way to add a peer: exactly three fields — the public
+    // key, the real IP or DDNS hostname, and the port. The device
+    // name is just a label, so the endpoint host is the display
+    // name (the form has no separate name field).
     const publicKey = String((opts && opts.publicKey) || '').trim();
-    return await wgAddPeerInternal(name, publicKey);
+    const host = String((opts && opts.endpointHost) || '').trim();
+    const portRaw = String((opts && opts.endpointPort) || '').trim();
+    if (!host) return { success: false, error: 'Type the real IP or DDNS hostname of this device.' };
+    if (!wireguard.isValidEndpointHost(host)) return { success: false, error: 'That is not a valid IP address or hostname.' };
+    if (!portRaw) return { success: false, error: 'Type the port of this device (usually 51820).' };
+    if (!/^\d+$/.test(portRaw)) return { success: false, error: 'Port must be a number from 1 to 65535.' };
+    const port = Number(portRaw);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return { success: false, error: 'Port must be a number from 1 to 65535.' };
+    return await wgAddPeerInternal(host, publicKey, host + ':' + port);
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not add the peer.' }; }
 });
 ipcMain.handle('wg-remove-peer', async (event, opts) => {
@@ -2603,49 +2625,6 @@ ipcMain.handle('wg-remove-peer', async (event, opts) => {
     } catch (e) { liveError = e && e.message ? e.message : String(e); }
     return { success: true, liveApplied, liveError };
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not remove the peer.' }; }
-});
-// Generate a client invite: the server creates the client's keypair
-// and config, so the server already holds that client's public key —
-// nothing has to travel back. The peer is added to the server config
-// (and applied live when the server is running) and the full .conf
-// comes back for the QR code, the copy box and the export file. The
-// QR is rendered with the `qrcode` package when it is installed;
-// without it the invite still works as text + file (qr: null).
-ipcMain.handle('wg-generate-invite', async (event, opts) => {
-  try {
-    const name = String((opts && opts.name) || '').trim().replace(/[\r\n]/g, ' ') || 'device';
-    const c = getWgConfig();
-    if (!c.server.privateKey || !wireguard.isWgKey(c.server.privateKey) || !wireguard.isWgKey(c.server.publicKey)) return { success: false, error: 'Start the server first — it needs a keypair before it can invite anyone.' };
-    if (!c.server.endpoint) {
-      try { const ip = await cloudServerMod.detectPublicIP(); if (ip) { c.server.endpoint = ip; saveWgConfig(); } } catch (e) {}
-    }
-    if (!c.server.endpoint) return { success: false, error: 'No public address for this server yet. Type a DDNS hostname in the Server panel, or check the internet connection.' };
-    const subnet = wireguard.tunnelSubnetFor(c.server.address);
-    const tunnelIp = wireguard.nextTunnelIp((c.server.peers || []).map((p) => p.tunnelIp), subnet);
-    if (!tunnelIp) { const b = subnet.replace(/\.0\/24$/, ''); return { success: false, error: 'No free tunnel address left (' + b + '.2 – ' + b + '.254 are all taken).' }; }
-    const kp = await wireguard.genkeypair();
-    if (!kp.success) return { success: false, error: kp.error };
-    const endpoint = wireguard.serverEndpoint(c.server.endpoint, c.server.listenPort);
-    const conf = wireguard.buildClientConf({ privateKey: kp.privateKey, address: tunnelIp + '/32', serverPublicKey: c.server.publicKey, endpoint, allowedIPs: wireguard.tunnelSubnetFor(c.server.address), extraInterfaceLines: wgObfuscationLines() });
-    const peer = { name, publicKey: kp.publicKey, tunnelIp, allowedIPs: tunnelIp + '/32', createdAt: new Date().toISOString() };
-    c.server.peers.push(peer);
-    saveWgConfig();
-    let liveApplied = false, liveError = null;
-    try {
-      const st = await wireguard.getStatus();
-      if (st.serverRunning) {
-        const r = await wireguard.setPeer(wireguard.SERVER_TUNNEL, peer.publicKey, peer.allowedIPs);
-        liveApplied = !!r.success;
-        if (!r.success) liveError = r.error;
-      }
-    } catch (e) { liveError = e && e.message ? e.message : String(e); }
-    let qr = null;
-    try {
-      const QRCode = require('qrcode');
-      qr = await QRCode.toDataURL(conf, { errorCorrectionLevel: 'M', margin: 1, width: 256 });
-    } catch (e) { qr = null; }
-    return { success: true, conf, qr, tunnelIp, name, publicKey: kp.publicKey, liveApplied, liveError };
-  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not generate an invite.' }; }
 });
 // Import a .conf file (or pasted text): parse it and show what it
 // holds. No side effects — wg-connect does the installing.
@@ -2674,12 +2653,13 @@ ipcMain.handle('wg-import-conf', async (event, opts) => {
   } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read that config file.' }; }
 });
 // Connect this machine as a client. Two forms:
-//  - { confText }: an imported .conf (invite, file, or paste) —
+//  - { confText }: an imported .conf (file, or paste) —
 //    installed as-is, metadata stored from the parse.
 //  - { serverPublicKey, endpoint, tunnelIp, fullTunnel }: typed by
 //    hand — the app generates this machine's keypair and builds the
-//    config. The tunnel address is the one the server assigned (it
-//    is in the invite); the app never invents one.
+//    config. The tunnel address is the one the server assigned (the
+//    server operator tells you when they add this device); the app
+//    never invents one.
 ipcMain.handle('wg-connect', async (event, opts) => {
   try {
     const o = opts || {};
@@ -2717,7 +2697,7 @@ ipcMain.handle('wg-connect', async (event, opts) => {
       if (!wireguard.isWgKey(o.serverPublicKey)) return { success: false, error: 'That is not a valid server public key.' };
       if (!o.endpoint || !/^[A-Za-z0-9.-]+:\d{1,5}$/.test(String(o.endpoint).trim())) return { success: false, error: 'Endpoint must be host:port, e.g. myhome.ddns.net:51820.' };
       const tunnelIp = wireguard.tunnelIpOf(o.tunnelIp) || '';
-      if (!tunnelIp) return { success: false, error: 'Type the tunnel address the server gave you (from the invite, e.g. 10.0.0.2).' };
+      if (!tunnelIp) return { success: false, error: 'Type the tunnel address the server operator gave you when they added this device (e.g. 10.0.0.2).' };
       const kp = await wireguard.genkeypair();
       if (!kp.success) return { success: false, error: kp.error };
       const allowedIPs = o.fullTunnel ? '0.0.0.0/0, ::/0' : wireguard.TUNNEL_SUBNET;
@@ -2847,9 +2827,9 @@ ipcMain.handle('wg-cloudjoin-poll', async (event, opts) => {
     }
     if (r.status === 'approved') {
       wgPendingJoins.delete(requestId);
-      // confText carries the private key (the same precedent as the
-      // invite conf the renderer already receives for QR/copy) — the
-      // renderer hands it straight to wg-connect, nothing else.
+      // confText carries the private key (it is this machine's own
+      // config text) — the renderer hands it straight to wg-connect,
+      // nothing else.
       return { success: true, status: 'approved', confText: r.confText, tunnelIp: r.tunnelIp, endpoint: r.endpoint };
     }
     return { success: true, status: r.status };
@@ -3059,7 +3039,7 @@ ipcMain.handle('wg-nat-start', async (event, opts) => {
     const peer = (c.server.peers || []).find((p) => p.tunnelIp === peerTunnelIp);
     const serverIp = wgTunnelServerIp();
     const isClientServer = !peer && !!c.client && c.client.serverPublicKey && serverIp && serverIp === peerTunnelIp;
-    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + peerTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then start the NAT service.' };
+    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + peerTunnelIp + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then start the NAT service.' };
     /* This gateway's own LAN, auto-detected (the tunnel subnet is
        excluded — the AmneziaWG adapter is not a LAN address). The
        form no longer asks for any of this: the user only adds
@@ -3182,7 +3162,7 @@ ipcMain.handle('wg-nat-save', async (event, input) => {
     const peer = (c.server.peers || []).find((p) => p.tunnelIp === peerTunnelIp);
     const serverIp = wgTunnelServerIp();
     const isClientServer = !peer && !!c.client && c.client.serverPublicKey && serverIp && serverIp === peerTunnelIp;
-    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + (peerTunnelIp || '—') + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save the NAT configuration.', errors: ['The remote gateway (' + (peerTunnelIp || '—') + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save the NAT configuration.'] };
+    if (!peer && !isClientServer) return { success: false, error: 'The remote gateway (' + (peerTunnelIp || '—') + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then save the NAT configuration.', errors: ['The remote gateway (' + (peerTunnelIp || '—') + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then save the NAT configuration.'] };
     const ownTunnelIp = await wgOwnTunnelIp();
     const tunnelSubnet = wireguard.tunnelSubnetFor(ownTunnelIp || c.server.address);
     const own = natGateway.detectLanAddress(undefined, [tunnelSubnet]);

@@ -546,43 +546,35 @@
         </div>
       </div>
       <div class="vpn-sec-label">Devices (peers)</div>
-      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Generate an invite below and a device will show up here.</p></div></div>
+      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p></div></div>
       <div style="margin-top:12px;">
         <div class="t-label">Join requests — devices asking to join over Cloud</div>
         <div class="t-sub">A device sends its public key through your Cloud connection. Approve it here and it gets its tunnel address back over the same channel — nothing to type.</div>
         <div id="wgJoinList" style="margin-top:6px;"><div class="t-sub">No join requests.</div></div>
       </div>
       <div style="margin-top:12px;">
-        <div class="t-label">Add a device by hand</div>
-        <div class="t-sub">The device shows its public key — paste it here (once).</div>
+        <div class="t-label">Add a device</div>
+        <div class="t-sub">One way: the device's public key, its real IP or DDNS hostname, and its port. The server reaches it at that address — the other side needs nothing.</div>
         <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <input type="text" id="wgPeerName" placeholder="Device name" autocomplete="off" style="flex:1; min-width:140px;">
           <input type="text" id="wgPeerKey" placeholder="Public key (44 characters, ends with =)" autocomplete="off" style="flex:2; min-width:220px;">
+          <input type="text" id="wgPeerHost" placeholder="Real IP or DDNS, e.g. 192.168.1.49" autocomplete="off" style="flex:1; min-width:160px;">
+          <input type="text" id="wgPeerPort" placeholder="Port" value="51820" inputmode="numeric" autocomplete="off" style="flex:0 0 90px; min-width:80px;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgPeerAddBtn">Add peer</button>
         </div>
       </div>
-      <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-        <button class="btn" type="button" id="wgInviteBtn">Generate invite</button>
-        <input type="text" id="wgInviteName" placeholder="New device name" autocomplete="off" style="flex:1; min-width:140px;">
-      </div>
-      <div id="wgInviteBox" style="display:none; margin-top:12px;">
-        <div class="t-label">Invite for <span id="wgInviteNameOut"></span> — tunnel address <span id="wgInviteIp"></span></div>
-        <div class="t-sub">Scan the QR code with the device's camera, or copy the config below. The server already holds this device's key — nothing has to travel back.</div>
-        <div style="display:flex; gap:16px; margin-top:8px; flex-wrap:wrap; align-items:flex-start;">
-          <img id="wgInviteQr" alt="Invite QR code" style="display:none; width:180px; height:180px; border:1px solid var(--border); border-radius:12px; background:#fff; padding:6px;">
-          <div style="flex:1; min-width:240px;">
-            <textarea id="wgInviteConf" readonly rows="8" class="wg-conf" style="width:100%;"></textarea>
-            <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-              <button class="btn btn-ghost btn-sm" type="button" id="wgInviteCopyBtn">Copy config</button>
-              <button class="btn btn-ghost btn-sm" type="button" id="wgInviteExportBtn">Export .conf file</button>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
     <div class="card" id="wgClientCard">
       <div class="vpn-sec-label">Client — connect to a server</div>
       <div class="t-sub" id="wgClientStatus">Not connected.</div>
+      <div style="margin-top:10px;">
+        <div class="t-label">Your public key — give this to the server operator</div>
+        <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
+          <div class="vpn-fact" id="wgClientKey" style="flex:1; min-width:220px; word-break:break-all;">—</div>
+          <button class="btn btn-ghost btn-sm" type="button" id="wgClientKeyCopyBtn">Copy</button>
+        </div>
+        <div class="t-sub" id="wgClientKeyHint">Connect once and your public key will show here.</div>
+      </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
         <button class="btn btn-primary" type="button" id="wgClientBtn">Connect</button>
         <button class="btn btn-ghost" type="button" id="wgImportBtn">Import .conf file</button>

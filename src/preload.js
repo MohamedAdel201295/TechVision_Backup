@@ -120,7 +120,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wgNatImport: () => ipcRenderer.invoke('wg-nat-import'),
   wgAddPeer: (opts) => ipcRenderer.invoke('wg-add-peer', opts),
   wgRemovePeer: (opts) => ipcRenderer.invoke('wg-remove-peer', opts),
-  wgGenerateInvite: (opts) => ipcRenderer.invoke('wg-generate-invite', opts),
   wgImportConf: (opts) => ipcRenderer.invoke('wg-import-conf', opts),
   wgConnect: (opts) => ipcRenderer.invoke('wg-connect', opts),
   wgDisconnect: () => ipcRenderer.invoke('wg-disconnect'),

@@ -2428,6 +2428,13 @@
       } else if (st.client) cs.textContent = 'Not connected. A client config is saved — press Connect to use it again.';
       else cs.textContent = 'Not connected.';
     }
+    // This machine's own public key — the server operator pastes it
+    // into the add-peer form. It lives in the saved client config,
+    // so it shows even while disconnected.
+    var ck = $('wgClientKey');
+    if (ck) ck.textContent = (st.client && st.client.publicKey) || '—';
+    var ckh = $('wgClientKeyHint');
+    if (ckh) ckh.textContent = (st.client && st.client.publicKey) ? 'The server operator pastes this key into the add-peer form, with this machine\u2019s real IP or DDNS and port.' : 'Connect once and your public key will show here.';
     var cb = $('wgClientBtn');
     if (cb) { cb.textContent = st.clientRunning ? 'Disconnect' : 'Connect'; cb.classList.toggle('btn-primary', !st.clientRunning); }
     // Prefill the manual client fields from the saved client config —
@@ -2633,7 +2640,7 @@
     var peers = (wgStatusCache && wgStatusCache.peers) || [];
     var ts = wgStatusCache && wgStatusCache.tunnelServer;
     var known = peers.some(function (p) { return p.tunnelIp === peerTunnelIp; }) || (ts && ts.tunnelIp === peerTunnelIp);
-    if (!known) return fail('The remote gateway (' + peerTunnelIp + ') is not a WireGuard peer yet — add it first (invite, Cloud join, or manual), then save.');
+    if (!known) return fail('The remote gateway (' + peerTunnelIp + ') is not a WireGuard peer yet — add it first (with the add-peer form, or over Cloud join), then save.');
     /* The form sends just the mode, the mapping rows and the
        picked peer: the subnets, the gateway LAN address and the
        far virtual address are auto-detected / auto-picked in main,
@@ -2656,14 +2663,14 @@
 
   function renderWgPeers(peers) {
     var list = $('wgPeerList'); if (!list) return;
-    var sig = JSON.stringify((peers || []).map(function (p) { return [p.name, p.tunnelIp, p.publicKey, p.online, p.latestHandshake, p.transferRx, p.transferTx]; }));
+    var sig = JSON.stringify((peers || []).map(function (p) { return [p.name, p.tunnelIp, p.publicKey, p.endpoint, p.online, p.latestHandshake, p.transferRx, p.transferTx]; }));
     if (sig === lastWgPeersSig) return;
     lastWgPeersSig = sig;
     list.innerHTML = '';
     if (!peers.length) {
       var empty = document.createElement('div');
       empty.className = 'empty-state';
-      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Generate an invite below and a device will show up here.</p>';
+      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p>';
       list.appendChild(empty);
       return;
     }
@@ -2674,7 +2681,7 @@
       var body = document.createElement('div'); body.className = 'vpn-peer-body';
       var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name + ' — ' + p.tunnelIp;
       var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
-      meta.textContent = (p.online ? ('online — last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected') + ' · ' + formatBytes(p.transferRx || 0) + ' down / ' + formatBytes(p.transferTx || 0) + ' up · ' + String(p.publicKey || '').slice(0, 12) + '…';
+      meta.textContent = (p.online ? ('online — last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected') + ' · ' + formatBytes(p.transferRx || 0) + ' down / ' + formatBytes(p.transferTx || 0) + ' up · ' + String(p.publicKey || '').slice(0, 12) + '…' + (p.endpoint ? (' · endpoint ' + p.endpoint) : '');
       body.appendChild(h); body.appendChild(meta);
       row.appendChild(d); row.appendChild(body);
       var rm = document.createElement('button'); rm.className = 'btn btn-ghost btn-sm'; rm.type = 'button'; rm.textContent = 'Remove';
@@ -2796,7 +2803,7 @@
   }
 
   // One poll of the outstanding join request. Approved hands the
-  // config straight to wg-connect (the same path as a pasted invite);
+  // config straight to wg-connect (the same path as a pasted config);
   // rejected / expired / server-restarted are terminal — the timer
   // stops and the user sends a fresh request.
   async function wgJoinPollOnce() {
@@ -3535,59 +3542,29 @@
   var wgPa = $('wgPeerAddBtn');
   if (wgPa) wgPa.addEventListener('click', async function () {
     if (!api || typeof api.wgAddPeer !== 'function') return wgMissing();
-    var name = ($('wgPeerName') || {}).value || '';
     var key = ($('wgPeerKey') || {}).value || '';
+    var host = ($('wgPeerHost') || {}).value || '';
+    var port = ($('wgPeerPort') || {}).value || '';
     try {
-      var r = await api.wgAddPeer({ name: name, publicKey: key });
+      var r = await api.wgAddPeer({ publicKey: key, endpointHost: host, endpointPort: port });
       if (r && r.success) {
         toast('Peer added', r.peer.name + ' got tunnel address ' + r.peer.tunnelIp + (r.liveApplied === false && r.liveError ? ' (saved, but the running tunnel did not pick it up: ' + r.liveError + ')' : '') + '.', 'success');
         var k = $('wgPeerKey'); if (k) k.value = '';
-        var n = $('wgPeerName'); if (n) n.value = '';
+        var h = $('wgPeerHost'); if (h) h.value = '';
+        var pt = $('wgPeerPort'); if (pt) pt.value = '51820';
       } else toast('Add failed', (r && r.error) || 'Could not add the peer.', 'error');
     } catch (e) { toast('Add failed', e && e.message ? e.message : 'Could not add the peer.', 'error'); }
     await loadWireGuard();
   });
-  var wgIb = $('wgInviteBtn');
-  if (wgIb) wgIb.addEventListener('click', async function () {
-    if (!api || typeof api.wgGenerateInvite !== 'function') return wgMissing();
-    if (wgBusy) return;
-    var name = (($('wgInviteName') || {}).value || '').trim() || 'device';
-    wgBusy = true; wgIb.disabled = true; wgIb.textContent = 'Generating…';
+  var wgCk = $('wgClientKeyCopyBtn');
+  if (wgCk) wgCk.addEventListener('click', async function () {
+    var ck = $('wgClientKey');
+    if (!ck || !ck.textContent || ck.textContent === '—') { toast('Nothing to copy', 'Connect once and your public key will show here.', 'error'); return; }
     try {
-      var r = await api.wgGenerateInvite({ name: name });
-      if (r && r.success) {
-        var box = $('wgInviteBox'); if (box) box.style.display = '';
-        var no = $('wgInviteNameOut'); if (no) no.textContent = r.name;
-        var ip = $('wgInviteIp'); if (ip) ip.textContent = r.tunnelIp;
-        var cf = $('wgInviteConf'); if (cf) cf.value = r.conf;
-        var qr = $('wgInviteQr');
-        if (qr) { if (r.qr) { qr.src = r.qr; qr.style.display = ''; } else qr.style.display = 'none'; }
-        var nin = $('wgInviteName'); if (nin) nin.value = '';
-        toast('Invite ready', r.name + ' got tunnel address ' + r.tunnelIp + '.', 'success');
-      } else toast('Invite failed', (r && r.error) || 'Could not generate an invite.', 'error');
-    } catch (e) { toast('Invite failed', e && e.message ? e.message : 'Could not generate an invite.', 'error'); }
-    finally { wgBusy = false; wgIb.disabled = false; wgIb.textContent = 'Generate invite'; await loadWireGuard(); }
-  });
-  var wgIc = $('wgInviteCopyBtn');
-  if (wgIc) wgIc.addEventListener('click', async function () {
-    var cf = $('wgInviteConf'); if (!cf || !cf.value) return;
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(cf.value);
-      else { cf.focus(); cf.select(); document.execCommand('copy'); }
-      toast('Copied', 'The invite config is on the clipboard.', 'success');
-    } catch (e) { toast('Copy failed', 'Select the text and copy it by hand.', 'error'); }
-  });
-  var wgIe = $('wgInviteExportBtn');
-  if (wgIe) wgIe.addEventListener('click', async function () {
-    var cf = $('wgInviteConf'); if (!cf || !cf.value) return;
-    if (!api || typeof api.showSaveDialog !== 'function' || typeof api.writeFile !== 'function') return wgMissing();
-    try {
-      var pick = await api.showSaveDialog({ defaultPath: (($('wgInviteNameOut') || {}).textContent || 'device') + '.conf', filters: [{ name: 'WireGuard config', extensions: ['conf'] }] });
-      if (pick && !pick.canceled && pick.filePath) {
-        await api.writeFile(pick.filePath, cf.value);
-        toast('Invite exported', 'Saved as ' + pick.filePath + '.', 'success');
-      }
-    } catch (e) { toast('Export failed', e && e.message ? e.message : 'Could not save the file.', 'error'); }
+      if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(ck.textContent);
+      else { var ta = document.createElement('textarea'); ta.value = ck.textContent; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); }
+      toast('Copied', 'Your public key is on the clipboard.', 'success');
+    } catch (e) { toast('Copy failed', 'Select the key and copy it by hand.', 'error'); }
   });
   var wgCb = $('wgClientBtn');
   if (wgCb) wgCb.addEventListener('click', async function () {

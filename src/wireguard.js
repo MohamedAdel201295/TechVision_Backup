@@ -287,7 +287,18 @@ function buildServerConf(opts) {
     const ips = p.allowedIPs || (p.tunnelIp ? tunnelIpOf(p.tunnelIp) + '/32' : null);
     if (!ips) throw new Error('Peer "' + (p.name || p.publicKey.slice(0, 8)) + '" has no tunnel address.');
     if (p.name) lines.push('# ' + String(p.name).replace(/[\r\n]/g, ' '));
-    lines.push('[Peer]', 'PublicKey = ' + p.publicKey, 'AllowedIPs = ' + ips);
+    lines.push('[Peer]', 'PublicKey = ' + p.publicKey);
+    // The peer's reachable address, when the operator typed one
+    // (the manual add-peer form always sets it; Cloud-join peers
+    // have none — the client initiates, so the server needs no
+    // endpoint for them). The server dials this address, so a peer
+    // without it can only ever be reached when IT connects first.
+    if (p.endpoint) {
+      const ep = String(p.endpoint).trim();
+      if (!isValidEndpoint(ep)) throw new Error('Peer "' + (p.name || p.publicKey.slice(0, 8)) + '" has an invalid endpoint (host:port).');
+      lines.push('Endpoint = ' + ep);
+    }
+    lines.push('AllowedIPs = ' + ips);
     lines.push.apply(lines, extraPeer);
     lines.push('');
   }
@@ -532,10 +543,16 @@ async function uninstallTunnelService(name) {
 /* ---------- live peer changes ---------- */
 /* Add or update one peer on a running tunnel without restarting it.
    `wg set` returns nothing on success. */
-async function setPeer(iface, publicKey, allowedIPs) {
+async function setPeer(iface, publicKey, allowedIPs, endpoint) {
   if (!isWgKey(publicKey)) return { success: false, error: 'Not a valid WireGuard public key.' };
   if (!allowedIPs || typeof allowedIPs !== 'string') return { success: false, error: 'No address for this peer.' };
-  const r = await runWg(['set', iface, 'peer', publicKey, 'allowed-ips', allowedIPs], 15000);
+  const args = ['set', iface, 'peer', publicKey];
+  if (endpoint) {
+    if (!isValidEndpoint(endpoint)) return { success: false, error: 'Not a valid endpoint (host:port).' };
+    args.push('endpoint', String(endpoint).trim());
+  }
+  args.push('allowed-ips', allowedIPs);
+  const r = await runWg(args, 15000);
   if (r.notFound) return { success: false, error: notInstalledMsg() };
   if (r.timedOut) return { success: false, error: 'WireGuard did not answer in time.' };
   if (r.code !== 0) return { success: false, error: (r.stderr || '').trim() || 'Could not update the peer.' };
@@ -589,7 +606,7 @@ function isValidIpv4(s) {
 
 /* The endpoint clients connect to: host + ':' + port, or '' when no
    host is saved yet. One place so a listen-port change flows to
-   every consumer (invite, Cloud-join approval) the same way. */
+   every consumer (manual add, Cloud-join approval) the same way. */
 function serverEndpoint(host, listenPort) {
   const h = String(host || '').trim();
   if (!h) return '';
@@ -601,6 +618,18 @@ function serverEndpoint(host, listenPort) {
 function isValidEndpointHost(host) {
   const h = String(host || '').trim();
   return h.length > 0 && h.length <= 253 && /^[A-Za-z0-9.-]+$/.test(h);
+}
+
+/* A full peer endpoint, host:port — the host is a real IP or DDNS
+   hostname (same rule as isValidEndpointHost) and the port is
+   1–65535. One validator for the manual add-peer form, the live
+   `wg set` call and the server config writer. */
+function isValidEndpoint(endpoint) {
+  const e = String(endpoint || '').trim();
+  const m = e.match(/^([A-Za-z0-9.-]+):(\d{1,5})$/);
+  if (!m) return false;
+  const port = Number(m[2]);
+  return isValidEndpointHost(m[1]) && Number.isInteger(port) && port >= 1 && port <= 65535;
 }
 
 /* Server export (the server card's Export button): the whole server
@@ -1027,7 +1056,7 @@ module.exports = {
   installTunnelService, uninstallTunnelService,
   setPeer, removePeer, nextTunnelIp, tunnelIpOf,
   isValidIpv4, tunnelSubnetFor, serverTunnelIpFor, validateServerSettings, serverEndpoint,
-  isValidEndpointHost, buildServerExport, validateServerImport,
+  isValidEndpointHost, isValidEndpoint, buildServerExport, validateServerImport,
   buildElevatedScript, resolveWg, resolveWireguard,
   resolveAmneziaWg, resolveAmneziaWireguard,
   setTransport, getTransport, setTransportBinaries, getTransportBinaries,
