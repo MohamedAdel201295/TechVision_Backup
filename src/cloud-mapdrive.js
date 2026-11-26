@@ -156,24 +156,65 @@ function officeUriFor(host, port, rel) {
   return scheme + ':ofe|u|' + davUrl(host, port) + '/' + segs.map((s) => encodeURIComponent(s)).join('/');
 }
 
+// Media (video/audio) opens straight from the WebDAV URL in the
+// default player — the player pulls ranges over HTTPS, so a big video
+// starts playing without downloading first. Returns null for anything
+// that is not media.
+const MEDIA_EXTS = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma'];
+function mediaUrlFor(host, port, rel) {
+  const i = String(rel || '').lastIndexOf('.');
+  if (i <= 0 || MEDIA_EXTS.indexOf(String(rel).slice(i + 1).toLowerCase()) < 0) return null;
+  if (!host || !port) return null;
+  const segs = String(rel || '').split('/').filter((s) => s !== '');
+  if (!segs.length) return null;
+  return davUrl(host, port) + '/' + segs.map((s) => encodeURIComponent(s)).join('/');
+}
+
+// The Credential Manager targets a Cloud login is seeded under.
+// Round 2 #14: the old code only seeded DOMAIN credentials
+// (`cmdkey /add:<host>` and `/add:<host:port>`) — those are what
+// `net use`/SMB consults. Office opens the file over HTTPS through
+// WinINET, which looks up GENERIC credentials keyed by the URL — a
+// bare-host domain credential never matches, so Office kept
+// prompting (and pre-filled the Windows logon user instead of the
+// Cloud user). The documented fix (Office WebDAV + Credential
+// Manager) is a generic credential whose address is the site URL, so
+// seed both kinds, under every target form WinINET and the WebClient
+// redirector may look up: the URL, the DAV root URL, and the bare
+// host forms, as generic and as domain credentials.
+function credentialTargetsFor(host, port) {
+  const h = String(host);
+  const p = String(port);
+  const base = 'https://' + h + ':' + p;
+  return [
+    { kind: 'generic', name: base },
+    { kind: 'generic', name: base + '/dav' },
+    { kind: 'generic', name: h },
+    { kind: 'generic', name: h + ':' + p },
+    { kind: 'add', name: h },
+    { kind: 'add', name: h + ':' + p },
+  ];
+}
+
 // Seed the Cloud credentials into the Windows Credential Manager so
-// Word/Excel do not prompt for a login when they open the WebDAV
-// URL. Best-effort: if it fails, Office prompts once and Windows can
-// remember it — still fine. Both the bare host and host:port are
-// seeded: Office/WinINET may look either one up.
+// Word/Excel (and media players) do not prompt for a login when they
+// open the WebDAV URL. Best-effort per target (a failure on one must
+// not block the rest); the caller logs the summary. Passwords are
+// passed as argv elements (never through a shell) and never logged.
 async function seedCredentials(host, port, user, password) {
   if (!isWindows()) return { success: false, error: 'Windows only.' };
   if (!host || !port || !user || !password) return { success: false, error: 'Missing credentials.' };
-  const h = String(host);
-  const targets = [h, h + ':' + String(port)];
-  let ok = false;
-  let lastErr = '';
+  const targets = credentialTargetsFor(host, port);
+  const failed = [];
+  let ok = 0;
   for (const t of targets) {
-    const r = await runCmd('cmdkey.exe', ['/add:' + t, '/user:' + String(user), '/pass:' + String(password)], 15000);
-    if (r.success) ok = true;
-    else lastErr = r.error || 'cmdkey failed.';
+    const flag = t.kind === 'generic' ? '/generic:' : '/add:';
+    const r = await runCmd('cmdkey.exe', [flag + t.name, '/user:' + String(user), '/pass:' + String(password)], 15000);
+    if (r.success) ok++;
+    else failed.push(t.kind + ':' + t.name + ' (' + (r.error || 'cmdkey failed') + ')');
   }
-  return ok ? { success: true } : { success: false, error: lastErr };
+  if (!ok) return { success: false, error: 'Could not store the Cloud credentials in Windows Credential Manager: ' + failed.join('; ') };
+  return { success: true, seeded: ok, failed: failed.length ? failed : undefined };
 }
 
 function mapErrorText(r) {
@@ -336,7 +377,9 @@ module.exports = {
   davUrl,
   officeSchemeFor,
   officeUriFor,
+  mediaUrlFor,
   seedCredentials,
+  credentialTargetsFor,
   loadState,
   saveState,
 };

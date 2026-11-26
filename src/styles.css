@@ -1016,6 +1016,13 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
      of card chrome). */
   #view-wizard .modal-wrap .wizard-card, #view-restore .modal-wrap .wizard-card { max-height: calc(100vh - 82px); }
   #view-wizard .modal-wrap .wizard-card .modal-body, #view-restore .modal-wrap .wizard-card .modal-body { max-height: calc(100vh - 195px); }
+  /* Cloud server panel: the DDNS field (round 2 #9) + the forward
+     guide pushed the settings card 95px past the viewport at
+     1024x768. At short heights the DDNS hint and the forward guide
+     (reference text — the same info is in the port/access hints)
+     hide, so the panel fits without scrolling. */
+  #cloudServerAddrsField .field .hint { display: none; }
+  #cloudForwardGuide { display: none; }
 }
 
 /* Very short screens (maximized window on a 1366x768 laptop,

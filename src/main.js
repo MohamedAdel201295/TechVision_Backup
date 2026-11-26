@@ -1807,6 +1807,7 @@ ipcMain.handle('cloud-get-config', async () => {
       users: srv.listUsers(),
       fingerprint: cfg.server.cert ? cfg.server.cert.fingerprint : null,
       accessMode: cloudAccessMode(cfg.server.accessMode),
+      ddnsHostname: cfg.server.ddnsHostname || '',
     },
     clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: cloudAccessMode(c.accessMode) })),
   };
@@ -1830,6 +1831,10 @@ ipcMain.handle('cloud-server-save', async (event, opts) => {
   cfg.server.enabled = !!(opts && opts.enabled);
   cfg.server.port = port;
   cfg.server.accessMode = accessMode;
+  // DDNS hostname (round 2 #9): recorded for clients — the server
+  // itself listens on 0.0.0.0 and never consumes it. Also feeds the
+  // certificate SANs (round 2 #12).
+  cfg.server.ddnsHostname = String((opts && opts.ddnsHostname) || '').trim().slice(0, 253);
   saveCloudConfig();
   try {
     if (wasRunning && portChanged) {
@@ -2020,7 +2025,11 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     }
     const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, password);
     const info = await cloudClient.info(conn);
-    cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
+    // Keep the password that just authenticated in the session
+    // (memory only, never written to disk): the record may not have
+    // one — e.g. after "Forget password" while still connected — and
+    // Office/media opens need a password to seed or they prompt.
+    cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite, password }));
     if (rec && opts.password && String(opts.password)) { rec.password = String(opts.password); saveCloudConfig(); }
     return { success: true, info };
   } catch (e) {
@@ -2352,6 +2361,38 @@ ipcMain.handle('cloud-set-open-mode', async (event, mode) => {
 // through to the temp open (the renderer tries the next method).
 // Returns { success: false } on any failure so the caller can fall
 // through silently — only the temp path shows an error to the user.
+// Round 2 #14: seed the Cloud credentials for an Office/media open
+// so no login prompt appears. The password comes from the live
+// session first (it is the one that just authenticated) and the
+// saved record second — a connected session may have no stored
+// password (e.g. after "Forget password"), and seeding with nothing
+// used to fail silently and leave Office prompting. The result is
+// LOGGED, never swallowed: a silent seed failure used to look
+// exactly like "the prompt is unavoidable". Best-effort: a failure
+// never blocks the open — Office then prompts once and Windows can
+// remember it. Never throws.
+async function seedCloudCredentialsForOpen(serverId, rec) {
+  try {
+    const conn = cloudSessions.get(serverId);
+    const user = (conn && conn.user) || rec.user;
+    const password = (conn && conn.password) || rec.password;
+    if (!user || !password) {
+      console.log(`[Cloud] No saved password for ${rec.host} — Office/media will prompt for the Cloud login once.`);
+      appendAppLog('warn', `[Cloud] Opening a file on ${rec.host} without a saved password — Windows will ask for the Cloud login.`);
+      return { success: false, error: 'No password saved for this server.' };
+    }
+    const r = await cloudMapDrive.seedCredentials(rec.host, rec.port, user, password);
+    if (r.success) console.log(`[Cloud] Credentials seeded for ${rec.host}:${rec.port} (${r.seeded || '?'} targets).`);
+    else {
+      console.log(`[Cloud] Credential seeding failed for ${rec.host}:${rec.port}: ${r.error}`);
+      appendAppLog('warn', `[Cloud] Could not store the login for ${rec.host} in Windows Credential Manager (${r.error || 'unknown error'}) — Office may ask for the Cloud user and password.`);
+    }
+    return r;
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+}
+
 ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
   try {
     const conn = cloudSessions.get(serverId);
@@ -2373,13 +2414,56 @@ ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
         if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
       }
     }
-    // Best-effort: seed the credentials so Office does not prompt
-    // for a login. If it fails, Office prompts once and Windows can
-    // remember it — still fine.
-    if (rec.password) { try { await cloudMapDrive.seedCredentials(rec.host, rec.port, rec.user, rec.password); } catch (e) {} }
+    // Seed the credentials so Office does not prompt for a login
+    // (round 2 #14: generic URL targets + session-password fallback,
+    // result logged — see seedCloudCredentialsForOpen).
+    await seedCloudCredentialsForOpen(serverId, rec);
     const err = await require('electron').shell.openExternal(uri);
     if (err) return { success: false, error: String(err) };
     return { success: true, mode: 'direct' };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Media in direct mode (round 2 #11): same shape as the Office open
+// above — the default player streams the WebDAV URL with Range
+// requests, so a video starts playing without downloading first.
+// Cert trust + credential seeding are identical to Office: the
+// player must trust the server cert, and must not be asked for a
+// login it cannot answer. Returns { success: false } on any failure
+// so the caller falls through to temp silently — only the temp path
+// shows an error. The built URL is returned even on failure (the
+// sandbox has no player, so the Windows-only cert step blocks the
+// open there — the caller/driver can still assert the exact URL).
+ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
+  try {
+    const conn = cloudSessions.get(serverId);
+    if (!conn) return { success: false, error: 'Not connected to this server.' };
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === serverId);
+    if (!rec) return { success: false, error: 'Server not found.' };
+    const url = cloudMapDrive.mediaUrlFor(rec.host, rec.port, relPath);
+    if (!url) return { success: false, error: 'not-media' };
+    if (rec.certPem) {
+      const fp = cloudServerMod.fingerprintOfCertPem(rec.certPem);
+      if (rec.fingerprint && rec.fingerprint !== fp) {
+        return { success: false, url, error: 'The saved certificate does not match this server. Remove the server in the Client tab and add it again.' };
+      }
+      const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+      if (!trusted.success) return { success: false, url, error: trusted.error };
+      if (!trusted.trusted) {
+        const inst = await cloudMapDrive.installCert(rec.certPem);
+        if (!inst.success) return { success: false, url, declined: !!inst.declined, error: inst.error };
+      }
+    }
+    // Seed the credentials so the player does not prompt for a login
+    // (round 2 #14: same generic URL targets as Office — players
+    // fetch over HTTPS the same way; result logged).
+    await seedCloudCredentialsForOpen(serverId, rec);
+    const err = await require('electron').shell.openExternal(url);
+    if (err) return { success: false, url, error: String(err) };
+    return { success: true, mode: 'direct', url };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -3318,28 +3402,75 @@ ipcMain.handle('job-restore', async (event, jobId) => {
 });
 
 ipcMain.handle('job-delete', async (event, jobId) => {
-  // Templates are saved by NAME (<name>.json) but their in-memory id is
-  // generated, so deleting by id alone never removed the file. Try id,
-  // then name, then a config file named after the id.
+  // Round 2 #13: the template file is NOT always named after the
+  // job's id or name. job-save-config names it <fileId>.json where
+  // fileId is the id the wizard generated — but a job folded from
+  // legacy run records (no jobId) carries the RUN's id, so neither
+  // `<id>.json` nor `<name>.json` matches and the template survived
+  // the delete, came back on the next start as a PENDING template,
+  // and the scheduler fired it for the missed daily slot. Scan the
+  // jobs dir and delete every template whose content matches this
+  // job by id or by name — except one that belongs to a different
+  // job still listed (same-name jobs stay separate tasks).
+  const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
+  function deleteTemplateFiles(id, name, source, destination) {
+    const removed = [];
+    try {
+      if (!fs.existsSync(jobsDir)) return removed;
+      // Ids of jobs other than the one being deleted: a template
+      // whose content id is one of these belongs to that other job
+      // and must survive even if the name matches.
+      const otherIds = new Set(jobHistory.filter(j => j.id !== id).map(j => j.id).filter(Boolean));
+      for (const file of fs.readdirSync(jobsDir)) {
+        if (!file.endsWith('.json') || file === 'history.json') continue;
+        const p = path.join(jobsDir, file);
+        let match = (file === `${id}.json` || file === `${name}.json`);
+        if (!match) {
+          try {
+            const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
+            const cid = content && content.id;
+            const cname = content && content.name;
+            if (cid && cid === id) match = true;
+            else if (cname && cname === name) {
+              // Same name, but the file may belong to a different job
+              // that happens to share the name — keep it, unless it
+              // is the same job by paths (a stale second template
+              // file for this job: an old <name>.json plus the
+              // current <id>.json both survive a delete otherwise).
+              const samePaths = source && destination && content.source && content.destination
+                && jobPathValue(content.source) === jobPathValue(source)
+                && jobPathValue(content.destination) === jobPathValue(destination);
+              if (!(cid && otherIds.has(cid)) || samePaths) match = true;
+            }
+          } catch (e) { /* unparseable file: only the filename guesses above apply */ }
+        }
+        if (match) {
+          try { fs.unlinkSync(p); removed.push(file); console.log(`[Main] Deleted job template file: ${p}`); } catch (e) { console.error('[Main] Failed to delete job template file:', e.message); }
+        }
+      }
+    } catch (e) { console.error('[Main] Failed to scan jobs dir for templates:', e.message); }
+    return removed;
+  }
   let idx = jobHistory.findIndex(j => j.id === jobId);
   if (idx < 0) idx = jobHistory.findIndex(j => j.name === jobId);
   if (idx >= 0) {
     const job = jobHistory[idx];
-    for (const fileName of [`${jobId}.json`, `${job.name}.json`]) {
-      try {
-        const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', fileName);
-        if (fs.existsSync(jobPath)) { fs.unlinkSync(jobPath); console.log(`[Main] Deleted job config file: ${jobPath}`); }
-      } catch (e) { console.error(`[Main] Failed to delete job config file:`, e.message); }
-    }
+    deleteTemplateFiles(job.id, job.name, job.source, job.destination);
     jobHistory.splice(idx, 1);
     saveJobHistory();
     notifyJobsUpdated();
     return { success: true };
   }
-  const orphanPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
+  // Orphan: no job in memory matches, but a template file may still
+  // exist on disk. Delete it (by content match) and persist the
+  // history — before this the handler returned success without ever
+  // saving, so any run records on disk came back on the next start.
+  const orphanPath = path.join(jobsDir, `${jobId}.json`);
+  const removed = deleteTemplateFiles(jobId, jobId);
   try {
-    if (jobId && fs.existsSync(orphanPath)) { fs.unlinkSync(orphanPath); return { success: true }; }
+    if (jobId && fs.existsSync(orphanPath) && !removed.includes(`${jobId}.json`)) { fs.unlinkSync(orphanPath); removed.push(`${jobId}.json`); }
   } catch (e) { /* fall through to not found */ }
+  if (removed.length) { saveJobHistory(); notifyJobsUpdated(); return { success: true }; }
   return { success: false, error: 'Job not found' };
 });
 

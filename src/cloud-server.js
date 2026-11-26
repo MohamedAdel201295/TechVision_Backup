@@ -65,16 +65,72 @@ function fingerprintOfCertPem(certPem) {
 }
 
 function defaultServerConfig() {
-  return { enabled: false, port: 8443, cert: null, users: [], accessMode: 'normal' };
+  return { enabled: false, port: 8443, cert: null, users: [], accessMode: 'normal', ddnsHostname: '' };
 }
 
-function ensureCert(cfg) {
-  if (cfg.cert && cfg.cert.cert && cfg.cert.key && cfg.cert.fingerprint) return cfg.cert;
+function certSans(certPem) {
+  try {
+    const x = new crypto.X509Certificate(certPem);
+    const san = x.subjectAltName || '';
+    const dns = [], ips = [];
+    for (const part of san.split(',')) {
+      const p = part.trim();
+      if (p.startsWith('DNS:')) dns.push(p.slice(4));
+      else if (p.startsWith('IP Address:')) ips.push(p.slice(11));
+    }
+    return { dns, ips, hasSans: dns.length > 0 || ips.length > 0 };
+  } catch (e) { return { dns: [], ips: [], hasSans: false }; }
+}
+
+// One-time migration (round 2 #12): a stored cert is regenerated
+// when it has no usable SANs at all (every cert made before this fix
+// — CN only, or the selfsigned default URI SAN that matches no host,
+// which is exactly why `net use` failed with error 1244), or when
+// the DDNS hostname was added/changed and is not in the cert yet.
+// Nothing else regenerates it: LAN addresses come and go (a VPN
+// going up/down adds/removes interfaces), and churning the
+// fingerprint on every such change would force every client to
+// re-trust for no reason.
+function certNeedsRegen(cfg) {
+  if (!cfg.cert || !cfg.cert.cert) return true;
+  const sans = certSans(cfg.cert.cert);
+  if (!sans.hasSans) return true;
+  const ddns = String((cfg.ddnsHostname) || '').trim();
+  if (ddns && sans.dns.indexOf(ddns) < 0) return true;
+  return false;
+}
+
+function certExtensions(cfg, publicIp) {
+  const altNames = [];
+  const seen = new Set();
+  const addDns = (v) => { const k = 'd:' + v; if (v && !seen.has(k)) { seen.add(k); altNames.push({ type: 2, value: v }); } };
+  const addIp = (v) => { const k = 'i:' + v; if (v && !seen.has(k)) { seen.add(k); altNames.push({ type: 7, ip: v }); } };
+  addDns(os.hostname() || 'TechVision-Cloud');
+  for (const ip of lanIPs()) addIp(ip);
+  addDns(String((cfg && cfg.ddnsHostname) || '').trim());
+  if (publicIp) addIp(publicIp);
+  // Same basicConstraints/keyUsage as the old default extensions —
+  // only the subjectAltName list is new, so pinning behaviour does
+  // not change: the cert stays its own trust anchor.
+  return [
+    { name: 'basicConstraints', cA: true },
+    { name: 'keyUsage', keyCertSign: true, digitalSignature: true, nonRepudiation: true, keyEncipherment: true, dataEncipherment: true },
+    { name: 'subjectAltName', altNames },
+  ];
+}
+
+async function ensureCert(cfg) {
+  if (cfg.cert && cfg.cert.cert && cfg.cert.key && cfg.cert.fingerprint && !certNeedsRegen(cfg)) return cfg.cert;
   if (!selfsigned) {
     throw new Error('The "selfsigned" package is not installed. Run "npm install" in the project folder, then start the server again.');
   }
+  // Public IP only when it can be detected (best-effort, 5s): the
+  // DDNS name already covers the public path, and a failed detect
+  // just leaves the IP out.
+  let publicIp = null;
+  try { publicIp = await detectPublicIP(); } catch (e) { publicIp = null; }
   const attrs = [{ name: 'commonName', value: os.hostname() || 'TechVision-Cloud' }];
-  const pems = selfsigned.generate(attrs, { days: 3650, keySize: 2048, algorithm: 'sha256' });
+  const pems = selfsigned.generate(attrs, { days: 3650, keySize: 2048, algorithm: 'sha256', extensions: certExtensions(cfg, publicIp) });
   cfg.cert = {
     cert: pems.cert,
     key: pems.private,
@@ -221,7 +277,7 @@ class CloudServer {
   async start() {
     if (this.httpsServer) return this.status();
     const scfg = this._serverCfg();
-    ensureCert(scfg);
+    await ensureCert(scfg);
     this.onConfigChange();
     const port = scfg.port || 8443;
     const server = https.createServer({ key: scfg.cert.key, cert: scfg.cert.cert }, (req, res) => {
@@ -991,4 +1047,4 @@ class CloudServer {
   }
 }
 
-module.exports = { CloudServer, defaultServerConfig, ensureCert, fingerprintOfCertPem, hashPassword, verifyPassword, lanIPs, detectPublicIP, MAX_UPLOAD_BYTES };
+module.exports = { CloudServer, defaultServerConfig, ensureCert, certSans, certNeedsRegen, fingerprintOfCertPem, hashPassword, verifyPassword, lanIPs, detectPublicIP, MAX_UPLOAD_BYTES };

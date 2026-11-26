@@ -105,6 +105,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // TechVision Cloud — open mode + Office direct open (spec v2)
   cloudSetOpenMode: (mode) => ipcRenderer.invoke('cloud-set-open-mode', mode),
   cloudOfficeOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-office-open', serverId, relPath),
+  cloudMediaOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-media-open', serverId, relPath),
   cloudClipboardFiles: () => ipcRenderer.invoke('cloud-clipboard-files'),
   cloudClientMkdir: (serverId, relPath) => ipcRenderer.invoke('cloud-client-mkdir', serverId, relPath),
   cloudClientDelete: (serverId, relPath) => ipcRenderer.invoke('cloud-client-delete', serverId, relPath),

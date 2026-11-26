@@ -303,6 +303,7 @@
       tds[3].textContent = formatBytes(job.size);
       tds[4].textContent = formatHMS(job.duration);
       tds[5].textContent = formatDashboardTime(job.timestamp);
+      tr.dataset.dest = job.destination || '';
       tr.addEventListener('click', function () { openDrawer(job); });
       body.appendChild(tr);
     });
@@ -310,28 +311,27 @@
   /* Storage donut: usage of the drive holding the latest backup's
      destination. Re-reads only when the destination changes, or when
      Check Storage is pressed (force). A failed read shows "—", never
-     a fake number. */
+     a fake number. A request token keeps a slow hover read from
+     overwriting a newer revert (round 2 #6). */
   var storageDest = '';
-  async function refreshStorageCard(force) {
+  var storageReq = 0;
+  async function renderStorageFor(dest, req) {
     var pctEl = $('dashStoragePct'); if (!pctEl) return;
-    var last = lastCompletedRun(jobs.filter(function (j) { return j.type !== 'TEMPLATE'; }));
-    var dest = last ? (last.destination || '') : '';
     var arc = $('dashDonutArc');
     var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
     if (!dest) {
+      if (req !== storageReq) return;
       set('dashStoragePct', '—');
       set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
       set('dashStorageDrive', 'No backups yet — run a job to see storage.');
       if (arc) arc.setAttribute('stroke-dasharray', '0 339.292');
-      storageDest = '';
       return;
     }
-    if (!force && dest === storageDest) return;
-    storageDest = dest;
     set('dashStorageDrive', dest);
     if (!api || typeof api.getDriveUsage !== 'function') return;
     try {
       var r = await api.getDriveUsage(dest);
+      if (req !== storageReq) return;
       if (!r || !r.success) {
         set('dashStoragePct', '—');
         set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
@@ -348,8 +348,36 @@
       set('dashFree', formatBytes(free));
       set('dashTotal', formatBytes(total));
     } catch (e) {
+      if (req !== storageReq) return;
       set('dashStoragePct', '—');
     }
+  }
+  async function refreshStorageCard(force) {
+    var pctEl = $('dashStoragePct'); if (!pctEl) return;
+    var last = lastCompletedRun(jobs.filter(function (j) { return j.type !== 'TEMPLATE'; }));
+    var dest = last ? (last.destination || '') : '';
+    if (!force && dest === storageDest) return;
+    storageDest = dest;
+    var req = ++storageReq;
+    await renderStorageFor(dest, req);
+  }
+  /* Hover preview (round 2 #6): hovering a row in Recent Backup Jobs
+     shows THAT job's backup storage in the card at once — its
+     destination, donut %, Used/Free/Total. Leaving the list reverts
+     to the latest backup's destination. The hover never touches
+     storageDest (the default's cache), so the revert is a plain
+     forced refresh. */
+  var storageHoverDest = null;
+  async function showStorageHover(dest) {
+    if (dest === storageHoverDest) return;
+    storageHoverDest = dest;
+    var req = ++storageReq;
+    await renderStorageFor(dest, req);
+  }
+  function clearStorageHover() {
+    if (storageHoverDest === null) return;
+    storageHoverDest = null;
+    refreshStorageCard(true);
   }
 
   /* ---------- history list ---------- */
@@ -849,6 +877,7 @@
   var wgPanel = 'server';        // 'server' | 'nat' — WireGuard tabs
   var cloudSelected = null;      // saved server record being connected to
   var cloudPendingProbe = null;  // { fingerprint, certPem } awaiting trust
+  var cloudCertChanged = false; // the server's cert changed since it was trusted — re-trust pending
   var cloudConn = null;          // { serverId, info } while connected
   var cloudPath = '';            // current remote path, '' = root, '/' separators
   var cloudTransferTimer = null;
@@ -957,7 +986,7 @@
       if (!api || typeof api.cloudServerSave !== 'function') { cloudMissing(); return; }
       try {
         var port = parseInt(($('cloudServerPort') || {}).value, 10);
-        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess });
+        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess, ddnsHostname: ($('cloudServerDdns') || {}).value || '' });
         if (r && r.success) { await loadCloud(); }
         else toast('Save failed', (r && r.error) || 'Could not save Cloud settings.', 'error');
       } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save Cloud settings.', 'error'); }
@@ -1033,13 +1062,19 @@
     document.querySelectorAll('#cloudClientAccessSeg .seg-btn').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-access') === cloudClientAccess); });
     var hint = $('cloudClientAccessHint');
     if (hint) hint.textContent = cloudClientAccess === 'tailscale'
-      ? 'Tailscale IP (100.x.x.x) of the server — pick a device below or type it.'
+      ? 'Tailscale IP (100.x.x.x) of the server — pick a device below.'
       : cloudClientAccess === 'wireguard'
-        ? 'WireGuard tunnel address (10.0.0.x) of the server — pick a device below or type it.'
+        ? 'WireGuard tunnel address (10.0.0.x) of the server — pick a device below.'
         : 'Public IP, DDNS hostname or LAN IP of the server.';
     var host = $('cloudClientHost');
     if (host) host.placeholder = cloudClientAccess === 'tailscale' ? '100.64.0.1' : cloudClientAccess === 'wireguard' ? '10.0.0.1' : '203.0.113.10';
     var pf = $('cloudClientPeerField'); if (pf) pf.style.display = cloudClientAccess === 'normal' ? 'none' : '';
+    /* Round 2 #7: the address field is the picker's output in VPN
+       modes — typing it is redundant — so it hides there and shows
+       only in Normal mode, where it is the only way to enter an
+       address. The hidden input still holds the picker's value, so
+       the connect logic reads it unchanged. */
+    var hf = $('cloudClientHostField'); if (hf) hf.style.display = cloudClientAccess === 'normal' ? '' : 'none';
     var apb = $('cloudClientWgAddPeerBtn'); if (apb) apb.style.display = cloudClientAccess === 'wireguard' ? '' : 'none';
     var pl = $('cloudClientPeerLabel');
     if (pl) pl.textContent = cloudClientAccess === 'wireguard' ? 'Pick a device from your WireGuard tunnel' : 'Pick a device from your Tailscale network';
@@ -1134,6 +1169,7 @@
     }
     var en = $('cloudServerEnabled'); if (en) en.checked = !!s.enabled;
     var port = $('cloudServerPort'); if (port) port.value = String(s.port || 8443);
+    var dd = $('cloudServerDdns'); if (dd) dd.value = s.ddnsHostname || '';
     var gp = $('cloudGuidePort'); if (gp) gp.textContent = String(s.port || 8443);
     var fp = $('cloudServerFactPort'); if (fp) fp.textContent = String(s.port || 8443);
     var fu = $('cloudServerFactUsers'); if (fu) fu.textContent = String((s.users || []).length);
@@ -1207,10 +1243,15 @@
       meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : srv.accessMode === 'wireguard' ? '🔐 WireGuard' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet') + (srv.hasPassword ? ' — password saved on this device' : '');
       var acts = document.createElement('div'); acts.className = 'drawer-actions';
       // Already connected to this server: say so instead of offering
-      // Connect again — Disconnect lives in the browser toolbar below.
+      // Connect again — Disconnect lives here on the card too (round
+      // 2 #8), next to the badge, so Connect / Disconnect / Forget
+      // are all together on the card.
       if (cloudConn && cloudConn.serverId === srv.id) {
         var badge = document.createElement('span'); badge.className = 'cloud-connected-badge'; badge.textContent = '● Connected';
         acts.appendChild(badge);
+        var disc = document.createElement('button'); disc.className = 'btn btn-ghost btn-sm'; disc.type = 'button'; disc.textContent = 'Disconnect';
+        disc.addEventListener('click', function () { cloudDisconnect(); });
+        acts.appendChild(disc);
       } else {
         // One click when the password is saved on this device: connect
         // straight in (the main process uses the stored password). Without
@@ -1408,6 +1449,7 @@
     var box = $('cloudConnectBox'); if (box) box.style.display = 'none';
     cloudSelected = null;
     cloudPendingProbe = null;
+    cloudCertChanged = false;
   }
 
   // One click on a saved server: the password is already on this device
@@ -1463,9 +1505,25 @@
     var pass = $('cloudConnectPass');
     var password = passwordOverride !== undefined ? (passwordOverride || '') : (pass ? pass.value : '');
     var justTrusted = null; // fingerprint trusted in this very click
-    // No trusted certificate yet: probe the server first (nothing
-    // sensitive is sent to probe), then trust its fingerprint.
-    if (!cloudSelected.fingerprint) {
+    // The server's certificate changed since this record was trusted
+    // (round 2 #12: the cert was regenerated with SANs). Offer to
+    // trust the new fingerprint — the same manual box as first trust,
+    // with the new fingerprint to compare. Never silently accept a
+    // different certificate.
+    function offerCertRetrust(probe) {
+      cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
+      cloudCertChanged = true;
+      var title2 = $('cloudConnectTitle'); if (title2) title2.textContent = 'Connect to ' + cloudSelected.name + (cloudSelected.user ? ' as ' + cloudSelected.user : '');
+      var ft2 = $('cloudFingerprintText'); if (ft2) ft2.textContent = probe.fingerprint;
+      var fb2 = $('cloudFingerprintBox'); if (fb2) fb2.style.display = '';
+      var box2 = $('cloudConnectBox'); if (box2) box2.style.display = '';
+      var btn2 = $('cloudConnectBtn'); if (btn2) btn2.textContent = 'Trust & connect';
+      toast('Server certificate changed', 'Compare the new fingerprint with the fingerprint shown on the server, then press Trust & connect.', '');
+    }
+    // No trusted certificate yet (or the trusted one changed — see
+    // below): probe the server first (nothing sensitive is sent to
+    // probe), then trust its fingerprint.
+    if (!cloudSelected.fingerprint || cloudCertChanged) {
       if (!cloudPendingProbe) {
         try {
           if (btn) { btn.disabled = true; btn.textContent = 'Checking server…'; }
@@ -1508,6 +1566,7 @@
         cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
         cloudSelected.certPem = cloudPendingProbe.certPem;
         justTrusted = cloudPendingProbe.fingerprint;
+        cloudCertChanged = false;
         var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
         await loadCloud();
       } catch (e) {
@@ -1524,20 +1583,40 @@
       if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
       var certPem = cloudSelected.certPem;
       if (!certPem) {
-        // Fingerprint known but the PEM was saved before this build:
-        // re-probe once to get it (the fingerprint must match).
+        // Fingerprint known but the PEM was saved before this build, or
+        // the record came from the list (cloud-get-config does not send
+        // the PEM): re-probe once to get it. A different fingerprint
+        // means the server's certificate changed — offer to trust the
+        // new one instead of dead-ending with "remove and add again".
         var p2 = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-        if (!p2 || !p2.success || p2.fingerprint !== cloudSelected.fingerprint) {
-          toast('Certificate changed', 'The server certificate does not match the trusted fingerprint. Remove the server and add it again.', 'error');
-          return;
-        }
+        if (!p2 || !p2.success) { toast('Cannot reach server', (p2 && p2.error) || 'Check the address and port.', 'error'); return; }
+        if (p2.fingerprint !== cloudSelected.fingerprint) { offerCertRetrust(p2); return; }
         certPem = p2.certPem;
       }
       var r = await api.cloudClientConnect({
         serverId: cloudSelected.id, host: cloudSelected.host, port: cloudSelected.port,
         certPem: certPem, user: cloudSelected.user, password: password || null,
       });
-      if (!r || !r.success) { toast('Connection failed', (r && r.error) || 'Wrong user name or password.', 'error'); return; }
+      if (!r || !r.success) {
+        var connErr = (r && r.error) || 'Wrong user name or password.';
+        // The server's certificate changed since this record was
+        // trusted (round 2 #12: the cert was regenerated with SANs).
+        // The pinned cert no longer validates it, so the login fails
+        // with a certificate error. Probe for the new fingerprint and
+        // offer to trust it — the same manual box as first trust, with
+        // the new fingerprint to compare. Never silently accept a
+        // different certificate.
+        if (/certificat/i.test(connErr) && cloudSelected.fingerprint) {
+          try {
+            var pr = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
+            if (pr && pr.success && pr.fingerprint && pr.fingerprint !== cloudSelected.fingerprint) {
+              offerCertRetrust(pr);
+              return;
+            }
+          } catch (e) {}
+        }
+        toast('Connection failed', connErr, 'error'); return;
+      }
       // Keep the server name: closeCloudConnect() clears cloudSelected.
       cloudConn = { serverId: cloudSelected.id, info: r.info, name: cloudSelected.name };
       cloudMapInvalidateCache();
@@ -1556,7 +1635,14 @@
     } catch (e) {
       toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
     } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+      if (btn) {
+        btn.disabled = false;
+        // A re-trust offer just set the label to "Trust & connect" —
+        // do not overwrite it on the way out (the fingerprint box
+        // being visible is the sign that the offer is on screen).
+        var fbox = $('cloudFingerprintBox');
+        if (!fbox || fbox.style.display === 'none') btn.textContent = 'Connect';
+      }
     }
   }
 
@@ -1923,6 +2009,7 @@
   function cloudOpenMode() { return (cloudCfg && cloudCfg.openMode === 'temp') ? 'temp' : 'direct'; }
   var CLOUD_PROGRAM_EXTS = ['exe', 'msi', 'bat', 'cmd', 'com', 'scr'];
   var CLOUD_OFFICE_EXTS = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
+  var CLOUD_MEDIA_EXTS = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma'];
   function cloudFileExt(name) {
     var i = String(name || '').lastIndexOf('.');
     return i <= 0 ? '' : String(name).slice(i + 1).toLowerCase();
@@ -1933,6 +2020,7 @@
   // drive works for them.
   function cloudIsProgramFile(name) { return CLOUD_PROGRAM_EXTS.indexOf(cloudFileExt(name)) >= 0; }
   function cloudIsOfficeDoc(name) { return CLOUD_OFFICE_EXTS.indexOf(cloudFileExt(name)) >= 0; }
+  function cloudIsMediaFile(name) { return CLOUD_MEDIA_EXTS.indexOf(cloudFileExt(name)) >= 0; }
   // The mode indicator: how the last file actually opened.
   function cloudSetLastOpenMode(mode) {
     var el = $('cloudOpenModeStatus');
@@ -1963,11 +2051,12 @@
 
   // Open a file the way Windows would: music plays, pictures open.
   // Direct mode tries, in order: the mapped drive, then (for Office
-  // documents) the Office app straight from the server, then temp +
-  // save-back. Temp mode goes straight to temp + save-back. Any step
-  // that fails falls through AUTOMATICALLY to the next one; only when
-  // every method fails does the user see an error. Programs never go
-  // through temp: without a mapped drive they get the Map prompt.
+  // documents) the Office app straight from the server, then (for
+  // video/audio) the default player straight from the server, then
+  // temp + save-back. Temp mode goes straight to temp + save-back.
+  // Any step that fails falls through AUTOMATICALLY to the next one;
+  // only when every method fails does the user see an error. Programs
+  // never go through temp: without a mapped drive they get the Map prompt.
   // Folders are entered, as before.
   async function cloudOpenFile(entry) {
     if (!entry) return;
@@ -1989,6 +2078,16 @@
         try {
           var o = await api.cloudOfficeOpen(cloudConn.serverId, entry.rel);
           if (o && o.success) { cloudSetLastOpenMode('direct'); return; }
+        } catch (e) {}
+      }
+      // (b2) Media (round 2 #11): play it straight from the server —
+      // the player streams ranges over WebDAV, so a video starts
+      // without downloading first. Falls through to temp when the
+      // direct open is unavailable (certificate declined, no player).
+      if (cloudIsMediaFile(entry.name) && api && typeof api.cloudMediaOpen === 'function') {
+        try {
+          var md = await api.cloudMediaOpen(cloudConn.serverId, entry.rel);
+          if (md && md.success) { cloudSetLastOpenMode('direct'); return; }
         } catch (e) {}
       }
     }
@@ -3279,8 +3378,20 @@
     var dvj = $('dashViewJobs'); if (dvj) dvj.addEventListener('click', function () { showView('jobs'); });
     var dval = $('dashViewAllJobs'); if (dval) dval.addEventListener('click', function () { showView('jobs'); });
     var dol = $('dashOpenLogs'); if (dol) dol.addEventListener('click', function () { showView('logs'); });
-    var dst = $('dashSettings'); if (dst) dst.addEventListener('click', function () { openSettings(); refreshVaultStatus(); });
-    var dcs = $('dashCheckStorage'); if (dcs) dcs.addEventListener('click', function () { refreshStorageCard(true); });
+    /* Round 2 #10: Backup Settings and Check Storage were removed
+       from Quick Actions — the gear (top bar) opens Settings, and
+       the storage card re-reads on its own. */
+    /* Recent Backup Jobs hover (round 2 #6): the row under the mouse
+       drives the Backup Storage card; leaving the list reverts. */
+    var drb = $('dashRecentBody');
+    if (drb) {
+      drb.addEventListener('mouseover', function (e) {
+        var tr = e.target && e.target.closest ? e.target.closest('tr') : null;
+        if (!tr || !drb.contains(tr)) return;
+        showStorageHover(tr.dataset.dest || '');
+      });
+      drb.addEventListener('mouseleave', clearStorageHover);
+    }
     var dopen = $('dashOpenLocation'); if (dopen) dopen.addEventListener('click', function () {
       if (storageDest && api && typeof api.openPath === 'function') api.openPath(storageDest).catch(function () {});
     });
@@ -3684,7 +3795,7 @@
         // Starting applies the port shown in the field first — changing
         // the port and pressing Start must not silently start the old one.
         var port = parseInt(($('cloudServerPort') || {}).value, 10);
-        var saved = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : true, port: port, accessMode: cloudServerAccess });
+        var saved = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : true, port: port, accessMode: cloudServerAccess, ddnsHostname: ($('cloudServerDdns') || {}).value || '' });
         if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save Cloud settings.', 'error'); return; }
         var r = await api.cloudServerStart();
         if (r && r.success) { toast('Server started', 'The Cloud server is running.', 'success'); await loadCloud(); }
@@ -3698,6 +3809,8 @@
     if (cse) cse.addEventListener('change', function () { saveCloudServerSettings(); });
     var csp = $('cloudServerPort');
     if (csp) csp.addEventListener('change', function () { saveCloudServerSettings(); });
+    var csd = $('cloudServerDdns');
+    if (csd) csd.addEventListener('change', function () { saveCloudServerSettings(); });
     var cdi = $('cloudDetectIpBtn');
     if (cdi) cdi.addEventListener('click', async function () {
       if (!api || typeof api.cloudDetectIP !== 'function') return cloudMissing();
@@ -3710,6 +3823,8 @@
           if (r.publicIP) lines.push('Public (from outside): ' + r.publicIP);
           else lines.push('Public: unknown (no internet or detection failed)');
           if (r.lanIPs && r.lanIPs.length) lines.push('LAN (same network): ' + r.lanIPs.join(', '));
+          var ddns = ($('cloudServerDdns') || {}).value || '';
+          if (ddns) lines.push('DDNS: ' + ddns);
           addrs.textContent = lines.join(' — ');
         }
       } catch (e) { toast('Detect error', e && e.message ? e.message : 'Could not detect addresses.', 'error'); }
@@ -3763,15 +3878,20 @@
           var u2 = $('cloudClientUser'); if (u2) u2.value = '';
           var p2 = $('cloudClientPass'); if (p2) p2.value = '';
           await loadCloud();
-          // Save & connect, one click: open the connect box with the
-          // password the user just typed (it is never stored), and do
-          // the whole thing at once — probe, trust the fingerprint,
-          // connect. Without a password the box stays open so the user
-          // can type it and press Connect there.
+          // Save & connect, one click: with a typed password go
+          // straight in — the box would only flash open and close
+          // again (it was pre-filled with the same password and the
+          // flow auto-connects). Without a password the box opens so
+          // the user can type it and press Connect there.
           var rec = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === r.id; });
           if (rec) {
-            openCloudConnect(rec, password);
-            if (password) cloudConnectFlow(true);
+            if (password) {
+              cloudSelected = rec;
+              cloudPendingProbe = null;
+              cloudConnectFlow(true, password);
+            } else {
+              openCloudConnect(rec);
+            }
           }
         } else toast('Save failed', (r && r.error) || 'Could not save server.', 'error');
       } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error'); }

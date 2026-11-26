@@ -165,8 +165,6 @@
           <button class="btn" type="button" id="dashRestore">↺ Restore Backup</button>
           <button class="btn" type="button" id="dashViewJobs">▤ View Jobs</button>
           <button class="btn" type="button" id="dashOpenLogs">≣ Open Logs</button>
-          <button class="btn" type="button" id="dashSettings">⚙ Backup Settings</button>
-          <button class="btn" type="button" id="dashCheckStorage">💾 Check Storage</button>
         </div>
       </section>
     </div>
@@ -489,6 +487,11 @@
         <label>Addresses</label>
         <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn">Detect my addresses</button>
         <div id="cloudServerAddrs" class="cloud-muted" style="margin-top:6px;">Detect your addresses to see them here.</div>
+        <div class="field" style="margin-top:10px; margin-bottom:0;">
+          <label for="cloudServerDdns">DDNS hostname <span class="optional">(optional)</span></label>
+          <input type="text" id="cloudServerDdns" placeholder="e.g. myhome.ddns.net" autocomplete="off">
+          <div class="hint">Your DDNS hostname — the address clients use from outside. It cannot be detected automatically; type it once and it is saved with the server settings.</div>
+        </div>
       </div>
       </div>
       <div class="settings-guide" id="cloudForwardGuide">
@@ -545,25 +548,29 @@
         </div>
         <div class="hint" id="cloudClientAccessHint">Public IP, DDNS hostname or LAN IP of the server.</div>
       </div>
+      <div style="display:flex; gap:12px; grid-column:1 / -1; margin-bottom:8px;">
+      <div style="flex:1; min-width:0;">
       <div class="field" id="cloudClientPeerField" style="display:none;">
         <label for="cloudClientPeer" id="cloudClientPeerLabel">Pick a device from your Tailscale network</label>
         <select id="cloudClientPeer"></select>
         <div class="hint" id="cloudClientPeerHint">Both devices must be on the same Tailscale network — see the VPN module.</div>
         <button class="btn btn-ghost btn-sm" type="button" id="cloudClientWgAddPeerBtn" style="display:none; margin-top:6px;">Add a device in the WireGuard module</button>
       </div>
-      <div class="field">
+      <div class="field" id="cloudClientHostField" style="margin-bottom:0;">
         <label for="cloudClientHost">Server address (public IP, LAN IP or hostname)</label>
         <input type="text" id="cloudClientHost" placeholder="203.0.113.10" autocomplete="off">
       </div>
-      <div class="field">
+      </div>
+      <div class="field" style="flex:0 0 150px; min-width:0; margin-bottom:0;">
         <label for="cloudClientPort">Port</label>
         <input type="text" id="cloudClientPort" value="8443" autocomplete="off">
       </div>
-      <div class="field">
+      </div>
+      <div class="field" style="grid-column:1 / -1;">
         <label for="cloudClientUser">User name</label>
         <input type="text" id="cloudClientUser" placeholder="admin" autocomplete="off">
       </div>
-      <div class="field">
+      <div class="field" style="grid-column:1 / -1;">
         <label for="cloudClientPass">Password</label>
         <input type="password" id="cloudClientPass" placeholder="Password of this user" autocomplete="off">
         <div class="hint">The password of the user above, as created on the server. Asked once when you connect — it is never stored on this computer.</div>
