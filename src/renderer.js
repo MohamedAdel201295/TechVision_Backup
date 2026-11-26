@@ -466,8 +466,13 @@
     if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
     else stopLogsAutoRefresh();
     /* The dashboard has nowhere to go back to — hiding its back bar
-       buys the tallest page ~48px so the whole page fits. */
-    var bb = $('backBar'); if (bb) bb.style.display = name === 'dashboard' ? 'none' : '';
+       buys the tallest page ~48px so the whole page fits. The wizard
+       and restore have their own Cancel button that returns to the
+       origin view (the same destination as Back), so their back bar
+       is redundant too — hiding it buys the wizard card the same
+       ~30px, which is what finally lets the tallest steps fit with
+       no scroll at all (round 2 #5). */
+    var bb = $('backBar'); if (bb) bb.style.display = (name === 'dashboard' || name === 'wizard' || name === 'restore') ? 'none' : '';
     /* The top-bar subtitle is redundant — every view carries its own
        heading and description in the page — so it stays hidden and
        every page gains ~15px of room. */
@@ -3199,7 +3204,7 @@
     if (!peers.length) {
       var empty = document.createElement('div');
       empty.className = 'empty-state';
-      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p>';
+      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Add a device above and it will show up here.</p>';
       list.appendChild(empty);
       return;
     }
@@ -3391,7 +3396,8 @@
         if (nav === 'vpn') showView('vpn');
         if (nav === 'wireguard') { showView('wireguard'); showWgPanel('server'); }
         if (nav === 'wireguard-site') { showView('wireguard'); showWgPanel('nat'); }
-        if (nav === 'wireguard-nat') { showView('wireguard'); showWgPanel('nat'); }
+        // (No 'wireguard-nat' item: it was a duplicate shortcut to the
+        // same Site-to-Site panel — removed in round 2 #2.)
         if (nav === 'cloud-server') { showCloudPanel('server'); setModule('cloud'); }
         if (nav === 'cloud-client') { showCloudPanel('client'); setModule('cloud'); }
         if (nav === 'cloud-mapdrive') { showCloudPanel('mapdrive'); setModule('cloud'); }
@@ -3626,7 +3632,7 @@
     $('drawerBackdrop').addEventListener('click', closeDrawer);
     $('drawerRun').addEventListener('click', function () { if (currentJob) runBackup(currentJob, false); });
     $('drawerRestore').addEventListener('click', function () { if (currentJob) openRestore(currentJob); });
-    $('drawerEdit').addEventListener('click', function () { if (currentJob) { closeDrawer(); openJobWizard(currentJob); } });
+    $('drawerEdit').addEventListener('click', function () { var j = currentJob; if (j) { closeDrawer(); openJobWizard(j); } });
     $('drawerDelete').addEventListener('click', async function () {
       if (!currentJob) return;
       try {

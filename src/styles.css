@@ -312,20 +312,27 @@ select.filter {
 .modal-wrap .wizard-card .modal-body { overflow-y: auto; max-height: calc(100vh - 210px); }
 .modal-wrap .wizard-card .modal-foot { flex-shrink: 0; }
 /* In-place wizard / restore: the card lives in the main area below the
-   top bar and the back bar, so its height budget is the window height
-   minus that chrome (~150px). The body scrolls internally when a step
-   is taller than the budget — the page itself never scrolls. */
+   top bar. The back bar is hidden on these two views (their Cancel
+   button returns to the origin view, same as Back), so the card starts
+   ~76px below the viewport top (measured, round 2 #5). Below the card
+   sit the wrap's 8px bottom padding and the main area's 12px, so the
+   card may be 100vh-96px; the card chrome (header + footer) is 113px,
+   so the body may be 100vh-209px. The old 150/330px reservations left
+   ~90px of dead space below the card while the body scrolled — the body
+   now uses that space, and the page itself never scrolls. The 780px
+   tier below re-measures the same budget (card starts ~64px down
+   there). */
 #view-wizard .modal-wrap, #view-restore .modal-wrap { padding: 4px 8px 8px; }
-#view-wizard .modal-wrap .wizard-card, #view-restore .modal-wrap .wizard-card { max-height: calc(100vh - 150px); }
-#view-wizard .modal-wrap .wizard-card .modal-body, #view-restore .modal-wrap .wizard-card .modal-body { max-height: calc(100vh - 330px); }
+#view-wizard .modal-wrap .wizard-card, #view-restore .modal-wrap .wizard-card { max-height: calc(100vh - 96px); }
+#view-wizard .modal-wrap .wizard-card .modal-body, #view-restore .modal-wrap .wizard-card .modal-body { max-height: calc(100vh - 209px); }
 .modal-card, .wizard-card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
   box-shadow: var(--shadow); overflow: hidden; animation: fadeUp .35s ease both;
 }
-.modal-head { padding: 18px 22px 0; display: flex; align-items: flex-start; gap: 12px; }
+.modal-head { padding: 8px 22px 0; display: flex; align-items: flex-start; gap: 12px; }
 .modal-head h1, .modal-head h2 { font-size: 20px; margin: 0; }
 .modal-head p { color: var(--muted); margin: 4px 0 0; font-size: 13px; }
-.modal-body { padding: 18px 22px 22px; }
+.modal-body { padding: 10px 22px 16px; }
 .field { margin-bottom: 11px; }
 .field label { display: block; font-weight: 500; font-size: 13px; margin-bottom: 6px; }
 .field label .optional { color: var(--muted-2); font-weight: 500; }
@@ -344,7 +351,7 @@ select.filter {
 .check input { width: 17px; height: 17px; accent-color: var(--accent); cursor: pointer; }
 
 /* Toggle switch */
-.toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 3px 0; border-bottom: 1px solid var(--border); }
 .toggle-row:last-child { border-bottom: none; }
 .toggle-row .t-label { font-weight: 500; }
 .toggle-row .t-sub { font-size: 12px; color: var(--muted); font-weight: 400; }
@@ -362,7 +369,7 @@ select.filter {
 .switch input:checked + .slider::before { transform: translateX(20px); }
 
 /* Step indicator */
-.steps { display: flex; gap: 0; margin: 14px 0 20px; }
+.steps { display: flex; gap: 0; margin: 6px 0 8px; }
 .step { flex: 1; text-align: center; position: relative; font-size: 12.5px; font-weight: 600; color: var(--muted-2); padding-top: 28px; }
 .step::before {
   content: attr(data-n); position: absolute; top: 0; left: 50%; transform: translateX(-50%);
@@ -398,12 +405,12 @@ select.filter {
 .note strong { color: var(--warning); }
 .note.info { border-color: rgba(14, 165, 233, .45); background: var(--info-bg); }
 .note.info strong { color: var(--brand-blue); }
-.modal-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 0 22px 20px; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 0 22px 10px; }
 .modal-foot .spacer { flex: 1; }
 
 /* Review table */
 .review { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-.review-row { display: flex; gap: 12px; padding: 11px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.review-row { display: flex; gap: 12px; padding: 6px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .review-row:last-child { border-bottom: none; }
 .review-row:nth-child(odd) { background: var(--surface-2); }
 .review-row .k { flex: 0 0 150px; color: var(--muted); font-weight: 500; }
@@ -714,8 +721,8 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 /* The % sits EXACTLY on the donut's centre (not the centre of the
    %-plus-"Used" group, which left it ~9px high). "Used" hangs just
    below it, still inside the hole. */
-.dash-donut-center b { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 26px; font-weight: 700; line-height: 1; }
-.dash-donut-center span { position: absolute; left: 50%; top: 50%; transform: translate(-50%, 0); margin-top: 17px; font-size: 12px; color: var(--muted); }
+.dash-donut-center b { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 20px; font-weight: 600; line-height: 1; }
+.dash-donut-center span { position: absolute; left: 50%; top: 50%; transform: translate(-50%, 0); margin-top: 13px; font-size: 12px; color: var(--muted); }
 .dash-legend { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; }
 .dash-legend li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 2px 0; }
 .dash-legend li span { display: flex; align-items: center; color: var(--muted); }
@@ -832,6 +839,10 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   margin-bottom: 8px; transition: transform var(--transition), border-color var(--transition);
 }
 .vpn-peer:hover { border-color: var(--accent); transform: translateY(-1px); }
+/* The last peer row's bottom margin is dead space inside the card —
+   with one peer the WireGuard card ran 2px past the viewport at
+   1200x800 (round 2 #5); trimming the last row's margin buys it back. */
+#wgPeerList .vpn-peer:last-child { margin-bottom: 6px; }
 #vpnPeersList .vpn-peer { grid-template-columns: 9px minmax(160px, 1.3fr) minmax(100px, .8fr) minmax(80px, .6fr) minmax(80px, .6fr) auto; }
 #wgPeerList .vpn-peer.wg-peer { grid-template-columns: 9px minmax(160px, 1.2fr) minmax(140px, 1fr) minmax(110px, .8fr) minmax(110px, .8fr) auto; }
 .vpn-peer-ip, .vpn-peer-os { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -933,7 +944,14 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
    scroll. Fires only when the viewport is <= 770px tall, so the
    default 1200x800 window (viewport ~772px) keeps its current
    look. */
-@media (max-height: 770px) {
+/* Short viewports. The threshold is 780px, not 770: the default
+   1200x800 window's real innerHeight is 772 (the title bar eats
+   ~28px), so a 770px threshold never fired at the user's actual
+   window — the WireGuard server tab ran 28px past the viewport there
+   while the drivers (metrics override 1200x800) saw a clean fit.
+   780px covers the real window with margin, and stays below 800 so
+   the metrics-override drivers still exercise the base layout. */
+@media (max-height: 780px) {
   .main { padding: 8px 16px; }
   .topbar { margin-bottom: 8px; }
   .topbar h1 { font-size: 18px; }
@@ -943,7 +961,7 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   .btn { padding: 8px 14px; }
   .field { margin-bottom: 6px; }
   /* Short screens: fields lose 3px of vertical padding each (the
-     720px tier already uses 7px — this extends it up to 770px).
+     720px tier already uses 7px — this extends it up to 780px).
      The password fields only joined .field in the problem-8 fix,
      and their 10px padding pushed the Settings email tab ~15px
      past the budget at 1024x768 (regression 2026-11-26c); 8px
@@ -957,6 +975,11 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   .cloud-form-grid .field { margin-bottom: 6px; }
   .toggle-row { padding: 4px 0; }
   .vpn-peer { padding: 8px 12px; margin-bottom: 6px; }
+  /* WireGuard peer rows: at short heights the tier's 8px padding
+     made the server card run past the viewport at 1024x768 (and at
+     the real 1200x772 window once this tier fires there) — 4px
+     buys it back. Tailscale rows keep the tier padding. */
+  #wgPeerList .vpn-peer { padding-top: 4px; padding-bottom: 4px; }
   /* Heroes: the status subtitle joins the status line (the label
      stays on its own row) so the hero loses a line of height. */
   .vpn-status-row > div:first-child { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 10px; }
@@ -973,6 +996,10 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   .dash-fact { padding: 8px 10px; }
   .dash-donut-wrap { width: 80px; height: 80px; }
   .dash-donut { width: 80px; height: 80px; }
+  /* Smaller donut, smaller % (hole is only ~49px here — 20px text
+     would fill it edge to edge, the same complaint as round 2 #1). */
+  .dash-donut-center b { font-size: 17px; }
+  .dash-donut-center span { margin-top: 11px; }
   .dash-table th { padding: 5px 8px; }
   .dash-table td { padding: 6px 8px; }
   /* Quick Actions go two-across so the six buttons take three
@@ -983,11 +1010,17 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   .jobs-detail-list > div { padding: 2px 0; }
   /* Wizard / restore in-view cards: tighter header. */
   #view-wizard.modal-wrap, #view-restore.modal-wrap { padding: 2px 8px 8px; }
+  /* Wizard height budget at short heights (round 2 #5): the card
+     starts ~64px below the viewport top here (back bar hidden), so
+     the card may be 100vh-82px and the body 100vh-195px (82 + 113px
+     of card chrome). */
+  #view-wizard .modal-wrap .wizard-card, #view-restore .modal-wrap .wizard-card { max-height: calc(100vh - 82px); }
+  #view-wizard .modal-wrap .wizard-card .modal-body, #view-restore .modal-wrap .wizard-card .modal-body { max-height: calc(100vh - 195px); }
 }
 
 /* Very short screens (maximized window on a 1366x768 laptop,
    viewport ~700px): a second, tighter compaction on top of the
-   770px tier. */
+   780px tier. */
 @media (max-height: 720px) {
   .topbar { margin-top: 6px; }
   .topbar h1 { font-size: 16px; }

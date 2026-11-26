@@ -41,7 +41,6 @@
       <button class="nav-group-head" type="button" data-group="wireguard"><span>WireGuard VPN</span><span class="nav-chevron">▾</span></button>
       <button class="nav-item" type="button" data-nav="wireguard"><span class="ico">🔐</span> Overview</button>
       <button class="nav-item" type="button" data-nav="wireguard-site"><span class="ico">🔗</span> Site-to-Site</button>
-      <button class="nav-item" type="button" data-nav="wireguard-nat"><span class="ico">⇄</span> NAT Gateway</button>
     </div>
     <div class="sidebar-foot">
       <div>Powered by TechVision</div>
@@ -813,9 +812,6 @@
         <button class="btn btn-ghost btn-sm" type="button" id="wgServerImportBtn">Import server</button>
       </div>
       <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:4px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
-      <div class="vpn-sec-label">Devices (peers)</div>
-      <div class="wg-peers-head"><span></span><span>Device</span><span>Status</span><span>Transfer</span><span>Key</span><span></span></div>
-      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p></div></div>
       <div style="margin-top:6px;">
         <div class="t-label">Add a device</div>
         <div class="t-sub">The device's public key, its real IP or DDNS hostname, and its port — the other side needs nothing.</div>
@@ -826,6 +822,9 @@
           <button class="btn btn-ghost btn-sm" type="button" id="wgPeerAddBtn">Add peer</button>
         </div>
       </div>
+      <div class="vpn-sec-label">Devices (peers)</div>
+      <div class="wg-peers-head"><span></span><span>Device</span><span>Status</span><span>Transfer</span><span>Key</span><span></span></div>
+      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Add a device above and it will show up here.</p></div></div>
     </div>
     <div class="card" id="wgNatCard" style="display:none;">
       <div class="vpn-sec-label">Site-to-site — link two networks</div>
@@ -961,7 +960,7 @@
           <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
           <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
         </div>
-        <h3 style="margin:18px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
+        <h3 style="margin:10px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
         <div class="toggle-row">
           <div><div class="t-label">Run on schedule</div><div class="t-sub">Run this job automatically.</div></div>
           <label class="switch"><input type="checkbox" id="optSchedule"><span class="slider"></span></label>
@@ -976,22 +975,24 @@
               <label><input type="radio" name="frequency" value="Custom"> Custom</label>
             </div>
           </div>
-          <div class="field" id="customDaysField" style="display:none;">
-            <label>Days</label>
-            <div class="radio-row" id="customDaysRow">
-              <label><input type="checkbox" name="customDay" value="6"> Sat</label>
-              <label><input type="checkbox" name="customDay" value="0"> Sun</label>
-              <label><input type="checkbox" name="customDay" value="1"> Mon</label>
-              <label><input type="checkbox" name="customDay" value="2"> Tue</label>
-              <label><input type="checkbox" name="customDay" value="3"> Wed</label>
-              <label><input type="checkbox" name="customDay" value="4"> Thu</label>
-              <label><input type="checkbox" name="customDay" value="5"> Fri</label>
+          <div style="display:flex; gap:12px;">
+            <div class="field" id="customDaysField" style="display:none; flex:1; min-width:0;">
+              <label>Days</label>
+              <div class="radio-row" id="customDaysRow">
+                <label><input type="checkbox" name="customDay" value="6"> Sat</label>
+                <label><input type="checkbox" name="customDay" value="0"> Sun</label>
+                <label><input type="checkbox" name="customDay" value="1"> Mon</label>
+                <label><input type="checkbox" name="customDay" value="2"> Tue</label>
+                <label><input type="checkbox" name="customDay" value="3"> Wed</label>
+                <label><input type="checkbox" name="customDay" value="4"> Thu</label>
+                <label><input type="checkbox" name="customDay" value="5"> Fri</label>
+              </div>
+              <div class="hint">Pick the days this job runs, at the time below.</div>
             </div>
-            <div class="hint">Pick the days this job runs, at the time below.</div>
-          </div>
-          <div class="field">
-            <label for="scheduleTime">Time</label>
-            <input type="time" id="scheduleTime" value="02:00">
+            <div class="field" style="flex:0 0 150px;">
+              <label for="scheduleTime">Time</label>
+              <input type="time" id="scheduleTime" value="02:00">
+            </div>
           </div>
         </div>
       </section>
@@ -1022,9 +1023,9 @@
 
       <!-- Step 5: Review -->
       <section class="step-panel" data-panel="5">
-        <h3 style="margin:0 0 10px;">Review your job</h3>
+        <h3 style="margin:0 0 6px;">Review your job</h3>
         <div class="review" id="reviewBox"></div>
-        <div class="note info" style="margin-top:14px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
+        <div class="note info" style="margin-top:8px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
       </section>
     </div>
     <div class="modal-foot">
