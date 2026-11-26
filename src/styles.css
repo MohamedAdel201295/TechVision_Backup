@@ -697,7 +697,8 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .dash-stat-value-sm { font-size: 17px; padding-top: 4px; }
 .dash-stat-label, .dash-stat-value, .dash-stat-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dash-stat-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.dash-row { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; margin-bottom: 10px; }
+.dash-row { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 12px; margin-bottom: 10px; }
+.dash-row > .card { min-width: 0; }
 .dash-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
 .link-btn { background: none; border: none; color: var(--accent); font-weight: 600; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 6px; font-family: inherit; }
 .link-btn:hover { background: var(--accent-bg); }
@@ -732,7 +733,22 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; margin-right: 8px; }
 .dot-used { background: var(--accent); }
 .dot-free { background: var(--surface-3); }
-.dash-storage-sub { margin-top: 6px; font-size: 12px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dash-storage-sub { margin-top: 6px; min-height: 18px; font-size: 12px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Keep the lower Dashboard cards stable as recent jobs appear/disappear.
+   A long list scrolls inside its card rather than resizing Quick Actions.
+   The height fills the viewport minus the fixed upper content (banner +
+   stats/storage row + gaps + padding): 475px above the short-height
+   tier, 446px inside it (see the clamp below). At 1200x800 that is
+   325px, so the page fits exactly; taller viewports cap at 330px. */
+.dash-jobs-row { --dash-jobs-height: clamp(230px, calc(100vh - 475px), 330px); }
+.dash-jobs-row > .card { height: var(--dash-jobs-height); min-width: 0; margin-bottom: 0; }
+.dash-recent { display: flex; flex-direction: column; }
+.dash-recent > .dash-card-head { flex: 0 0 auto; }
+.dash-recent-content { flex: 1; min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.dash-recent-content .dash-table { min-width: 510px; }
+.dash-recent-content .empty-state { padding: 16px 12px; }
+.dash-recent-content .empty-state .big { font-size: 32px; line-height: 1; }
+.dash-recent-content .empty-state p { margin-bottom: 10px; font-size: 13px; }
 .dash-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .dash-table th { text-align: left; color: var(--muted); font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
 .dash-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
@@ -999,6 +1015,7 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   .dash-stat { padding: 10px 12px; }
   .dash-ico { width: 36px; height: 36px; flex: 0 0 36px; font-size: 17px; }
   .dash-row { gap: 8px; margin-bottom: 8px; }
+  .dash-jobs-row { --dash-jobs-height: clamp(230px, calc(100vh - 446px), 330px); }
   .dash-card-head { margin-bottom: 4px; }
   .dash-banner { padding: 8px 12px; }
   .dash-facts { gap: 8px; margin-top: 8px; }

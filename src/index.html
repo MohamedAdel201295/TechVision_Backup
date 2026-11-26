@@ -144,9 +144,10 @@
         <div class="dash-storage-sub" id="dashStorageDrive"></div>
       </section>
     </div>
-    <div class="dash-row">
+    <div class="dash-row dash-jobs-row">
       <section class="card dash-recent">
         <div class="dash-card-head"><h2 class="section-title" style="margin:0;">Recent Backup Jobs</h2><button class="link-btn" type="button" id="dashViewAllJobs">View All Jobs →</button></div>
+        <div class="dash-recent-content">
         <table class="dash-table">
           <thead><tr><th>Job Name</th><th>Type</th><th>Status</th><th>Size</th><th>Duration</th><th>Completed At</th></tr></thead>
           <tbody id="dashRecentBody"></tbody>
@@ -156,6 +157,7 @@
           <h3>No backups yet</h3>
           <p>Create your first backup job and protect your files.</p>
           <button class="btn btn-primary" type="button" id="dashEmptyNewJobBtn">＋ Create your first backup</button>
+        </div>
         </div>
       </section>
       <section class="card dash-actions">
