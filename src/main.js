@@ -1828,16 +1828,20 @@ ipcMain.handle('cloud-server-save', async (event, opts) => {
   const wasRunning = getCloudServer().isRunning();
   const portChanged = cfg.server.port !== port;
   const accessMode = cloudAccessMode(opts && opts.accessMode);
-  cfg.server.enabled = !!(opts && opts.enabled);
-  cfg.server.port = port;
-  cfg.server.accessMode = accessMode;
   // DDNS hostname (round 2 #9): recorded for clients — the server
   // itself listens on 0.0.0.0 and never consumes it. Also feeds the
   // certificate SANs (round 2 #12).
-  cfg.server.ddnsHostname = String((opts && opts.ddnsHostname) || '').trim().slice(0, 253);
+  const ddnsHostname = String((opts && opts.ddnsHostname) || '').trim().slice(0, 253);
+  // A DDNS change feeds the cert SANs, so a running server must
+  // restart for the new cert to take effect — same as a port change.
+  const ddnsChanged = ddnsHostname.toLowerCase() !== String(cfg.server.ddnsHostname || '').trim().toLowerCase();
+  cfg.server.enabled = !!(opts && opts.enabled);
+  cfg.server.port = port;
+  cfg.server.accessMode = accessMode;
+  cfg.server.ddnsHostname = ddnsHostname;
   saveCloudConfig();
   try {
-    if (wasRunning && portChanged) {
+    if (wasRunning && (portChanged || ddnsChanged)) {
       await getCloudServer().stop();
       if (cfg.server.enabled) await getCloudServer().start();
     } else if (cfg.server.enabled && !wasRunning) {

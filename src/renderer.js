@@ -307,6 +307,14 @@
       tr.addEventListener('click', function () { openDrawer(job); });
       body.appendChild(tr);
     });
+    // The list was just re-built: if the mouse is still over a row,
+    // re-apply the hover — a re-render replaces the row element, and
+    // a stationary mouse fires no new mouseover to restore it.
+    if (storageHoverDest !== null) {
+      var hoveredRow = body.querySelector('tr:hover');
+      if (hoveredRow) showStorageHover(hoveredRow.dataset.dest || '');
+      else clearStorageHover();
+    }
   }
   /* Storage donut: usage of the drive holding the latest backup's
      destination. Re-reads only when the destination changes, or when
@@ -358,6 +366,9 @@
     var dest = last ? (last.destination || '') : '';
     if (!force && dest === storageDest) return;
     storageDest = dest;
+    // A hover preview is on screen: a background refresh must not
+    // clobber it — the revert happens on mouseleave instead.
+    if (storageHoverDest !== null) return;
     var req = ++storageReq;
     await renderStorageFor(dest, req);
   }
@@ -876,8 +887,7 @@
   var cloudPanel = 'home';       // 'home' | 'server' | 'client' | 'mapdrive'
   var wgPanel = 'server';        // 'server' | 'nat' — WireGuard tabs
   var cloudSelected = null;      // saved server record being connected to
-  var cloudPendingProbe = null;  // { fingerprint, certPem } awaiting trust
-  var cloudCertChanged = false; // the server's cert changed since it was trusted — re-trust pending
+  var cloudPendingProbe = null;  // { fingerprint, certPem, changed } awaiting trust
   var cloudConn = null;          // { serverId, info } while connected
   var cloudPath = '';            // current remote path, '' = root, '/' separators
   var cloudTransferTimer = null;
@@ -1153,6 +1163,22 @@
     if (prevValue) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevValue) { sel.value = prevValue; break; } }
   }
 
+  // Last detected addresses, kept so the Server panel can re-render
+  // them (with the saved DDNS) without re-detecting every time.
+  var cloudDetectedAddresses = null;
+  function renderCloudServerAddresses() {
+    var addrs = $('cloudServerAddrs'); if (!addrs) return;
+    var lines = [];
+    if (cloudDetectedAddresses) {
+      var r = cloudDetectedAddresses;
+      lines.push(r.publicIP ? 'Public (from outside): ' + r.publicIP : 'Public: unknown (no internet or detection failed)');
+      if (r.lanIPs && r.lanIPs.length) lines.push('LAN (same network): ' + r.lanIPs.join(', '));
+    }
+    var ddns = cloudCfg && cloudCfg.server && cloudCfg.server.ddnsHostname;
+    if (ddns) lines.push('DDNS: ' + ddns);
+    addrs.textContent = lines.join(' — ') || 'Detect your addresses to see them here.';
+  }
+
   function renderCloudServer() {
     if (!cloudCfg) return;
     var s = cloudCfg.server || {};
@@ -1170,6 +1196,7 @@
     var en = $('cloudServerEnabled'); if (en) en.checked = !!s.enabled;
     var port = $('cloudServerPort'); if (port) port.value = String(s.port || 8443);
     var dd = $('cloudServerDdns'); if (dd) dd.value = s.ddnsHostname || '';
+    renderCloudServerAddresses();
     var gp = $('cloudGuidePort'); if (gp) gp.textContent = String(s.port || 8443);
     var fp = $('cloudServerFactPort'); if (fp) fp.textContent = String(s.port || 8443);
     var fu = $('cloudServerFactUsers'); if (fu) fu.textContent = String((s.users || []).length);
@@ -1434,9 +1461,16 @@
     await renderMapdrivePanel();
   }
 
+  // Pick the server a connect is for: close any open connect box and
+  // take a COPY of the record, so later mutations (a newly trusted
+  // fingerprint) do not rewrite the list entry before it is saved.
+  function selectCloudServer(srv) {
+    closeCloudConnect();
+    cloudSelected = Object.assign({}, srv);
+  }
+
   function openCloudConnect(srv, presetPassword) {
-    cloudSelected = srv;
-    cloudPendingProbe = null;
+    selectCloudServer(srv);
     var box = $('cloudConnectBox'); if (box) box.style.display = '';
     var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name + (srv.user ? ' as ' + srv.user : '');
     var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
@@ -1449,14 +1483,16 @@
     var box = $('cloudConnectBox'); if (box) box.style.display = 'none';
     cloudSelected = null;
     cloudPendingProbe = null;
-    cloudCertChanged = false;
+    // Leave nothing typed or stuck behind: a failed probe must not
+    // leave the button disabled or labelled "Checking server…".
+    var pass = $('cloudConnectPass'); if (pass) pass.value = '';
+    var btn = $('cloudConnectBtn'); if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
   }
 
   // One click on a saved server: the password is already on this device
   // (the main process uses the stored one), so go straight in — no box.
   async function cloudConnectSaved(srv) {
-    cloudSelected = srv;
-    cloudPendingProbe = null;
+    selectCloudServer(srv);
     await cloudConnectFlow(true, null);
   }
 
@@ -1490,18 +1526,16 @@
   }
 
   async function cloudConnectFlow(autoTrust, passwordOverride) {
-    if (!cloudSelected) return;
+    // Work on a local copy of the selected record: if the user picks
+    // another server mid-flow, the stale flow must stop, not connect
+    // to the wrong server.
+    var selected = cloudSelected;
+    if (!selected) return;
     if (!api || typeof api.cloudClientProbe !== 'function' || typeof api.cloudClientConnect !== 'function') return cloudMissing();
-    /* WireGuard mode: the tunnel has to be up before probing — a
-       down tunnel fails fast here with a clear message instead of
-       waiting out the 15s probe timeout. Main re-checks the same
-       way in cloud-client-connect for the trusted path. */
-    var wgMode = (cloudSelected.accessMode || cloudClientAccess) === 'wireguard';
-    if (wgMode) {
-      var wgCheck = await wgTunnelUpFor(cloudSelected.host);
-      if (!wgCheck.ok) { toast('WireGuard tunnel is down', wgCheck.error, 'error'); return; }
-    }
     var btn = $('cloudConnectBtn');
+    // A double-click must not start the flow twice.
+    if (btn && btn.disabled) return;
+    if (btn) btn.disabled = true;
     var pass = $('cloudConnectPass');
     var password = passwordOverride !== undefined ? (passwordOverride || '') : (pass ? pass.value : '');
     var justTrusted = null; // fingerprint trusted in this very click
@@ -1510,41 +1544,57 @@
     // trust the new fingerprint — the same manual box as first trust,
     // with the new fingerprint to compare. Never silently accept a
     // different certificate.
-    function offerCertRetrust(probe) {
-      cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
-      cloudCertChanged = true;
-      var title2 = $('cloudConnectTitle'); if (title2) title2.textContent = 'Connect to ' + cloudSelected.name + (cloudSelected.user ? ' as ' + cloudSelected.user : '');
-      var ft2 = $('cloudFingerprintText'); if (ft2) ft2.textContent = probe.fingerprint;
-      var fb2 = $('cloudFingerprintBox'); if (fb2) fb2.style.display = '';
-      var box2 = $('cloudConnectBox'); if (box2) box2.style.display = '';
-      var btn2 = $('cloudConnectBtn'); if (btn2) btn2.textContent = 'Trust & connect';
-      toast('Server certificate changed', 'Compare the new fingerprint with the fingerprint shown on the server, then press Trust & connect.', '');
+    function offerTrust(probe, changed) {
+      cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem, changed: changed };
+      var title = $('cloudConnectTitle');
+      if (title) title.textContent = 'Connect to ' + selected.name + (selected.user ? ' as ' + selected.user : '');
+      var ft = $('cloudFingerprintText'); if (ft) ft.textContent = probe.fingerprint;
+      var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = '';
+      var box = $('cloudConnectBox'); if (box) box.style.display = '';
+      if (pass && password) pass.value = password;
+      if (btn) btn.textContent = 'Trust & connect';
+      toast(changed ? 'Server certificate changed' : 'Check the fingerprint',
+        'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
     }
-    // No trusted certificate yet (or the trusted one changed — see
-    // below): probe the server first (nothing sensitive is sent to
-    // probe), then trust its fingerprint.
-    if (!cloudSelected.fingerprint || cloudCertChanged) {
-      if (!cloudPendingProbe) {
-        try {
-          if (btn) { btn.disabled = true; btn.textContent = 'Checking server…'; }
-          var probe = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-          if (!probe || !probe.success) { toast('Cannot reach server', (probe && probe.error) || 'Check the address and port.', 'error'); return; }
-          cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
-        } catch (e) {
-          toast('Cannot reach server', e && e.message ? e.message : 'Check the address and port.', 'error');
+
+    try {
+      /* WireGuard mode: the tunnel has to be up before probing — a
+         down tunnel fails fast here with a clear message instead of
+         waiting out the 15s probe timeout. Main re-checks the same
+         way in cloud-client-connect for the trusted path. */
+      if ((selected.accessMode || cloudClientAccess) === 'wireguard') {
+        var wgCheck = await wgTunnelUpFor(selected.host);
+        if (selected !== cloudSelected) return;
+        if (!wgCheck.ok) { toast('WireGuard tunnel is down', wgCheck.error, 'error'); return; }
+      }
+
+      // No trusted certificate yet (or the trusted one changed — see
+      // below): probe the server first (nothing sensitive is sent to
+      // probe), then trust its fingerprint.
+      var probe = cloudPendingProbe;
+      var certPem = selected.certPem;
+      // A changed certificate must never be trusted by a one-click
+      // Save & connect — only the manual Trust & connect button
+      // (which calls this with no arguments, so autoTrust is
+      // undefined) may accept it, after the user compared the
+      // fingerprint.
+      if (probe && probe.changed && autoTrust) return;
+      if (!probe && (!selected.fingerprint || !certPem)) {
+        if (btn) btn.textContent = 'Checking server…';
+        probe = await api.cloudClientProbe(selected.host, selected.port);
+        if (selected !== cloudSelected) return;
+        if (!probe || !probe.success) {
+          toast('Cannot reach server', (probe && probe.error) || 'Check the address and port.', 'error');
           return;
-        } finally {
-          // A failed probe must leave the button usable again, with its
-          // normal label — otherwise it stays stuck on "Checking server…".
-          if (btn) { btn.disabled = false; if (btn.textContent === 'Checking server…') btn.textContent = 'Connect'; }
         }
-        if (!autoTrust) {
+        if (selected.fingerprint && probe.fingerprint !== selected.fingerprint) {
+          offerTrust(probe, true);
+          return;
+        }
+        if (!selected.fingerprint && !autoTrust) {
           // Manual path: show the fingerprint and wait for the user to
           // compare it with the server screen and press Trust & connect.
-          var ft = $('cloudFingerprintText'); if (ft) ft.textContent = cloudPendingProbe.fingerprint;
-          var fbox = $('cloudFingerprintBox'); if (fbox) fbox.style.display = '';
-          if (btn) btn.textContent = 'Trust & connect';
-          toast('Check the fingerprint', 'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
+          offerTrust(probe, false);
           return;
         }
         // Save & connect asked for one click: trust this fingerprint
@@ -1552,51 +1602,35 @@
         // Connected toast and stays pinned afterwards; a changed
         // certificate is still refused on the next connect.
       }
+
       // Trust the probed fingerprint (user pressed Trust & connect, or
       // Save & connect is doing the whole thing in one click).
-      try {
-        if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+      if (probe && probe.fingerprint !== selected.fingerprint) {
+        if (btn) btn.textContent = 'Saving…';
         var saved = await api.cloudClientSave({
-          id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
-          port: cloudSelected.port, user: cloudSelected.user,
-          fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
-          accessMode: cloudClientAccess,
+          id: selected.id, name: selected.name, host: selected.host, port: selected.port,
+          user: selected.user, fingerprint: probe.fingerprint, certPem: probe.certPem,
+          accessMode: selected.accessMode,
         });
+        if (selected !== cloudSelected) return;
         if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
-        cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
-        cloudSelected.certPem = cloudPendingProbe.certPem;
-        justTrusted = cloudPendingProbe.fingerprint;
-        cloudCertChanged = false;
+        selected.fingerprint = probe.fingerprint;
+        selected.certPem = probe.certPem;
+        justTrusted = probe.fingerprint;
+        cloudPendingProbe = null;
         var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
-        await loadCloud();
-      } catch (e) {
-        toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error');
-        return;
-      } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
       }
-    }
-    // Trusted certificate: connect with the password — typed in the box,
-    // or the one saved on this device when this is a one-click reconnect.
-    if (!password && !cloudSelected.hasPassword) { toast('Password needed', 'Enter the password for user ' + (cloudSelected.user || '') + '.', 'error'); return; }
-    try {
-      if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
-      var certPem = cloudSelected.certPem;
-      if (!certPem) {
-        // Fingerprint known but the PEM was saved before this build, or
-        // the record came from the list (cloud-get-config does not send
-        // the PEM): re-probe once to get it. A different fingerprint
-        // means the server's certificate changed — offer to trust the
-        // new one instead of dead-ending with "remove and add again".
-        var p2 = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-        if (!p2 || !p2.success) { toast('Cannot reach server', (p2 && p2.error) || 'Check the address and port.', 'error'); return; }
-        if (p2.fingerprint !== cloudSelected.fingerprint) { offerCertRetrust(p2); return; }
-        certPem = p2.certPem;
-      }
+      if (probe) certPem = probe.certPem;
+
+      // Trusted certificate: connect with the password — typed in the box,
+      // or the one saved on this device when this is a one-click reconnect.
+      if (!password && !selected.hasPassword) { toast('Password needed', 'Enter the password for user ' + (selected.user || '') + '.', 'error'); return; }
+      if (btn) btn.textContent = 'Connecting…';
       var r = await api.cloudClientConnect({
-        serverId: cloudSelected.id, host: cloudSelected.host, port: cloudSelected.port,
-        certPem: certPem, user: cloudSelected.user, password: password || null,
+        serverId: selected.id, host: selected.host, port: selected.port,
+        certPem: certPem, user: selected.user, password: password || null,
       });
+      if (selected !== cloudSelected) return;
       if (!r || !r.success) {
         var connErr = (r && r.error) || 'Wrong user name or password.';
         // The server's certificate changed since this record was
@@ -1606,25 +1640,25 @@
         // offer to trust it — the same manual box as first trust, with
         // the new fingerprint to compare. Never silently accept a
         // different certificate.
-        if (/certificat/i.test(connErr) && cloudSelected.fingerprint) {
-          try {
-            var pr = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-            if (pr && pr.success && pr.fingerprint && pr.fingerprint !== cloudSelected.fingerprint) {
-              offerCertRetrust(pr);
-              return;
-            }
-          } catch (e) {}
+        if (/certificat/i.test(connErr) && selected.fingerprint) {
+          var replacement = null;
+          try { replacement = await api.cloudClientProbe(selected.host, selected.port); } catch (e) {}
+          if (selected !== cloudSelected) return;
+          if (replacement && replacement.success && replacement.fingerprint && replacement.fingerprint !== selected.fingerprint) {
+            offerTrust(replacement, true);
+            return;
+          }
         }
         toast('Connection failed', connErr, 'error'); return;
       }
-      // Keep the server name: closeCloudConnect() clears cloudSelected.
-      cloudConn = { serverId: cloudSelected.id, info: r.info, name: cloudSelected.name };
+      // `selected` is a local copy, so closeCloudConnect() clearing
+      // cloudSelected below cannot lose the server name.
+      cloudConn = { serverId: selected.id, info: r.info, name: selected.name };
       cloudMapInvalidateCache();
-      if (pass) pass.value = '';
       closeCloudConnect();
       cloudPath = '';
       var browser = $('cloudBrowser'); if (browser) browser.style.display = '';
-      toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).') + (justTrusted ? ' Server fingerprint ' + justTrusted.slice(0, 16) + '… trusted.' : ''));
+      toast('Connected', 'Signed in as ' + (r.info.user || selected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).') + (justTrusted ? ' Server fingerprint ' + justTrusted.slice(0, 16) + '… trusted.' : ''));
       renderCloudHome();
       // Re-read the config: a typed password was just saved on this
       // device, so the server card must now show Connect + Forget
@@ -1633,15 +1667,14 @@
       await cloudBrowse('');
       cloudStartPoller();
     } catch (e) {
-      toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
+      if (selected === cloudSelected) toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
     } finally {
-      if (btn) {
+      if (btn && selected === cloudSelected) {
         btn.disabled = false;
         // A re-trust offer just set the label to "Trust & connect" —
-        // do not overwrite it on the way out (the fingerprint box
-        // being visible is the sign that the offer is on screen).
-        var fbox = $('cloudFingerprintBox');
-        if (!fbox || fbox.style.display === 'none') btn.textContent = 'Connect';
+        // do not overwrite it on the way out (a pending probe is the
+        // sign that the offer is on screen).
+        btn.textContent = cloudPendingProbe ? 'Trust & connect' : 'Connect';
       }
     }
   }
@@ -3393,7 +3426,8 @@
       drb.addEventListener('mouseleave', clearStorageHover);
     }
     var dopen = $('dashOpenLocation'); if (dopen) dopen.addEventListener('click', function () {
-      if (storageDest && api && typeof api.openPath === 'function') api.openPath(storageDest).catch(function () {});
+      var dest = storageHoverDest === null ? storageDest : storageHoverDest;
+      if (dest && api && typeof api.openPath === 'function') api.openPath(dest).catch(function () {});
     });
 
     $('navRestore').addEventListener('click', function () { openRestore(null); });
@@ -3816,17 +3850,8 @@
       if (!api || typeof api.cloudDetectIP !== 'function') return cloudMissing();
       try {
         cdi.disabled = true; cdi.textContent = 'Detecting…';
-        var r = await api.cloudDetectIP();
-        var addrs = $('cloudServerAddrs');
-        if (addrs) {
-          var lines = [];
-          if (r.publicIP) lines.push('Public (from outside): ' + r.publicIP);
-          else lines.push('Public: unknown (no internet or detection failed)');
-          if (r.lanIPs && r.lanIPs.length) lines.push('LAN (same network): ' + r.lanIPs.join(', '));
-          var ddns = ($('cloudServerDdns') || {}).value || '';
-          if (ddns) lines.push('DDNS: ' + ddns);
-          addrs.textContent = lines.join(' — ');
-        }
+        cloudDetectedAddresses = await api.cloudDetectIP();
+        renderCloudServerAddresses();
       } catch (e) { toast('Detect error', e && e.message ? e.message : 'Could not detect addresses.', 'error'); }
       finally { cdi.disabled = false; cdi.textContent = 'Detect my addresses'; }
     });
@@ -3886,9 +3911,8 @@
           var rec = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === r.id; });
           if (rec) {
             if (password) {
-              cloudSelected = rec;
-              cloudPendingProbe = null;
-              cloudConnectFlow(true, password);
+              selectCloudServer(rec);
+              await cloudConnectFlow(true, password);
             } else {
               openCloudConnect(rec);
             }
