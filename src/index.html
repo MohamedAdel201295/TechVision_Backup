@@ -18,7 +18,7 @@
         <div class="brand-sub">Backup • Cloud • VPN</div>
       </div>
     </div>
-    <div class="nav-group" id="navGroupBackup">
+    <div class="nav-group collapsed" id="navGroupBackup">
       <button class="nav-group-head" type="button" data-group="backup"><span>Backup</span><span class="nav-chevron">▾</span></button>
       <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
       <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
@@ -26,18 +26,18 @@
       <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
       <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
     </div>
-    <div class="nav-group" id="navGroupCloud">
+    <div class="nav-group collapsed" id="navGroupCloud">
       <button class="nav-group-head" type="button" data-group="cloud"><span>Cloud</span><span class="nav-chevron">▾</span></button>
       <button class="nav-item" type="button" data-nav="cloud"><span class="ico">☁</span> Overview</button>
       <button class="nav-item" type="button" data-nav="cloud-server"><span class="ico">🖥️</span> Server</button>
       <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
       <button class="nav-item" type="button" data-nav="cloud-mapdrive"><span class="ico">🗺️</span> Map network</button>
     </div>
-    <div class="nav-group" id="navGroupVpn">
+    <div class="nav-group collapsed" id="navGroupVpn">
       <button class="nav-group-head" type="button" data-group="vpn"><span>Tailscale VPN</span><span class="nav-chevron">▾</span></button>
       <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> Overview</button>
     </div>
-    <div class="nav-group" id="navGroupWireguard">
+    <div class="nav-group collapsed" id="navGroupWireguard">
       <button class="nav-group-head" type="button" data-group="wireguard"><span>WireGuard VPN</span><span class="nav-chevron">▾</span></button>
       <button class="nav-item" type="button" data-nav="wireguard"><span class="ico">🔐</span> Overview</button>
       <button class="nav-item" type="button" data-nav="wireguard-site"><span class="ico">🔗</span> Site-to-Site</button>
@@ -131,7 +131,7 @@
       <section class="card dash-storage">
         <div class="dash-card-head"><h2 class="section-title" style="margin:0;">Backup Storage</h2><button class="link-btn" type="button" id="dashOpenLocation">Open Location ⤢</button></div>
         <div class="dash-donut-wrap">
-          <svg class="dash-donut" viewBox="0 0 150 150" width="150" height="150" aria-hidden="true">
+          <svg class="dash-donut" viewBox="0 0 150 150" width="96" height="96" aria-hidden="true">
             <circle cx="75" cy="75" r="54" fill="none" stroke="var(--surface-3)" stroke-width="16"></circle>
             <circle id="dashDonutArc" cx="75" cy="75" r="54" fill="none" stroke="var(--accent)" stroke-width="16" stroke-linecap="round" stroke-dasharray="0 339.292" transform="rotate(-90 75 75)"></circle>
           </svg>
@@ -185,6 +185,10 @@
       <span class="jobs-chip chip-ok">Completed <b id="jobsChipCompleted">—</b></span>
       <span class="jobs-chip chip-run">Running <b id="jobsChipRunning">—</b></span>
       <span class="jobs-chip chip-bad">Failed <b id="jobsChipFailed">—</b></span>
+      <label class="search-box jobs-search">
+        <span aria-hidden="true">🔍</span>
+        <input type="text" id="jobsSearchInput" placeholder="Search jobs…" autocomplete="off">
+      </label>
     </div>
     <div class="jobs-toolbar">
       <button class="btn btn-primary btn-sm" type="button" id="jobsRunBtn">▶ Run Now</button>
@@ -193,10 +197,6 @@
       <button class="btn btn-ghost btn-sm" type="button" id="jobsRefreshBtn">⟳ Refresh</button>
       <button class="btn btn-ghost btn-sm" type="button" id="jobsClearHistoryBtn">🗑 Clear History</button>
       <span class="jobs-toolbar-spacer"></span>
-      <label class="search-box jobs-search">
-        <span aria-hidden="true">🔍</span>
-        <input type="text" id="jobsSearchInput" placeholder="Search jobs…" autocomplete="off">
-      </label>
       <select class="filter" id="jobsStatusFilter" aria-label="Filter by status">
         <option value="all">All Jobs</option>
         <option value="COMPLETED">Completed</option>
@@ -338,10 +338,11 @@
         <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
       </div>
     </div>
-    <div id="settingsEmailSection" class="card cloud-section" style="display:none;">
+        <div id="settingsEmailSection" class="card cloud-section" style="display:none;">
       <h3 style="margin:0 0 4px;font-size:16px;">✉ Email notifications</h3>
       <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">Get an email when a backup starts or finishes, or when the app was closed and a scheduled backup was missed.</p>
-      <div class="settings-guide">
+      <details class="settings-guide">
+        <summary>How to fill this in — Gmail needs an App Password, not your normal password</summary>
         <div class="settings-guide-title">What to fill in</div>
         <ul>
           <li><b>Send notifications to</b> — the inbox that receives the emails.</li>
@@ -354,8 +355,10 @@
           <li>Your backup job password or the master password — those belong to encryption, not to email.</li>
           <li>The app only ever emails the address in “Send notifications to” — nothing else.</li>
         </ul>
-      </div>
-      <div class="toggle-row">
+      </details>
+      <div class="settings-email-grid">
+        <div>
+<div class="toggle-row">
         <div><div class="t-label">Email notifications</div><div class="t-sub">Send mail for backup events.</div></div>
         <label class="switch"><input type="checkbox" id="settingEmailEnabled"><span class="slider"></span></label>
       </div>
@@ -371,7 +374,9 @@
         <div><div class="t-label">Notify if service was down</div><div class="t-sub">Email when a scheduled backup was missed because the app was closed.</div></div>
         <label class="switch"><input type="checkbox" id="settingEmailMissed" checked><span class="slider"></span></label>
       </div>
-      <div class="field">
+        </div>
+        <div class="settings-email-fields">
+<div class="field">
         <label for="settingEmailTo">Send notifications to (email)</label>
         <input type="text" id="settingEmailTo" placeholder="you@example.com" autocomplete="off">
       </div>
@@ -393,6 +398,8 @@
         <label for="settingEmailPort">SMTP port</label>
         <input type="text" id="settingEmailPort" value="465" autocomplete="off">
         <div class="hint">465 = SSL, 587 = STARTTLS. Most company servers use one of these two.</div>
+      </div>
+        </div>
       </div>
       <button class="btn" type="button" id="emailTestBtn" style="margin-top:8px;">✉ Send test email</button>
     </div>
@@ -434,9 +441,9 @@
         </dl>
       </button>
     </div>
-    <div id="cloudServerPanel" style="display:none;">
+    <div id="cloudServerPanel" class="cloud-server-grid" style="display:none;">
       <h3 style="margin:14px 0 4px;font-size:16px;">Server — share a folder</h3>
-      <div class="card cloud-section">
+      <div class="card cloud-section cloud-server-status">
         <div class="cloud-status-row">
           <span class="pill pill-pending" id="cloudServerPill">Stopped</span>
           <span id="cloudServerInfo" class="cloud-muted">Not running</span>
@@ -446,11 +453,11 @@
           <div class="cloud-fact"><div class="t-label">Port</div><div class="cloud-fact-value" id="cloudServerFactPort">8443</div></div>
           <div class="cloud-fact"><div class="t-label">Users</div><div class="cloud-fact-value" id="cloudServerFactUsers">0</div></div>
         </div>
-        <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap;">
+        <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
           <button class="btn btn-primary" type="button" id="cloudServerStartBtn">▶ Start server</button>
         </div>
       </div>
-      <div class="card cloud-section">
+      <div class="card cloud-section cloud-server-settings">
       <div class="toggle-row">
         <div><div class="t-label">Server enabled</div><div class="t-sub">Start serving when the app starts (it stays alive in the tray).</div></div>
         <label class="switch"><input type="checkbox" id="cloudServerEnabled"><span class="slider"></span></label>
@@ -474,6 +481,7 @@
         <div id="cloudWireguardIp" class="cloud-muted">Checking WireGuard…</div>
         <div class="hint">Clients on the same WireGuard tunnel use this address + the port. No port forwarding needed — the one UDP 51820 forward that brings the tunnel up covers everything inside it.</div>
       </div>
+      <div class="cloud-form-grid">
       <div class="field">
         <label for="cloudServerPort">Port</label>
         <input type="text" id="cloudServerPort" value="8443" autocomplete="off">
@@ -484,6 +492,7 @@
         <div id="cloudServerAddrs" class="cloud-muted">Detect your addresses to see them here.</div>
         <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn" style="margin-top:6px;">Detect my addresses</button>
       </div>
+      </div>
       <div class="settings-guide" id="cloudForwardGuide">
         <div class="settings-guide-title">To reach this server from outside</div>
         <ul>
@@ -493,10 +502,11 @@
         </ul>
       </div>
       </div>
-      <div class="card cloud-section">
+      <div class="card cloud-section cloud-server-users">
       <h3 style="margin:0 0 4px;font-size:14px;">Users</h3>
       <p class="cloud-muted" style="margin:0 0 8px;">Each user sees only their own folder. Give a user the whole drive (D:\) or one folder (D:\HR). Passwords are stored hashed, never in plain text.</p>
       <div id="cloudUsersList" class="job-list"></div>
+      <div class="cloud-form-grid">
       <div class="field">
         <label for="cloudUserName">User name</label>
         <input type="text" id="cloudUserName" placeholder="e.g. admin or HR" autocomplete="off">
@@ -516,6 +526,7 @@
         <div><div class="t-label">Can write</div><div class="t-sub">Upload, delete and rename. Off = read-only.</div></div>
         <label class="switch"><input type="checkbox" id="cloudUserCanWrite" checked><span class="slider"></span></label>
       </div>
+      </div>
       <button class="btn" type="button" id="cloudUserAddBtn">＋ Add user</button>
       </div>
     </div>
@@ -523,6 +534,7 @@
       <h3 style="margin:14px 0 4px;font-size:16px;">Client — open a shared folder</h3>
       <div class="card cloud-section">
       <div id="cloudServersList" class="job-list"></div>
+      <div class="cloud-form-grid">
       <div class="field">
         <label for="cloudClientName">Name</label>
         <input type="text" id="cloudClientName" placeholder="e.g. Home server" autocomplete="off">
@@ -558,6 +570,7 @@
         <label for="cloudClientPass">Password</label>
         <input type="password" id="cloudClientPass" placeholder="Password of this user" autocomplete="off">
         <div class="hint">The password of the user above, as created on the server. Asked once when you connect — it is never stored on this computer.</div>
+      </div>
       </div>
       <button class="btn" type="button" id="cloudClientAddBtn">＋ Save &amp; connect</button>
       </div>
@@ -753,8 +766,10 @@
         <div>
           <div class="t-label">AmneziaWG status</div>
           <div class="vpn-status"><span id="wgStatusDot" class="vpn-dot"></span><span id="wgStatusText">Checking…</span></div>
-          <div class="t-sub" id="wgStatusSub"></div>
-          <div class="t-sub" id="wgTransportLine" style="display:none;"></div>
+          <div style="display:flex; gap:10px; align-items:baseline;">
+            <div class="t-sub" id="wgStatusSub"></div>
+            <div class="t-sub" id="wgTransportLine" style="display:none;"></div>
+          </div>
         </div>
       </div>
       <div id="wgNotInstalled" style="display:none;">
@@ -766,49 +781,55 @@
         </div>
       </div>
     </div>
+    <div class="cloud-tabs" role="tablist">
+      <button class="cloud-tab active" type="button" data-wg-tab="server">Server</button>
+      <button class="cloud-tab" type="button" data-wg-tab="nat">Site-to-Site</button>
+    </div>
     <div class="card" id="wgServerCard">
       <div class="vpn-sec-label">Server — this machine is the hub</div>
       <div class="vpn-facts">
         <div class="vpn-fact-tile"><div class="t-label">Public key</div><div class="vpn-fact" id="wgServerKey">—</div></div>
       </div>
-      <div style="margin-top:12px;">
+      <div class="wg-server-grid" style="margin-top:6px;">
+      <div style="margin-top:0;">
         <div class="t-label">Tunnel address &amp; port</div>
-        <div class="t-sub">This server's address inside the tunnel, and the UDP port your router forwards. Defaults: 10.0.0.1 and 51820.</div>
+        <div class="t-sub">Address inside the tunnel, and the UDP port your router forwards.</div>
         <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
           <input type="text" id="wgServerIp" placeholder="10.0.0.1" autocomplete="off" style="flex:1; min-width:140px;">
           <input type="text" id="wgServerPort" placeholder="51820" autocomplete="off" inputmode="numeric" style="flex:1; min-width:100px;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgServerSettingsSaveBtn">Save</button>
         </div>
       </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
-        <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>
-        <button class="btn btn-ghost btn-sm" type="button" id="wgServerExportBtn">Export server</button>
-        <button class="btn btn-ghost btn-sm" type="button" id="wgServerImportBtn">Import server</button>
-      </div>
-      <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:10px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
-      <div style="margin-top:12px;">
+      <div style="margin-top:0;">
         <div class="t-label">Endpoint — the address clients connect to</div>
-        <div class="t-sub">The public IP is read automatically. If you use DDNS, type the hostname here instead.</div>
+        <div class="t-sub">Public IP is read automatically; a DDNS hostname works too.</div>
         <div style="display:flex; gap:8px; margin-top:6px;">
           <input type="text" id="wgEndpoint" placeholder="203.0.113.10 or myhome.ddns.net" autocomplete="off" style="flex:1;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgEndpointSaveBtn">Save</button>
         </div>
       </div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">
+        <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerExportBtn">Export server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerImportBtn">Import server</button>
+      </div>
+      <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:4px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
       <div class="vpn-sec-label">Devices (peers)</div>
       <div class="wg-peers-head"><span></span><span>Device</span><span>Status</span><span>Transfer</span><span>Key</span><span></span></div>
       <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p></div></div>
-      <div style="margin-top:12px;">
+      <div style="margin-top:6px;">
         <div class="t-label">Add a device</div>
-        <div class="t-sub">One way: the device's public key, its real IP or DDNS hostname, and its port. The server reaches it at that address — the other side needs nothing.</div>
+        <div class="t-sub">The device's public key, its real IP or DDNS hostname, and its port — the other side needs nothing.</div>
         <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <input type="text" id="wgPeerKey" placeholder="Public key (44 characters, ends with =)" autocomplete="off" style="flex:2; min-width:220px;">
-          <input type="text" id="wgPeerHost" placeholder="Real IP or DDNS, e.g. 192.168.1.49" autocomplete="off" style="flex:1; min-width:160px;">
-          <input type="text" id="wgPeerPort" placeholder="Port" value="51820" inputmode="numeric" autocomplete="off" style="flex:0 0 90px; min-width:80px;">
+          <input type="text" id="wgPeerKey" placeholder="Public key (44 characters, ends with =)" autocomplete="off" style="flex:2; min-width:150px;">
+          <input type="text" id="wgPeerHost" placeholder="Real IP or DDNS, e.g. 192.168.1.49" autocomplete="off" style="flex:1; min-width:110px;">
+          <input type="text" id="wgPeerPort" placeholder="Port" value="51820" inputmode="numeric" autocomplete="off" style="flex:0 0 70px; min-width:60px;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgPeerAddBtn">Add peer</button>
         </div>
       </div>
     </div>
-    <div class="card" id="wgNatCard">
+    <div class="card" id="wgNatCard" style="display:none;">
       <div class="vpn-sec-label">Site-to-site — link two networks</div>
       <div class="t-sub wg-nat-intro">Add each device: name, real IP, alias IP.</div>
       <div class="t-sub vpn-note" id="wgNatStatus" style="margin-top:10px;">NAT service: stopped.</div>

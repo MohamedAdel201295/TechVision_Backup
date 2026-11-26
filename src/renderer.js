@@ -350,7 +350,7 @@
      the visible view; going back to Backup returns to the last backup
      view instead of always resetting to Dashboard. */
   var currentModule = 'backup';
-  var lastBackupView = 'dashboard';
+  var lastBackupView = 'dashboard'; // the view Back / closing Settings returns to (any module)
 
   function applyModuleUI(mod) {
     currentModule = mod;
@@ -389,17 +389,6 @@
     showView('dashboard');
   }
 
-  /* Scroll to a card inside the WireGuard view AFTER the status load
-     finishes: loadWireGuard() hides/shows cards, and scrolling before
-     that races it (same pattern as the Cloud jump button). */
-  function wgScrollTo(cardId) {
-    var go = function () { var t = $(cardId); if (t) { try { t.scrollIntoView({ block: 'start' }); } catch (e) {} } };
-    if (typeof loadWireGuard === 'function') {
-      try { var p = loadWireGuard(); if (p && typeof p.then === 'function') { p.then(go); return; } } catch (e) {}
-    }
-    go();
-  }
-
   function showView(name) {
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
@@ -429,13 +418,20 @@
        syncCloudNav() marks it (called by showView('cloud') below and
        by showCloudPanel). Only mark Overview when the home panel is open. */
     if (btn && !(name === 'cloud' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive'))) btn.classList.add('active');
-    /* A view reached from elsewhere (Back button, jump button) must
-       never land on a hidden item: reopen the active item's group. */
-    var ab = document.querySelector('.nav-item.active');
-    if (ab) { var ag = ab.closest('.nav-group'); if (ag) ag.classList.remove('collapsed'); }
+    /* Groups open ONLY when the user clicks the group header — never
+       on navigation. A view reached from elsewhere (Back button, jump
+       button, Quick Action) shows in the main area on the right while
+       the sidebar stays exactly as the user left it. */
     if (name === 'jobs') renderJobsView();
     if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
     else stopLogsAutoRefresh();
+    /* The dashboard has nowhere to go back to — hiding its back bar
+       buys the tallest page ~48px so the whole page fits. */
+    var bb = $('backBar'); if (bb) bb.style.display = name === 'dashboard' ? 'none' : '';
+    /* The top-bar subtitle is redundant — every view carries its own
+       heading and description in the page — so it stays hidden and
+       every page gains ~15px of room. */
+    var asub = $('appSubtitle'); if (asub) asub.style.display = 'none';
     if (name === 'dashboard' || name === 'jobs' || name === 'logs') {
       lastBackupView = name; applyModuleUI('backup');
       setBackTitle('Backup');
@@ -450,18 +446,21 @@
       setAppTitle('Settings', 'Your preferences for TechVision Backup.');
     }
     if (name === 'cloud') {
+      lastBackupView = name;
       applyModuleUI('cloud'); syncCloudNav();
       setBackTitle(cloudPanel === 'server' ? 'Cloud — Server' : cloudPanel === 'client' ? 'Cloud — Client' : cloudPanel === 'mapdrive' ? 'Cloud — Map network' : 'Cloud');
       setAppTitle('TechVision Cloud', 'Your own remote drive — share a folder or open one, encrypted.');
       loadCloud();
     }
     if (name === 'vpn') {
+      lastBackupView = name;
       applyModuleUI('vpn');
       setBackTitle('VPN');
       setAppTitle('TechVision Tailscale VPN', 'Your private network — every device, anywhere, as if it were home.');
       loadVpn();
     }
     if (name === 'wireguard') {
+      lastBackupView = name;
       applyModuleUI('wireguard');
       setBackTitle('WireGuard VPN');
       setAppTitle('TechVision WireGuard VPN', 'Your own VPN server — no accounts, no middleman, one port on the router.');
@@ -737,7 +736,7 @@
       rows.forEach(function (r) {
         var div = document.createElement('div');
         var dt = document.createElement('dt'); dt.textContent = r[0];
-        var dd = document.createElement('dd'); dd.textContent = r[1];
+        var dd = document.createElement('dd'); dd.textContent = r[1]; dd.title = r[1];
         div.appendChild(dt); div.appendChild(dd); listEl.appendChild(div);
       });
     }
@@ -765,6 +764,7 @@
   /* ---------- TechVision Cloud ---------- */
   var cloudCfg = null;           // last cloud-get-config result
   var cloudPanel = 'home';       // 'home' | 'server' | 'client' | 'mapdrive'
+  var wgPanel = 'server';        // 'server' | 'nat' — WireGuard tabs
   var cloudSelected = null;      // saved server record being connected to
   var cloudPendingProbe = null;  // { fingerprint, certPem } awaiting trust
   var cloudConn = null;          // { serverId, info } while connected
@@ -788,6 +788,15 @@
     } catch (e) {
       toast('Cloud', e && e.message ? e.message : 'Could not load Cloud settings.', 'error');
     }
+  }
+
+  /* WireGuard tabs (Server / Site-to-Site): one card visible at a
+     time, like the Cloud tabs, so each tab fits the window height. */
+  function showWgPanel(panel) {
+    wgPanel = panel;
+    var server = $('wgServerCard'); if (server) server.style.display = panel === 'server' ? '' : 'none';
+    var nat = $('wgNatCard'); if (nat) nat.style.display = panel === 'nat' ? '' : 'none';
+    document.querySelectorAll('[data-wg-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-wg-tab') === panel); });
   }
 
   function showCloudPanel(panel) {
@@ -1066,6 +1075,7 @@
         var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = u.name;
         var meta = document.createElement('div'); meta.className = 'job-meta';
         meta.textContent = (u.canWrite ? 'Read + write' : 'Read-only') + ' — ' + u.root;
+        meta.title = u.root;
         var acts = document.createElement('div'); acts.className = 'drawer-actions';
         var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete user';
         del.addEventListener('click', function () {
@@ -1079,8 +1089,8 @@
           });
         });
         acts.appendChild(del);
-        body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
-        card.appendChild(body);
+        body.appendChild(h); body.appendChild(meta);
+        card.appendChild(body); card.appendChild(acts);
         list.appendChild(card);
       });
     }
@@ -2836,9 +2846,9 @@
       return;
     }
     if (ni) ni.style.display = 'none';
-    if (sc) sc.style.display = '';
+    if (sc) sc.style.display = wgPanel === 'server' ? '' : 'none';
     if (tl) {
-      if (st.transport === 'amneziawg') { tl.style.display = ''; tl.textContent = st.obfuscated ? 'Transport: AmneziaWG — traffic is obfuscated, so it doesn\u2019t look like WireGuard on the network.' : 'Transport: AmneziaWG.'; }
+      if (st.transport === 'amneziawg') { tl.style.display = ''; tl.textContent = st.obfuscated ? 'Transport: AmneziaWG (obfuscated)' : 'Transport: AmneziaWG.'; }
       else { tl.style.display = ''; tl.textContent = 'Transport: stock WireGuard (no obfuscation).'; }
     }
     if (st.serverRunning) {
@@ -2861,7 +2871,7 @@
     var sp = $('wgServerPort');
     if (sp && document.activeElement !== sp) sp.value = String((st.server && st.server.listenPort) || 51820);
     var ph = $('wgPortHint');
-    if (ph) ph.textContent = 'On your router, forward UDP ' + ((st.server && st.server.listenPort) || 51820) + ' to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.';
+    if (ph) ph.textContent = 'On your router, forward UDP ' + ((st.server && st.server.listenPort) || 51820) + ' to this machine — the only router step.';
     var ep = $('wgEndpoint');
     if (ep && document.activeElement !== ep) ep.value = (st.server && st.server.endpoint) || '';
     renderWgPeers(st.peers || []);
@@ -2941,7 +2951,7 @@
     var mk = function (cls, ph) {
       var el = document.createElement('input');
       el.type = 'text'; el.className = cls; el.placeholder = ph; el.autocomplete = 'off';
-      el.style.cssText = 'flex:1; min-width:130px;';
+      el.style.cssText = 'flex:1; min-width:100px;';
       el.addEventListener('input', function () { wgNatFormDirty = true; });
       return el;
     };
@@ -3248,13 +3258,16 @@
     var cn = $('confirmNo'); if (cn) cn.addEventListener('click', closeConfirm);
     var cb2 = $('confirmBackdrop'); if (cb2) cb2.addEventListener('click', closeConfirm);
     /* Collapsible nav groups: the arrow next to Backup / Cloud / VPN
-       folds its items away; the active item's group reopens on its
-       own whenever navigation lands on it (see showView). */
+       folds its items away. All groups start collapsed and open only
+       when the user clicks the header — navigation never opens one. */
     document.querySelectorAll('.nav-group-head').forEach(function (head) {
       head.addEventListener('click', function () {
         var g = head.closest('.nav-group');
         if (g) g.classList.toggle('collapsed');
       });
+    });
+    document.querySelectorAll('[data-wg-tab]').forEach(function (tab) {
+      tab.addEventListener('click', function () { showWgPanel(tab.getAttribute('data-wg-tab')); });
     });
     document.querySelectorAll('[data-cloud-tab]').forEach(function (tab) {
       tab.addEventListener('click', function () {
@@ -3274,8 +3287,8 @@
         if (nav === 'cloud') { showCloudPanel('home'); showView('cloud'); }
         if (nav === 'vpn') showView('vpn');
         if (nav === 'wireguard') showView('wireguard');
-        if (nav === 'wireguard-site') { showView('wireguard'); wgScrollTo('wgServerCard'); }
-        if (nav === 'wireguard-nat') { showView('wireguard'); wgScrollTo('wgNatCard'); }
+        if (nav === 'wireguard-site') { showView('wireguard'); showWgPanel('server'); }
+        if (nav === 'wireguard-nat') { showView('wireguard'); showWgPanel('nat'); }
         if (nav === 'cloud-server') { showCloudPanel('server'); setModule('cloud'); }
         if (nav === 'cloud-client') { showCloudPanel('client'); setModule('cloud'); }
         if (nav === 'cloud-mapdrive') { showCloudPanel('mapdrive'); setModule('cloud'); }
