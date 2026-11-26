@@ -36,6 +36,9 @@ const EOCD_SIG = 0x06054b50;
 const CD_SIG = 0x02014b50;
 const LFH_SIG = 0x04034b50;
 const AES_EXTRA_ID = 0x9901;
+const ZIP64_EOCD_SIG = 0x06064b50;
+const ZIP64_LOC_SIG = 0x07064b50;
+const ZIP64_EXTRA_ID = 0x0001;
 // Ciphertext bytes read per stream chunk while decrypting.
 const DECRYPT_CHUNK = 64 * 1024;
 let tmpCounter = 0;
@@ -106,6 +109,92 @@ function parseExtra(extra, wantId) {
   return null;
 }
 
+// --- Zip64 support (P1-6) ---
+// A Zip64 archive stores the real values where the 32-bit fields
+// hold sentinels: the end-of-central-directory record holds
+// 0xFFFF counts / 0xFFFFFFFF sizes and offsets (resolved through
+// the Zip64 EOCD record + locator just before it), and a central
+// directory entry holds 0xFFFFFFFF sizes / local offset (resolved
+// through its Zip64 extra field 0x0001). Multi-disk archives are
+// still rejected — TechVision never writes them and the reader
+// cannot fetch entries from another disk.
+
+// The Zip64 extra field stores the values that are sentinels in the
+// central directory, in this fixed order: uncompressed size (8),
+// compressed size (8), local header offset (8), disk start (4) —
+// only the sentinel fields appear. `need` says which ones to read.
+function parseZip64Extra(extra, need) {
+  const raw = parseExtra(extra, ZIP64_EXTRA_ID);
+  if (!raw) throw new Error('Zip64 entry is missing its Zip64 extra field.');
+  let off = 0;
+  const out = {};
+  const take64 = () => {
+    if (off + 8 > raw.length) throw new Error('Zip64 entry has a truncated Zip64 extra field.');
+    const v = raw.readBigUInt64LE(off); off += 8;
+    if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Zip64 entry value is too large.');
+    return Number(v);
+  };
+  const take32 = () => {
+    if (off + 4 > raw.length) throw new Error('Zip64 entry has a truncated Zip64 extra field.');
+    const v = raw.readUInt32LE(off); off += 4;
+    return v;
+  };
+  if (need.size) out.size = take64();
+  if (need.compressedSize) out.compressedSize = take64();
+  if (need.localOffset) out.localOffset = take64();
+  if (need.diskStart) out.diskStart = take32();
+  return out;
+}
+
+// Zip64 EOCD locator (20 bytes, immediately before the EOCD):
+// signature, disk holding the Zip64 record, offset of the record,
+// total disks. Returns the record's absolute file offset.
+function parseZip64Locator(locBuf) {
+  if (locBuf.length < 20 || locBuf.readUInt32LE(0) !== ZIP64_LOC_SIG) {
+    throw new Error('Zip64 archive is missing its end-of-central-directory locator.');
+  }
+  const recOff = locBuf.readBigUInt64LE(8);
+  if (recOff > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Zip64 archive end-of-central-directory offset is too large.');
+  return Number(recOff);
+}
+
+// Zip64 EOCD record (fixed part 56 bytes): signature, record size
+// (8), version made by (2), version needed (2), disk (4), CD start
+// disk (4), entries on this disk (8), total entries (8), CD size
+// (8), CD offset (8). Returns the real EOCD values.
+function parseZip64Record(recBuf) {
+  if (recBuf.length < 56 || recBuf.readUInt32LE(0) !== ZIP64_EOCD_SIG) {
+    throw new Error('Zip64 archive has a corrupt end-of-central-directory record.');
+  }
+  const disk = recBuf.readUInt32LE(16);
+  const cdDisk = recBuf.readUInt32LE(20);
+  if (disk !== 0 || cdDisk !== 0) throw new Error('Multi-disk archives are not supported by the AES reader.');
+  const total = recBuf.readBigUInt64LE(32);
+  const cdSize = recBuf.readBigUInt64LE(40);
+  const cdOffset = recBuf.readBigUInt64LE(48);
+  for (const pair of [['entry count', total], ['central directory size', cdSize], ['central directory offset', cdOffset]]) {
+    if (pair[1] > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Zip64 archive ' + pair[0] + ' is too large.');
+  }
+  return { count: Number(total), cdSize: Number(cdSize), cdOffset: Number(cdOffset) };
+}
+
+// Resolve the EOCD's count/size/offset when any of them is a Zip64
+// sentinel. `readAt` reads `length` bytes at an absolute file
+// offset (buffer slice or fd pread) — the locator sits immediately
+// before the EOCD and the record at the offset it names.
+function resolveZip64EOCD(eocd, readAt) {
+  const count = eocd.count;
+  const cdSize = eocd.cdSize;
+  const cdOffset = eocd.cdOffset;
+  if (count !== 0xFFFF && cdSize !== 0xFFFFFFFF && cdOffset !== 0xFFFFFFFF) {
+    return { count: count, cdSize: cdSize, cdOffset: cdOffset };
+  }
+  const locBuf = readAt(eocd.eocdOff - 20, 20);
+  const recOff = parseZip64Locator(locBuf);
+  const recBuf = readAt(recOff, 56);
+  return parseZip64Record(recBuf);
+}
+
 // Walk `count` central-directory entries starting at `startOff` in
 // `buf` (which holds the central-directory bytes). Shared by the
 // whole-buffer parser and the file-descriptor reader below.
@@ -118,21 +207,36 @@ function parseEntriesAt(buf, startOff, count) {
     const flags = buf.readUInt16LE(off + 8);
     const method = buf.readUInt16LE(off + 10);
     const crc = buf.readUInt32LE(off + 16);
-    const compressedSize = buf.readUInt32LE(off + 20);
-    const uncompressedSize = buf.readUInt32LE(off + 24);
+    let compressedSize = buf.readUInt32LE(off + 20);
+    let uncompressedSize = buf.readUInt32LE(off + 24);
     const nameLen = buf.readUInt16LE(off + 28);
     const extraLen = buf.readUInt16LE(off + 30);
     const commentLen = buf.readUInt16LE(off + 32);
-    const localOffset = buf.readUInt32LE(off + 42);
+    const diskStart = buf.readUInt16LE(off + 34);
+    let localOffset = buf.readUInt32LE(off + 42);
     if (off + 46 + nameLen + extraLen + commentLen > buf.length) throw new Error('Central directory is corrupt (entry overruns the file).');
-    // Zip64 per-entry sentinels: a value of 0xFFFFFFFF means the real
-    // value lives in a Zip64 extra field, which this reader does not
-    // parse — report Zip64 instead of a bogus 4 GB size.
-    if (compressedSize === 0xFFFFFFFF || uncompressedSize === 0xFFFFFFFF || localOffset === 0xFFFFFFFF) {
-      throw new Error('Zip64 entries are not supported by the AES reader.');
-    }
     const name = buf.toString('utf8', off + 46, off + 46 + nameLen);
     const extra = buf.subarray(off + 46 + nameLen, off + 46 + nameLen + extraLen);
+    // Zip64 per-entry sentinels: a value of 0xFFFFFFFF means the real
+    // value lives in the Zip64 extra field (0x0001) — read it there
+    // instead of reporting a bogus 4 GB size.
+    if (compressedSize === 0xFFFFFFFF || uncompressedSize === 0xFFFFFFFF || localOffset === 0xFFFFFFFF || diskStart === 0xFFFF) {
+      const resolved = parseZip64Extra(extra, {
+        size: uncompressedSize === 0xFFFFFFFF,
+        compressedSize: compressedSize === 0xFFFFFFFF,
+        localOffset: localOffset === 0xFFFFFFFF,
+        diskStart: diskStart === 0xFFFF
+      });
+      if (resolved.size !== undefined) uncompressedSize = resolved.size;
+      if (resolved.compressedSize !== undefined) compressedSize = resolved.compressedSize;
+      if (resolved.localOffset !== undefined) localOffset = resolved.localOffset;
+      if (resolved.diskStart !== undefined && resolved.diskStart !== 0) {
+        throw new Error('Multi-disk archives are not supported by the AES reader.');
+      }
+    }
+    if (diskStart !== 0 && diskStart !== 0xFFFF) {
+      throw new Error('Multi-disk archives are not supported by the AES reader.');
+    }
     const aes = parseExtra(extra, AES_EXTRA_ID);
     let aesStrength = 0; let realMethod = method; let aeVersion = 0;
     if (aes) {
@@ -169,12 +273,18 @@ function parseEntriesAt(buf, startOff, count) {
 function parseCentralDirectory(buf) {
   const eocd = findEOCD(buf);
   if (eocd < 0) throw new Error('Not a ZIP file (end-of-central-directory record not found).');
-  const count = buf.readUInt16LE(eocd + 10);
-  const cdSize = buf.readUInt32LE(eocd + 12);
-  const cdOffset = buf.readUInt32LE(eocd + 16);
-  if (count === 0xFFFF || cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF) {
-    throw new Error('Zip64 archives are not supported by the AES reader.');
-  }
+  const resolved = resolveZip64EOCD({
+    count: buf.readUInt16LE(eocd + 10),
+    cdSize: buf.readUInt32LE(eocd + 12),
+    cdOffset: buf.readUInt32LE(eocd + 16),
+    eocdOff: eocd
+  }, function (offset, length) {
+    if (offset < 0 || offset + length > buf.length) throw new Error('Zip64 end-of-central-directory record is out of bounds.');
+    return buf.subarray(offset, offset + length);
+  });
+  const count = resolved.count;
+  const cdSize = resolved.cdSize;
+  const cdOffset = resolved.cdOffset;
   if (cdOffset + cdSize > buf.length) throw new Error('Central directory is corrupt (extends past the end of the file).');
   return parseEntriesAt(buf, cdOffset, count);
 }
@@ -194,12 +304,19 @@ function readEntries(zipPath) {
     const tail = readFully(fd, tailLen, size - tailLen);
     const eocdRel = findEOCD(tail);
     if (eocdRel < 0) throw new Error('Not a ZIP file (end-of-central-directory record not found).');
-    const count = tail.readUInt16LE(eocdRel + 10);
-    const cdSize = tail.readUInt32LE(eocdRel + 12);
-    const cdOffset = tail.readUInt32LE(eocdRel + 16);
-    if (count === 0xFFFF || cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF) {
-      throw new Error('Zip64 archives are not supported by the AES reader.');
-    }
+    const eocdAbs = size - tailLen + eocdRel;
+    const resolved = resolveZip64EOCD({
+      count: tail.readUInt16LE(eocdRel + 10),
+      cdSize: tail.readUInt32LE(eocdRel + 12),
+      cdOffset: tail.readUInt32LE(eocdRel + 16),
+      eocdOff: eocdAbs
+    }, function (offset, length) {
+      if (offset < 0) throw new Error('Zip64 end-of-central-directory record is out of bounds.');
+      return readFully(fd, length, offset);
+    });
+    const count = resolved.count;
+    const cdSize = resolved.cdSize;
+    const cdOffset = resolved.cdOffset;
     if (cdOffset + cdSize > size) throw new Error('Central directory is corrupt (extends past the end of the file).');
     const cdBuf = cdSize > 0 ? readFully(fd, cdSize, cdOffset) : Buffer.alloc(0);
     return parseEntriesAt(cdBuf, 0, count);
