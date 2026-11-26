@@ -80,10 +80,10 @@
   }
   function setProgress(pct, files, fileName) {
     var p = Math.max(0, Math.min(100, Number(pct) || 0));
-    $('progressPct').textContent = Math.round(p) + '%';
-    $('progressFill').style.width = p + '%';
-    if (files !== undefined) $('progressCount').textContent = files + ' files';
-    if (fileName !== undefined) $('progressFile').textContent = fileName;
+    $('restoreProgressPct').textContent = Math.round(p) + '%';
+    $('restoreProgressFill').style.width = p + '%';
+    if (files !== undefined) $('restoreProgressCount').textContent = files + ' files';
+    if (fileName !== undefined) $('restoreProgressFile').textContent = fileName;
   }
   function showResult(ok, title, message) {
     var box = $('resultBox');
@@ -141,8 +141,8 @@
     var apply = function () {
       var useOrig = orig.checked && hasSource;
       $('restoreTo').disabled = useOrig;
-      $('browseDest').disabled = useOrig;
-      if (useOrig) { $('restoreTo').value = jobInfo.source; $('destError').classList.remove('show'); }
+      $('restoreBrowseDest').disabled = useOrig;
+      if (useOrig) { $('restoreTo').value = jobInfo.source; $('restoreDestError').classList.remove('show'); }
     };
     orig.addEventListener('change', apply);
     cust.addEventListener('change', apply);
@@ -157,7 +157,7 @@
       else if (result && Array.isArray(result.filePaths) && result.filePaths.length) path = result.filePaths[0];
       else if (result && result.filePath) path = result.filePath;
       else if (Array.isArray(result) && result.length) path = result[0];
-      if (path) { $('restoreTo').value = path; $('destError').classList.remove('show'); }
+      if (path) { $('restoreTo').value = path; $('restoreDestError').classList.remove('show'); }
     } catch (e) { toast('Browse failed', e && e.message ? e.message : 'Could not open the folder picker.', 'error'); }
   }
   async function startRestore() {
@@ -166,8 +166,8 @@
     var ok = true;
     if (!zipPath) { $('fileError').classList.add('show'); ok = false; }
     else $('fileError').classList.remove('show');
-    if (!dest) { $('destError').classList.add('show'); ok = false; }
-    else $('destError').classList.remove('show');
+    if (!dest) { $('restoreDestError').classList.add('show'); ok = false; }
+    else $('restoreDestError').classList.remove('show');
     var pw = $('restorePassword').value;
     if (isEncryptedBackup && !pw) { $('restorePasswordError').classList.add('show'); ok = false; }
     else $('restorePasswordError').classList.remove('show');
@@ -175,10 +175,10 @@
     if (!api || typeof api.restoreAll !== 'function') { toast('Restore unavailable', 'Restore API is not available.', 'error'); return; }
     $('startBtn').disabled = true;
     $('startBtn').textContent = 'Restoring…';
-    $('cancelBtn').disabled = true;
+    $('restoreCancelBtn').disabled = true;
     $('resultBox').style.display = 'none';
     var le0 = $('restoreLogEmpty'); if (le0) le0.style.display = '';
-    $('progressCard').classList.add('show');
+    $('restoreProgressCard').classList.add('show');
     var pe = $('restoreProgressEmpty'); if (pe) pe.style.display = 'none';
     setProgress(0, 0, '');
     var pct = 0;
@@ -204,40 +204,24 @@
     } finally {
       $('startBtn').disabled = false;
       $('startBtn').textContent = 'Start Restore';
-      $('cancelBtn').disabled = false;
+      $('restoreCancelBtn').disabled = false;
       setTimeout(function () {
-        $('progressCard').classList.remove('show');
+        $('restoreProgressCard').classList.remove('show');
         var pe2 = $('restoreProgressEmpty'); if (pe2) pe2.style.display = '';
       }, 1200);
     }
   }
   function closeWizard() {
+    /* In-place wizard: closing means going back to the view it was
+       opened from (Dashboard or Jobs) — there is no separate window
+       any more. The old closeRestoreWizard IPC is kept as a fallback. */
+    if (typeof window.__closeWizardView === 'function') { window.__closeWizardView(); return; }
     if (api && typeof api.closeRestoreWizard === 'function') { api.closeRestoreWizard(); }
   }
-  // Wire immediately like the job wizard: this script sits at the end of
-  // <body>, so the buttons already exist. DOMContentLoaded-only wiring was
-  // the pattern that left wizard buttons dead.
-  function wireRestore() {
-    if (wireRestore.done) return; wireRestore.done = true;
-    function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
-    on('browseFile', 'click', pickFile);
-    on('browseDest', 'click', pickFolder);
-    on('startBtn', 'click', startRestore);
-    on('cancelBtn', 'click', closeWizard);
-    on('restoreAdvancedBtn', 'click', function () {
-      var adv = $('restoreAdvanced'), btn = $('restoreAdvancedBtn');
-      if (!adv || !btn) return;
-      var open = adv.style.display === 'none';
-      adv.style.display = open ? '' : 'none';
-      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
-      btn.textContent = open ? 'Advanced Options ▾' : 'Advanced Options ▸';
-    });
-    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeWizard(); });
-    if (api && typeof api.getSettings === 'function') {
-      api.getSettings().then(function (s) { if (s && s.theme) applyTheme(s.theme); }).catch(function () {});
-    }
-    // Edit/restore from History: pre-fill the backup file from the job
-    // passed to the wizard (its result.backup_path).
+  /* Pre-fill from the job this restore was opened from (its
+     result.backup_path), if any. Runs on first wire-up and on every
+     reset, so opening Restore twice does not keep stale state. */
+  function loadPendingRestore() {
     if (api && typeof api.getJobConfig === 'function') {
       api.getJobConfig(null).then(function (cfg) {
         if (cfg) {
@@ -253,6 +237,65 @@
       }).catch(function () {});
     } else setupRestoreDest();
   }
+  /* Reset the restore view to a blank state. Called every time the
+     restore view opens — the old separate window reloaded its page on
+     every open, so this is the in-place equivalent of that fresh
+     start. Exposed for renderer.js. */
+  function resetRestore() {
+    if (timer) { clearInterval(timer); timer = null; }
+    jobInfo = null; isEncryptedBackup = false;
+    $('backupFile').value = '';
+    $('restoreTo').value = '';
+    $('restorePassword').value = '';
+    $('restorePasswordField').style.display = 'none';
+    showValid(null, null);
+    var ei = $('restoreInfoEmpty'); if (ei) ei.style.display = '';
+    var il = $('restoreInfoList'); if (il) { il.style.display = 'none'; il.innerHTML = ''; }
+    var pc = $('restoreProgressCard'); if (pc) pc.classList.remove('show');
+    var pe = $('restoreProgressEmpty'); if (pe) pe.style.display = '';
+    var rb = $('resultBox'); if (rb) { rb.style.display = 'none'; rb.innerHTML = ''; }
+    var le = $('restoreLogEmpty'); if (le) le.style.display = '';
+    var orig = $('restoreDestOriginal'), cust = $('restoreDestCustom');
+    if (orig) orig.checked = false;
+    if (cust) cust.checked = true;
+    var hint = $('restoreOriginalHint'); if (hint) hint.style.display = '';
+    var adv = $('restoreAdvanced'); if (adv) adv.style.display = 'none';
+    var abtn = $('restoreAdvancedBtn');
+    if (abtn) { abtn.setAttribute('aria-expanded', 'false'); abtn.textContent = 'Advanced Options ▸'; }
+    var sb = $('startBtn'); if (sb) { sb.disabled = false; sb.textContent = 'Start Restore'; }
+    var cb = $('restoreCancelBtn'); if (cb) cb.disabled = false;
+    setProgress(0, 0, '');
+    setupRestoreDest();
+    loadPendingRestore();
+  }
+  // Wire immediately like the job wizard: this script sits at the end of
+  // <body>, so the buttons already exist. DOMContentLoaded-only wiring was
+  // the pattern that left wizard buttons dead.
+  function wireRestore() {
+    if (wireRestore.done) return; wireRestore.done = true;
+    function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
+    on('browseFile', 'click', pickFile);
+    on('restoreBrowseDest', 'click', pickFolder);
+    on('startBtn', 'click', startRestore);
+    on('restoreCancelBtn', 'click', closeWizard);
+    on('restoreAdvancedBtn', 'click', function () {
+      var adv = $('restoreAdvanced'), btn = $('restoreAdvancedBtn');
+      if (!adv || !btn) return;
+      var open = adv.style.display === 'none';
+      adv.style.display = open ? '' : 'none';
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      btn.textContent = open ? 'Advanced Options ▾' : 'Advanced Options ▸';
+    });
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { var v = $('view-restore'); if (v && v.style.display !== 'none') closeWizard(); } });
+    if (api && typeof api.getSettings === 'function') {
+      api.getSettings().then(function (s) { if (s && s.theme) applyTheme(s.theme); }).catch(function () {});
+    }
+    // Edit/restore from History: pre-fill the backup file from the job
+    // passed to the wizard (its result.backup_path).
+    loadPendingRestore();
+  }
+  /* In-place wizard: renderer.js opens this view and calls reset(). */
+  window.__restoreWizard = { reset: resetRestore };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireRestore);
   else wireRestore();
 })();

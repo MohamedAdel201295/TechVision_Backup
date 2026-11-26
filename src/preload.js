@@ -56,8 +56,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     vaultChangePassword: (oldPassword, newPassword) => ipcRenderer.invoke('vault-change-password', oldPassword, newPassword),
     vaultHasJobPassword: (jobId) => ipcRenderer.invoke('vault-has-job-password', jobId),
     vaultStoreJobPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-password', jobId, jobPassword),
-    showSettingsWindow: () => ipcRenderer.invoke('window-show-settings'),
-    closeSettings: () => ipcRenderer.invoke('window-close-settings'),
 
   // Job detail actions
   openEditJob: (jobId) => ipcRenderer.invoke('job-open-edit', jobId),
@@ -65,14 +63,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   restoreJob: (jobId) => ipcRenderer.invoke('job-restore', jobId),
   deleteJob: (jobId) => ipcRenderer.invoke('job-delete', jobId),
 
-  // Window management
-    showJobWizard: (job) => ipcRenderer.invoke('window-show-job-wizard', job || null),
-    showRestoreWizard: (job) => ipcRenderer.invoke('window-show-restore-wizard', job || null),
-    showLogViewer: () => ipcRenderer.invoke('window-show-log-viewer'),
-    closeLogViewer: () => ipcRenderer.invoke('window-close-log-viewer'),
-    closeJobWizard: () => ipcRenderer.invoke('window-close-job-wizard'),
-    closeRestoreWizard: () => ipcRenderer.invoke('window-close-restore-wizard'),
-    getRecentLog: () => ipcRenderer.invoke('log-get-recent'),
+  // Window management — the wizard and restore are in-place views in
+  // the main window now (no second window). These two calls only hand
+  // the pending job to main; the wizard scripts read it back with
+  // getJobConfig(null) when the view opens.
+    setWizardPending: (job) => ipcRenderer.invoke('wizard-set-pending', job || null),
+    setRestorePending: (job) => ipcRenderer.invoke('restore-set-pending', job || null),
 
   // Refresh jobs list
   refreshJobs: (jobs) => ipcRenderer.invoke('jobs-refresh', jobs),

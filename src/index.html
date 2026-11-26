@@ -246,7 +246,7 @@
         <h2 class="section-title" style="margin:0;">Logs</h2>
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Today's tasks, what finished, what failed or is still waiting for its drive — and the full log.</p>
       </div>
-      <button class="btn btn-ghost" type="button" id="logsRefreshBtn">⟳ Refresh</button>
+      <button class="btn btn-ghost" type="button" id="logsRefreshBtn"><span class="refresh-glyph">⟳</span> Refresh</button>
     </div>
     <div class="log-tabs" id="logsTabs" role="tablist">
       <button class="log-tab active" type="button" data-logtab="today">Today</button>
@@ -442,7 +442,6 @@
       </button>
     </div>
     <div id="cloudServerPanel" class="cloud-server-grid" style="display:none;">
-      <h3 style="margin:14px 0 4px;font-size:16px;">Server — share a folder</h3>
       <div class="card cloud-section cloud-server-status">
         <div class="cloud-status-row">
           <span class="pill pill-pending" id="cloudServerPill">Stopped</span>
@@ -489,8 +488,8 @@
       </div>
       <div class="field" id="cloudServerAddrsField">
         <label>Addresses</label>
-        <div id="cloudServerAddrs" class="cloud-muted">Detect your addresses to see them here.</div>
-        <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn" style="margin-top:6px;">Detect my addresses</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn">Detect my addresses</button>
+        <div id="cloudServerAddrs" class="cloud-muted" style="margin-top:6px;">Detect your addresses to see them here.</div>
       </div>
       </div>
       <div class="settings-guide" id="cloudForwardGuide">
@@ -523,7 +522,7 @@
         </div>
       </div>
       <div class="toggle-row">
-        <div><div class="t-label">Can write</div><div class="t-sub">Upload, delete and rename. Off = read-only.</div></div>
+        <div><div class="t-label">Can write</div><div class="t-sub">Upload, delete, rename.</div></div>
         <label class="switch"><input type="checkbox" id="cloudUserCanWrite" checked><span class="slider"></span></label>
       </div>
       </div>
@@ -531,7 +530,6 @@
       </div>
     </div>
     <div id="cloudClientPanel" style="display:none;">
-      <h3 style="margin:14px 0 4px;font-size:16px;">Client — open a shared folder</h3>
       <div class="card cloud-section">
       <div id="cloudServersList" class="job-list"></div>
       <div class="cloud-form-grid">
@@ -793,7 +791,7 @@
       <div class="wg-server-grid" style="margin-top:6px;">
       <div style="margin-top:0;">
         <div class="t-label">Tunnel address &amp; port</div>
-        <div class="t-sub">Address inside the tunnel, and the UDP port your router forwards.</div>
+        <div class="t-sub" title="Address inside the tunnel, and the UDP port your router forwards.">Address inside the tunnel, and the UDP port your router forwards.</div>
         <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
           <input type="text" id="wgServerIp" placeholder="10.0.0.1" autocomplete="off" style="flex:1; min-width:140px;">
           <input type="text" id="wgServerPort" placeholder="51820" autocomplete="off" inputmode="numeric" style="flex:1; min-width:100px;">
@@ -802,7 +800,7 @@
       </div>
       <div style="margin-top:0;">
         <div class="t-label">Endpoint — the address clients connect to</div>
-        <div class="t-sub">Public IP is read automatically; a DDNS hostname works too.</div>
+        <div class="t-sub" title="Public IP is read automatically; a DDNS hostname works too.">Public IP is read automatically; a DDNS hostname works too.</div>
         <div style="display:flex; gap:8px; margin-top:6px;">
           <input type="text" id="wgEndpoint" placeholder="203.0.113.10 or myhome.ddns.net" autocomplete="off" style="flex:1;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgEndpointSaveBtn">Save</button>
@@ -862,6 +860,284 @@
         <button class="btn btn-ghost" type="button" id="wgNatStopBtn">Stop NAT service</button>
       </div>
     </div>
+  </div>
+  <div id="view-wizard" style="display:none;">
+<div class="modal-wrap">
+  <div class="wizard-card">
+    <div class="modal-head">
+      <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
+      <div>
+        <h1 id="wizardTitle">New Backup Job</h1>
+        <p>Five quick steps — the wizard stays open while you pick folders.</p>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="steps" id="steps">
+        <div class="step active" data-n="1" data-step="1">Source</div>
+        <div class="step" data-n="2" data-step="2">Destination</div>
+        <div class="step" data-n="3" data-step="3">Options</div>
+        <div class="step" data-n="4" data-step="4">Encryption</div>
+        <div class="step" data-n="5" data-step="5">Review</div>
+      </div>
+
+      <!-- Step 1: Source -->
+      <section class="step-panel active" data-panel="1">
+        <div class="field">
+          <label for="jobName">Job Name</label>
+          <input type="text" id="jobName" value="My Backup" placeholder="My Backup">
+          <div class="field-error" id="jobNameError">Please enter a job name.</div>
+        </div>
+        <div class="field" id="sourceMatchField">
+          <label>Find this drive again by</label>
+          <div class="radio-row">
+            <label><input type="radio" name="sourceMatch" value="label" checked> Name <span id="sourceMatchLabel" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="sourceMatch" value="letter"> Drive letter <span id="sourceMatchLetter" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="sourceMatch" value="serial"> Serial number <span id="sourceMatchSerial" style="color:var(--muted-2);font-size:12px;"></span></label>
+          </div>
+          <div class="hint">Pick one first, then Browse. The name, letter and serial are read automatically from the drive you pick — you never type a serial.</div>
+        </div>
+        <div class="field">
+          <label for="sourceDir">Source — folder or file</label>
+          <div class="input-row">
+            <input type="text" id="sourceDir" placeholder="Select a folder or a single file" readonly>
+            <button class="btn" type="button" id="browseSource">Browse</button>
+          </div>
+          <div class="hint">Pick a folder to back up, or a single file. The wizard stays open after you click OK.</div>
+          <div class="field-error" id="sourceError">Please choose a source folder or file.</div>
+        </div>
+        <div class="field">
+          <label for="patternInput">Include Patterns <span class="optional">(optional)</span></label>
+          <div class="input-row">
+            <input type="text" id="patternInput" placeholder='Add pattern (*.txt, *.docx)'>
+            <button class="btn" type="button" id="addPatternBtn">＋ Add</button>
+          </div>
+          <div class="chips" id="patternChips"></div>
+          <div class="hint">Empty means: back up everything in the source folder.</div>
+        </div>
+      </section>
+
+      <!-- Step 2: Destination -->
+      <section class="step-panel" data-panel="2">
+        <div class="field" id="destMatchField">
+          <label>Find this drive again by</label>
+          <div class="radio-row">
+            <label><input type="radio" name="destMatch" value="label" checked> Name <span id="destMatchLabel" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="destMatch" value="letter"> Drive letter <span id="destMatchLetter" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="destMatch" value="serial"> Serial number <span id="destMatchSerial" style="color:var(--muted-2);font-size:12px;"></span></label>
+          </div>
+          <div class="hint">Pick one first, then Browse. The name, letter and serial are read automatically from the drive you pick — you never type a serial.</div>
+        </div>
+        <div class="field">
+          <label for="destDir">Destination Directory</label>
+          <div class="input-row">
+            <input type="text" id="destDir" placeholder="Select a destination folder" readonly>
+            <button class="btn" type="button" id="browseDest">Browse</button>
+          </div>
+          <div class="hint">The .zip backup file is created in this folder. The wizard stays open after you click OK.</div>
+          <div class="field-error" id="destError">Please choose a destination folder.</div>
+        </div>
+        <div class="note info"><strong>Tip:</strong> use a different drive or an external drive for the destination, so a disk failure does not take the backup with it.</div>
+      </section>
+
+      <!-- Step 3: Options & Schedule -->
+      <section class="step-panel" data-panel="3">
+        <h3 style="margin:0 0 6px;">Backup Options</h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Back up only files that changed since the last backup.</div></div>
+          <label class="switch"><input type="checkbox" id="optIncremental" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Store the backup as a compressed .zip file.</div></div>
+          <label class="switch"><input type="checkbox" id="optCompress" checked><span class="slider"></span></label>
+        </div>
+        <div id="compressLevelField" style="margin:2px 0 0;">
+          <div class="radio-row">
+            <label><input type="radio" name="compressLevel" value="standard" checked> Standard <span style="color:var(--muted-2);font-size:12px;">— Deflate level 6, faster</span></label>
+            <label><input type="radio" name="compressLevel" value="advanced"> Advanced <span style="color:var(--muted-2);font-size:12px;">— Deflate level 9, smaller</span></label>
+          </div>
+          <div class="hint">The level the ZIP will actually use — Standard compresses faster, Advanced squeezes smaller.</div>
+        </div>
+        <div class="toggle-row">
+          <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
+          <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
+        </div>
+        <h3 style="margin:18px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Run on schedule</div><div class="t-sub">Run this job automatically.</div></div>
+          <label class="switch"><input type="checkbox" id="optSchedule"><span class="slider"></span></label>
+        </div>
+        <div id="scheduleFields" style="display:none; margin-top:12px;">
+          <div class="field">
+            <label>Frequency</label>
+            <div class="radio-row">
+              <label><input type="radio" name="frequency" value="Daily" checked> Daily</label>
+              <label><input type="radio" name="frequency" value="Weekly"> Weekly</label>
+              <label><input type="radio" name="frequency" value="Monthly"> Monthly</label>
+              <label><input type="radio" name="frequency" value="Custom"> Custom</label>
+            </div>
+          </div>
+          <div class="field" id="customDaysField" style="display:none;">
+            <label>Days</label>
+            <div class="radio-row" id="customDaysRow">
+              <label><input type="checkbox" name="customDay" value="6"> Sat</label>
+              <label><input type="checkbox" name="customDay" value="0"> Sun</label>
+              <label><input type="checkbox" name="customDay" value="1"> Mon</label>
+              <label><input type="checkbox" name="customDay" value="2"> Tue</label>
+              <label><input type="checkbox" name="customDay" value="3"> Wed</label>
+              <label><input type="checkbox" name="customDay" value="4"> Thu</label>
+              <label><input type="checkbox" name="customDay" value="5"> Fri</label>
+            </div>
+            <div class="hint">Pick the days this job runs, at the time below.</div>
+          </div>
+          <div class="field">
+            <label for="scheduleTime">Time</label>
+            <input type="time" id="scheduleTime" value="02:00">
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 4: Encryption (independent of compression) -->
+      <section class="step-panel" data-panel="4">
+        <h3 style="margin:0 0 6px;">Encryption</h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Encrypt backup (AES-256)</div><div class="t-sub">Protect the backup with a password. Standard WinZip AES — 7-Zip and WinRAR can open it too.</div></div>
+          <label class="switch"><input type="checkbox" id="optEncrypt"><span class="slider"></span></label>
+        </div>
+        <div id="encFields" style="display:none; margin-top:12px;">
+          <div class="field">
+            <label for="encPassword">Backup password</label>
+            <input type="password" id="encPassword" placeholder="At least 8 characters" autocomplete="new-password">
+            <div class="field-error" id="encPasswordError">Please enter a password of at least 8 characters.</div>
+          </div>
+          <div class="field">
+            <label for="encPasswordConfirm">Confirm password</label>
+            <input type="password" id="encPasswordConfirm" placeholder="Repeat the password" autocomplete="new-password">
+            <div class="field-error" id="encPasswordConfirmError">Passwords do not match.</div>
+          </div>
+          <div class="note info" id="encModeNote"></div>
+          <div class="note" id="encVaultNote" style="display:none;"><strong>Password saved:</strong> this job already has a password in the vault — leave the fields blank to keep it.</div>
+          <div class="hint">The password is never written into the job file. If the vault is unlocked it is stored encrypted there so scheduled backups can run; otherwise you will be asked for it at run time. If you forget it, the backup cannot be opened — anywhere.</div>
+        </div>
+      </section>
+
+      <!-- Step 5: Review -->
+      <section class="step-panel" data-panel="5">
+        <h3 style="margin:0 0 10px;">Review your job</h3>
+        <div class="review" id="reviewBox"></div>
+        <div class="note info" style="margin-top:14px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
+      </section>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" type="button" id="cancelBtn">Cancel</button>
+      <span class="spacer"></span>
+      <button class="btn" type="button" id="backBtn" style="display:none;">← Back</button>
+      <button class="btn btn-primary" type="button" id="nextBtn">Next →</button>
+      <button class="btn btn-primary" type="button" id="createBtn" style="display:none;">Create Job</button>
+    </div>
+  </div>
+</div>
+  </div>
+  <div id="view-restore" style="display:none;">
+<div class="modal-wrap restore-wrap">
+  <div class="wizard-card">
+    <div class="modal-head">
+      <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
+      <div>
+        <h1>Restore Backup</h1>
+        <p>Pick a .zip backup file and a folder to restore it into.</p>
+      </div>
+    </div>
+    <div class="modal-body restore-layout">
+      <div class="restore-main">
+        <section class="restore-step">
+          <div class="restore-step-head"><span class="restore-step-num">1</span><h3>Select Backup File</h3></div>
+          <div class="field">
+            <label for="backupFile">Backup file</label>
+            <div class="input-row">
+              <input type="text" id="backupFile" placeholder="Select a .zip backup file" readonly>
+              <button class="btn" type="button" id="browseFile">Browse</button>
+            </div>
+            <div class="restore-valid" id="restoreValid" style="display:none;"></div>
+            <div class="field-error" id="fileError">Please choose a .zip backup file.</div>
+          </div>
+        </section>
+        <section class="restore-step">
+          <div class="restore-step-head"><span class="restore-step-num">2</span><h3>Restore From</h3></div>
+          <div class="restore-mode-card">
+            <div class="restore-mode-title">↺ Restore All</div>
+            <div class="restore-mode-sub">Restore every file in the backup.</div>
+          </div>
+        </section>
+        <section class="restore-step">
+          <div class="restore-step-head"><span class="restore-step-num">3</span><h3>Restore To</h3></div>
+          <div class="field">
+            <div class="radio-row">
+              <label><input type="radio" name="restoreDest" value="original" id="restoreDestOriginal"> Original Location <span style="color:var(--muted-2);font-size:12px;">(Recommended)</span></label>
+              <label><input type="radio" name="restoreDest" value="custom" id="restoreDestCustom" checked> Custom Location</label>
+            </div>
+            <div class="hint" id="restoreOriginalHint" style="display:none;">Open Restore from a job to use its original location.</div>
+          </div>
+          <div class="field">
+            <label for="restoreTo">Destination folder</label>
+            <div class="input-row">
+              <input type="text" id="restoreTo" placeholder="Select destination folder" readonly>
+              <button class="btn" type="button" id="restoreBrowseDest">Browse</button>
+            </div>
+            <div class="field-error" id="restoreDestError">Please choose a destination folder.</div>
+          </div>
+          <div class="field" id="restorePasswordField" style="display:none;">
+            <label for="restorePassword">Backup password</label>
+            <input type="password" id="restorePassword" placeholder="Password for this encrypted backup" autocomplete="off">
+            <div class="hint">This backup is encrypted (AES-256). Enter its backup password — the same one used when it was created. Without it, the files cannot be restored.</div>
+            <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>
+          <div id="restoreAdvanced" style="display:none; margin-top:10px;">
+            <label class="check"><input type="checkbox" id="optOverwrite"> Overwrite existing files</label>
+            <label class="check"><input type="checkbox" id="restoreOptVerify" checked> Verify restored files</label>
+          </div>
+          <div class="note" style="margin-top:14px;">
+            <strong>Phase 2</strong><br>
+            Streaming restore with yauzl is implemented.<br>
+            VSS (Volume Shadow Copy) is NOT implemented. Locked files will be skipped during backup.
+          </div>
+        </section>
+      </div>
+      <aside class="restore-side">
+        <div class="card">
+          <h3>Backup Information</h3>
+          <div class="restore-empty" id="restoreInfoEmpty">No backup file selected yet.</div>
+          <dl class="restore-info-list" id="restoreInfoList" style="display:none;"></dl>
+        </div>
+        <div class="card">
+          <h3>Restore Progress</h3>
+          <div class="restore-empty" id="restoreProgressEmpty">No restore running.</div>
+          <section class="progress-card" id="restoreProgressCard" aria-live="polite" style="margin:0;">
+            <div class="progress-head">
+              <span><span class="spinner"></span> <span id="restoreProgressTitle">Restoring…</span></span>
+              <span class="progress-pct" id="restoreProgressPct">0%</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" id="restoreProgressFill"></div></div>
+            <div class="progress-sub">
+              <span id="restoreProgressCount">0 files</span>
+              <span class="file" id="restoreProgressFile"></span>
+            </div>
+          </section>
+        </div>
+        <div class="card">
+          <h3>Restore Log</h3>
+          <div class="restore-empty" id="restoreLogEmpty">No restore run yet.</div>
+          <div id="resultBox" style="display:none;"></div>
+        </div>
+      </aside>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" type="button" id="restoreCancelBtn">Cancel</button>
+      <span class="spacer"></span>
+      <button class="btn btn-primary" type="button" id="startBtn">Start Restore</button>
+    </div>
+  </div>
+</div>
   </div>
   </main>
 </div>
@@ -944,5 +1220,7 @@
 </div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <script src="renderer.js"></script>
+<script src="job-wizard.js"></script>
+<script src="restore-wizard.js"></script>
 </body>
 </html>

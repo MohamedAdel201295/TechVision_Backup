@@ -296,13 +296,10 @@ const APP_ICON = path.join(ASSETS_PATH, 'TechVision_Logo.png');
 let tray = null;
 let isQuitting = false;
 
-// Main window
+// Main window — the only window. The job wizard, restore wizard, log
+// viewer and settings used to be separate BrowserWindows; they are
+// in-place views in index.html now, so no other window exists.
 let mainWindow;
-let restoreWindow;
-let logViewerWindow;
-let jobWizardWindow;
-let settingsWindow;
-let jobDetailsWindow;
 let pendingWizardJob = null;
 let pendingRestoreJob = null;
 
@@ -842,68 +839,10 @@ function createMainWindow() {
   });
 }
 
-function createJobWizardWindow() {
-  jobWizardWindow = new BrowserWindow({
-    width: 780,
-    height: 760,
-    minWidth: 700,
-    minHeight: 620,
-    icon: APP_ICON,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  jobWizardWindow.loadFile(path.join(__dirname, 'job-wizard.html'));
-  jobWizardWindow.show();
-
-  jobWizardWindow.on('closed', () => {
-    jobWizardWindow = null;
-  });
-}
-
-function createRestoreWindow() {
-  restoreWindow = new BrowserWindow({
-    width: 960,
-    height: 840,
-    minWidth: 860,
-    minHeight: 640,
-    icon: APP_ICON,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  restoreWindow.loadFile(path.join(__dirname, 'restore-wizard.html'));
-  restoreWindow.show();
-
-  restoreWindow.on('closed', () => {
-    restoreWindow = null;
-  });
-}
-
-function createLogViewerWindow() {
-  logViewerWindow = new BrowserWindow({
-    width: 900,
-    height: 650,
-    icon: APP_ICON,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  logViewerWindow.loadFile(path.join(__dirname, 'log-viewer.html'));
-
-  logViewerWindow.on('closed', () => {
-    logViewerWindow = null;
-  });
-}
+/* The job wizard, restore wizard and log viewer used to be separate
+   BrowserWindows (createJobWizardWindow / createRestoreWindow /
+   createLogViewerWindow). They are in-place views in the main window
+   now, so those functions are gone — the main window is the only one. */
 
 
 
@@ -1463,14 +1402,14 @@ ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, pas
 
 // File operations
 // Use the window that actually called the dialog as its parent.
-// Also check for active wizard windows which might be the callers.
+// (The wizard windows used to be callers too; they are in-place views
+// in the main window now, so the caller is always the main window.)
 function dialogParentWindow(event) {
   try {
     const callerWindow = event && event.sender && BrowserWindow.fromWebContents(event.sender);
-    // Return the calling window if found, otherwise try wizard windows, finally mainWindow
-    return callerWindow || jobWizardWindow || restoreWindow || mainWindow;
+    return callerWindow || mainWindow;
   } catch (e) {
-    return jobWizardWindow || mainWindow;
+    return mainWindow;
   }
 }
 
@@ -1743,88 +1682,18 @@ ipcMain.handle('job-list-stored', async () => {
   }
 });
 
-// Window management
-ipcMain.handle('window-show-job-wizard', async (event, job) => {
+// Pending job for the in-place wizard / restore views. The renderer
+// hands the job here before opening the view; the wizard scripts read
+// it back with job-get-config (no id) when the view resets. No window
+// is created — the wizard and restore live in the main window now.
+ipcMain.handle('wizard-set-pending', async (event, job) => {
   if (job && typeof job === 'object') pendingWizardJob = job;
-  if (!jobWizardWindow) {
-    createJobWizardWindow();
-  } else {
-    // Reload so the wizard always starts fresh: current saved theme,
-    // empty fields, and freshly wired buttons (a re-shown window kept
-    // the old page, old theme and stale state).
-    jobWizardWindow.loadFile(path.join(__dirname, 'job-wizard.html'));
-    jobWizardWindow.show();
-  }
   return { success: true };
 });
 
-ipcMain.handle('window-show-restore-wizard', async (event, job) => {
+ipcMain.handle('restore-set-pending', async (event, job) => {
   if (job && typeof job === 'object') pendingRestoreJob = job;
-  if (!restoreWindow) {
-    createRestoreWindow();
-  } else {
-    restoreWindow.loadFile(path.join(__dirname, 'restore-wizard.html'));
-    restoreWindow.show();
-  }
   return { success: true };
-});
-
-ipcMain.handle('window-show-log-viewer', async () => {
-  if (!logViewerWindow) {
-    createLogViewerWindow();
-  } else {
-    logViewerWindow.show();
-  }
-  return { success: true };
-});
-
-// Close window handlers
-ipcMain.handle('window-close-job-wizard', async () => {
-  if (jobWizardWindow) {
-    jobWizardWindow.close();
-  }
-  return { success: true };
-});
-
-ipcMain.handle('window-close-restore-wizard', async () => {
-  if (restoreWindow) {
-    restoreWindow.close();
-  }
-  return { success: true };
-});
-
-ipcMain.handle('window-close-log-viewer', async () => {
-  if (logViewerWindow) {
-    logViewerWindow.close();
-  }
-  return { success: true };
-});
-
-// Log retrieval
-ipcMain.handle('log-get-recent', async () => {
-  const logDir = path.join(app.getPath('userData'), '.techvision', 'logs');
-  try {
-    if (!fs.existsSync(logDir)) return [];
-    const files = fs.readdirSync(logDir)
-      .filter(f => f.endsWith('.log'))
-      .map(f => ({ name: f, path: path.join(logDir, f) }));
-    
-    if (files.length === 0) return [];
-    
-    // Get most recent
-    const mostRecent = files.reduce((a, b) => {
-      const aStat = fs.statSync(a.path);
-      const bStat = fs.statSync(b.path);
-      return aStat.mtime > bStat.mtime ? a : b;
-    });
-    
-    // Read content and return as array of lines
-    const content = fs.readFileSync(mostRecent.path, 'utf-8');
-    return content.split(/\r?\n/).filter(l => l.trim());
-  } catch (e) {
-    console.error('[Main] log-get-recent error:', e);
-    return [];
-  }
 });
 
 // Full app log for the Logs view: the central app.log, newest last.
@@ -3313,35 +3182,8 @@ ipcMain.handle('vault-store-job-password', async (event, jobId, jobPassword) => 
   } catch (e) { return { success: false, error: e.message }; }
 });
 
-// Settings window
-ipcMain.handle('window-show-settings', async () => {
-  if (!settingsWindow) {
-    settingsWindow = new BrowserWindow({
-      width: 400,
-      height: 500,
-      icon: APP_ICON,
-      webPreferences: {
-        preload: path.join(__dirname, 'preload.js'),
-        contextIsolation: true,
-        nodeIntegration: false
-      }
-    });
-    settingsWindow.loadFile(path.join(__dirname, 'settings.html'));
-    settingsWindow.on('closed', () => {
-      settingsWindow = null;
-    });
-  } else {
-    settingsWindow.show();
-  }
-  return { success: true };
-});
-
-ipcMain.handle('window-close-settings', async () => {
-  if (settingsWindow) {
-    settingsWindow.close();
-  }
-  return { success: true };
-});
+// Settings is a full page in the main window now (view-settings) —
+// the old separate settings window is gone.
 
 // Job detail actions
 ipcMain.handle('job-open-edit', async (event, jobId) => {

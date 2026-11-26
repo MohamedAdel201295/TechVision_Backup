@@ -84,6 +84,12 @@
   var currentLogTab = 'today';
   var logsTimer = null;
   var fullLogLines = [];
+  // Signatures of what the Logs view currently shows. The 10s
+  // auto-refresh re-renders the same data most of the time — when the
+  // signature matches, the DOM is left completely alone so the view
+  // never flashes. (Same pattern as the Cloud file-list poller.)
+  var lastLogsSig = '';
+  var lastFullLogSig = '';
 
   /* ---------- toasts (never alert()) ---------- */
   function toast(title, message, kind) {
@@ -189,19 +195,34 @@
   }
 
   /* ---------- dashboard 01: stats, status, recent, storage ---------- */
+  /* Time + day split out of formatDashboardTime: the LAST BACKUP stat
+     card is narrow, and "Today, 10:44 AM" clipped even at 17px. The
+     card shows just the time, and the day + type move to the sub
+     line — short, always fully visible. */
+  function formatTimeOnly(v) {
+    if (!v) return '—';
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d.getTime())) return safeStr(v);
+    var h = d.getHours(); var ampm = h >= 12 ? 'PM' : 'AM'; var h12 = h % 12; if (h12 === 0) h12 = 12;
+    return h12 + ':' + String(d.getMinutes()).padStart(2, '0') + ' ' + ampm;
+  }
+  function formatDayWord(v) {
+    if (!v) return '';
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d.getTime())) return '';
+    var now = new Date();
+    var sameDay = function (a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); };
+    var y = new Date(now); y.setDate(y.getDate() - 1);
+    if (sameDay(d, now)) return 'Today';
+    if (sameDay(d, y)) return 'Yesterday';
+    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+  }
   function formatDashboardTime(v) {
     if (!v) return '—';
     var d = v instanceof Date ? v : new Date(v);
     if (isNaN(d.getTime())) return safeStr(v);
-    var now = new Date();
-    var sameDay = function (a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); };
-    var y = new Date(now); y.setDate(y.getDate() - 1);
-    var h = d.getHours(); var ampm = h >= 12 ? 'PM' : 'AM'; var h12 = h % 12; if (h12 === 0) h12 = 12;
-    var hm = h12 + ':' + String(d.getMinutes()).padStart(2, '0') + ' ' + ampm;
-    if (sameDay(d, now)) return 'Today, ' + hm;
-    if (sameDay(d, y)) return 'Yesterday, ' + hm;
-    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear() + ', ' + hm;
+    return formatDayWord(v) + ', ' + formatTimeOnly(v);
   }
   function formatHMS(sec) {
     var n = Math.max(0, Math.round(safeNum(sec, 0)));
@@ -231,8 +252,8 @@
     set('dashSuccessJobs', String(ok.length));
     set('dashFailedJobs', String(bad.length));
     var last = lastCompletedRun(list);
-    set('dashLastBackup', last ? formatDashboardTime(last.timestamp) : '—');
-    set('dashLastBackupSub', last ? (last.type === 'INCREMENTAL' ? 'Incremental' : 'Full') + ' Backup – ' + last.name : 'No backups yet');
+    set('dashLastBackup', last ? formatTimeOnly(last.timestamp) : '—');
+    set('dashLastBackupSub', last ? formatDayWord(last.timestamp) + ' · ' + (last.type === 'INCREMENTAL' ? 'Incremental' : 'Full') : 'No backups yet');
     renderDashboardStatus(list, bad, last);
     renderDashboardRecent(list);
   }
@@ -351,6 +372,8 @@
      view instead of always resetting to Dashboard. */
   var currentModule = 'backup';
   var lastBackupView = 'dashboard'; // the view Back / closing Settings returns to (any module)
+  var currentView = 'dashboard'; // the view currently shown in the main area
+  var wizardReturnView = 'dashboard'; // the view the wizard / restore returns to on Back or Cancel
 
   function applyModuleUI(mod) {
     currentModule = mod;
@@ -384,16 +407,27 @@
   function goBack() {
     var settingsView = $('view-settings');
     if (settingsView && settingsView.style.display !== 'none') { showView(lastBackupView || 'dashboard'); return; }
+    var wizView = $('view-wizard');
+    if (wizView && wizView.style.display !== 'none') { showView(wizardReturnView || 'dashboard'); return; }
+    var resView = $('view-restore');
+    if (resView && resView.style.display !== 'none') { showView(wizardReturnView || 'dashboard'); return; }
     var cloudView = $('view-cloud');
     if (cloudView && cloudView.style.display !== 'none' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive')) { showCloudPanel('home'); return; }
     showView('dashboard');
   }
 
+  /* The in-place wizard / restore close by going back — there is no
+     separate window any more, so the wizard scripts call this. */
+  window.__closeWizardView = function () { showView(wizardReturnView || 'dashboard'); };
+
   function showView(name) {
+    currentView = name;
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
     var wgView = $('view-wireguard');
     var settingsView = $('view-settings');
+    var wizView = $('view-wizard');
+    var resView = $('view-restore');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
     if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
@@ -401,12 +435,14 @@
     if (vpnView) vpnView.style.display = name === 'vpn' ? '' : 'none';
     if (wgView) wgView.style.display = name === 'wireguard' ? '' : 'none';
     if (settingsView) settingsView.style.display = name === 'settings' ? '' : 'none';
+    if (wizView) wizView.style.display = name === 'wizard' ? '' : 'none';
+    if (resView) resView.style.display = name === 'restore' ? '' : 'none';
     /* One refresh per module, at the top — the same ⟳ icon-button
        pattern as the Tailscale one, shown only while its module is
        active. The settings gear is always visible (the sidebar has
        no Settings item — the gear at the top right is the only way
        in, from any module). */
-    var isBackup = name === 'dashboard' || name === 'jobs' || name === 'logs';
+    var isBackup = name === 'dashboard' || name === 'jobs' || name === 'logs' || name === 'wizard' || name === 'restore';
     var gb2 = $('settingsBtn'); if (gb2) gb2.style.display = '';
     var brb = $('backupTopRefreshBtn'); if (brb) brb.style.display = isBackup ? '' : 'none';
     var crb2 = $('cloudTopRefreshBtn'); if (crb2) crb2.style.display = name === 'cloud' ? '' : 'none';
@@ -418,6 +454,10 @@
        syncCloudNav() marks it (called by showView('cloud') below and
        by showCloudPanel). Only mark Overview when the home panel is open. */
     if (btn && !(name === 'cloud' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive'))) btn.classList.add('active');
+    /* The wizard / restore have no data-nav item — their sidebar
+       buttons are #navNewJob / #navRestore, marked active here. */
+    if (name === 'wizard') { var nw = $('navNewJob'); if (nw) nw.classList.add('active'); }
+    if (name === 'restore') { var nr = $('navRestore'); if (nr) nr.classList.add('active'); }
     /* Groups open ONLY when the user clicks the group header — never
        on navigation. A view reached from elsewhere (Back button, jump
        button, Quick Action) shows in the main area on the right while
@@ -444,6 +484,21 @@
       applyModuleUI('backup');
       setBackTitle('Settings');
       setAppTitle('Settings', 'Your preferences for TechVision Backup.');
+    }
+    if (name === 'wizard') {
+      /* In-place wizard: it belongs to the Backup module but is NOT
+         a lastBackupView — Back / Cancel returns to the view it was
+         opened from (wizardReturnView). */
+      applyModuleUI('backup');
+      setBackTitle('New Backup Job');
+      setAppTitle('New Backup Job', 'Five quick steps — pick folders, options and encryption.');
+    }
+    if (name === 'restore') {
+      /* Same rule as the wizard: Back / Cancel returns to
+         wizardReturnView, never to the dashboard unconditionally. */
+      applyModuleUI('backup');
+      setBackTitle('Restore');
+      setAppTitle('Restore Backup', 'Pick a .zip backup file and a folder to restore it into.');
     }
     if (name === 'cloud') {
       lastBackupView = name;
@@ -562,6 +617,18 @@
       items.sort(function (a, b) { return new Date(b.run.timestamp || 0) - new Date(a.run.timestamp || 0); });
       if (emptyText) emptyText.textContent = 'No failed or waiting tasks. Everything ran fine.';
     }
+    // Silent background refresh: if the list would look exactly the
+    // same, do not touch the DOM at all — no flash, no scroll jump.
+    // A tab switch or a new/changed run changes the signature, so
+    // those still rebuild.
+    var sig = currentLogTab + '|' + items.map(function (it) {
+      var r = it.run;
+      return (it.job.id || it.job.name) + '|' + (r.timestamp || '') + '|' +
+        String(r.status || (r.success ? 'COMPLETED' : 'FAILED')).toUpperCase() + '|' +
+        safeNum(r.files, 0) + '|' + (r.size || 0) + '|' + (r.error || '') + '|' + (it.waiting ? 'W' : '');
+    }).join('\n');
+    if (sig === lastLogsSig) return;
+    lastLogsSig = sig;
     list.innerHTML = '';
     if (!items.length) { if (empty) empty.style.display = 'block'; return; }
     if (empty) empty.style.display = 'none';
@@ -591,6 +658,16 @@
       if (q && String(l).toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
+    // Silent background refresh: same filter + same lines means the
+    // box already shows exactly this — leave the DOM alone.
+    var sig = level + '|' + q + '|' + visible.join('\n');
+    if (sig === lastFullLogSig) return;
+    lastFullLogSig = sig;
+    // Keep the reader's place: only follow the tail when he was
+    // already at the bottom; otherwise restore his scroll position
+    // instead of yanking him to the end every 10 seconds.
+    var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 4;
+    var prevTop = box.scrollTop;
     box.innerHTML = '';
     if (!visible.length) {
       box.textContent = fullLogLines.length ? 'No log lines match this filter.' : 'No log lines yet. Run a backup or wait for a scheduled one to see activity here.';
@@ -602,7 +679,7 @@
       div.textContent = String(l);
       box.appendChild(div);
     });
-    box.scrollTop = box.scrollHeight;
+    box.scrollTop = atBottom ? box.scrollHeight : prevTop;
   }
   function compressionLabel(job) {
     var c = (job.compression || (job.raw && job.raw.compression) || 'standard').toLowerCase();
@@ -2346,13 +2423,29 @@
     }
   }
   async function openRestore(job) {
-    if (!api || typeof api.showRestoreWizard !== 'function') { toast('Restore unavailable', 'Restore API is not available.', 'error'); return; }
-    try { await api.showRestoreWizard(job ? (job.raw || job) : null); }
+    /* In-place restore: the pending job goes to main (the restore
+       script reads it back with getJobConfig(null)), the view resets
+       to a blank state, and it opens in the main area — no second
+       window any more. */
+    if (!api || typeof api.setRestorePending !== 'function') { toast('Restore unavailable', 'Restore API is not available.', 'error'); return; }
+    try {
+      await api.setRestorePending(job ? (job.raw || job) : null);
+      wizardReturnView = lastBackupView || 'dashboard';
+      if (window.__restoreWizard && typeof window.__restoreWizard.reset === 'function') window.__restoreWizard.reset();
+      showView('restore');
+    }
     catch (e) { toast('Restore failed', e && e.message ? e.message : 'Could not open Restore.', 'error'); }
   }
   async function openJobWizard(job) {
-    if (!api || typeof api.showJobWizard !== 'function') { toast('New Job unavailable', 'Job wizard API is not available.', 'error'); return; }
-    try { await api.showJobWizard(job ? (job.raw || job) : null); }
+    /* In-place wizard: same pattern as openRestore — pending job to
+       main, reset the wizard view, open it in the main area. */
+    if (!api || typeof api.setWizardPending !== 'function') { toast('New Job unavailable', 'Job wizard API is not available.', 'error'); return; }
+    try {
+      await api.setWizardPending(job ? (job.raw || job) : null);
+      wizardReturnView = lastBackupView || 'dashboard';
+      if (window.__jobWizard && typeof window.__jobWizard.reset === 'function') window.__jobWizard.reset();
+      showView('wizard');
+    }
     catch (e) { toast('New Job failed', e && e.message ? e.message : 'Could not open the job wizard.', 'error'); }
   }
 
@@ -2379,7 +2472,17 @@
   if (api && typeof api.onJobsUpdated === 'function') {
     api.onJobsUpdated(function () { loadJobs(); });
   }
+  // One visible spin on a refresh button the user pressed himself.
+  // The background auto-refresh never calls this, so it stays silent.
+  function spinOnce(el) {
+    if (!el) return;
+    el.classList.remove('spinning');
+    void el.offsetWidth;
+    el.classList.add('spinning');
+    el.addEventListener('animationend', function h() { el.classList.remove('spinning'); el.removeEventListener('animationend', h); });
+  }
   async function refreshJobs() {
+    spinOnce($('backupTopRefreshBtn'));
     if (api && typeof api.refreshJobs === 'function') {
       try { await api.refreshJobs(); } catch (e) { /* fall through to reload */ }
     }
@@ -3286,8 +3389,8 @@
         if (nav === 'logs') showView('logs');
         if (nav === 'cloud') { showCloudPanel('home'); showView('cloud'); }
         if (nav === 'vpn') showView('vpn');
-        if (nav === 'wireguard') showView('wireguard');
-        if (nav === 'wireguard-site') { showView('wireguard'); showWgPanel('server'); }
+        if (nav === 'wireguard') { showView('wireguard'); showWgPanel('server'); }
+        if (nav === 'wireguard-site') { showView('wireguard'); showWgPanel('nat'); }
         if (nav === 'wireguard-nat') { showView('wireguard'); showWgPanel('nat'); }
         if (nav === 'cloud-server') { showCloudPanel('server'); setModule('cloud'); }
         if (nav === 'cloud-client') { showCloudPanel('client'); setModule('cloud'); }
@@ -3306,6 +3409,7 @@
     var wgApb = $('cloudClientWgAddPeerBtn');
     if (wgApb) wgApb.addEventListener('click', function () {
       showView('wireguard');
+      showWgPanel('server'); // the Add-a-device form lives in the server card
       // Focus AFTER the status load finishes: it hides the server
       // card when the transport is not installed, and focusing
       // before that races it (the card hides under the focus).
@@ -3544,7 +3648,7 @@
       btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
     });
     var lrb = $('logsRefreshBtn');
-    if (lrb) lrb.addEventListener('click', function () { loadJobs().then(function () { renderLogs(currentLogTab); }); });
+    if (lrb) lrb.addEventListener('click', function () { spinOnce(lrb.querySelector('.refresh-glyph')); loadJobs().then(function () { renderLogs(currentLogTab); }); });
     var llf = $('logsLevelFilter');
     if (llf) llf.addEventListener('change', renderFullLog);
     var ls = $('logsSearch');
