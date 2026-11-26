@@ -6,6 +6,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node src/test/run-tests.js",
+    "test:job-delete": "node --test src/test/job-delete-regression.js",
     "build": "electron-builder",
     "prebuild": "node scripts/prepare-protected-build.js"
   },

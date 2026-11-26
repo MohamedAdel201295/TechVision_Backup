@@ -777,7 +777,7 @@ async function loadStoredJobs() {
   try {
     if (!fs.existsSync(jobsDir)) return;
     const files = fs.readdirSync(jobsDir);
-    const jsonFiles = files.filter(f => f.endsWith('.json') && f !== 'history.json');
+    const jsonFiles = files.filter(f => f.endsWith('.json') && f !== 'history.json' && f !== 'waiting.json');
     for (const file of jsonFiles) {
       try {
         const content = fs.readFileSync(path.join(jobsDir, file), 'utf-8');
@@ -838,8 +838,10 @@ function saveJobHistory() {
     fs.writeFileSync(tmpPath, JSON.stringify(recordsToSave, null, 2));
     fs.renameSync(tmpPath, historyPath);
     console.log(`[Main] Saved ${recordsToSave.length} job history records`);
+    return true;
   } catch (e) {
     console.error('[Main] Failed to save job history:', e.message);
+    return false;
   }
 }
 
@@ -1110,6 +1112,7 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
 
 async function executeScheduledBackup(job, resolved) {
   if (!job || !job.source || !job.destination) return;
+  if (!jobHistory.includes(job)) return; // deleted/replaced while resolving drives
   // Resolved paths from the drive watcher: the source may have moved
   // to another letter (same volume label), or the destination too.
   const sourcePath = (resolved && resolved.source && resolved.source.path) || job.source;
@@ -1155,7 +1158,7 @@ async function executeScheduledBackup(job, resolved) {
   }
   const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
   const jobId = `${job.name}-scheduled-${Date.now()}`;
-  activeJobs.set(jobId, { name: job.name, status: 'running' });
+  activeJobs.set(jobId, { name: job.name, jobId: job.id, status: 'running' });
   notifyEmail('started', { name: job.name, type: useIncremental ? 'incremental' : 'full', source: job.source, destination: job.destination });
   try {
     const engine = new BackupEngine(jobConfig);
@@ -1219,6 +1222,7 @@ async function checkSchedules() {
     // drive — the engine creates it — so the job waits only when the
     // source is missing or the destination's drive is provably absent.
     const resolved = await resolveJobPaths(job);
+    if (!jobHistory.includes(job)) continue;
     if (resolved.source.found && (resolved.destination.found || resolved.destination.drivePresent !== false)) {
       if (job.waitingForDrive) { delete job.waitingForDrive; saveWaitingState(); notifyJobsUpdated(); }
       executeScheduledBackup(job, resolved);
@@ -1852,7 +1856,7 @@ ipcMain.handle('job-list-stored', async () => {
   try {
     if (!fs.existsSync(jobsDir)) return [];
     const files = fs.readdirSync(jobsDir);
-    return files.filter(f => f.endsWith('.json') && f !== 'history.json').map(f => {
+    return files.filter(f => f.endsWith('.json') && f !== 'history.json' && f !== 'waiting.json').map(f => {
       const content = fs.readFileSync(path.join(jobsDir, f), 'utf-8');
       return JSON.parse(content);
     });
@@ -3593,6 +3597,7 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
   // the engine with a confusing error).
   const src = await driveResolver.resolvePathAsync(jobPathValue(job.source), job.sourceDriveMatch || job.sourceVolumeLabel || null);
   const dst = await driveResolver.resolvePathAsync(jobPathValue(job.destination), job.destinationDriveMatch || job.destinationVolumeLabel || null);
+  if (!jobHistory.includes(job)) return { success: false, error: 'Job was deleted or changed before the backup started.' };
   // A missing SOURCE always blocks the run. A missing DESTINATION
   // blocks it only when its drive is provably absent: a destination
   // folder that does not exist yet is created by the engine, so
@@ -3718,19 +3723,26 @@ ipcMain.handle('job-delete', async (event, jobId) => {
       // and must survive even if the name matches.
       const otherIds = new Set(jobHistory.filter(j => j.id !== id).map(j => j.id).filter(Boolean));
       for (const file of fs.readdirSync(jobsDir)) {
-        if (!file.endsWith('.json') || file === 'history.json') continue;
+        if (!file.endsWith('.json') || file === 'history.json' || file === 'waiting.json') continue;
         const p = path.join(jobsDir, file);
         // Read the template FIRST: the filename alone cannot tell
         // whose job it is — a legacy <name>.json may belong to a
         // different live job that happens to share the name, and a
-        // file named <id>.json may carry another job's content. An
-        // unreadable or locked file is skipped (logged), never
-        // deleted, and never allowed to fail the whole delete.
+        // file named <id>.json may carry another job's content.
+        // An unreadable file that could be this job's own template
+        // (<id>.json / <name>.json) makes deletion inconclusive:
+        // report failure instead of claiming success with a live
+        // template. Any other unreadable file is skipped (logged) —
+        // it belongs to another job or is junk, and must not block
+        // every delete forever.
         let content;
         try {
           content = JSON.parse(fs.readFileSync(p, 'utf-8'));
         } catch (e) {
           console.error(`[Main] Skipping unreadable job template file during delete: ${p} (${e.message})`);
+          if (file === id + '.json' || file === name + '.json') {
+            throw new Error(`Cannot verify job template ${file}: ${e.message}`);
+          }
           continue;
         }
         const cid = content && content.id;
@@ -3749,19 +3761,36 @@ ipcMain.handle('job-delete', async (event, jobId) => {
           if (!(cid && otherIds.has(cid)) || samePaths) match = true;
         }
         if (match) {
-          try { fs.unlinkSync(p); removed.push(file); console.log(`[Main] Deleted job template file: ${p}`); } catch (e) { console.error('[Main] Failed to delete job template file:', e.message); }
+          try { fs.unlinkSync(p); removed.push(file); console.log(`[Main] Deleted job template file: ${p}`); }
+          catch (e) { throw new Error(`Cannot delete job template ${file}: ${e.message}`); }
         }
       }
-    } catch (e) { console.error('[Main] Failed to scan jobs dir for templates:', e.message); }
+    } catch (e) { console.error('[Main] Failed to scan jobs dir for templates:', e.message); throw e; }
     return removed;
   }
   let idx = jobHistory.findIndex(j => j.id === jobId);
   if (idx < 0) idx = jobHistory.findIndex(j => j.name === jobId);
   if (idx >= 0) {
     const job = jobHistory[idx];
-    deleteTemplateFiles(job.id, job.name, job.source, job.destination);
-    jobHistory.splice(idx, 1);
-    saveJobHistory();
+    // Old name/id files can represent the same task. Remove their
+    // in-memory entries too, or a remaining schedule recreates history.
+    const sameTask = j => j.id === job.id || (j.name === job.name
+      && job.source && job.destination
+      && jobPathValue(j.source) === jobPathValue(job.source)
+      && jobPathValue(j.destination) === jobPathValue(job.destination));
+    const deleting = jobHistory.filter(sameTask);
+    if ([...activeJobs.values()].some(a => deleting.some(j => a.jobId ? a.jobId === j.id : a.name === j.name))) {
+      return { success: false, error: 'This backup is running. Wait for it to finish before deleting the job.' };
+    }
+    try { deleteTemplateFiles(job.id, job.name, job.source, job.destination); }
+    catch (e) { return { success: false, error: e.message }; }
+    const previous = jobHistory;
+    jobHistory = jobHistory.filter(j => !sameTask(j));
+    if (!saveJobHistory()) {
+      jobHistory = previous;
+      return { success: false, error: 'Could not save deleted job history. Deletion is incomplete; please retry.' };
+    }
+    saveWaitingState();
     notifyJobsUpdated();
     return { success: true };
   }
@@ -3769,11 +3798,16 @@ ipcMain.handle('job-delete', async (event, jobId) => {
   // exist on disk. Delete it (by content match) and persist the
   // history — before this the handler returned success without ever
   // saving, so any run records on disk came back on the next start.
-  const removed = deleteTemplateFiles(jobId, jobId);
+  let removed;
+  try { removed = deleteTemplateFiles(jobId, jobId); }
+  catch (e) { return { success: false, error: e.message }; }
   // No blind fallback unlink of <jobId>.json here: if the content
   // scan skipped that file it either belongs to a different live job
   // or is unreadable, and both must survive the delete.
-  if (removed.length) { saveJobHistory(); notifyJobsUpdated(); return { success: true }; }
+  if (removed.length) {
+    if (!saveJobHistory()) return { success: false, error: 'Could not save deleted job history.' };
+    saveWaitingState(); notifyJobsUpdated(); return { success: true };
+  }
   return { success: false, error: 'Job not found' };
 });
 
