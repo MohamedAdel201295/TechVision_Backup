@@ -60,6 +60,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Job detail actions
   openEditJob: (jobId) => ipcRenderer.invoke('job-open-edit', jobId),
   runBackupForJob: (jobId) => ipcRenderer.invoke('job-run-backup', jobId),
+  stopBackup: (jobId) => ipcRenderer.invoke('job-stop-backup', jobId),
   restoreJob: (jobId) => ipcRenderer.invoke('job-restore', jobId),
   deleteJob: (jobId) => ipcRenderer.invoke('job-delete', jobId),
 

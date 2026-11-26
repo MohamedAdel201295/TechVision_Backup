@@ -447,6 +447,12 @@ let pendingRestoreJob = null;
 
 // Active jobs tracking (Map for tracking in-progress operations)
 const activeJobs = new Map();
+// Live engine per active run, keyed the same way as activeJobs, so
+// job-stop-backup can cancel the exact run that is going. Entries
+// are removed together with the activeJobs entry (finally in the
+// scheduled path, after the record in the manual paths) so a
+// finished run never stays registered.
+const activeEngines = new Map();
 let jobHistory = [];
 
 // Get jobs history file path
@@ -505,7 +511,14 @@ function normalizeJobObject(job, defaultType = 'full') {
     lastScheduledRun: job.lastScheduledRun || null,
     runs: Array.isArray(job.runs) ? job.runs : [],
     runCount: job.runCount ?? (Array.isArray(job.runs) ? job.runs.length : 0),
-    loaded: job.loaded || false
+    loaded: job.loaded || false,
+    // Name of the template file this job was loaded from, when it
+    // was loaded from one (set by loadStoredJobs / job-save-config).
+    // Delete uses it to remove the job's own file BY NAME instead of
+    // relying only on the content scan — a file the scan skips
+    // (unreadable under an odd filename, content that matches
+    // nothing) used to survive while delete still reported success.
+    templateFile: job.templateFile || null
   };
   // A job with runs is a real job, not a template: showing
   // "TEMPLATE / COMPLETED" is contradictory. Only a job that never
@@ -612,6 +625,7 @@ function mergeJobEntries(entries) {
       if (entry.encryptionEnabled !== undefined) job.encryptionEnabled = entry.encryptionEnabled === true;
       if (entry.options) job.options = entry.options;
       if (entry.lastScheduledRun) job.lastScheduledRun = entry.lastScheduledRun;
+      if (entry.templateFile) job.templateFile = entry.templateFile;
       if (!job.runs.length) {
         job.status = entry.status || 'pending';
         job.type = 'template';
@@ -711,6 +725,14 @@ function runErrorLine(result) {
   return 'Backup failed — see the log for details.';
 }
 
+// A stopped run is recorded as 'cancelled' — not 'failed' (it is not
+// an error) and not 'completed'. The Logs failed tab and the failure
+// email both key off this status, so a stop stays out of both.
+function runStatusOf(result) {
+  if (result && result.cancelled) return 'cancelled';
+  return result && result.success ? 'completed' : 'failed';
+}
+
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
   let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
@@ -785,6 +807,9 @@ async function loadStoredJobs() {
         const normalized = normalizeJobObject(rawJob, 'template');
         if (normalized) {
           normalized.loaded = true;
+          // Remember which file this template came from, so delete
+          // can remove it by name (see deleteTemplateFiles).
+          normalized.templateFile = file;
           jobHistory.push(normalized);
           console.log(`[Main] Loaded stored job template: ${normalized.name}`);
         } else {
@@ -1159,14 +1184,18 @@ async function executeScheduledBackup(job, resolved) {
   const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
   const jobId = `${job.name}-scheduled-${Date.now()}`;
   activeJobs.set(jobId, { name: job.name, jobId: job.id, status: 'running' });
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
   notifyEmail('started', { name: job.name, type: useIncremental ? 'incremental' : 'full', source: job.source, destination: job.destination });
   try {
     const engine = new BackupEngine(jobConfig);
+    activeEngines.set(jobId, engine);
     engine.logger = true;
     const result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
     const jobRecord = {
       id: jobId, name: job.name, type: useIncremental ? 'incremental' : 'full',
-      success: result.success, status: result.success ? 'completed' : 'failed',
+      success: result.success, status: runStatusOf(result),
       source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination),
       timestamp: new Date().toISOString(), files: result.files_backed_up,
       size: result.total_bytes, duration: result.duration_seconds, result,
@@ -1175,7 +1204,9 @@ async function executeScheduledBackup(job, resolved) {
     recordRun(job.name, jobRecord);
     job.lastScheduledRun = new Date().toISOString();
     saveJobHistory();
-    notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+    // A stopped run sends no finished/failed email — the user asked
+    // for the stop, it is not a failure.
+    if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
     console.log(`[Scheduler] Scheduled backup ${useIncremental ? 'incremental' : 'full'} for ${job.name}: ${jobRecord.status}`);
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } catch (e) {
@@ -1195,6 +1226,7 @@ async function executeScheduledBackup(job, resolved) {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } finally {
     activeJobs.delete(jobId);
+    activeEngines.delete(jobId);
   }
 }
 
@@ -1396,6 +1428,10 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, jobId: jobConfig.id || null, status: 'running' });
+  activeEngines.set(jobId, engine);
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
 
   notifyEmail('started', { name: jobName, type: 'full', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
 
@@ -1419,7 +1455,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     name: jobName,
     type: 'full',
     success: result.success,
-    status: result.success ? 'completed' : 'failed',
+    status: runStatusOf(result),
     source: jobPathValue(jobConfig.source),
     destination: jobPathValue(jobConfig.destination),
     timestamp: new Date().toISOString(),
@@ -1434,6 +1470,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   saveJobHistory();
   notifyJobsUpdated();
   activeJobs.delete(jobId);
+  activeEngines.delete(jobId);
 
   // The run used a password the user typed: if the vault is unlocked,
   // save it there (encrypted) so scheduled runs of this job work too.
@@ -1443,7 +1480,9 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
     try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
   }
-  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+  // A stopped run sends no finished/failed email — the user asked
+  // for the stop, it is not a failure.
+  if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
   return jobRecord;
 });
@@ -1484,6 +1523,10 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
 
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, jobId: jobConfig.id || null, status: 'running' });
+  activeEngines.set(jobId, engine);
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
   notifyEmail('started', { name: jobName, type: 'incremental', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
 
   engine.logger = true;
@@ -1502,7 +1545,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     name: jobName,
     type: 'incremental',
     success: result.success,
-    status: result.success ? 'completed' : 'failed',
+    status: runStatusOf(result),
     source: jobPathValue(jobConfig.source),
     destination: jobPathValue(jobConfig.destination),
     timestamp: new Date().toISOString(),
@@ -1517,11 +1560,14 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   saveJobHistory();
   notifyJobsUpdated();
   activeJobs.delete(jobId);
+  activeEngines.delete(jobId);
 
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
     try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
   }
-  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+  // A stopped run sends no finished/failed email — the user asked
+  // for the stop, it is not a failure.
+  if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Incremental backup completed: ${jobName}`);
   return jobRecord;
 });
@@ -1765,6 +1811,10 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     delete jobConfig.encryptionPassword;
     if (jobConfig.encryption && typeof jobConfig.encryption === 'object') delete jobConfig.encryption.password;
     delete jobConfig.password;
+    // templateFile is derived state (which file the job was loaded
+    // from), not config — it is re-set from the written filename
+    // below and must not be persisted into the file itself.
+    delete jobConfig.templateFile;
   }
   // Removable drives: remember HOW to find the source/destination
   // drive again — by name, by letter, or by serial number. The wizard
@@ -1814,7 +1864,8 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     // add it to the in-memory history now so Create Job shows it at once.
     const tpl = normalizeJobObject(Object.assign({}, jobConfig, {
       id: jobConfig.id || ('job-' + jobConfig.name),
-      type: 'TEMPLATE', status: 'PENDING', loaded: true
+      type: 'TEMPLATE', status: 'PENDING', loaded: true,
+      templateFile: `${fileId}.json`
     }));
     if (tpl) {
       let existing = jobHistory.findIndex(j => j.id === tpl.id);
@@ -2544,6 +2595,16 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
     const cfg = getCloudConfig();
     const rec = cfg.clients.find((c) => c.id === serverId);
     if (!rec) return { success: false, error: 'Server not found.' };
+    // Client-connection guard (the user asked for this, 2026-11-27):
+    // never attempt a mapping when the Client is not connected to
+    // THIS server. A live session proves the server answers, the
+    // password is right and the certificate is the pinned one —
+    // without it, `net use` fails with a cryptic error (e.g. 1244)
+    // for a problem the Client tab would have shown plainly. The
+    // renderer answers 'not-connected' with a message and a jump to
+    // the Client tab. (Startup auto-reconnect is separate and keeps
+    // working without a session — see reconnectMapDrives.)
+    if (!cloudSessions.get(serverId)) return { success: false, error: 'not-connected' };
     if (!getClientPassword(rec)) return { success: false, error: 'password-needed' };
     const l = String(letter || '').toUpperCase();
     if (!/^[A-Z]$/.test(l)) return { success: false, error: 'Pick a drive letter (A–Z).' };
@@ -2572,6 +2633,29 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
         const inst = await cloudMapDrive.installCert(rec.certPem);
         if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
       }
+    } else {
+      // No trusted certificate saved for this server at all: the
+      // install step used to be skipped silently here and `net use`
+      // then failed with System error 1244. Say so plainly instead
+      // — connecting once in the Client tab trusts the certificate
+      // and saves it. (Unreachable from the Map button itself now
+      // that the connection guard above requires a live session,
+      // which implies a trusted certificate — kept as a loud guard
+      // for direct IPC callers.)
+      return { success: false, error: 'This server has no trusted certificate saved yet — connect once in the Client tab first (it trusts the certificate), then map the drive.' };
+    }
+    // Windows hostname validation: `net use` only sends the login
+    // when the certificate covers the mapped host (IP SAN for an IP,
+    // DNS SAN for a name). A certificate issued before this address
+    // existed on the server (e.g. Tailscale came up after the server
+    // first started) never gains the SAN — certNeedsRegen
+    // deliberately does not churn on interface changes — so check
+    // here and fail with the actual cause instead of letting
+    // `net use` answer with System error 1244. (null = host form
+    // this check cannot judge, e.g. IPv6: proceed as before.)
+    const covers = cloudServerMod.certCoversHost(rec.certPem, rec.host);
+    if (covers === false) {
+      return { success: false, error: 'The server certificate does not cover this address (' + rec.host + '). It was issued before this address existed on the server — restart the Cloud server on the server machine so it issues a new certificate covering it, then connect again in the Client tab (Trust & connect) and map the drive.' };
     }
     const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
     if (!mapped.success) return { success: false, error: mapped.error };
@@ -3636,11 +3720,15 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
   const runType = useIncremental ? 'incremental' : 'full';
   const runJobId = `${jobName}-${Date.now()}`;
   activeJobs.set(runJobId, { name: jobName, jobId: job.id, status: 'running' });
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
   notifyEmail('started', { name: jobName, type: runType, source: jobPathValue(backupConfig.source), destination: jobPathValue(backupConfig.destination) });
 
   let result;
   try {
     const engine = new BackupEngine(backupConfig);
+    activeEngines.set(runJobId, engine);
     engine.logger = true;
     result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
   } catch (e) {
@@ -3654,7 +3742,7 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     name: jobName,
     type: runType,
     success: result.success,
-    status: result.success ? 'completed' : 'failed',
+    status: runStatusOf(result),
     source: jobPathValue(backupConfig.source),
     destination: jobPathValue(backupConfig.destination),
     timestamp: new Date().toISOString(),
@@ -3668,8 +3756,35 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
   saveJobHistory();
   notifyJobsUpdated();
   activeJobs.delete(runJobId);
-  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+  activeEngines.delete(runJobId);
+  // A stopped run sends no finished/failed email — the user asked
+  // for the stop, it is not a failure.
+  if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   return { success: result.success, job: job, result: result };
+});
+
+// Stop a running backup. jobId is the job's id (job.id); the name is
+// used as a fallback so runs started without a stored id (ad-hoc
+// runs) stop too. Returns promptly — the run's own await unwinds
+// through the engine's cancel flag, deletes the partial artifact
+// and records the run as 'cancelled'. Stopping a job that is not
+// running is NOT_RUNNING, not an error.
+ipcMain.handle('job-stop-backup', async (event, jobId) => {
+  let name = null;
+  if (jobId) {
+    const job = jobHistory.find((j) => j.id === jobId);
+    if (job) name = job.name;
+  }
+  let stopped = 0;
+  for (const [key, engine] of activeEngines) {
+    const a = activeJobs.get(key);
+    if (!a) continue;
+    if ((jobId && a.jobId === jobId) || (name && a.name === name)) {
+      try { engine.requestCancel(); stopped++; } catch (e) {}
+    }
+  }
+  if (!stopped) return { success: false, error: 'NOT_RUNNING' };
+  return { success: true, stopped: stopped };
 });
 
 ipcMain.handle('job-restore', async (event, jobId) => {
@@ -3714,10 +3829,28 @@ ipcMain.handle('job-delete', async (event, jobId) => {
   // job by id or by name — except one that belongs to a different
   // job still listed (same-name jobs stay separate tasks).
   const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
-  function deleteTemplateFiles(id, name, source, destination) {
+  function deleteTemplateFiles(id, name, source, destination, knownFiles) {
     const removed = [];
     try {
       if (!fs.existsSync(jobsDir)) return removed;
+      // A loaded template's own file is known by name from load time
+      // (job.templateFile) — delete it directly instead of relying
+      // only on the content scan below. This closes the silent-
+      // success hole: a file the scan skips (unreadable under an odd
+      // filename, content that matches nothing) used to survive
+      // while delete still reported success, so the row vanished and
+      // the template came back on the next start. Unlink needs no
+      // read, so even a corrupt or read-locked file is removed; a
+      // file that cannot be unlinked fails the delete loudly instead
+      // of lying about it. A known file already gone from disk is
+      // simply skipped — the job is already gone for good.
+      for (const known of new Set(knownFiles || [])) {
+        if (!known) continue;
+        const kp = path.join(jobsDir, known);
+        if (!fs.existsSync(kp)) continue;
+        try { fs.unlinkSync(kp); removed.push(known); console.log(`[Main] Deleted job template file: ${kp}`); }
+        catch (e) { throw new Error(`Cannot delete job template ${known}: ${e.message}`); }
+      }
       // Ids of jobs other than the one being deleted: a template
       // whose content id is one of these belongs to that other job
       // and must survive even if the name matches.
@@ -3782,7 +3915,7 @@ ipcMain.handle('job-delete', async (event, jobId) => {
     if ([...activeJobs.values()].some(a => deleting.some(j => a.jobId ? a.jobId === j.id : a.name === j.name))) {
       return { success: false, error: 'This backup is running. Wait for it to finish before deleting the job.' };
     }
-    try { deleteTemplateFiles(job.id, job.name, job.source, job.destination); }
+    try { deleteTemplateFiles(job.id, job.name, job.source, job.destination, deleting.filter(j => j.loaded).map(j => j.templateFile)); }
     catch (e) { return { success: false, error: e.message }; }
     const previous = jobHistory;
     jobHistory = jobHistory.filter(j => !sameTask(j));

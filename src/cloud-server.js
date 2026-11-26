@@ -109,6 +109,27 @@ function certNeedsRegen(cfg) {
   return false;
 }
 
+// Does this certificate cover `host` for Windows hostname validation
+// (`net use` / WebClient)? An IPv4 host needs an IP SAN, a hostname
+// needs a DNS SAN. Returns true / false, or null when the host form
+// cannot be judged here (IPv6) — the caller then proceeds as before
+// instead of blocking a mapping it cannot evaluate.
+// This is the 1244 hole (2026-11-27): the SANs are frozen at issuance
+// — an address that appears later (Tailscale coming up after the
+// server first started) is never in the cert, certNeedsRegen never
+// fires for it, and `net use` fails with System error 1244 while the
+// in-app Client still connects fine (fingerprint pinning does no
+// hostname validation). The map flow must check coverage and fail
+// with the actual cause instead of the cryptic 1244.
+function certCoversHost(certPem, host) {
+  const h = String(host || '').trim().toLowerCase().replace(/\.$/, '');
+  if (!h) return false;
+  if (h.indexOf(':') >= 0) return null; // IPv6 (incl. bracketed): not judged here
+  const sans = certSans(certPem);
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return sans.ips.indexOf(h) >= 0;
+  return sans.dns.map(function (n) { return String(n).toLowerCase(); }).indexOf(h) >= 0;
+}
+
 function certExtensions(cfg, publicIp) {
   const altNames = [];
   const seen = new Set();
@@ -1059,4 +1080,4 @@ class CloudServer {
   }
 }
 
-module.exports = { CloudServer, defaultServerConfig, ensureCert, certSans, certNeedsRegen, fingerprintOfCertPem, hashPassword, verifyPassword, lanIPs, detectPublicIP, MAX_UPLOAD_BYTES };
+module.exports = { CloudServer, defaultServerConfig, ensureCert, certSans, certCoversHost, certNeedsRegen, fingerprintOfCertPem, hashPassword, verifyPassword, lanIPs, detectPublicIP, MAX_UPLOAD_BYTES };

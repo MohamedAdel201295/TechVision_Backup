@@ -208,6 +208,7 @@ class BackupResult extends EventEmitter {
   constructor() {
     super();
     this.success = false;
+    this.cancelled = false; // stopped by the user — not a failure
     this.files_backed_up = 0;
     this.files_skipped = 0;
     this.files_failed = 0;
@@ -300,6 +301,18 @@ class BackupState {
 }
 
 /**
+ * Thrown (internally) when the user stops a running backup. The run
+ * methods catch it, delete the partial artifact and return a result
+ * with cancelled:true — it never escapes to main.js as a throw.
+ */
+class BackupCancelled extends Error {
+  constructor() {
+    super('Backup stopped by user');
+    this.code = 'BACKUP_CANCELLED';
+  }
+}
+
+/**
  * Backup Engine Class
  */
 class BackupEngine {
@@ -309,6 +322,19 @@ class BackupEngine {
     // shouldExclude and source.path / destination.path always exist.
     this.jobConfig = jobConfig instanceof JobConfig ? jobConfig : new JobConfig(jobConfig || {});
     this.logger = logger;
+    // Stop support (one flag per engine — a fresh engine is created
+    // for every run, so the flag starts false and is never reused):
+    // requestCancel() sets it; the run loops and the finalize race
+    // check it. _activeStreams is the stream of the file currently
+    // being read (gate / plain copy), _activeArchive/_activeOutput
+    // are the ZIP being written — requestCancel() tears all of them
+    // down so a stop lands promptly, not just between files.
+    this._cancelRequested = false;
+    this._cancelWait = null;
+    this._cancelResolve = null;
+    this._activeStreams = null;
+    this._activeArchive = null;
+    this._activeOutput = null;
     const destPath = (this.jobConfig.destination && this.jobConfig.destination.path) || '';
     this.logsDir = destPath ? path.join(destPath, 'logs') : './logs';
     this.backupDir = destPath || './backup';
@@ -342,6 +368,34 @@ class BackupEngine {
         this._initError = e;
       }
     }
+  }
+
+  /**
+   * Stop this run. Synchronous and prompt: it only sets the flag and
+   * tears down the live streams — the run's own awaits then unwind
+   * through the cancel checks (per-file loop, finalize race) and the
+   * outer catch deletes the partial artifact and returns
+   * { cancelled: true }. Safe to call when no run is active (a fresh
+   * engine just records the flag). Mid-file: destroying the active
+   * read stream with a BackupCancelled error settles the gate /
+   * plain-copy await at once; a stream already handed to archiver is
+   * stopped by archive.abort() instead, and the finalize race (which
+   * also listens on the cancel waiter) plus the post-race flag check
+   * end the run even if the archive never reports the abort.
+   */
+  requestCancel() {
+    this._cancelRequested = true;
+    if (typeof this._cancelResolve === 'function') { try { this._cancelResolve(); } catch (e) {} }
+    const streams = this._activeStreams;
+    this._activeStreams = null;
+    if (streams) {
+      const err = new BackupCancelled();
+      try { if (streams.rs) streams.rs.destroy(err); } catch (e) {}
+      try { if (streams.tee) streams.tee.destroy(err); } catch (e) {}
+      try { if (streams.ws) streams.ws.destroy(); } catch (e) {}
+    }
+    try { if (this._activeArchive && typeof this._activeArchive.abort === 'function') this._activeArchive.abort(); } catch (e) {}
+    try { if (this._activeOutput) this._activeOutput.destroy(); } catch (e) {}
   }
 
   /**
@@ -412,12 +466,17 @@ class BackupEngine {
     return new Promise((resolve, reject) => {
       const rs = fs.createReadStream(file);
       const ws = fs.createWriteStream(dest);
+      // Stop support: requestCancel() destroys these, so a stop
+      // mid-copy settles this promise at once (via fail, below)
+      // instead of waiting for the whole file to copy.
+      this._activeStreams = { rs: rs, ws: ws };
       const hash = crypto.createHash('sha256');
       let bytesCopied = 0;
       let failed = false;
       const fail = (err) => {
         if (failed) return;
         failed = true;
+        if (this._activeStreams && this._activeStreams.rs === rs) this._activeStreams = null;
         try { rs.destroy(); } catch (e) {}
         try { ws.destroy(); } catch (e) {}
         // A failed copy must not leave a truncated file behind that
@@ -432,7 +491,7 @@ class BackupEngine {
       });
       rs.on('error', fail);
       ws.on('error', fail);
-      ws.on('finish', () => resolve({ dest: dest, hash: hash.digest('hex'), size: bytesCopied }));
+      ws.on('finish', () => { if (this._activeStreams && this._activeStreams.rs === rs) this._activeStreams = null; resolve({ dest: dest, hash: hash.digest('hex'), size: bytesCopied }); });
       rs.pipe(ws);
     });
   }
@@ -522,6 +581,10 @@ class BackupEngine {
     this.log('info', `Destination: ${plainCopy ? copyDir + ' (plain files, no ZIP)' : zipPath + (this.jobConfig.encryptionEnabled ? ' (AES-256 encrypted)' : '')}`);
 
     try {
+      // Stop support: a waiter the finalize race listens on, so a
+      // stop during finalize ends the run at once. The flag itself
+      // starts false in the constructor (one engine per run).
+      this._cancelWait = new Promise((resolve) => { this._cancelResolve = resolve; });
       // Real progress: one metric — bytes actually read from the
       // source (plus bytes of skipped files) over total source bytes,
       // 0→99%. The old renderer-side fake bar raced to 92% and froze
@@ -589,6 +652,10 @@ class BackupEngine {
           this.log('info', `Archive created: ${archive.pointer()} bytes`);
         });
         archive.pipe(output);
+        // Stop support: requestCancel() aborts this archive and
+        // destroys this output stream.
+        this._activeArchive = archive;
+        this._activeOutput = outputStream;
       }
 
       // Collect all files
@@ -627,6 +694,10 @@ class BackupEngine {
         const fileSize = stats ? stats.size : 0;
         let fileCounted = 0;
         try {
+          // Stop requested (between files): end the run now — the
+          // outer catch deletes the partial artifact and records
+          // the run as cancelled.
+          if (this._cancelRequested) throw new BackupCancelled();
           const relativePath = path.relative(sourceBase, file).replace(/\\/g, '/');
           currentFileName = relativePath;
 
@@ -712,6 +783,9 @@ class BackupEngine {
               flush(callback) { hashState.hash = hash.digest('hex'); callback(); }
             });
             const rs = fs.createReadStream(file);
+            // Stop support: requestCancel() destroys this stream, so
+            // a stop while the gate waits settles it at once.
+            this._activeStreams = { rs: rs, tee: null };
             // Gate: wait until the stream has its first chunk (or EOF)
             // BEFORE handing it to archiver. A file that fails to open
             // or read at all (deleted mid-run, transient error) is then
@@ -740,7 +814,11 @@ class BackupEngine {
             rs.on('error', onStreamError);
             tee.on('error', onStreamError);
             rs.pipe(tee);
+            this._activeStreams = { rs: rs, tee: tee };
             archive.append(tee, { name: relativePath, stats });
+            // From here the stream belongs to archiver (a stop aborts
+            // the archive instead of destroying the stream).
+            this._activeStreams = null;
           }
           backedUpInfo.set(relativePath, { info: fileInfo, hashState: hashState });
           result.files_backed_up++;
@@ -748,6 +826,9 @@ class BackupEngine {
           this.log('info', `Backed up: ${relativePath}`);
           filesSeen++;
         } catch (err) {
+          // A stop turns into a cancelled run, not a failed file:
+          // rethrow so the outer catch handles the cleanup.
+          if (this._cancelRequested || (err && err.code === 'BACKUP_CANCELLED')) throw new BackupCancelled();
           // A file that fails on the actual read (locked between the
           // probe and the read, deleted mid-run, I/O error) is a
           // locked skip when the OS says so, a failure otherwise —
@@ -770,11 +851,19 @@ class BackupEngine {
         // Race the normal completion against a source-stream failure:
         // archiver never reports a failing stream, so without this
         // race the run would hang here forever. The loser's rejection
-        // is swallowed — the race reports the outcome.
+        // is swallowed — the race reports the outcome. The cancel
+        // waiter joins the race so a stop during finalize ends the
+        // run at once instead of waiting for the archive to finish.
         const normalPath = (async () => { await archive.finalize(); await outputClosed; })();
         normalPath.catch(() => {});
-        await Promise.race([normalPath, archiveFailed]);
+        await Promise.race([normalPath, archiveFailed, this._cancelWait]);
+        // A stop during finalize ends the run here — the archive is
+        // aborted by requestCancel and the partial ZIP is deleted by
+        // the outer catch, like any other cancellation.
+        if (this._cancelRequested) throw new BackupCancelled();
         if (streamError) throw streamError;
+        this._activeArchive = null;
+        this._activeOutput = null;
       }
 
       // Set the backup path on result
@@ -793,6 +882,10 @@ class BackupEngine {
       backupState.state = {};
       backupState.setBaseDir(sourceBase);
       for (const [relativePath, entry] of backedUpInfo) {
+        // A stop that lands while the state is being built still
+        // cancels the run (the complete ZIP is removed by the catch
+        // — a cancelled run leaves no artifact behind).
+        if (this._cancelRequested) throw new BackupCancelled();
         // The ZIP-path hash resolves only once the stream was fully
         // consumed (after finalize, which already happened above);
         // the plain-copy hash was final at copy time. Either way the
@@ -838,15 +931,36 @@ class BackupEngine {
 
     } catch (err) {
       result.success = false;
-      result.error_messages.push(err.message);
-      this.log('error', `Full backup failed: ${err.message}`);
-      // A failed ZIP is truncated (no central directory) — delete it
-      // so it can never be mistaken for a valid backup. A failed
-      // plain-copy folder keeps the files that did copy (only the
-      // failed file's partial is removed, in _copyPlainFile).
-      if (!plainCopy) {
-        try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+      // A stop is a cancelled run, not a failure: one clean message,
+      // no failure email (main.js keys off result.cancelled), and
+      // the partial artifact is removed — a failed plain-copy folder
+      // keeps the files that did copy, but a cancelled run leaves
+      // nothing behind at all.
+      if (this._cancelRequested || (err && err.code === 'BACKUP_CANCELLED')) {
+        result.cancelled = true;
+        result.error_messages = ['Backup stopped by user'];
+        result.duration_seconds = (Date.now() - startTime) / 1000;
+        this.log('info', 'Full backup stopped by user');
+        if (plainCopy) {
+          try { if (fs.existsSync(copyDir)) fs.rmSync(copyDir, { recursive: true, force: true }); } catch (e) {}
+        } else {
+          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+        }
+      } else {
+        result.error_messages.push(err.message);
+        this.log('error', `Full backup failed: ${err.message}`);
+        // A failed ZIP is truncated (no central directory) — delete it
+        // so it can never be mistaken for a valid backup. A failed
+        // plain-copy folder keeps the files that did copy (only the
+        // failed file's partial is removed, in _copyPlainFile).
+        if (!plainCopy) {
+          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+        }
       }
+    } finally {
+      this._activeArchive = null;
+      this._activeOutput = null;
+      this._activeStreams = null;
     }
 
     this._writeLog(logFile, result);
@@ -925,6 +1039,9 @@ class BackupEngine {
     this.log('info', `Destination: ${plainCopyInc ? copyDirInc + ' (plain files, no ZIP)' : zipPath + (this.jobConfig.encryptionEnabled ? ' (AES-256 encrypted)' : '')}`);
 
     try {
+      // Stop support: a waiter the finalize race listens on (see the
+      // full backup — the flag itself starts false in the constructor).
+      this._cancelWait = new Promise((resolve) => { this._cancelResolve = resolve; });
       // Get previous state
       const prevState = backupState.state;
 
@@ -978,6 +1095,10 @@ class BackupEngine {
           this.log('info', `Archive created: ${archive.pointer()} bytes`);
         });
         archive.pipe(output);
+        // Stop support: requestCancel() aborts this archive and
+        // destroys this output stream.
+        this._activeArchive = archive;
+        this._activeOutput = outputStream;
       }
 
       // Collect current files
@@ -1003,6 +1124,10 @@ class BackupEngine {
         const fileSize = stats ? stats.size : 0;
         let fileCounted = 0;
         try {
+          // Stop requested (between files): end the run now — the
+          // outer catch deletes the partial artifact and records
+          // the run as cancelled.
+          if (this._cancelRequested) throw new BackupCancelled();
           const relativePath = path.relative(sourceBaseInc, file).replace(/\\/g, '/');
           currentFileName = relativePath;
 
@@ -1092,6 +1217,9 @@ class BackupEngine {
                 flush(callback) { incHashState.hash = hash.digest('hex'); callback(); }
               });
               const rs = fs.createReadStream(file);
+              // Stop support: requestCancel() destroys this stream,
+              // so a stop while the gate waits settles it at once.
+              this._activeStreams = { rs: rs, tee: null };
               // Same gate as full backups: a file that fails to open
               // or read at all is one failed file, not a failed run
               // (the error is captured, never swallowed — see the
@@ -1111,7 +1239,11 @@ class BackupEngine {
               rs.on('error', onStreamError);
               tee.on('error', onStreamError);
               rs.pipe(tee);
+              this._activeStreams = { rs: rs, tee: tee };
               archive.append(tee, { name: relativePath, stats });
+              // From here the stream belongs to archiver (a stop aborts
+              // the archive instead of destroying the stream).
+              this._activeStreams = null;
               currentInfo = { path: file, size: stats.size, mtime: stats.mtimeMs, hash: null };
               result.files_backed_up++;
               result.total_bytes += fileSize;
@@ -1132,6 +1264,9 @@ class BackupEngine {
             if (currentInfo) backupState.set(file, currentInfo);
           }
         } catch (err) {
+          // A stop turns into a cancelled run, not a failed file:
+          // rethrow so the outer catch handles the cleanup.
+          if (this._cancelRequested || (err && err.code === 'BACKUP_CANCELLED')) throw new BackupCancelled();
           if (err && (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EBUSY')) {
             result.locked_files_skipped++;
             result.files_skipped++;
@@ -1149,8 +1284,16 @@ class BackupEngine {
       if (!plainCopyInc) {
         const normalPath = (async () => { await archive.finalize(); await outputClosed; })();
         normalPath.catch(() => {});
-        await Promise.race([normalPath, archiveFailed]);
+        // The cancel waiter joins the race so a stop during finalize
+        // ends the run at once (see the full backup).
+        await Promise.race([normalPath, archiveFailed, this._cancelWait]);
+        // A stop during finalize ends the run here — the archive is
+        // aborted by requestCancel and the partial ZIP is deleted by
+        // the outer catch, like any other cancellation.
+        if (this._cancelRequested) throw new BackupCancelled();
         if (streamError) throw streamError;
+        this._activeArchive = null;
+        this._activeOutput = null;
       }
 
       // Set the backup path on result
@@ -1164,6 +1307,10 @@ class BackupEngine {
       // were stored by reference, so mutating the info objects here
       // updates what gets saved.
       for (const [relativePath, entry] of incBackedUp) {
+        // A stop that lands while the hashes resolve still cancels
+        // the run (the complete ZIP is removed by the catch — a
+        // cancelled run leaves no artifact behind).
+        if (this._cancelRequested) throw new BackupCancelled();
         if (entry.hashState.hash) entry.info.hash = entry.hashState.hash;
         else entry.info.hash = await this.calculateHash(entry.info.path);
       }
@@ -1201,11 +1348,31 @@ class BackupEngine {
 
     } catch (err) {
       result.success = false;
-      result.error_messages.push(err.message);
-      this.log('error', `Incremental backup failed: ${err.message}`);
-      if (!plainCopyInc) {
-        try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+      // A stop is a cancelled run, not a failure (see the full
+      // backup): one clean message, no failure email, and the
+      // partial artifact is removed — including the plain-copy
+      // folder, which a failed run keeps.
+      if (this._cancelRequested || (err && err.code === 'BACKUP_CANCELLED')) {
+        result.cancelled = true;
+        result.error_messages = ['Backup stopped by user'];
+        result.duration_seconds = (Date.now() - startTime) / 1000;
+        this.log('info', 'Incremental backup stopped by user');
+        if (plainCopyInc) {
+          try { if (fs.existsSync(copyDirInc)) fs.rmSync(copyDirInc, { recursive: true, force: true }); } catch (e) {}
+        } else {
+          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+        }
+      } else {
+        result.error_messages.push(err.message);
+        this.log('error', `Incremental backup failed: ${err.message}`);
+        if (!plainCopyInc) {
+          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+        }
       }
+    } finally {
+      this._activeArchive = null;
+      this._activeOutput = null;
+      this._activeStreams = null;
     }
 
     this._writeLog(logFile, result);

@@ -246,10 +246,16 @@ select.filter {
 .pill-pending { background: var(--warning-bg); color: var(--warning); }
 .pill-running { background: var(--info-bg); color: var(--info); }
 .pill-running::before { animation: pulseDot 1s infinite; }
+.pill-cancelled { background: var(--surface-3); color: var(--muted); border: 1px dashed var(--border); }
 .pill-failed { background: var(--danger-bg); color: var(--danger); }
 .pill-template { background: var(--surface-3); color: var(--muted); }
 .pill-full { background: var(--info-bg); color: var(--info); }
 .pill-incremental { background: rgba(168, 85, 247, .14); color: #a855f7; }
+/* Stop button inside a Dashboard Recent row (next to the RUNNING
+   pill) and in the backup progress card. Small, same window, no
+   layout change: the button only exists while a run is active. */
+.dash-stop-btn { padding: 2px 8px; font-size: 12px; margin-left: 6px; vertical-align: middle; }
+.progress-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 
 .empty-state {
   text-align: center; padding: 48px 20px; border: 1px dashed var(--border);

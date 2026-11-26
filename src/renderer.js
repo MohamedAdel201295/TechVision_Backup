@@ -48,7 +48,7 @@
     var type = safeStr(raw.type, 'FULL').toUpperCase();
     if (type !== 'FULL' && type !== 'INCREMENTAL' && type !== 'TEMPLATE') type = 'FULL';
     var status = safeStr(raw.status, 'PENDING').toUpperCase();
-    if (['COMPLETED', 'RUNNING', 'PENDING', 'FAILED', 'TEMPLATE'].indexOf(status) === -1) status = 'PENDING';
+    if (['COMPLETED', 'RUNNING', 'PENDING', 'FAILED', 'CANCELLED', 'TEMPLATE'].indexOf(status) === -1) status = 'PENDING';
     var job = {
       id: raw.id || raw.jobId || '',
       name: name,
@@ -280,7 +280,12 @@
     set('dashLastBackup', last ? formatTimeOnly(last.timestamp) : '—');
     set('dashLastBackupSub', last ? formatDayWord(last.timestamp) + ' · ' + (last.type === 'INCREMENTAL' ? 'Incremental' : 'Full') : 'No backups yet');
     renderDashboardStatus(list, bad, last);
-    renderDashboardRecent(list);
+    // A template on its very first run has no row yet (the list
+    // above excludes templates) — but it IS the most recent backup
+    // activity, so the Recent list includes it while it runs, with
+    // its Stop button. The counts above keep excluding templates,
+    // as before.
+    renderDashboardRecent(list.concat(jobs.filter(function (j) { return j.type === 'TEMPLATE' && j.running; })));
   }
   function renderDashboardStatus(list, bad, last) {
     var banner = $('dashBanner'); if (!banner) return;
@@ -328,6 +333,21 @@
       tds[3].textContent = formatBytes(job.size);
       tds[4].textContent = formatHMS(job.duration);
       tds[5].textContent = formatDashboardTime(job.timestamp);
+      // A running job gets its Stop button right next to the RUNNING
+      // pill. The row click still opens the drawer — the button
+      // stops the click from reaching it.
+      if (job.running) {
+        var stopBtn = document.createElement('button');
+        stopBtn.type = 'button';
+        stopBtn.className = 'btn btn-sm dash-stop-btn';
+        stopBtn.textContent = '■ Stop';
+        stopBtn.title = 'Stop this backup';
+        stopBtn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          stopJobById(job.id);
+        });
+        tds[2].appendChild(stopBtn);
+      }
       tr.dataset.dest = job.destination || '';
       tr.addEventListener('click', function () { openDrawer(job); });
       body.appendChild(tr);
@@ -497,6 +517,7 @@
     if (status === 'COMPLETED') return 'pill-completed';
     if (status === 'RUNNING') return 'pill-running';
     if (status === 'FAILED') return 'pill-failed';
+    if (status === 'CANCELLED') return 'pill-cancelled';
     if (status === 'TEMPLATE' || type === 'TEMPLATE') return 'pill-template';
     return 'pill-pending';
   }
@@ -752,7 +773,9 @@
       items = runs.filter(function (it) { return it.run.success === true || String(it.run.status || '').toUpperCase() === 'COMPLETED'; });
       if (emptyText) emptyText.textContent = 'No completed backups yet.';
     } else if (currentLogTab === 'failed') {
-      items = runs.filter(function (it) { return it.run.success === false || String(it.run.status || '').toUpperCase() === 'FAILED'; });
+      // A run stopped by the user is 'cancelled', not failed: it
+      // stays out of this tab (it still shows under Today).
+      items = runs.filter(function (it) { return (it.run.success === false || String(it.run.status || '').toUpperCase() === 'FAILED') && String(it.run.status || '').toUpperCase() !== 'CANCELLED'; });
       // Jobs still waiting for their drive belong here too — they have
       // not run, and the user asked to see what did not happen.
       jobs.forEach(function (job) {
@@ -912,10 +935,15 @@
       if (bSub) bSub.textContent = 'Create your first backup job to protect your files.';
       if (listEl) listEl.innerHTML = '';
       if (waitEl) waitEl.innerHTML = '';
+      var sb0 = $('jobsDetailsStop'); if (sb0) sb0.style.display = 'none';
       return;
     }
     if (name) name.textContent = job.name;
     if (pill) { pill.className = 'pill ' + pillClass(job.status, job.type); pill.textContent = job.status; }
+    // Stop is visible only while THIS job is actually running; the
+    // jobs-updated refresh at run end hides it again.
+    var stopBtn = $('jobsDetailsStop');
+    if (stopBtn) stopBtn.style.display = job.running ? '' : 'none';
     if (banner) {
       banner.classList.remove('warn', 'bad', 'idle');
       if (job.status === 'COMPLETED') {
@@ -986,6 +1014,25 @@
         else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
       } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
     }, { title: 'Delete job?', yesLabel: 'Yes, delete job', noLabel: 'Keep job' });
+  }
+
+  /* ---------- stop a running backup ---------- */
+  // One stop path for every Stop button (Jobs details, Dashboard row,
+  // progress card): main matches the job id against the live runs
+  // (falling back to the job name) and cancels the engine. The run
+  // unwinds on its own; the jobs-updated refresh at the end hides
+  // the button and shows the run as CANCELLED.
+  async function stopJobById(jobId) {
+    if (!jobId || !api || typeof api.stopBackup !== 'function') return;
+    try {
+      var res = await api.stopBackup(jobId);
+      if (res && res.success) toast('Stopping backup', 'The backup is stopping — the partial files are removed.', '');
+      else toast('Nothing to stop', (res && res.error === 'NOT_RUNNING') ? 'That backup is not running any more.' : ((res && res.error) || 'Could not stop the backup.'), 'error');
+    } catch (e) { toast('Stop failed', e && e.message ? e.message : 'Could not stop the backup.', 'error'); }
+  }
+  async function stopSelectedJob() {
+    var j = selectedJob();
+    if (j) stopJobById(j.id);
   }
 
   /* ---------- TechVision Cloud ---------- */
@@ -1539,7 +1586,12 @@
     if (recHint) recHint.textContent = hasPassword
       ? 'Maps this drive again every time the app opens.'
       : 'Save the server password in the Client tab to reconnect automatically.';
-    if (srvHint) srvHint.textContent = hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.';
+    // Say the connection state here too, before the user presses Map:
+    // mapping needs a live Client connection to this server (the
+    // guard in cloudMapDriveAction), not just a saved record.
+    var connectedHere = !!(cloudConn && cloudConn.serverId === serverId);
+    if (srvHint) srvHint.textContent = (hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.')
+      + (connectedHere ? '' : ' Not connected — connect in the Client tab before mapping.');
   }
 
   async function cloudMapDriveAction() {
@@ -1558,6 +1610,15 @@
         cloudMapInvalidateCache();
       } else if (r && r.error === 'password-needed') {
         toast('Password needed', 'Save the server password in the Client tab first — connect once with the password, and it is saved on this device.', 'error');
+      } else if (r && r.error === 'not-connected') {
+        // Client-connection guard: never attempt the mapping when
+        // the Client is not connected to this server. Say so, then
+        // jump to the Client tab with this server selected, so
+        // Connect is one click away — then he maps from here.
+        toast('Not connected', 'You are not connected to this server in the Client tab. Connect first, then map the drive.', 'error');
+        var srv = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === serverId; });
+        if (srv) selectCloudServer(srv);
+        showCloudPanel('client');
       } else {
         toast('Mapping failed', (r && r.error) || 'Could not map the drive.', 'error');
       }
@@ -2580,6 +2641,9 @@
     $('progressSize').textContent = '';
     $('progressFile').textContent = '';
     $('progressCard').classList.add('show');
+    // A fresh run gets a fresh Stop button (re-armed after the
+    // previous run disabled it with "Stopping…").
+    var psb = $('progressStopBtn'); if (psb) { psb.disabled = false; psb.textContent = '■ Stop backup'; }
     setProgressButtons(true);
   }
   function setProgress(pct, files, size, fileName) {
@@ -2623,10 +2687,16 @@
       input.onkeydown = function (ev) { if (ev.key === 'Enter') done(input.value || null); };
     });
   }
+  /* The job id of the manual run currently showing in the progress
+     card — the card's Stop button stops THIS run. */
+  var currentRunJobId = null;
   async function runBackup(job, incremental) {
     if (!job) return;
     if (!api || typeof api.runFullBackup !== 'function') { toast('Backup unavailable', 'Backup API is not available.', 'error'); return; }
     var cfg = job.raw || job;
+    // The normalized job id — main matches it against the live runs
+    // (by id, falling back to the job name).
+    currentRunJobId = job.id || cfg.id || null;
     // Encrypted job whose password is not in the vault: ask now, and
     // pass it for this run only (main.js stores it if the vault is open).
     if (cfg.encryptionEnabled === true) {
@@ -2658,21 +2728,30 @@
         ? await api.runIncrementalBackup(cfg)
         : await api.runFullBackup(cfg);
       if (stopProgress) stopProgress();
-      setProgress(100, result && result.files, result && result.size);
-      var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
-      setTimeout(function () { hideProgress(); }, 900);
-      if (result && (result.success === false || result.status === 'failed')) {
-        if (result.error === 'ENCRYPTION_PASSWORD_REQUIRED') {
-          toast('Password required', 'This job is encrypted and no password is saved. Unlock the vault in Settings, or run it and enter the password when asked.', 'error');
-        } else {
-          toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
-        }
+      currentRunJobId = null;
+      if (result && result.status === 'cancelled') {
+        // Stopped by the user: the bar never reaches 100% (the run
+        // did not finish), and it is neither a success nor a failure.
+        setTimeout(function () { hideProgress(); }, 900);
+        toast('Backup stopped', job.name + ' — the backup was stopped and the partial files were removed.', '');
       } else {
-        toast('Backup completed', job.name + ' — ' + files + ' file' + (files === 1 ? '' : 's') + ' backed up.', 'success');
+        setProgress(100, result && result.files, result && result.size);
+        var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
+        setTimeout(function () { hideProgress(); }, 900);
+        if (result && (result.success === false || result.status === 'failed')) {
+          if (result.error === 'ENCRYPTION_PASSWORD_REQUIRED') {
+            toast('Password required', 'This job is encrypted and no password is saved. Unlock the vault in Settings, or run it and enter the password when asked.', 'error');
+          } else {
+            toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
+          }
+        } else {
+          toast('Backup completed', job.name + ' — ' + files + ' file' + (files === 1 ? '' : 's') + ' backed up.', 'success');
+        }
       }
       await loadJobs();
     } catch (e) {
       if (stopProgress) stopProgress();
+      currentRunJobId = null;
       hideProgress();
       toast('Backup failed', e && e.message ? e.message : 'The backup did not complete.', 'error');
     }
@@ -2716,6 +2795,27 @@
       var data = await api.getJobHistory();
       var arr = Array.isArray(data) ? data : (data && Array.isArray(data.jobs) ? data.jobs : (data && Array.isArray(data.history) ? data.history : []));
       jobs = arr.map(normJob);
+      // Which jobs are running RIGHT NOW: main tracks live runs in
+      // activeJobs (job-get-active). A running job shows RUNNING +
+      // its Stop button; the jobs-updated event at run start/end
+      // re-runs this, so the button appears and disappears with the
+      // run. Name matching is the fallback for runs started without
+      // a stored id — two same-name jobs can never run at once, so
+      // the name cannot point at the wrong run.
+      var active = [];
+      if (api && typeof api.getActiveJobs === 'function') {
+        try { active = await api.getActiveJobs() || []; } catch (e) { active = []; }
+      }
+      var runningById = {}, runningByName = {};
+      active.forEach(function (a) {
+        if (!a || a.status !== 'running') return;
+        if (a.jobId) runningById[a.jobId] = true;
+        if (a.name) runningByName[String(a.name).toLowerCase()] = true;
+      });
+      jobs.forEach(function (j) {
+        j.running = !!(runningById[j.id] || runningByName[String(j.name).toLowerCase()]);
+        if (j.running) j.status = 'RUNNING';
+      });
     } catch (e) {
       toast('Could not load history', e && e.message ? e.message : 'History could not be loaded.', 'error');
       jobs = [];
@@ -3566,6 +3666,12 @@
     /* Jobs page 02 toolbar + details panel: everything acts on the
        selected row (first row when nothing is picked yet). */
     var jrb = $('jobsRunBtn'); if (jrb) jrb.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
+    var jsb = $('jobsDetailsStop'); if (jsb) jsb.addEventListener('click', stopSelectedJob);
+    var psb = $('progressStopBtn'); if (psb) psb.addEventListener('click', function () {
+      if (!currentRunJobId) return;
+      psb.disabled = true; psb.textContent = 'Stopping…';
+      stopJobById(currentRunJobId);
+    });
     var jeb = $('jobsEditBtn'); if (jeb) jeb.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
     var jdb = $('jobsDeleteBtn'); if (jdb) jdb.addEventListener('click', deleteSelectedJob);
     var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', refreshJobs);
