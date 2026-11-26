@@ -555,6 +555,21 @@ process.on('unhandledRejection', (reason) => {
   } catch (e) { /* logging must never break the app */ }
 });
 
+// One-line failure reason for a run record. The Logs view only
+// shows run.error under a failed run, and the failure email only
+// prints job.error — but the engine's detailed reasons live in
+// result.error_messages, which neither surface read. The LAST
+// message is the summary line ("N file(s) failed to back up..." /
+// "N file(s) skipped because they were locked..."), which reads
+// best as a single line; the full per-file list stays in the log
+// file. Returns null for a successful run.
+function runErrorLine(result) {
+  if (!result || result.success) return null;
+  const msgs = result.error_messages;
+  if (Array.isArray(msgs) && msgs.length) return String(msgs[msgs.length - 1]);
+  return 'Backup failed — see the log for details.';
+}
+
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
   let job = jobRecord.jobId ? jobHistory.find(j => j.id === jobRecord.jobId) : null;
@@ -1062,7 +1077,8 @@ async function executeScheduledBackup(job, resolved) {
       success: result.success, status: result.success ? 'completed' : 'failed',
       source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination),
       timestamp: new Date().toISOString(), files: result.files_backed_up,
-      size: result.total_bytes, duration: result.duration_seconds, result
+      size: result.total_bytes, duration: result.duration_seconds, result,
+      error: runErrorLine(result)
     };
     recordRun(job.name, jobRecord);
     job.lastScheduledRun = new Date().toISOString();
@@ -1317,7 +1333,8 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     files: result.files_backed_up,
     size: result.total_bytes,
     duration: result.duration_seconds,
-    result: result
+    result: result,
+    error: runErrorLine(result)
   };
 
   recordRun(jobName, jobRecord);
@@ -1399,7 +1416,8 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     files: result.files_backed_up,
     size: result.total_bytes,
     duration: result.duration_seconds,
-    result: result
+    result: result,
+    error: runErrorLine(result)
   };
   
   recordRun(jobName, jobRecord);
@@ -3416,7 +3434,8 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     files: result.files_backed_up,
     size: result.total_bytes,
     duration: result.duration_seconds,
-    result: result
+    result: result,
+    error: runErrorLine(result)
   };
   recordRun(jobName, jobRecord);
   saveJobHistory();
