@@ -31,6 +31,9 @@ class RestoreResult extends EventEmitter {
     // manifest): the restore succeeded, but the user should know
     // what was NOT verified.
     this.warnings = [];
+    // The backup chain that was applied, oldest first (basenames) —
+    // empty for a plain single-artifact restore.
+    this.chain = [];
   }
 }
 
@@ -98,6 +101,79 @@ function copyFileHashed(src, dest) {
 }
 
 /**
+ * Incremental chain restore (P1-8).
+ *
+ * A job's artifacts live side by side in one folder as
+ * `<job>_full_<ISO-stamp>.zip` (or a plain folder without .zip)
+ * and `<job>_incremental_<ISO-stamp>.zip` (or folder). The ISO
+ * stamps sort lexicographically in chronological order. An
+ * incremental on its own is only a DELTA — restoring it alone
+ * silently drops every unchanged file (they live only in the
+ * base Full). So restoring any artifact restores its whole chain:
+ * the newest Full at or before it, then every incremental after
+ * that Full up to and including it, oldest first, so newer files
+ * overwrite older ones.
+ *
+ * Deletions are a known limitation: an incremental records no
+ * tombstones, so a file deleted from the source after the Full is
+ * still restored from the Full. Removing it would need deletion
+ * records in the backup state, which do not exist yet.
+ */
+
+// `<job>_full_<stamp>` / `<job>_incremental_<stamp>`, stamp =
+// new Date().toISOString().replace(/[:.]/g, '-') (see
+// techvision-core.js). The job name is greedy: a job literally
+// named `my_full_job` still parses as job `my_full_job`.
+const ARTIFACT_RE = /^(.*)_(full|incremental)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.zip)?$/;
+
+function parseArtifactName(fileName) {
+  const m = ARTIFACT_RE.exec(fileName);
+  if (!m) return null;
+  return { jobName: m[1], kind: m[2], stamp: m[3] };
+}
+
+// Resolve the chain for one artifact. Returns null when the path
+// is not a job artifact (or does not exist) — the caller then
+// restores just that artifact, as before. Otherwise returns
+// { chain, baseMissing }: `chain` is the artifact paths oldest
+// first ending with the selected one; `baseMissing` is true when
+// the selected artifact is an incremental whose base Full is not
+// in the folder (the chain is then just the selected artifact).
+function findBackupChain(artifactPath) {
+  let stat = null;
+  try { stat = fs.statSync(artifactPath); } catch (e) { return null; }
+  if (!stat.isFile() && !stat.isDirectory()) return null;
+  const dir = path.dirname(artifactPath);
+  const selected = parseArtifactName(path.basename(artifactPath));
+  if (!selected) return null;
+  let names = null;
+  try { names = fs.readdirSync(dir); } catch (e) { return null; }
+  const siblings = [];
+  for (const name of names) {
+    const parsed = parseArtifactName(name);
+    if (!parsed || parsed.jobName !== selected.jobName) continue;
+    const full = path.join(dir, name);
+    try {
+      const s = fs.statSync(full);
+      if (!s.isFile() && !s.isDirectory()) continue;
+    } catch (e) { continue; }
+    siblings.push({ path: full, kind: parsed.kind, stamp: parsed.stamp });
+  }
+  siblings.sort((a, b) => (a.stamp < b.stamp ? -1 : (a.stamp > b.stamp ? 1 : 0)));
+  const selIdx = siblings.findIndex((s) => path.resolve(s.path) === path.resolve(artifactPath));
+  if (selIdx < 0) return null;
+  if (selected.kind === 'full') return { chain: [artifactPath], baseMissing: false };
+  // Newest Full at or before the selected incremental is the base.
+  let baseIdx = -1;
+  for (let i = selIdx; i >= 0; i--) {
+    if (siblings[i].kind === 'full') { baseIdx = i; break; }
+  }
+  if (baseIdx < 0) return { chain: [artifactPath], baseMissing: true };
+  const chain = siblings.slice(baseIdx, selIdx + 1).map((s) => s.path);
+  return { chain: chain, baseMissing: false };
+}
+
+/**
  * Restore Engine Class
  * Uses streaming extraction with yauzl for memory efficiency
  */
@@ -119,9 +195,44 @@ class RestoreEngine {
   }
 
   /**
-   * Restore all files from ZIP using streaming (yauzl)
+   * Restore all files from one backup artifact, or from its whole
+   * incremental chain when it is an incremental (see findBackupChain
+   * above): the base Full plus every incremental up to it, oldest
+   * first. A Full on its own restores exactly as before.
    */
   async restore_all(zipPath, restoreDir, password) {
+    const chain = findBackupChain(zipPath);
+    if (!chain || (chain.chain.length === 1 && !chain.baseMissing)) {
+      return this._restoreSingle(zipPath, restoreDir, password);
+    }
+    const result = new RestoreResult();
+    const startTime = Date.now();
+    result.chain = chain.chain.map((p) => path.basename(p));
+    for (const artifact of chain.chain) {
+      const one = await this._restoreSingle(artifact, restoreDir, password);
+      result.files_restored += one.files_restored;
+      result.files_verified += one.files_verified;
+      result.files_mismatched += one.files_mismatched;
+      result.total_bytes += one.total_bytes;
+      result.errors.push(...one.errors);
+      result.warnings.push(...one.warnings);
+    }
+    if (chain.baseMissing) {
+      result.errors.push('Base full backup not found — this incremental backup is only a delta; files that did not change are missing from this restore.');
+    } else {
+      result.warnings.push('Restored a backup chain, oldest first: ' + result.chain.join(' + ') + '.');
+    }
+    result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+    result.success = result.files_restored > 0 && result.errors.length === 0 && result.files_mismatched === 0;
+    return result;
+  }
+
+  /**
+   * Restore all files from a SINGLE artifact (one ZIP or one plain
+   * folder). This is the old restore_all body, unchanged — the chain
+   * wrapper above calls it once per artifact.
+   */
+  async _restoreSingle(zipPath, restoreDir, password) {
     const result = new RestoreResult();
     const startTime = Date.now();
     // Encrypted backup (WinZip AES-256): yauzl cannot decrypt, so the
@@ -504,9 +615,64 @@ class RestoreEngine {
   }
 
   /**
-   * Restore single file to specific location
+   * Restore a single file to a specific location. When the file is
+   * not in the picked artifact, the chain is searched backwards:
+   * an unchanged file lives only in the base Full, not in the
+   * incremental that was picked.
    */
   async restoreFile(zipPath, entryName, destPath, password) {
+    const chain = findBackupChain(zipPath);
+    try {
+      return await this._restoreFileSingle(zipPath, entryName, destPath, password);
+    } catch (e) {
+      if (e.code !== 'ENTRY_NOT_FOUND' || !chain || chain.chain.length < 2) throw e;
+      const earlier = chain.chain.slice(0, -1).reverse();
+      for (const artifact of earlier) {
+        try {
+          return await this._restoreFileSingle(artifact, entryName, destPath, password);
+        } catch (e2) {
+          if (e2.code !== 'ENTRY_NOT_FOUND') throw e2;
+          // Not in this one either — keep looking backwards.
+        }
+      }
+      throw e; // not in any artifact of the chain
+    }
+  }
+
+  /**
+   * Restore a single file from ONE artifact (ZIP or plain folder).
+   * Rejects with code 'ENTRY_NOT_FOUND' when the file is not in
+   * this artifact, so the chain wrapper above can keep looking.
+   */
+  async _restoreFileSingle(zipPath, entryName, destPath, password) {
+    // Plain-copy backup folder: the entry is a plain file inside
+    // it. (Single-file restore never supported folders before —
+    // yauzl cannot open a directory — so this branch also fixes
+    // that gap. The manifest check mirrors the bulk folder path.)
+    if (zipPath && fs.existsSync(zipPath) && fs.statSync(zipPath).isDirectory()) {
+      const rel = entryName.replace(/\\/g, '/');
+      const src = path.join(zipPath, rel);
+      if (rel === MANIFEST_NAME || rel.startsWith('../') || path.isAbsolute(rel) ||
+          !fs.existsSync(src) || !fs.statSync(src).isFile()) {
+        const e = new Error('Entry not found in backup: ' + entryName);
+        e.code = 'ENTRY_NOT_FOUND';
+        throw e;
+      }
+      const manifest = readManifest(zipPath);
+      const dir = path.dirname(destPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmpPath = tempPathFor(destPath);
+      const copied = await copyFileHashed(src, tmpPath);
+      if (manifest) {
+        const want = manifest.files[rel];
+        if (!want || copied.hash !== want.sha256 || copied.size !== want.size) {
+          try { fs.unlinkSync(tmpPath); } catch (e2) {}
+          throw new Error('Hash mismatch (corrupt backup file): ' + rel);
+        }
+      }
+      fs.renameSync(tmpPath, destPath);
+      return { files: 1 };
+    }
     // Encrypted entry: decrypt it directly with the AES reader.
     // Only an unreadable central directory falls through to yauzl
     // (e.g. Zip64); a decrypt failure (wrong password, tampered
@@ -563,7 +729,11 @@ class RestoreEngine {
         let found = false;
         zipfile.on('error', (e) => done(e));
         zipfile.on('end', () => {
-          if (!found) done(new Error('Entry not found in backup: ' + entryName));
+          if (!found) {
+            const e = new Error('Entry not found in backup: ' + entryName);
+            e.code = 'ENTRY_NOT_FOUND';
+            done(e);
+          }
         });
         zipfile.readEntry();
 
@@ -638,5 +808,6 @@ class RestoreEngine {
 
 module.exports = {
   RestoreEngine,
-  RestoreResult
+  RestoreResult,
+  findBackupChain
 };
