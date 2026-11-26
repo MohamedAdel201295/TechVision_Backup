@@ -718,15 +718,13 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .dash-donut-wrap { position: relative; width: 96px; height: 96px; margin: 2px auto 0; }
 .dash-donut { display: block; }
 .dash-donut-center { position: absolute; inset: 0; }
-/* The % sits EXACTLY on the donut's centre (not the centre of the
-   %-plus-"Used" group, which left it ~9px high). "Used" hangs just
-   below it, still inside the hole. */
+/* The % sits EXACTLY on the donut's centre. (Round 3 #1: the "Used"
+   label that used to hang below it was removed.) */
 .dash-donut-center b { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 20px; font-weight: 600; line-height: 1; }
 /* "100%" is 4 characters: at 20px it fills ~91% of the hole. The
    narrow size keeps a 3-digit value at most ~72% of the hole
    (round 3). 2-digit values keep the 20px size. */
 .dash-donut-center b.donut-narrow { font-size: 15px; }
-.dash-donut-center span { position: absolute; left: 50%; top: 50%; transform: translate(-50%, 0); margin-top: 13px; font-size: 12px; color: var(--muted); }
 .dash-legend { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; }
 .dash-legend li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 2px 0; }
 .dash-legend li span { display: flex; align-items: center; color: var(--muted); }
@@ -1013,7 +1011,6 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   /* Narrow 3-digit value at the compact donut too (hole is only
      ~49px here — "100%" at 17px measures ~44px, ~91% of it). */
   .dash-donut-center b.donut-narrow { font-size: 13px; }
-  .dash-donut-center span { margin-top: 11px; }
   .dash-table th { padding: 5px 8px; }
   .dash-table td { padding: 6px 8px; }
   /* Quick Actions go two-across so the six buttons take three
