@@ -197,7 +197,7 @@ function download(conn, relPath, destPath, onProgress) {
   });
 }
 
-function upload(conn, localPath, remoteDir, onProgress) {
+function upload(conn, localPath, remoteDir, onProgress, asName) {
   return new Promise((resolve, reject) => {
     let total = 0;
     try { total = fs.statSync(localPath).size; } catch (e) { return reject(e); }
@@ -209,7 +209,12 @@ function upload(conn, localPath, remoteDir, onProgress) {
       try { req.destroy(); } catch (_) {}
       reject(e);
     };
-    const headers = { 'X-Filename': path.basename(localPath) };
+    // The name the server saves the file under. By default the local
+    // file's name; save-back passes the original server name, because
+    // a temp copy is named "<tag>-<name>" and must not land on the
+    // server under the tagged name.
+    const fileName = String(asName || '').split(/[\\/]/).pop() || path.basename(localPath);
+    const headers = { 'X-Filename': fileName };
     if (conn.token) headers.Authorization = 'Bearer ' + conn.token;
     let stallTimer = null;
     const armStall = () => {

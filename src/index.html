@@ -15,67 +15,40 @@
       <div style="display:none; width:38px; height:38px; border-radius:9px; background:linear-gradient(135deg,#0ea5e9,#22c55e); color:#fff; align-items:center; justify-content:center; font-weight:800; font-size:20px;">V</div>
       <div>
         <div class="brand-name"><span>Tech</span>Vision</div>
-        <div class="brand-sub">Backup</div>
+        <div class="brand-sub">Backup • Cloud • VPN</div>
       </div>
     </div>
-    <div id="moduleSwitcher">
-      <div class="nav-label">Modules</div>
-      <button class="module-item active" type="button" data-module="backup"><span class="ico">💾</span> Backup</button>
-      <button class="module-item" type="button" data-module="cloud"><span class="ico">☁</span> Cloud</button>
-      <button class="module-item" type="button" data-module="vpn"><span class="ico">🛡️</span> VPN</button>
-      <button class="module-item" type="button" data-module="wireguard"><span class="ico">🔐</span> WireGuard VPN</button>
-    </div>
-    <div class="nav-group" id="navGroupBackup">
+    <div class="nav-group collapsed" id="navGroupBackup">
+      <button class="nav-group-head" type="button" data-group="backup"><span>Backup</span><span class="nav-chevron">▾</span></button>
       <button class="nav-item active" type="button" data-nav="dashboard"><span class="ico">▦</span> Dashboard</button>
       <button class="nav-item" type="button" data-nav="jobs"><span class="ico">▤</span> Jobs</button>
-      <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
-      <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> New Job</button>
+      <button class="nav-item" type="button" id="navNewJob"><span class="ico">＋</span> Create New Job</button>
       <button class="nav-item" type="button" id="navRestore"><span class="ico">↺</span> Restore</button>
+      <button class="nav-item" type="button" data-nav="logs"><span class="ico">≣</span> Logs</button>
     </div>
-    <div class="nav-group" id="navGroupCloud" style="display:none;">
+    <div class="nav-group collapsed" id="navGroupCloud">
+      <button class="nav-group-head" type="button" data-group="cloud"><span>Cloud</span><span class="nav-chevron">▾</span></button>
+      <button class="nav-item" type="button" data-nav="cloud"><span class="ico">☁</span> Overview</button>
       <button class="nav-item" type="button" data-nav="cloud-server"><span class="ico">🖥️</span> Server</button>
       <button class="nav-item" type="button" data-nav="cloud-client"><span class="ico">💻</span> Client</button>
+      <button class="nav-item" type="button" data-nav="cloud-mapdrive"><span class="ico">🗺️</span> Map network</button>
     </div>
-    <div class="nav-group" id="navGroupVpn" style="display:none;">
-      <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> Tailscale VPN</button>
+    <div class="nav-group collapsed" id="navGroupVpn">
+      <button class="nav-group-head" type="button" data-group="vpn"><span>Tailscale VPN</span><span class="nav-chevron">▾</span></button>
+      <button class="nav-item" type="button" data-nav="vpn"><span class="ico">🛡️</span> Overview</button>
     </div>
-    <div class="nav-group" id="navGroupWireguard" style="display:none;">
-      <button class="nav-item" type="button" data-nav="wireguard"><span class="ico">🔐</span> WireGuard VPN</button>
+    <div class="nav-group collapsed" id="navGroupWireguard">
+      <button class="nav-group-head" type="button" data-group="wireguard"><span>WireGuard VPN</span><span class="nav-chevron">▾</span></button>
+      <button class="nav-item" type="button" data-nav="wireguard"><span class="ico">🔐</span> Overview</button>
+      <button class="nav-item" type="button" data-nav="wireguard-site"><span class="ico">🔗</span> Site-to-Site</button>
     </div>
     <div class="sidebar-foot">
-      <div>TechVision Backup</div>
       <div>Powered by TechVision</div>
       <div id="sidebarVersion">Version 1.0.0</div>
     </div>
   </aside>
   <main class="main">
-    <div class="view modules-view" id="view-modules" style="display:none;">
-      <div class="modules-hero">
-        <div class="modules-brand">
-          <img src="assets/TechVision_Logo.png" alt="TechVision logo" onerror="this.style.display='none'">
-          <span>TechVision</span>
-        </div>
-        <div class="modules-grid">
-          <button class="module-card" type="button" data-module-enter="backup">
-            <span class="module-card-ico">💾</span>
-            <span class="module-card-title">TechVision Backup</span>
-          </button>
-          <button class="module-card" type="button" data-module-enter="cloud">
-            <span class="module-card-ico">☁</span>
-            <span class="module-card-title">TechVision Cloud</span>
-          </button>
-          <button class="module-card" type="button" data-module-enter="vpn">
-            <span class="module-card-ico">🛡️</span>
-            <span class="module-card-title">TechVision Tailscale VPN</span>
-          </button>
-          <button class="module-card" type="button" data-module-enter="wireguard">
-            <span class="module-card-ico">🔐</span>
-            <span class="module-card-title">TechVision WireGuard VPN</span>
-          </button>
-        </div>
-      </div>
-    </div>
-    <div class="backbar" id="backBar" style="display:none;">
+    <div class="backbar" id="backBar">
       <button class="back-btn" type="button" id="topBackBtn">‹ Back</button>
       <span class="backbar-title" id="backBarTitle">Backup</span>
     </div>
@@ -94,28 +67,40 @@
       </div>
     </header>
   <div id="view-dashboard">
-    <section class="stats" aria-label="Backup statistics">
-      <div class="stat-card">
-        <div class="stat-label">Total Backups</div>
-        <div class="stat-value" id="statTotal">0</div>
-        <div class="stat-sub" id="statTotalSub">No backups yet</div>
+    <div class="dash-stats" aria-label="Backup statistics">
+      <div class="dash-stat">
+        <div class="dash-ico ico-blue">💾</div>
+        <div class="dash-stat-text">
+          <div class="dash-stat-label">Total Backup Jobs</div>
+          <div class="dash-stat-value" id="dashTotalJobs">—</div>
+          <div class="dash-stat-sub" id="dashTotalJobsSub">—</div>
+        </div>
       </div>
-      <div class="stat-card">
-        <div class="stat-label">Total Data</div>
-        <div class="stat-value" id="statData">0 <small>MB</small></div>
-        <div class="stat-sub" id="statDataSub">Across all backups</div>
+      <div class="dash-stat">
+        <div class="dash-ico ico-green">✓</div>
+        <div class="dash-stat-text">
+          <div class="dash-stat-label">Successful Jobs</div>
+          <div class="dash-stat-value" id="dashSuccessJobs">—</div>
+          <div class="dash-stat-sub" id="dashSuccessJobsSub">Last 7 days</div>
+        </div>
       </div>
-      <div class="stat-card">
-        <div class="stat-label">Last Backup</div>
-        <div class="stat-value" id="statLast" style="font-size:22px; padding-top:4px;">—</div>
-        <div class="stat-sub" id="statLastSub">Never</div>
+      <div class="dash-stat">
+        <div class="dash-ico ico-amber">⚠</div>
+        <div class="dash-stat-text">
+          <div class="dash-stat-label">Failed Jobs</div>
+          <div class="dash-stat-value" id="dashFailedJobs">—</div>
+          <div class="dash-stat-sub" id="dashFailedJobsSub">Last 7 days</div>
+        </div>
       </div>
-      <div class="stat-card">
-        <div class="stat-label">Success Rate</div>
-        <div class="stat-value" id="statSuccess">—</div>
-        <div class="stat-sub" id="statSuccessSub">No runs yet</div>
+      <div class="dash-stat">
+        <div class="dash-ico ico-blue">◷</div>
+        <div class="dash-stat-text">
+          <div class="dash-stat-label">Last Backup</div>
+          <div class="dash-stat-value dash-stat-value-sm" id="dashLastBackup">—</div>
+          <div class="dash-stat-sub" id="dashLastBackupSub">—</div>
+        </div>
       </div>
-    </section>
+    </div>
     <section class="progress-card" id="progressCard" aria-live="polite">
       <div class="progress-head">
         <span><span class="spinner" id="progressSpinner"></span> <span id="progressTitle">Backing up…</span></span>
@@ -128,52 +113,128 @@
         <span class="file" id="progressFile"></span>
       </div>
     </section>
-    <div class="toolbar">
-      <label class="search-box">
-        <span aria-hidden="true">🔍</span>
-        <input type="text" id="searchInput" placeholder="Search backups…" autocomplete="off">
-      </label>
-      <select class="filter" id="statusFilter" aria-label="Filter by status">
-        <option value="all">All statuses</option>
-        <option value="COMPLETED">Completed</option>
-        <option value="RUNNING">Running</option>
-        <option value="PENDING">Pending</option>
-        <option value="FAILED">Failed</option>
-        <option value="TEMPLATE">Template</option>
-      </select>
-      <select class="filter" id="typeFilter" aria-label="Filter by type">
-        <option value="all">All types</option>
-        <option value="FULL">Full</option>
-        <option value="INCREMENTAL">Incremental</option>
-        <option value="TEMPLATE">Template</option>
-      </select>
+    <div class="dash-row">
+      <section class="card dash-status">
+        <div class="dash-card-head"><h2 class="section-title" style="margin:0;">Backup Status</h2></div>
+        <div class="dash-banner" id="dashBanner">
+          <span class="dash-banner-ico" id="dashBannerIco">✓</span>
+          <div><div class="dash-banner-title" id="dashBannerTitle">System Protected</div>
+          <div class="dash-banner-sub" id="dashBannerSub">All scheduled backups are running normally.</div></div>
+        </div>
+        <div class="dash-facts">
+          <div class="dash-fact"><div class="t-label">Next Scheduled Backup</div><b id="dashNextRun">—</b><span class="dash-fact-sub" id="dashNextRunSub"></span></div>
+          <div class="dash-fact"><div class="t-label">Last Backup Size</div><b id="dashLastSize">—</b></div>
+          <div class="dash-fact"><div class="t-label">Backup Duration</div><b id="dashLastDuration">—</b></div>
+        </div>
+      </section>
+      <section class="card dash-storage">
+        <div class="dash-card-head"><h2 class="section-title" style="margin:0;">Backup Storage</h2><button class="link-btn" type="button" id="dashOpenLocation">Open Location ⤢</button></div>
+        <div class="dash-donut-wrap">
+          <svg class="dash-donut" viewBox="0 0 150 150" width="96" height="96" aria-hidden="true">
+            <circle cx="75" cy="75" r="54" fill="none" stroke="var(--surface-3)" stroke-width="16"></circle>
+            <circle id="dashDonutArc" cx="75" cy="75" r="54" fill="none" stroke="var(--accent)" stroke-width="16" stroke-linecap="round" stroke-dasharray="0 339.292" transform="rotate(-90 75 75)"></circle>
+          </svg>
+          <div class="dash-donut-center"><b id="dashStoragePct">—</b><span>Used</span></div>
+        </div>
+        <ul class="dash-legend">
+          <li><span><span class="dot dot-used"></span>Used Space</span><b id="dashUsed">—</b></li>
+          <li><span><span class="dot dot-free"></span>Free Space</span><b id="dashFree">—</b></li>
+          <li><span>Total Capacity</span><b id="dashTotal">—</b></li>
+        </ul>
+        <div class="dash-storage-sub" id="dashStorageDrive"></div>
+      </section>
     </div>
-    <div class="history-head">
-      <h2 class="section-title" style="margin:0;">Backup History</h2>
-      <button class="btn btn-danger btn-sm" type="button" id="clearHistoryBtn">🗑 Clear History</button>
-    </div>
-    <div class="job-list" id="jobList"></div>
-    <div class="empty-state" id="emptyState" style="display:none;">
-      <div class="big">🛡️</div>
-      <h3>No backups yet</h3>
-      <p>Create your first backup job and protect your files.</p>
-      <button class="btn btn-primary" type="button" id="emptyNewJobBtn">＋ Create your first backup</button>
+    <div class="dash-row">
+      <section class="card dash-recent">
+        <div class="dash-card-head"><h2 class="section-title" style="margin:0;">Recent Backup Jobs</h2><button class="link-btn" type="button" id="dashViewAllJobs">View All Jobs →</button></div>
+        <table class="dash-table">
+          <thead><tr><th>Job Name</th><th>Type</th><th>Status</th><th>Size</th><th>Duration</th><th>Completed At</th></tr></thead>
+          <tbody id="dashRecentBody"></tbody>
+        </table>
+        <div class="empty-state" id="dashRecentEmpty" style="display:none;">
+          <div class="big">🛡️</div>
+          <h3>No backups yet</h3>
+          <p>Create your first backup job and protect your files.</p>
+          <button class="btn btn-primary" type="button" id="dashEmptyNewJobBtn">＋ Create your first backup</button>
+        </div>
+      </section>
+      <section class="card dash-actions">
+        <div class="dash-card-head"><h2 class="section-title" style="margin:0;">Quick Actions</h2></div>
+        <div class="dash-actions-grid">
+          <button class="btn btn-primary" type="button" id="dashNewJob">＋ Create Backup Job</button>
+          <button class="btn" type="button" id="dashRestore">↺ Restore Backup</button>
+          <button class="btn" type="button" id="dashViewJobs">▤ View Jobs</button>
+          <button class="btn" type="button" id="dashOpenLogs">≣ Open Logs</button>
+        </div>
+      </section>
     </div>
   </div>
   <div id="view-jobs" style="display:none;">
     <div class="view-head">
       <div>
-        <h2 class="section-title" style="margin:0;">Jobs — up next</h2>
-        <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">The jobs waiting for their turn to run: never run yet, or scheduled. Finished jobs live in the Dashboard history.</p>
+        <h2 class="section-title" style="margin:0;">Jobs</h2>
+        <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Every backup job — pick one to see its details, run it, or edit it.</p>
       </div>
       <button class="btn btn-primary" type="button" id="jobsNewJobBtn">＋ New Job</button>
     </div>
-    <div class="job-list" id="jobsList"></div>
-    <div class="empty-state" id="jobsEmptyState" style="display:none;">
-      <div class="big">✅</div>
-      <h3>Nothing waiting</h3>
-      <p>No job is waiting to run — create one, or set a schedule on an existing job.</p>
-      <button class="btn btn-primary" type="button" id="jobsEmptyNewJobBtn">＋ Create a job</button>
+    <div class="jobs-chips" id="jobsChips">
+      <span class="jobs-chip">Total Jobs <b id="jobsChipTotal">—</b></span>
+      <span class="jobs-chip chip-ok">Completed <b id="jobsChipCompleted">—</b></span>
+      <span class="jobs-chip chip-run">Running <b id="jobsChipRunning">—</b></span>
+      <span class="jobs-chip chip-bad">Failed <b id="jobsChipFailed">—</b></span>
+      <label class="search-box jobs-search">
+        <span aria-hidden="true">🔍</span>
+        <input type="text" id="jobsSearchInput" placeholder="Search jobs…" autocomplete="off">
+      </label>
+    </div>
+    <div class="jobs-toolbar">
+      <button class="btn btn-primary btn-sm" type="button" id="jobsRunBtn">▶ Run Now</button>
+      <button class="btn btn-sm" type="button" id="jobsEditBtn">✎ Edit</button>
+      <button class="btn btn-danger btn-sm" type="button" id="jobsDeleteBtn">🗑 Delete</button>
+      <button class="btn btn-ghost btn-sm" type="button" id="jobsRefreshBtn">⟳ Refresh</button>
+      <button class="btn btn-ghost btn-sm" type="button" id="jobsClearHistoryBtn">🗑 Clear History</button>
+      <span class="jobs-toolbar-spacer"></span>
+      <select class="filter" id="jobsStatusFilter" aria-label="Filter by status">
+        <option value="all">All Jobs</option>
+        <option value="COMPLETED">Completed</option>
+        <option value="RUNNING">Running</option>
+        <option value="PENDING">Pending</option>
+        <option value="FAILED">Failed</option>
+      </select>
+      <select class="filter" id="jobsSortSelect" aria-label="Sort jobs">
+        <option value="newest">Last Run (Newest)</option>
+        <option value="oldest">Last Run (Oldest)</option>
+        <option value="name">Name (A–Z)</option>
+      </select>
+    </div>
+    <div class="jobs-layout">
+      <div class="jobs-table-wrap">
+        <table class="dash-table jobs-table">
+          <thead><tr><th>Job Name</th><th>Type</th><th>Sources</th><th>Schedule</th><th>Last Run</th><th>Status</th></tr></thead>
+          <tbody id="jobsTableBody"></tbody>
+        </table>
+        <div class="empty-state" id="jobsEmptyState" style="display:none;">
+          <div class="big">✅</div>
+          <h3>No jobs yet</h3>
+          <p>Create your first backup job to protect your files.</p>
+          <button class="btn btn-primary" type="button" id="jobsEmptyNewJobBtn">＋ Create a job</button>
+        </div>
+      </div>
+      <aside class="card jobs-details" id="jobsDetails">
+        <div class="dash-card-head"><h2 class="section-title" style="margin:0;" id="jobsDetailsName">—</h2><span class="pill" id="jobsDetailsPill">—</span></div>
+        <div class="dash-banner" id="jobsDetailsBanner">
+          <span class="dash-banner-ico" id="jobsDetailsBannerIco">✓</span>
+          <div><div class="dash-banner-title" id="jobsDetailsBannerTitle">—</div>
+          <div class="dash-banner-sub" id="jobsDetailsBannerSub">—</div></div>
+        </div>
+        <dl class="jobs-detail-list" id="jobsDetailsList"></dl>
+        <div id="jobsDetailsWaiting"></div>
+        <div class="jobs-details-actions">
+          <button class="btn btn-primary btn-sm" type="button" id="jobsDetailsRun">▶ Run Now</button>
+          <button class="btn btn-sm" type="button" id="jobsDetailsRestore">↺ Restore...</button>
+          <button class="btn btn-sm" type="button" id="jobsDetailsEdit">✎ Edit Job</button>
+        </div>
+      </aside>
     </div>
   </div>
   <div id="view-logs" style="display:none;">
@@ -182,7 +243,7 @@
         <h2 class="section-title" style="margin:0;">Logs</h2>
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Today's tasks, what finished, what failed or is still waiting for its drive — and the full log.</p>
       </div>
-      <button class="btn btn-ghost" type="button" id="logsRefreshBtn">⟳ Refresh</button>
+      <button class="btn btn-ghost" type="button" id="logsRefreshBtn"><span class="refresh-glyph">⟳</span> Refresh</button>
     </div>
     <div class="log-tabs" id="logsTabs" role="tablist">
       <button class="log-tab active" type="button" data-logtab="today">Today</button>
@@ -211,6 +272,138 @@
       <p id="logsEmptyText">No runs match this tab.</p>
     </div>
   </div>
+  <div id="view-settings" style="display:none;">
+    <div class="cloud-tabs" role="tablist">
+      <button class="cloud-tab active" type="button" data-settings-tab="general">General</button>
+      <button class="cloud-tab" type="button" data-settings-tab="backup">Backup</button>
+      <button class="cloud-tab" type="button" data-settings-tab="security">Security</button>
+      <button class="cloud-tab" type="button" data-settings-tab="email">Email <span id="emailTabStatus" class="t-sub"></span></button>
+    </div>
+    <div id="settingsGeneralSection" class="card cloud-section">
+      <div class="toggle-row">
+        <div><div class="t-label">Light theme</div><div class="t-sub">Switch between dark and light.</div></div>
+        <label class="switch"><input type="checkbox" id="settingLightTheme"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Start with Windows</div><div class="t-sub">Launch TechVision Backup automatically when Windows starts.</div></div>
+        <label class="switch"><input type="checkbox" id="settingAutoStart" checked><span class="slider"></span></label>
+      </div>
+    </div>
+    <div id="settingsBackupSection" class="card cloud-section" style="display:none;">
+      <div class="toggle-row">
+        <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Default for new jobs.</div></div>
+        <label class="switch"><input type="checkbox" id="settingCompress" checked><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after each backup.</div></div>
+        <label class="switch"><input type="checkbox" id="settingVerify" checked><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Default for new jobs.</div></div>
+        <label class="switch"><input type="checkbox" id="settingIncremental" checked><span class="slider"></span></label>
+      </div>
+    </div>
+    <div id="settingsSecuritySection" class="card cloud-section" style="display:none;">
+      <h3 style="margin:0 0 4px;font-size:14px;">Master password</h3>
+      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where job passwords for encrypted backups are stored. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
+      <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
+      <div id="vaultSetupBox">
+        <div class="field">
+          <label for="vaultNewPass">New master password</label>
+          <input type="password" id="vaultNewPass" placeholder="At least 8 characters" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="vaultNewPassConfirm">Confirm master password</label>
+          <input type="password" id="vaultNewPassConfirm" placeholder="Repeat the master password" autocomplete="new-password">
+        </div>
+        <button class="btn" type="button" id="vaultSetupBtn" style="margin-top:4px;">Set master password</button>
+      </div>
+      <div id="vaultChangeBox" style="display:none;">
+        <div class="field">
+          <label for="vaultOldPass">Current master password</label>
+          <input type="password" id="vaultOldPass" placeholder="Current master password" autocomplete="current-password">
+        </div>
+        <div class="field">
+          <label for="vaultChangeNew">New master password</label>
+          <input type="password" id="vaultChangeNew" placeholder="At least 8 characters" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="vaultChangeConfirm">Confirm new master password</label>
+          <input type="password" id="vaultChangeConfirm" placeholder="Repeat the new master password" autocomplete="new-password">
+        </div>
+        <button class="btn" type="button" id="vaultChangeBtn" style="margin-top:4px;">Change master password</button>
+        <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
+      </div>
+    </div>
+        <div id="settingsEmailSection" class="card cloud-section" style="display:none;">
+      <h3 style="margin:0 0 4px;font-size:16px;">✉ Email notifications</h3>
+      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">Get an email when a backup starts or finishes, or when the app was closed and a scheduled backup was missed.</p>
+      <details class="settings-guide">
+        <summary>How to fill this in — Gmail needs an App Password, not your normal password</summary>
+        <div class="settings-guide-title">What to fill in</div>
+        <ul>
+          <li><b>Send notifications to</b> — the inbox that receives the emails.</li>
+          <li><b>Sender email + password</b> — the account the app sends from.</li>
+          <li><b>SMTP host + port</b> — Gmail is prefilled (smtp.gmail.com, 465). For a company mailbox, ask your mail admin for the server and port.</li>
+        </ul>
+        <div class="settings-guide-title">What NOT to put here</div>
+        <ul>
+          <li>Your normal Gmail password — Gmail needs an <b>App Password</b> (Google Account → Security → 2-Step Verification → App passwords).</li>
+          <li>Your backup job password or the master password — those belong to encryption, not to email.</li>
+          <li>The app only ever emails the address in “Send notifications to” — nothing else.</li>
+        </ul>
+      </details>
+      <div class="settings-email-grid">
+        <div>
+<div class="toggle-row">
+        <div><div class="t-label">Email notifications</div><div class="t-sub">Send mail for backup events.</div></div>
+        <label class="switch"><input type="checkbox" id="settingEmailEnabled"><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Notify on start</div><div class="t-sub">Email when a backup starts.</div></div>
+        <label class="switch"><input type="checkbox" id="settingEmailStart" checked><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Notify on finish</div><div class="t-sub">Email when a backup finishes or fails.</div></div>
+        <label class="switch"><input type="checkbox" id="settingEmailFinish" checked><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Notify if service was down</div><div class="t-sub">Email when a scheduled backup was missed because the app was closed.</div></div>
+        <label class="switch"><input type="checkbox" id="settingEmailMissed" checked><span class="slider"></span></label>
+      </div>
+        </div>
+        <div class="settings-email-fields">
+<div class="field">
+        <label for="settingEmailTo">Send notifications to (email)</label>
+        <input type="text" id="settingEmailTo" placeholder="you@example.com" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="settingEmailUser">Sender email address</label>
+        <input type="text" id="settingEmailUser" placeholder="you@gmail.com or you@company.com" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="settingEmailPass">Email password</label>
+        <input type="password" id="settingEmailPass" placeholder="account password" autocomplete="off">
+        <div class="hint">Company mail: use the normal account password. Gmail: use an App Password (Google Account &rarr; Security &rarr; 2-Step Verification &rarr; App passwords), not your normal Gmail password.</div>
+      </div>
+      <div class="field">
+        <label for="settingEmailHost">SMTP host</label>
+        <input type="text" id="settingEmailHost" value="smtp.gmail.com" autocomplete="off">
+        <div class="hint">Gmail: smtp.gmail.com. Company domain: your mail server, e.g. mail.company.com (ask your mail admin if unsure).</div>
+      </div>
+      <div class="field">
+        <label for="settingEmailPort">SMTP port</label>
+        <input type="text" id="settingEmailPort" value="465" autocomplete="off">
+        <div class="hint">465 = SSL, 587 = STARTTLS. Most company servers use one of these two.</div>
+      </div>
+        </div>
+      </div>
+      <button class="btn" type="button" id="emailTestBtn" style="margin-top:8px;">✉ Send test email</button>
+    </div>
+    <div style="display:flex; gap:8px; margin-top:4px;">
+      <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
+    </div>
+  </div>
   <div id="view-cloud" style="display:none;">
     <div class="view-head">
       <div id="cloudViewHeadText">
@@ -218,26 +411,49 @@
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Share a folder from this computer (Server) or open a shared folder on another computer (Client) — over your network or the internet, encrypted.</p>
       </div>
     </div>
+    <div class="cloud-tabs" role="tablist">
+      <button class="cloud-tab active" type="button" data-cloud-tab="home">Overview</button>
+      <button class="cloud-tab" type="button" data-cloud-tab="server">Server</button>
+      <button class="cloud-tab" type="button" data-cloud-tab="client">Client</button>
+      <button class="cloud-tab" type="button" data-cloud-tab="mapdrive">Map network</button>
+    </div>
     <div class="cloud-modes" id="cloudModes">
       <button class="cloud-mode-card" type="button" id="cloudModeServer">
-        <div class="cloud-mode-ico">🖥️</div>
+        <div class="cloud-mode-top"><span class="cloud-mode-ico">🖥️</span><span class="pill pill-pending" id="cloudServerModeBadge">Stopped</span></div>
         <div class="cloud-mode-title">Server</div>
         <div class="cloud-mode-sub">Share a folder from this computer so other devices can open it.</div>
-        <div class="cloud-mode-status" id="cloudServerModeStatus">Stopped</div>
+        <dl class="cloud-facts">
+          <div><dt>Protocol</dt><dd>HTTPS</dd></div>
+          <div><dt>Port</dt><dd id="cloudServerModePort">8443</dd></div>
+          <div><dt>Users</dt><dd id="cloudServerModeUsers">0</dd></div>
+        </dl>
       </button>
       <button class="cloud-mode-card" type="button" id="cloudModeClient">
-        <div class="cloud-mode-ico">💻</div>
+        <div class="cloud-mode-top"><span class="cloud-mode-ico">💻</span><span class="pill pill-pending" id="cloudClientModeBadge">Not connected</span></div>
         <div class="cloud-mode-title">Client</div>
         <div class="cloud-mode-sub">Open a shared folder on another computer and work with its files.</div>
-        <div class="cloud-mode-status" id="cloudClientModeStatus">Not connected</div>
+        <dl class="cloud-facts">
+          <div><dt>Server</dt><dd id="cloudClientModeAddr">—</dd></div>
+          <div><dt>Saved servers</dt><dd id="cloudClientModeCount">0</dd></div>
+        </dl>
       </button>
     </div>
-    <div id="cloudServerPanel" style="display:none;">
-      <h3 style="margin:14px 0 4px;font-size:16px;">Server — share a folder</h3>
-      <div class="cloud-status-row">
-        <span class="pill pill-pending" id="cloudServerPill">Stopped</span>
-        <span id="cloudServerInfo" class="cloud-muted">Not running</span>
+    <div id="cloudServerPanel" class="cloud-server-grid" style="display:none;">
+      <div class="card cloud-section cloud-server-status">
+        <div class="cloud-status-row">
+          <span class="pill pill-pending" id="cloudServerPill">Stopped</span>
+          <span id="cloudServerInfo" class="cloud-muted">Not running</span>
+        </div>
+        <div class="cloud-facts-grid">
+          <div class="cloud-fact"><div class="t-label">Protocol</div><div class="cloud-fact-value">HTTPS</div></div>
+          <div class="cloud-fact"><div class="t-label">Port</div><div class="cloud-fact-value" id="cloudServerFactPort">8443</div></div>
+          <div class="cloud-fact"><div class="t-label">Users</div><div class="cloud-fact-value" id="cloudServerFactUsers">0</div></div>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">
+          <button class="btn btn-primary" type="button" id="cloudServerStartBtn">▶ Start server</button>
+        </div>
       </div>
+      <div class="card cloud-section cloud-server-settings">
       <div class="toggle-row">
         <div><div class="t-label">Server enabled</div><div class="t-sub">Start serving when the app starts (it stays alive in the tray).</div></div>
         <label class="switch"><input type="checkbox" id="cloudServerEnabled"><span class="slider"></span></label>
@@ -261,6 +477,7 @@
         <div id="cloudWireguardIp" class="cloud-muted">Checking WireGuard…</div>
         <div class="hint">Clients on the same WireGuard tunnel use this address + the port. No port forwarding needed — the one UDP 51820 forward that brings the tunnel up covers everything inside it.</div>
       </div>
+      <div class="cloud-form-grid">
       <div class="field">
         <label for="cloudServerPort">Port</label>
         <input type="text" id="cloudServerPort" value="8443" autocomplete="off">
@@ -268,8 +485,14 @@
       </div>
       <div class="field" id="cloudServerAddrsField">
         <label>Addresses</label>
-        <div id="cloudServerAddrs" class="cloud-muted">Detect your addresses to see them here.</div>
-        <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn" style="margin-top:6px;">Detect my addresses</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="cloudDetectIpBtn">Detect my addresses</button>
+        <div id="cloudServerAddrs" class="cloud-muted" style="margin-top:6px;">Detect your addresses to see them here.</div>
+        <div class="field" style="margin-top:10px; margin-bottom:0;">
+          <label for="cloudServerDdns">DDNS hostname <span class="optional">(optional)</span></label>
+          <input type="text" id="cloudServerDdns" placeholder="e.g. myhome.ddns.net" autocomplete="off">
+          <div class="hint">Your DDNS hostname — the address clients use from outside. It cannot be detected automatically; type it once and it is saved with the server settings.</div>
+        </div>
+      </div>
       </div>
       <div class="settings-guide" id="cloudForwardGuide">
         <div class="settings-guide-title">To reach this server from outside</div>
@@ -279,12 +502,12 @@
           <li>From the same network, clients use the LAN address + this port.</li>
         </ul>
       </div>
-      <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
-        <button class="btn btn-primary" type="button" id="cloudServerStartBtn">▶ Start server</button>
       </div>
-      <h3 style="margin:18px 0 4px;font-size:14px;">Users</h3>
+      <div class="card cloud-section cloud-server-users">
+      <h3 style="margin:0 0 4px;font-size:14px;">Users</h3>
       <p class="cloud-muted" style="margin:0 0 8px;">Each user sees only their own folder. Give a user the whole drive (D:\) or one folder (D:\HR). Passwords are stored hashed, never in plain text.</p>
       <div id="cloudUsersList" class="job-list"></div>
+      <div class="cloud-form-grid">
       <div class="field">
         <label for="cloudUserName">User name</label>
         <input type="text" id="cloudUserName" placeholder="e.g. admin or HR" autocomplete="off">
@@ -301,14 +524,17 @@
         </div>
       </div>
       <div class="toggle-row">
-        <div><div class="t-label">Can write</div><div class="t-sub">Upload, delete and rename. Off = read-only.</div></div>
+        <div><div class="t-label">Can write</div><div class="t-sub">Upload, delete, rename.</div></div>
         <label class="switch"><input type="checkbox" id="cloudUserCanWrite" checked><span class="slider"></span></label>
       </div>
+      </div>
       <button class="btn" type="button" id="cloudUserAddBtn">＋ Add user</button>
+      </div>
     </div>
     <div id="cloudClientPanel" style="display:none;">
-      <h3 style="margin:14px 0 4px;font-size:16px;">Client — open a shared folder</h3>
+      <div class="card cloud-section">
       <div id="cloudServersList" class="job-list"></div>
+      <div class="cloud-form-grid">
       <div class="field">
         <label for="cloudClientName">Name</label>
         <input type="text" id="cloudClientName" placeholder="e.g. Home server" autocomplete="off">
@@ -322,30 +548,36 @@
         </div>
         <div class="hint" id="cloudClientAccessHint">Public IP, DDNS hostname or LAN IP of the server.</div>
       </div>
+      <div style="display:flex; gap:12px; grid-column:1 / -1; margin-bottom:8px;">
+      <div style="flex:1; min-width:0;">
       <div class="field" id="cloudClientPeerField" style="display:none;">
         <label for="cloudClientPeer" id="cloudClientPeerLabel">Pick a device from your Tailscale network</label>
         <select id="cloudClientPeer"></select>
         <div class="hint" id="cloudClientPeerHint">Both devices must be on the same Tailscale network — see the VPN module.</div>
         <button class="btn btn-ghost btn-sm" type="button" id="cloudClientWgAddPeerBtn" style="display:none; margin-top:6px;">Add a device in the WireGuard module</button>
       </div>
-      <div class="field">
+      <div class="field" id="cloudClientHostField" style="margin-bottom:0;">
         <label for="cloudClientHost">Server address (public IP, LAN IP or hostname)</label>
         <input type="text" id="cloudClientHost" placeholder="203.0.113.10" autocomplete="off">
       </div>
-      <div class="field">
+      </div>
+      <div class="field" style="flex:0 0 150px; min-width:0; margin-bottom:0;">
         <label for="cloudClientPort">Port</label>
         <input type="text" id="cloudClientPort" value="8443" autocomplete="off">
       </div>
-      <div class="field">
+      </div>
+      <div class="field" style="grid-column:1 / -1;">
         <label for="cloudClientUser">User name</label>
         <input type="text" id="cloudClientUser" placeholder="admin" autocomplete="off">
       </div>
-      <div class="field">
+      <div class="field" style="grid-column:1 / -1;">
         <label for="cloudClientPass">Password</label>
         <input type="password" id="cloudClientPass" placeholder="Password of this user" autocomplete="off">
         <div class="hint">The password of the user above, as created on the server. Asked once when you connect — it is never stored on this computer.</div>
       </div>
+      </div>
       <button class="btn" type="button" id="cloudClientAddBtn">＋ Save &amp; connect</button>
+      </div>
       <div id="cloudConnectBox" style="display:none; margin-top:16px;">
         <h3 style="margin:0 0 4px;font-size:14px;" id="cloudConnectTitle">Connect</h3>
         <div id="cloudFingerprintBox" class="settings-guide" style="display:none;">
@@ -363,7 +595,7 @@
           <button class="btn btn-ghost" type="button" id="cloudConnectCancelBtn">Cancel</button>
         </div>
       </div>
-      <div id="cloudBrowser" style="display:none; margin-top:16px;">
+      <div id="cloudBrowser" class="card cloud-section" style="display:none; margin-top:16px;">
         <div class="cloud-browser-head">
           <div id="cloudCrumbs" class="cloud-crumbs"></div>
         </div>
@@ -380,6 +612,13 @@
           <button class="btn btn-sm" type="button" id="cloudMkdirBtn">＋ New folder</button>
           <button class="btn btn-ghost btn-sm" type="button" id="cloudBrowserRefreshBtn">⟳ Refresh</button>
           <button class="btn btn-ghost btn-sm" type="button" id="cloudDisconnectBtn">Disconnect</button>
+          <span class="cloud-toolbar-sep"></span>
+          <label class="cloud-muted" for="cloudOpenModeSel">Open:</label>
+          <select id="cloudOpenModeSel" title="How files open when you double-click them">
+            <option value="direct">Direct</option>
+            <option value="temp">temp</option>
+          </select>
+          <span id="cloudOpenModeStatus" class="cloud-muted"></span>
           <span id="cloudBrowserInfo" class="cloud-muted"></span>
           <span id="cloudClipboardInfo" class="cloud-muted" style="display:none;"></span>
         </div>
@@ -398,9 +637,34 @@
         </div>
       </div>
     </div>
+    <div id="cloudMapPanel" style="display:none;">
+      <h3 style="margin:14px 0 4px;font-size:16px;">Map network — open a server as a drive</h3>
+      <div class="card cloud-section">
+      <p class="cloud-muted" style="margin:0 0 8px;">Files open directly from the drive — no download. Edits save back to the server.</p>
+      <div class="field">
+        <label for="cloudMapServer">Server</label>
+        <select id="cloudMapServer"></select>
+        <div class="hint" id="cloudMapServerHint">Pick a saved server from the Client tab.</div>
+      </div>
+      <div class="field">
+        <label for="cloudMapLetter">Drive letter</label>
+        <select id="cloudMapLetter"></select>
+      </div>
+      <div class="toggle-row">
+        <div><div class="t-label">Reconnect when the app starts</div><div class="t-sub" id="cloudMapReconnectHint">Maps this drive again every time the app opens.</div></div>
+        <label class="switch"><input type="checkbox" id="cloudMapReconnect" checked><span class="slider"></span></label>
+      </div>
+      <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
+        <button class="btn btn-primary" type="button" id="cloudMapBtn">Map drive</button>
+        <button class="btn btn-danger" type="button" id="cloudMapDisconnectBtn" style="display:none;">Disconnect</button>
+        <button class="btn" type="button" id="cloudMapExplorerBtn" style="display:none;">Open in Explorer</button>
+      </div>
+      <div id="cloudMapStatus" class="cloud-muted">Not mapped</div>
+      </div>
+    </div>
   </div>
   <div id="view-vpn" style="display:none;">
-    <div class="card vpn-hero">
+    <div class="card vpn-hero" id="vpnHero">
       <div class="vpn-status-row">
         <div>
           <div class="t-label">Tailscale status</div>
@@ -496,17 +760,20 @@
         </div>
         <span id="vpnPeersCount" class="pill pill-template" style="display:none;"></span>
       </div>
+      <div class="vpn-peers-head"><span></span><span>Device</span><span>Tailscale IP</span><span>OS</span><span>Status</span><span></span></div>
       <div id="vpnPeersList"><div class="empty-state"><div class="big">🛡️</div><h3>No devices yet</h3><p>Sign in to Tailscale and your devices will show up here.</p></div></div>
     </div>
   </div>
   <div id="view-wireguard" style="display:none;">
-    <div class="card vpn-hero">
+    <div class="card vpn-hero" id="wgHero">
       <div class="vpn-status-row">
         <div>
           <div class="t-label">AmneziaWG status</div>
           <div class="vpn-status"><span id="wgStatusDot" class="vpn-dot"></span><span id="wgStatusText">Checking…</span></div>
-          <div class="t-sub" id="wgStatusSub"></div>
-          <div class="t-sub" id="wgTransportLine" style="display:none;"></div>
+          <div style="display:flex; gap:10px; align-items:baseline;">
+            <div class="t-sub" id="wgStatusSub"></div>
+            <div class="t-sub" id="wgTransportLine" style="display:none;"></div>
+          </div>
         </div>
       </div>
       <div id="wgNotInstalled" style="display:none;">
@@ -518,48 +785,55 @@
         </div>
       </div>
     </div>
+    <div class="cloud-tabs" role="tablist">
+      <button class="cloud-tab active" type="button" data-wg-tab="server">Server</button>
+      <button class="cloud-tab" type="button" data-wg-tab="nat">Site-to-Site</button>
+    </div>
     <div class="card" id="wgServerCard">
       <div class="vpn-sec-label">Server — this machine is the hub</div>
       <div class="vpn-facts">
         <div class="vpn-fact-tile"><div class="t-label">Public key</div><div class="vpn-fact" id="wgServerKey">—</div></div>
       </div>
-      <div style="margin-top:12px;">
+      <div class="wg-server-grid" style="margin-top:6px;">
+      <div style="margin-top:0;">
         <div class="t-label">Tunnel address &amp; port</div>
-        <div class="t-sub">This server's address inside the tunnel, and the UDP port your router forwards. Defaults: 10.0.0.1 and 51820.</div>
+        <div class="t-sub" title="Address inside the tunnel, and the UDP port your router forwards.">Address inside the tunnel, and the UDP port your router forwards.</div>
         <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
           <input type="text" id="wgServerIp" placeholder="10.0.0.1" autocomplete="off" style="flex:1; min-width:140px;">
           <input type="text" id="wgServerPort" placeholder="51820" autocomplete="off" inputmode="numeric" style="flex:1; min-width:100px;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgServerSettingsSaveBtn">Save</button>
         </div>
       </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
-        <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>
-        <button class="btn btn-ghost btn-sm" type="button" id="wgServerExportBtn">Export server</button>
-        <button class="btn btn-ghost btn-sm" type="button" id="wgServerImportBtn">Import server</button>
-      </div>
-      <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:10px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
-      <div style="margin-top:12px;">
+      <div style="margin-top:0;">
         <div class="t-label">Endpoint — the address clients connect to</div>
-        <div class="t-sub">The public IP is read automatically. If you use DDNS, type the hostname here instead.</div>
+        <div class="t-sub" title="Public IP is read automatically; a DDNS hostname works too.">Public IP is read automatically; a DDNS hostname works too.</div>
         <div style="display:flex; gap:8px; margin-top:6px;">
           <input type="text" id="wgEndpoint" placeholder="203.0.113.10 or myhome.ddns.net" autocomplete="off" style="flex:1;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgEndpointSaveBtn">Save</button>
         </div>
       </div>
-      <div class="vpn-sec-label">Devices (peers)</div>
-      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p></div></div>
-      <div style="margin-top:12px;">
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:6px;">
+        <button class="btn btn-primary" type="button" id="wgServerBtn">Start server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerExportBtn">Export server</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="wgServerImportBtn">Import server</button>
+      </div>
+      <div class="t-sub vpn-note" id="wgPortHint" style="margin-top:4px;">On your router, forward UDP 51820 to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.</div>
+      <div style="margin-top:6px;">
         <div class="t-label">Add a device</div>
-        <div class="t-sub">One way: the device's public key, its real IP or DDNS hostname, and its port. The server reaches it at that address — the other side needs nothing.</div>
+        <div class="t-sub">The device's public key, its real IP or DDNS hostname, and its port — the other side needs nothing.</div>
         <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap;">
-          <input type="text" id="wgPeerKey" placeholder="Public key (44 characters, ends with =)" autocomplete="off" style="flex:2; min-width:220px;">
-          <input type="text" id="wgPeerHost" placeholder="Real IP or DDNS, e.g. 192.168.1.49" autocomplete="off" style="flex:1; min-width:160px;">
-          <input type="text" id="wgPeerPort" placeholder="Port" value="51820" inputmode="numeric" autocomplete="off" style="flex:0 0 90px; min-width:80px;">
+          <input type="text" id="wgPeerKey" placeholder="Public key (44 characters, ends with =)" autocomplete="off" style="flex:2; min-width:150px;">
+          <input type="text" id="wgPeerHost" placeholder="Real IP or DDNS, e.g. 192.168.1.49" autocomplete="off" style="flex:1; min-width:110px;">
+          <input type="text" id="wgPeerPort" placeholder="Port" value="51820" inputmode="numeric" autocomplete="off" style="flex:0 0 70px; min-width:60px;">
           <button class="btn btn-ghost btn-sm" type="button" id="wgPeerAddBtn">Add peer</button>
         </div>
       </div>
+      <div class="vpn-sec-label">Devices (peers)</div>
+      <div class="wg-peers-head"><span></span><span>Device</span><span>Status</span><span>Transfer</span><span>Key</span><span></span></div>
+      <div id="wgPeerList"><div class="empty-state"><div class="big">🔐</div><h3>No devices yet</h3><p>Add a device above and it will show up here.</p></div></div>
     </div>
-    <div class="card" id="wgNatCard">
+    <div class="card" id="wgNatCard" style="display:none;">
       <div class="vpn-sec-label">Site-to-site — link two networks</div>
       <div class="t-sub wg-nat-intro">Add each device: name, real IP, alias IP.</div>
       <div class="t-sub vpn-note" id="wgNatStatus" style="margin-top:10px;">NAT service: stopped.</div>
@@ -593,6 +867,286 @@
       </div>
     </div>
   </div>
+  <div id="view-wizard" style="display:none;">
+<div class="modal-wrap">
+  <div class="wizard-card">
+    <div class="modal-head">
+      <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
+      <div>
+        <h1 id="wizardTitle">New Backup Job</h1>
+        <p>Five quick steps — the wizard stays open while you pick folders.</p>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="steps" id="steps">
+        <div class="step active" data-n="1" data-step="1">Source</div>
+        <div class="step" data-n="2" data-step="2">Destination</div>
+        <div class="step" data-n="3" data-step="3">Options</div>
+        <div class="step" data-n="4" data-step="4">Encryption</div>
+        <div class="step" data-n="5" data-step="5">Review</div>
+      </div>
+
+      <!-- Step 1: Source -->
+      <section class="step-panel active" data-panel="1">
+        <div class="field">
+          <label for="jobName">Job Name</label>
+          <input type="text" id="jobName" value="My Backup" placeholder="My Backup">
+          <div class="field-error" id="jobNameError">Please enter a job name.</div>
+        </div>
+        <div class="field" id="sourceMatchField">
+          <label>Find this drive again by</label>
+          <div class="radio-row">
+            <label><input type="radio" name="sourceMatch" value="label" checked> Name <span id="sourceMatchLabel" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="sourceMatch" value="letter"> Drive letter <span id="sourceMatchLetter" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="sourceMatch" value="serial"> Serial number <span id="sourceMatchSerial" style="color:var(--muted-2);font-size:12px;"></span></label>
+          </div>
+          <div class="hint">Pick one first, then Browse. The name, letter and serial are read automatically from the drive you pick — you never type a serial.</div>
+        </div>
+        <div class="field">
+          <label for="sourceDir">Source — folder or file</label>
+          <div class="input-row">
+            <input type="text" id="sourceDir" placeholder="Select a folder or a single file" readonly>
+            <button class="btn" type="button" id="browseSource">Browse</button>
+          </div>
+          <div class="hint">Pick a folder to back up, or a single file. The wizard stays open after you click OK.</div>
+          <div class="field-error" id="sourceError">Please choose a source folder or file.</div>
+        </div>
+        <div class="field">
+          <label for="patternInput">Include Patterns <span class="optional">(optional)</span></label>
+          <div class="input-row">
+            <input type="text" id="patternInput" placeholder='Add pattern (*.txt, *.docx)'>
+            <button class="btn" type="button" id="addPatternBtn">＋ Add</button>
+          </div>
+          <div class="chips" id="patternChips"></div>
+          <div class="hint">Empty means: back up everything in the source folder.</div>
+        </div>
+      </section>
+
+      <!-- Step 2: Destination -->
+      <section class="step-panel" data-panel="2">
+        <div class="field" id="destMatchField">
+          <label>Find this drive again by</label>
+          <div class="radio-row">
+            <label><input type="radio" name="destMatch" value="label" checked> Name <span id="destMatchLabel" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="destMatch" value="letter"> Drive letter <span id="destMatchLetter" style="color:var(--muted-2);font-size:12px;"></span></label>
+            <label><input type="radio" name="destMatch" value="serial"> Serial number <span id="destMatchSerial" style="color:var(--muted-2);font-size:12px;"></span></label>
+          </div>
+          <div class="hint">Pick one first, then Browse. The name, letter and serial are read automatically from the drive you pick — you never type a serial.</div>
+        </div>
+        <div class="field">
+          <label for="destDir">Destination Directory</label>
+          <div class="input-row">
+            <input type="text" id="destDir" placeholder="Select a destination folder" readonly>
+            <button class="btn" type="button" id="browseDest">Browse</button>
+          </div>
+          <div class="hint">The .zip backup file is created in this folder. The wizard stays open after you click OK.</div>
+          <div class="field-error" id="destError">Please choose a destination folder.</div>
+        </div>
+        <div class="note info"><strong>Tip:</strong> use a different drive or an external drive for the destination, so a disk failure does not take the backup with it.</div>
+      </section>
+
+      <!-- Step 3: Options & Schedule -->
+      <section class="step-panel" data-panel="3">
+        <h3 style="margin:0 0 6px;">Backup Options</h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Back up only files that changed since the last backup.</div></div>
+          <label class="switch"><input type="checkbox" id="optIncremental" checked><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Store the backup as a compressed .zip file.</div></div>
+          <label class="switch"><input type="checkbox" id="optCompress" checked><span class="slider"></span></label>
+        </div>
+        <div id="compressLevelField" style="margin:2px 0 0;">
+          <div class="radio-row">
+            <label><input type="radio" name="compressLevel" value="standard" checked> Standard <span style="color:var(--muted-2);font-size:12px;">— Deflate level 6, faster</span></label>
+            <label><input type="radio" name="compressLevel" value="advanced"> Advanced <span style="color:var(--muted-2);font-size:12px;">— Deflate level 9, smaller</span></label>
+          </div>
+          <div class="hint">The level the ZIP will actually use — Standard compresses faster, Advanced squeezes smaller.</div>
+        </div>
+        <div class="toggle-row">
+          <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
+          <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
+        </div>
+        <h3 style="margin:10px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Run on schedule</div><div class="t-sub">Run this job automatically.</div></div>
+          <label class="switch"><input type="checkbox" id="optSchedule"><span class="slider"></span></label>
+        </div>
+        <div id="scheduleFields" style="display:none; margin-top:12px;">
+          <div class="field">
+            <label>Frequency</label>
+            <div class="radio-row">
+              <label><input type="radio" name="frequency" value="Daily" checked> Daily</label>
+              <label><input type="radio" name="frequency" value="Weekly"> Weekly</label>
+              <label><input type="radio" name="frequency" value="Monthly"> Monthly</label>
+              <label><input type="radio" name="frequency" value="Custom"> Custom</label>
+            </div>
+          </div>
+          <div style="display:flex; gap:12px;">
+            <div class="field" id="customDaysField" style="display:none; flex:1; min-width:0;">
+              <label>Days</label>
+              <div class="radio-row" id="customDaysRow">
+                <label><input type="checkbox" name="customDay" value="6"> Sat</label>
+                <label><input type="checkbox" name="customDay" value="0"> Sun</label>
+                <label><input type="checkbox" name="customDay" value="1"> Mon</label>
+                <label><input type="checkbox" name="customDay" value="2"> Tue</label>
+                <label><input type="checkbox" name="customDay" value="3"> Wed</label>
+                <label><input type="checkbox" name="customDay" value="4"> Thu</label>
+                <label><input type="checkbox" name="customDay" value="5"> Fri</label>
+              </div>
+              <div class="hint">Pick the days this job runs, at the time below.</div>
+            </div>
+            <div class="field" style="flex:0 0 150px;">
+              <label for="scheduleTime">Time</label>
+              <input type="time" id="scheduleTime" value="02:00">
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 4: Encryption (independent of compression) -->
+      <section class="step-panel" data-panel="4">
+        <h3 style="margin:0 0 6px;">Encryption</h3>
+        <div class="toggle-row">
+          <div><div class="t-label">Encrypt backup (AES-256)</div><div class="t-sub">Protect the backup with a password. Standard WinZip AES — 7-Zip and WinRAR can open it too.</div></div>
+          <label class="switch"><input type="checkbox" id="optEncrypt"><span class="slider"></span></label>
+        </div>
+        <div id="encFields" style="display:none; margin-top:12px;">
+          <div class="field">
+            <label for="encPassword">Backup password</label>
+            <input type="password" id="encPassword" placeholder="At least 8 characters" autocomplete="new-password">
+            <div class="field-error" id="encPasswordError">Please enter a password of at least 8 characters.</div>
+          </div>
+          <div class="field">
+            <label for="encPasswordConfirm">Confirm password</label>
+            <input type="password" id="encPasswordConfirm" placeholder="Repeat the password" autocomplete="new-password">
+            <div class="field-error" id="encPasswordConfirmError">Passwords do not match.</div>
+          </div>
+          <div class="note info" id="encModeNote"></div>
+          <div class="note" id="encVaultNote" style="display:none;"><strong>Password saved:</strong> this job already has a password in the vault — leave the fields blank to keep it.</div>
+          <div class="hint">The password is never written into the job file. If the vault is unlocked it is stored encrypted there so scheduled backups can run; otherwise you will be asked for it at run time. If you forget it, the backup cannot be opened — anywhere.</div>
+        </div>
+      </section>
+
+      <!-- Step 5: Review -->
+      <section class="step-panel" data-panel="5">
+        <h3 style="margin:0 0 6px;">Review your job</h3>
+        <div class="review" id="reviewBox"></div>
+        <div class="note info" style="margin-top:8px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
+      </section>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" type="button" id="cancelBtn">Cancel</button>
+      <span class="spacer"></span>
+      <button class="btn" type="button" id="backBtn" style="display:none;">← Back</button>
+      <button class="btn btn-primary" type="button" id="nextBtn">Next →</button>
+      <button class="btn btn-primary" type="button" id="createBtn" style="display:none;">Create Job</button>
+    </div>
+  </div>
+</div>
+  </div>
+  <div id="view-restore" style="display:none;">
+<div class="modal-wrap restore-wrap">
+  <div class="wizard-card">
+    <div class="modal-head">
+      <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
+      <div>
+        <h1>Restore Backup</h1>
+        <p>Pick a .zip backup file and a folder to restore it into.</p>
+      </div>
+    </div>
+    <div class="modal-body restore-layout">
+      <div class="restore-main">
+        <section class="restore-step">
+          <div class="restore-step-head"><span class="restore-step-num">1</span><h3>Select Backup File</h3></div>
+          <div class="field">
+            <label for="backupFile">Backup file</label>
+            <div class="input-row">
+              <input type="text" id="backupFile" placeholder="Select a .zip backup file" readonly>
+              <button class="btn" type="button" id="browseFile">Browse</button>
+            </div>
+            <div class="restore-valid" id="restoreValid" style="display:none;"></div>
+            <div class="field-error" id="fileError">Please choose a .zip backup file.</div>
+          </div>
+        </section>
+        <section class="restore-step">
+          <div class="restore-step-head"><span class="restore-step-num">2</span><h3>Restore From</h3></div>
+          <div class="restore-mode-card">
+            <div class="restore-mode-title">↺ Restore All</div>
+            <div class="restore-mode-sub">Restore every file in the backup.</div>
+          </div>
+        </section>
+        <section class="restore-step">
+          <div class="restore-step-head"><span class="restore-step-num">3</span><h3>Restore To</h3></div>
+          <div class="field">
+            <div class="radio-row">
+              <label><input type="radio" name="restoreDest" value="original" id="restoreDestOriginal"> Original Location <span style="color:var(--muted-2);font-size:12px;">(Recommended)</span></label>
+              <label><input type="radio" name="restoreDest" value="custom" id="restoreDestCustom" checked> Custom Location</label>
+            </div>
+            <div class="hint" id="restoreOriginalHint" style="display:none;">Open Restore from a job to use its original location.</div>
+          </div>
+          <div class="field">
+            <label for="restoreTo">Destination folder</label>
+            <div class="input-row">
+              <input type="text" id="restoreTo" placeholder="Select destination folder" readonly>
+              <button class="btn" type="button" id="restoreBrowseDest">Browse</button>
+            </div>
+            <div class="field-error" id="restoreDestError">Please choose a destination folder.</div>
+          </div>
+          <div class="field" id="restorePasswordField" style="display:none;">
+            <label for="restorePassword">Backup password</label>
+            <input type="password" id="restorePassword" placeholder="Password for this encrypted backup" autocomplete="off">
+            <div class="hint">This backup is encrypted (AES-256). Enter its backup password — the same one used when it was created. Without it, the files cannot be restored.</div>
+            <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>
+          <div id="restoreAdvanced" style="display:none; margin-top:10px;">
+            <label class="check"><input type="checkbox" id="optOverwrite"> Overwrite existing files</label>
+            <label class="check"><input type="checkbox" id="restoreOptVerify" checked> Verify restored files</label>
+          </div>
+          <div class="note" style="margin-top:14px;">
+            <strong>Phase 2</strong><br>
+            Streaming restore with yauzl is implemented.<br>
+            VSS (Volume Shadow Copy) is NOT implemented. Locked files will be skipped during backup.
+          </div>
+        </section>
+      </div>
+      <aside class="restore-side">
+        <div class="card">
+          <h3>Backup Information</h3>
+          <div class="restore-empty" id="restoreInfoEmpty">No backup file selected yet.</div>
+          <dl class="restore-info-list" id="restoreInfoList" style="display:none;"></dl>
+        </div>
+        <div class="card">
+          <h3>Restore Progress</h3>
+          <div class="restore-empty" id="restoreProgressEmpty">No restore running.</div>
+          <section class="progress-card" id="restoreProgressCard" aria-live="polite" style="margin:0;">
+            <div class="progress-head">
+              <span><span class="spinner"></span> <span id="restoreProgressTitle">Restoring…</span></span>
+              <span class="progress-pct" id="restoreProgressPct">0%</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" id="restoreProgressFill"></div></div>
+            <div class="progress-sub">
+              <span id="restoreProgressCount">0 files</span>
+              <span class="file" id="restoreProgressFile"></span>
+            </div>
+          </section>
+        </div>
+        <div class="card">
+          <h3>Restore Log</h3>
+          <div class="restore-empty" id="restoreLogEmpty">No restore run yet.</div>
+          <div id="resultBox" style="display:none;"></div>
+        </div>
+      </aside>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" type="button" id="restoreCancelBtn">Cancel</button>
+      <span class="spacer"></span>
+      <button class="btn btn-primary" type="button" id="startBtn">Start Restore</button>
+    </div>
+  </div>
+</div>
+  </div>
   </main>
 </div>
 <div id="cloudContextMenu" class="cloud-context-menu" style="display:none;"></div>
@@ -620,130 +1174,6 @@
     <button class="btn btn-sm" type="button" id="drawerRestore">↺ Restore</button>
     <button class="btn btn-sm" type="button" id="drawerEdit">✎ Edit</button>
     <button class="btn btn-danger btn-sm" type="button" id="drawerDelete">🗑 Delete</button>
-  </div>
-</aside>
-<div class="backdrop" id="settingsBackdrop"></div>
-<aside class="drawer" id="settingsDrawer" aria-label="Settings">
-  <button class="icon-btn close-x" type="button" id="settingsClose" aria-label="Close settings">✕</button>
-  <h2>Settings</h2>
-  <div id="settingsHomeView" style="margin-top:14px;">
-    <div class="toggle-row">
-      <div><div class="t-label">Light theme</div><div class="t-sub">Switch between dark and light.</div></div>
-      <label class="switch"><input type="checkbox" id="settingLightTheme"><span class="slider"></span></label>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Start with Windows</div><div class="t-sub">Launch TechVision Backup automatically when Windows starts.</div></div>
-      <label class="switch"><input type="checkbox" id="settingAutoStart" checked><span class="slider"></span></label>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Default for new jobs.</div></div>
-      <label class="switch"><input type="checkbox" id="settingCompress" checked><span class="slider"></span></label>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after each backup.</div></div>
-      <label class="switch"><input type="checkbox" id="settingVerify" checked><span class="slider"></span></label>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Default for new jobs.</div></div>
-      <label class="switch"><input type="checkbox" id="settingIncremental" checked><span class="slider"></span></label>
-    </div>
-    <button class="settings-menu-row" type="button" id="emailMenuRow">
-      <span class="settings-menu-icon">✉</span>
-      <span class="settings-menu-text"><span class="t-label">Email notifications</span><span class="t-sub" id="emailMenuStatus">Off — tap to set up</span></span>
-      <span class="settings-menu-chevron">›</span>
-    </button>
-    <h3 style="margin:18px 0 4px;font-size:14px;">Master password</h3>
-    <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where job passwords for encrypted backups are stored. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
-    <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
-    <div id="vaultSetupBox">
-      <div class="field">
-        <label for="vaultNewPass">New master password</label>
-        <input type="password" id="vaultNewPass" placeholder="At least 8 characters" autocomplete="new-password">
-      </div>
-      <div class="field">
-        <label for="vaultNewPassConfirm">Confirm master password</label>
-        <input type="password" id="vaultNewPassConfirm" placeholder="Repeat the master password" autocomplete="new-password">
-      </div>
-      <button class="btn" type="button" id="vaultSetupBtn" style="margin-top:4px;">Set master password</button>
-    </div>
-    <div id="vaultChangeBox" style="display:none;">
-      <div class="field">
-        <label for="vaultOldPass">Current master password</label>
-        <input type="password" id="vaultOldPass" placeholder="Current master password" autocomplete="current-password">
-      </div>
-      <div class="field">
-        <label for="vaultChangeNew">New master password</label>
-        <input type="password" id="vaultChangeNew" placeholder="At least 8 characters" autocomplete="new-password">
-      </div>
-      <div class="field">
-        <label for="vaultChangeConfirm">Confirm new master password</label>
-        <input type="password" id="vaultChangeConfirm" placeholder="Repeat the new master password" autocomplete="new-password">
-      </div>
-      <button class="btn" type="button" id="vaultChangeBtn" style="margin-top:4px;">Change master password</button>
-      <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
-    </div>
-  </div>
-  <div id="settingsEmailView" style="display:none; margin-top:14px;">
-    <button class="btn btn-ghost settings-back-btn" type="button" id="emailBackBtn">‹ Settings</button>
-    <h3 style="margin:14px 0 4px;font-size:16px;">✉ Email notifications</h3>
-    <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">Get an email when a backup starts or finishes, or when the app was closed and a scheduled backup was missed.</p>
-    <div class="settings-guide">
-      <div class="settings-guide-title">What to fill in</div>
-      <ul>
-        <li><b>Send notifications to</b> — the inbox that receives the emails.</li>
-        <li><b>Sender email + password</b> — the account the app sends from.</li>
-        <li><b>SMTP host + port</b> — Gmail is prefilled (smtp.gmail.com, 465). For a company mailbox, ask your mail admin for the server and port.</li>
-      </ul>
-      <div class="settings-guide-title">What NOT to put here</div>
-      <ul>
-        <li>Your normal Gmail password — Gmail needs an <b>App Password</b> (Google Account → Security → 2-Step Verification → App passwords).</li>
-        <li>Your backup job password or the master password — those belong to encryption, not to email.</li>
-        <li>The app only ever emails the address in “Send notifications to” — nothing else.</li>
-      </ul>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Email notifications</div><div class="t-sub">Send mail for backup events.</div></div>
-      <label class="switch"><input type="checkbox" id="settingEmailEnabled"><span class="slider"></span></label>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Notify on start</div><div class="t-sub">Email when a backup starts.</div></div>
-      <label class="switch"><input type="checkbox" id="settingEmailStart" checked><span class="slider"></span></label>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Notify on finish</div><div class="t-sub">Email when a backup finishes or fails.</div></div>
-      <label class="switch"><input type="checkbox" id="settingEmailFinish" checked><span class="slider"></span></label>
-    </div>
-    <div class="toggle-row">
-      <div><div class="t-label">Notify if service was down</div><div class="t-sub">Email when a scheduled backup was missed because the app was closed.</div></div>
-      <label class="switch"><input type="checkbox" id="settingEmailMissed" checked><span class="slider"></span></label>
-    </div>
-    <div class="field">
-      <label for="settingEmailTo">Send notifications to (email)</label>
-      <input type="text" id="settingEmailTo" placeholder="you@example.com" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="settingEmailUser">Sender email address</label>
-      <input type="text" id="settingEmailUser" placeholder="you@gmail.com or you@company.com" autocomplete="off">
-    </div>
-    <div class="field">
-      <label for="settingEmailPass">Email password</label>
-      <input type="password" id="settingEmailPass" placeholder="account password" autocomplete="off">
-      <div class="hint">Company mail: use the normal account password. Gmail: use an App Password (Google Account &rarr; Security &rarr; 2-Step Verification &rarr; App passwords), not your normal Gmail password.</div>
-    </div>
-    <div class="field">
-      <label for="settingEmailHost">SMTP host</label>
-      <input type="text" id="settingEmailHost" value="smtp.gmail.com" autocomplete="off">
-      <div class="hint">Gmail: smtp.gmail.com. Company domain: your mail server, e.g. mail.company.com (ask your mail admin if unsure).</div>
-    </div>
-    <div class="field">
-      <label for="settingEmailPort">SMTP port</label>
-      <input type="text" id="settingEmailPort" value="465" autocomplete="off">
-      <div class="hint">465 = SSL, 587 = STARTTLS. Most company servers use one of these two.</div>
-    </div>
-    <button class="btn" type="button" id="emailTestBtn" style="margin-top:8px;">✉ Send test email</button>
-  </div>
-  <div class="drawer-actions">
-    <button class="btn btn-primary" type="button" id="settingsSave">Save Settings</button>
   </div>
 </aside>
 <div class="backdrop" id="confirmBackdrop"></div>
@@ -798,5 +1228,7 @@
 </div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <script src="renderer.js"></script>
+<script src="job-wizard.js"></script>
+<script src="restore-wizard.js"></script>
 </body>
 </html>

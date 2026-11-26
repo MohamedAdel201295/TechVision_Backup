@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     deleteFile: (filePath) => ipcRenderer.invoke('fs-delete', filePath),
     fileExists: (filePath) => ipcRenderer.invoke('fs-exists', filePath),
     getZipInfo: (zipPath) => ipcRenderer.invoke('zip-get-info', zipPath),
+    getDriveUsage: (targetPath) => ipcRenderer.invoke('fs-drive-usage', targetPath),
+    openPath: (targetPath) => ipcRenderer.invoke('fs-open-path', targetPath),
     getAppLog: () => ipcRenderer.invoke('logs-get'),
 
     // Dialog operations
@@ -54,8 +56,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     vaultChangePassword: (oldPassword, newPassword) => ipcRenderer.invoke('vault-change-password', oldPassword, newPassword),
     vaultHasJobPassword: (jobId) => ipcRenderer.invoke('vault-has-job-password', jobId),
     vaultStoreJobPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-password', jobId, jobPassword),
-    showSettingsWindow: () => ipcRenderer.invoke('window-show-settings'),
-    closeSettings: () => ipcRenderer.invoke('window-close-settings'),
 
   // Job detail actions
   openEditJob: (jobId) => ipcRenderer.invoke('job-open-edit', jobId),
@@ -63,14 +63,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   restoreJob: (jobId) => ipcRenderer.invoke('job-restore', jobId),
   deleteJob: (jobId) => ipcRenderer.invoke('job-delete', jobId),
 
-  // Window management
-    showJobWizard: (job) => ipcRenderer.invoke('window-show-job-wizard', job || null),
-    showRestoreWizard: (job) => ipcRenderer.invoke('window-show-restore-wizard', job || null),
-    showLogViewer: () => ipcRenderer.invoke('window-show-log-viewer'),
-    closeLogViewer: () => ipcRenderer.invoke('window-close-log-viewer'),
-    closeJobWizard: () => ipcRenderer.invoke('window-close-job-wizard'),
-    closeRestoreWizard: () => ipcRenderer.invoke('window-close-restore-wizard'),
-    getRecentLog: () => ipcRenderer.invoke('log-get-recent'),
+  // Window management — the wizard and restore are in-place views in
+  // the main window now (no second window). These two calls only hand
+  // the pending job to main; the wizard scripts read it back with
+  // getJobConfig(null) when the view opens.
+    setWizardPending: (job) => ipcRenderer.invoke('wizard-set-pending', job || null),
+    setRestorePending: (job) => ipcRenderer.invoke('restore-set-pending', job || null),
 
   // Refresh jobs list
   refreshJobs: (jobs) => ipcRenderer.invoke('jobs-refresh', jobs),
@@ -80,6 +78,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // listening when it finishes (no duplicate listeners on repeat runs).
   onBackupProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('backup-progress', h); return () => ipcRenderer.removeListener('backup-progress', h); },
   onCloudProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('cloud-progress', h); return () => ipcRenderer.removeListener('cloud-progress', h); },
+  // Temp + save-back results from main (saved-back / conflict / error)
+  onCloudSaveback: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('cloud-saveback', h); return () => ipcRenderer.removeListener('cloud-saveback', h); },
 
   // TechVision Cloud — server
   cloudGetConfig: () => ipcRenderer.invoke('cloud-get-config'),
@@ -102,11 +102,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cloudClientUpload: (serverId, localPath, remoteDir) => ipcRenderer.invoke('cloud-client-upload', serverId, localPath, remoteDir),
   cloudClientUploadFiles: (serverId, localPaths, remoteDir) => ipcRenderer.invoke('cloud-client-upload-files', serverId, localPaths, remoteDir),
   cloudClientOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-client-open', serverId, relPath),
+  // TechVision Cloud — open mode + Office direct open (spec v2)
+  cloudSetOpenMode: (mode) => ipcRenderer.invoke('cloud-set-open-mode', mode),
+  cloudOfficeOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-office-open', serverId, relPath),
+  cloudMediaOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-media-open', serverId, relPath),
   cloudClipboardFiles: () => ipcRenderer.invoke('cloud-clipboard-files'),
   cloudClientMkdir: (serverId, relPath) => ipcRenderer.invoke('cloud-client-mkdir', serverId, relPath),
   cloudClientDelete: (serverId, relPath) => ipcRenderer.invoke('cloud-client-delete', serverId, relPath),
   cloudClientRename: (serverId, from, to) => ipcRenderer.invoke('cloud-client-rename', serverId, from, to),
   cloudClientCopy: (serverId, from, to) => ipcRenderer.invoke('cloud-client-copy', serverId, from, to),
+  // TechVision Cloud — Map network drive
+  cloudMapdriveStatus: () => ipcRenderer.invoke('cloud-mapdrive-status'),
+  cloudMapdriveMap: (serverId, letter, reconnect) => ipcRenderer.invoke('cloud-mapdrive-map', serverId, letter, reconnect),
+  cloudMapdriveDisconnect: (serverId) => ipcRenderer.invoke('cloud-mapdrive-disconnect', serverId),
+  cloudMapdriveOpenExplorer: (letter) => ipcRenderer.invoke('cloud-mapdrive-open-explorer', letter),
+  cloudMapdriveOpenMapped: (serverId, relPath) => ipcRenderer.invoke('cloud-mapdrive-open-mapped', serverId, relPath),
   // TechVision WireGuard VPN — self-hosted WireGuard (no coordination server)
   wgGetStatus: () => ipcRenderer.invoke('wg-get-status'),
   wgListPeers: () => ipcRenderer.invoke('wg-list-peers'),

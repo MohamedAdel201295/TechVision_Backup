@@ -305,7 +305,50 @@
     }
   }
   function closeWizard() {
+    /* In-place wizard: closing means going back to the view it was
+       opened from (Dashboard or Jobs) — there is no separate window
+       any more. The old closeJobWizard IPC is kept as a fallback. */
+    if (typeof window.__closeWizardView === 'function') { window.__closeWizardView(); return; }
     if (api && typeof api.closeJobWizard === 'function') { api.closeJobWizard(); }
+  }
+  /* Reset the wizard to a blank new job (or the pending edit job) and
+     show step 1. Called every time the wizard view opens — the old
+     separate window reloaded its page on every open, so this is the
+     in-place equivalent of that fresh start. Exposed for renderer.js. */
+  function resetWizard() {
+    step = 1; patterns = []; editing = null; hasSavedPassword = false;
+    $('wizardTitle').textContent = 'New Backup Job';
+    $('jobName').value = 'My Backup';
+    $('jobNameError').classList.remove('show');
+    $('sourceDir').value = ''; $('sourceError').classList.remove('show');
+    $('destDir').value = ''; $('destError').classList.remove('show');
+    $('patternInput').value = ''; renderChips();
+    setMatchMode('source', 'label'); setMatchMode('dest', 'label');
+    setText('sourceMatchLabel', ''); setText('sourceMatchLetter', ''); setText('sourceMatchSerial', '');
+    setText('destMatchLabel', ''); setText('destMatchLetter', ''); setText('destMatchSerial', '');
+    var smf = $('sourceMatchField'); if (smf) smf.style.display = '';
+    var dmf = $('destMatchField'); if (dmf) dmf.style.display = '';
+    $('optIncremental').checked = true;
+    $('optCompress').checked = true;
+    var clf = $('compressLevelField'); if (clf) clf.style.display = '';
+    var std = document.querySelector('input[name="compressLevel"][value="standard"]'); if (std) std.checked = true;
+    $('optVerify').checked = true;
+    $('optSchedule').checked = false;
+    $('scheduleFields').style.display = 'none';
+    var daily = document.querySelector('input[name="frequency"][value="Daily"]'); if (daily) daily.checked = true;
+    $('customDaysField').style.display = 'none';
+    document.querySelectorAll('input[name="customDay"]').forEach(function (c) { c.checked = false; });
+    $('scheduleTime').value = '02:00';
+    $('optEncrypt').checked = false;
+    $('encFields').style.display = 'none';
+    $('encPassword').value = ''; $('encPasswordConfirm').value = '';
+    $('encPasswordError').classList.remove('show');
+    $('encPasswordConfirmError').classList.remove('show');
+    var evn = $('encVaultNote'); if (evn) evn.style.display = 'none';
+    $('reviewBox').innerHTML = '';
+    $('createBtn').disabled = false; $('createBtn').textContent = 'Create Job';
+    showStep(1);
+    loadExisting().catch(function () { /* start blank */ });
   }
   async function loadExisting() {
     if (!api) return;
@@ -401,9 +444,11 @@
     on('backBtn', 'click', function () { showStep(Math.max(1, step - 1)); });
     on('createBtn', 'click', createJob);
     on('cancelBtn', 'click', closeWizard);
-    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeWizard(); });
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { var v = $('view-wizard'); if (v && v.style.display !== 'none') closeWizard(); } });
     loadExisting().catch(function(e) { /* ignore async errors on initial load */ });
   }
+  /* In-place wizard: renderer.js opens this view and calls reset(). */
+  window.__jobWizard = { reset: resetWizard };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wireWizard);
   else wireWizard();
 })();

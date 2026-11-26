@@ -14,6 +14,8 @@ const vault = require('./vault.js');
 const driveResolver = require('./drive-resolver.js');
 const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
+const cloudMapDrive = require('./cloud-mapdrive.js');
+const cloudSavebackMod = require('./cloud-saveback.js');
 const vpn = require('./vpn.js');
 const wireguard = require('./wireguard.js');
 const natGateway = require('./nat-gateway.js');
@@ -43,6 +45,11 @@ function getCloudConfig() {
   if (!cloudConfig || typeof cloudConfig !== 'object') cloudConfig = {};
   if (!cloudConfig.server || typeof cloudConfig.server !== 'object') cloudConfig.server = cloudServerMod.defaultServerConfig();
   if (!Array.isArray(cloudConfig.clients)) cloudConfig.clients = [];
+  // Open mode: how a double-click opens a file — 'direct' (mapped
+  // drive, then Office direct, then temp + save-back) or 'temp'
+  // (always temp + save-back). The user picks it in the browser
+  // toolbar; no mode ever creates a drive letter.
+  if (cloudConfig.openMode !== 'temp' && cloudConfig.openMode !== 'direct') cloudConfig.openMode = 'direct';
   return cloudConfig;
 }
 function saveCloudConfig() {
@@ -68,6 +75,56 @@ function getCloudServer() {
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
+
+// ---------- TechVision Cloud — Map network drive ----------
+// State file: <userData>/.techvision/mapdrive.json —
+// { mappings: [{ serverId, letter, host, port, user, reconnect }] }.
+let mapdriveState = null;
+function mapdriveConfigPath() {
+  return path.join(app.getPath('userData'), '.techvision', 'mapdrive.json');
+}
+function getMapdriveState() {
+  if (mapdriveState) return mapdriveState;
+  mapdriveState = cloudMapDrive.loadState(mapdriveConfigPath());
+  return mapdriveState;
+}
+function saveMapdriveState(state) {
+  if (state) mapdriveState = state;
+  cloudMapDrive.saveState(mapdriveConfigPath(), mapdriveState);
+}
+
+// ---------- TechVision Cloud — temp + save-back ----------
+// After a server file is opened from a temp copy, watch the copy
+// while the app is open; edits upload back to the same server path.
+// Session-only: the watches live in this process, so a restart never
+// re-uploads a stale temp file. See src/cloud-saveback.js.
+async function cloudSavebackSnapshot(serverId, relPath) {
+  const conn = cloudSessions.get(serverId);
+  if (!conn) return null;
+  try {
+    const dir = String(relPath).split('/').slice(0, -1).join('/');
+    const base = path.basename(relPath);
+    const r = await cloudClient.list(conn, dir);
+    const e = (r.entries || []).find((x) => x.name === base);
+    return e ? { size: e.size, mtime: e.mtime } : null;
+  } catch (e) { return null; }
+}
+const cloudSaveback = cloudSavebackMod.createSaveback({
+  listEntry: (serverId, relPath) => cloudSavebackSnapshot(serverId, relPath),
+  uploadFile: async (serverId, relPath, localPath) => {
+    const conn = cloudSessions.get(serverId);
+    if (!conn) throw new Error('Not connected to this server.');
+    const dir = String(relPath).split('/').slice(0, -1).join('/');
+    await cloudClient.upload(conn, localPath, dir, undefined, path.basename(relPath));
+  },
+  notify: (ev) => {
+    const name = ev.name || path.basename(ev.relPath || '');
+    if (ev.kind === 'saved-back') appendAppLog('info', '[Cloud] Saved back to the server: ' + name);
+    else if (ev.kind === 'conflict') appendAppLog('warn', '[Cloud] Not overwritten — the server copy of ' + name + ' changed since the download. Your edits are still in the temp copy.');
+    else appendAppLog('error', '[Cloud] Save-back failed for ' + name + ': ' + (ev.error || ''));
+    try { if (typeof mainWindow !== 'undefined' && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('cloud-saveback', ev); } catch (e) {}
+  },
+});
 
 // ---------- TechVision WireGuard VPN ----------
 // Config file: <userData>/.techvision/wireguard.json — { server, client }.
@@ -239,13 +296,10 @@ const APP_ICON = path.join(ASSETS_PATH, 'TechVision_Logo.png');
 let tray = null;
 let isQuitting = false;
 
-// Main window
+// Main window — the only window. The job wizard, restore wizard, log
+// viewer and settings used to be separate BrowserWindows; they are
+// in-place views in index.html now, so no other window exists.
 let mainWindow;
-let restoreWindow;
-let logViewerWindow;
-let jobWizardWindow;
-let settingsWindow;
-let jobDetailsWindow;
 let pendingWizardJob = null;
 let pendingRestoreJob = null;
 
@@ -497,6 +551,21 @@ process.on('unhandledRejection', (reason) => {
     appendAppLog('error', '[Main] Unhandled rejection: ' + (reason && reason.stack ? reason.stack : String(reason)));
   } catch (e) { /* logging must never break the app */ }
 });
+
+// One-line failure reason for a run record. The Logs view only
+// shows run.error under a failed run, and the failure email only
+// prints job.error — but the engine's detailed reasons live in
+// result.error_messages, which neither surface read. The LAST
+// message is the summary line ("N file(s) failed to back up..." /
+// "N file(s) skipped because they were locked..."), which reads
+// best as a single line; the full per-file list stays in the log
+// file. Returns null for a successful run.
+function runErrorLine(result) {
+  if (!result || result.success) return null;
+  const msgs = result.error_messages;
+  if (Array.isArray(msgs) && msgs.length) return String(msgs[msgs.length - 1]);
+  return 'Backup failed — see the log for details.';
+}
 
 function recordRun(jobName, jobRecord) {
   const key = (jobName || 'Unnamed Job').toLowerCase();
@@ -770,68 +839,10 @@ function createMainWindow() {
   });
 }
 
-function createJobWizardWindow() {
-  jobWizardWindow = new BrowserWindow({
-    width: 780,
-    height: 760,
-    minWidth: 700,
-    minHeight: 620,
-    icon: APP_ICON,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  jobWizardWindow.loadFile(path.join(__dirname, 'job-wizard.html'));
-  jobWizardWindow.show();
-
-  jobWizardWindow.on('closed', () => {
-    jobWizardWindow = null;
-  });
-}
-
-function createRestoreWindow() {
-  restoreWindow = new BrowserWindow({
-    width: 780,
-    height: 760,
-    minWidth: 700,
-    minHeight: 620,
-    icon: APP_ICON,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  restoreWindow.loadFile(path.join(__dirname, 'restore-wizard.html'));
-  restoreWindow.show();
-
-  restoreWindow.on('closed', () => {
-    restoreWindow = null;
-  });
-}
-
-function createLogViewerWindow() {
-  logViewerWindow = new BrowserWindow({
-    width: 900,
-    height: 650,
-    icon: APP_ICON,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
-  });
-
-  logViewerWindow.loadFile(path.join(__dirname, 'log-viewer.html'));
-
-  logViewerWindow.on('closed', () => {
-    logViewerWindow = null;
-  });
-}
+/* The job wizard, restore wizard and log viewer used to be separate
+   BrowserWindows (createJobWizardWindow / createRestoreWindow /
+   createLogViewerWindow). They are in-place views in the main window
+   now, so those functions are gone — the main window is the only one. */
 
 
 
@@ -851,6 +862,9 @@ app.whenReady().then(() => {
     if (getCloudConfig().server && getCloudConfig().server.enabled) {
       getCloudServer().start().catch((e) => appendAppLog('error', '[Cloud] Auto-start failed: ' + (e && e.message ? e.message : e)));
     }
+    // Map network drives: reconnect the ones the user asked to keep.
+    // Best-effort and silent — a missing server never blocks startup.
+    reconnectMapDrives().catch(() => {});
     // WireGuard control channel: if the tunnel was left running
     // (server or client), the listener starts again so the other
     // gateway can wake this gateway's NAT. Best-effort — a bind
@@ -1002,7 +1016,8 @@ async function executeScheduledBackup(job, resolved) {
       success: result.success, status: result.success ? 'completed' : 'failed',
       source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination),
       timestamp: new Date().toISOString(), files: result.files_backed_up,
-      size: result.total_bytes, duration: result.duration_seconds, result
+      size: result.total_bytes, duration: result.duration_seconds, result,
+      error: runErrorLine(result)
     };
     recordRun(job.name, jobRecord);
     job.lastScheduledRun = new Date().toISOString();
@@ -1257,7 +1272,8 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     files: result.files_backed_up,
     size: result.total_bytes,
     duration: result.duration_seconds,
-    result: result
+    result: result,
+    error: runErrorLine(result)
   };
 
   recordRun(jobName, jobRecord);
@@ -1339,7 +1355,8 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     files: result.files_backed_up,
     size: result.total_bytes,
     duration: result.duration_seconds,
-    result: result
+    result: result,
+    error: runErrorLine(result)
   };
   
   recordRun(jobName, jobRecord);
@@ -1385,14 +1402,14 @@ ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, pas
 
 // File operations
 // Use the window that actually called the dialog as its parent.
-// Also check for active wizard windows which might be the callers.
+// (The wizard windows used to be callers too; they are in-place views
+// in the main window now, so the caller is always the main window.)
 function dialogParentWindow(event) {
   try {
     const callerWindow = event && event.sender && BrowserWindow.fromWebContents(event.sender);
-    // Return the calling window if found, otherwise try wizard windows, finally mainWindow
-    return callerWindow || jobWizardWindow || restoreWindow || mainWindow;
+    return callerWindow || mainWindow;
   } catch (e) {
-    return jobWizardWindow || mainWindow;
+    return mainWindow;
   }
 }
 
@@ -1488,6 +1505,27 @@ ipcMain.handle('fs-delete', async (event, filePath) => {
 
 ipcMain.handle('fs-exists', async (event, filePath) => {
   return { exists: fs.existsSync(filePath) };
+});
+
+// Drive usage + open a path in Explorer (Dashboard storage card)
+ipcMain.handle('fs-drive-usage', async (event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath) return { success: false, error: 'No path' };
+    var st = fs.statfsSync(targetPath);
+    var total = st.blocks * st.bsize;
+    var free = st.bfree * st.bsize;
+    if (!Number.isFinite(total) || total <= 0) return { success: false, error: 'Unknown drive' };
+    return { success: true, total: total, free: free };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read drive' }; }
+});
+
+ipcMain.handle('fs-open-path', async (event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath) return { success: false, error: 'No path' };
+    var err = await require('electron').shell.openPath(targetPath);
+    if (err) return { success: false, error: err };
+    return { success: true };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open path' }; }
 });
 
 // ZIP operations
@@ -1644,88 +1682,18 @@ ipcMain.handle('job-list-stored', async () => {
   }
 });
 
-// Window management
-ipcMain.handle('window-show-job-wizard', async (event, job) => {
+// Pending job for the in-place wizard / restore views. The renderer
+// hands the job here before opening the view; the wizard scripts read
+// it back with job-get-config (no id) when the view resets. No window
+// is created — the wizard and restore live in the main window now.
+ipcMain.handle('wizard-set-pending', async (event, job) => {
   if (job && typeof job === 'object') pendingWizardJob = job;
-  if (!jobWizardWindow) {
-    createJobWizardWindow();
-  } else {
-    // Reload so the wizard always starts fresh: current saved theme,
-    // empty fields, and freshly wired buttons (a re-shown window kept
-    // the old page, old theme and stale state).
-    jobWizardWindow.loadFile(path.join(__dirname, 'job-wizard.html'));
-    jobWizardWindow.show();
-  }
   return { success: true };
 });
 
-ipcMain.handle('window-show-restore-wizard', async (event, job) => {
+ipcMain.handle('restore-set-pending', async (event, job) => {
   if (job && typeof job === 'object') pendingRestoreJob = job;
-  if (!restoreWindow) {
-    createRestoreWindow();
-  } else {
-    restoreWindow.loadFile(path.join(__dirname, 'restore-wizard.html'));
-    restoreWindow.show();
-  }
   return { success: true };
-});
-
-ipcMain.handle('window-show-log-viewer', async () => {
-  if (!logViewerWindow) {
-    createLogViewerWindow();
-  } else {
-    logViewerWindow.show();
-  }
-  return { success: true };
-});
-
-// Close window handlers
-ipcMain.handle('window-close-job-wizard', async () => {
-  if (jobWizardWindow) {
-    jobWizardWindow.close();
-  }
-  return { success: true };
-});
-
-ipcMain.handle('window-close-restore-wizard', async () => {
-  if (restoreWindow) {
-    restoreWindow.close();
-  }
-  return { success: true };
-});
-
-ipcMain.handle('window-close-log-viewer', async () => {
-  if (logViewerWindow) {
-    logViewerWindow.close();
-  }
-  return { success: true };
-});
-
-// Log retrieval
-ipcMain.handle('log-get-recent', async () => {
-  const logDir = path.join(app.getPath('userData'), '.techvision', 'logs');
-  try {
-    if (!fs.existsSync(logDir)) return [];
-    const files = fs.readdirSync(logDir)
-      .filter(f => f.endsWith('.log'))
-      .map(f => ({ name: f, path: path.join(logDir, f) }));
-    
-    if (files.length === 0) return [];
-    
-    // Get most recent
-    const mostRecent = files.reduce((a, b) => {
-      const aStat = fs.statSync(a.path);
-      const bStat = fs.statSync(b.path);
-      return aStat.mtime > bStat.mtime ? a : b;
-    });
-    
-    // Read content and return as array of lines
-    const content = fs.readFileSync(mostRecent.path, 'utf-8');
-    return content.split(/\r?\n/).filter(l => l.trim());
-  } catch (e) {
-    console.error('[Main] log-get-recent error:', e);
-    return [];
-  }
 });
 
 // Full app log for the Logs view: the central app.log, newest last.
@@ -1831,6 +1799,7 @@ ipcMain.handle('cloud-get-config', async () => {
   const cfg = getCloudConfig();
   const srv = getCloudServer();
   return {
+    openMode: cfg.openMode || 'direct',
     server: {
       enabled: !!cfg.server.enabled,
       port: cfg.server.port || 8443,
@@ -1838,6 +1807,7 @@ ipcMain.handle('cloud-get-config', async () => {
       users: srv.listUsers(),
       fingerprint: cfg.server.cert ? cfg.server.cert.fingerprint : null,
       accessMode: cloudAccessMode(cfg.server.accessMode),
+      ddnsHostname: cfg.server.ddnsHostname || '',
     },
     clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: cloudAccessMode(c.accessMode) })),
   };
@@ -1861,6 +1831,10 @@ ipcMain.handle('cloud-server-save', async (event, opts) => {
   cfg.server.enabled = !!(opts && opts.enabled);
   cfg.server.port = port;
   cfg.server.accessMode = accessMode;
+  // DDNS hostname (round 2 #9): recorded for clients — the server
+  // itself listens on 0.0.0.0 and never consumes it. Also feeds the
+  // certificate SANs (round 2 #12).
+  cfg.server.ddnsHostname = String((opts && opts.ddnsHostname) || '').trim().slice(0, 253);
   saveCloudConfig();
   try {
     if (wasRunning && portChanged) {
@@ -2051,7 +2025,11 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     }
     const conn = await cloudClient.login(opts.host, parseInt(opts.port, 10), opts.certPem, opts.user, password);
     const info = await cloudClient.info(conn);
-    cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite }));
+    // Keep the password that just authenticated in the session
+    // (memory only, never written to disk): the record may not have
+    // one — e.g. after "Forget password" while still connected — and
+    // Office/media opens need a password to seed or they prompt.
+    cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite, password }));
     if (rec && opts.password && String(opts.password)) { rec.password = String(opts.password); saveCloudConfig(); }
     return { success: true, info };
   } catch (e) {
@@ -2065,6 +2043,9 @@ ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
     try { await cloudClient.logout(conn); } catch (e) { /* local drop is enough */ }
   }
   cloudSessions.delete(serverId);
+  // No session, no save-back: a disconnected server's temp copies
+  // stop being watched (their edits stay in the temp copy).
+  try { cloudSaveback.stop(serverId); } catch (e) {}
   return { success: true };
 });
 
@@ -2179,12 +2160,17 @@ ipcMain.handle('cloud-client-upload-files', async (event, serverId, localPaths, 
 
 // Open a server file with the app Windows would use for it: download a
 // copy into the temp folder and hand it to the OS (music plays, pictures
-// open, a game runs). The copy lives in the temp folder, so editing it
-// does NOT write back to the server — that needs the file mounted as a
-// real drive, which is a separate feature.
+// open). The copy is then WATCHED while the app is open: edits save
+// back to the same server path (temp + save-back). Programs (.exe and
+// friends) never come through here — the renderer blocks them, and
+// this guard stops any other caller too: a game is a whole folder of
+// files, and one temp file can never run it.
+const CLOUD_PROGRAM_EXTS = new Set(['exe', 'msi', 'bat', 'cmd', 'com', 'scr']);
 ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
   const conn = cloudSessions.get(serverId);
   if (!conn) return { success: false, error: 'Not connected to this server.' };
+  const openExt = String(path.basename(relPath || '')).split('.').pop().toLowerCase();
+  if (CLOUD_PROGRAM_EXTS.has(openExt)) return { success: false, error: 'program-needs-drive' };
   const tmpRoot = path.join(os.tmpdir(), 'TechVision-Cloud');
   try { fs.mkdirSync(tmpRoot, { recursive: true }); } catch (e) {}
   // Best-effort cleanup of opened copies older than 7 days, so the temp
@@ -2216,8 +2202,302 @@ ipcMain.handle('cloud-client-open', async (event, serverId, relPath) => {
   }
   const err = await require('electron').shell.openPath(dest);
   if (err) return { success: false, error: 'Downloaded to ' + dest + ' but Windows could not open it: ' + err, dest };
-  return { success: true, dest };
+  // Temp + save-back: snapshot the server copy now, then watch the
+  // temp copy. A later edit uploads back silently; a server-side
+  // change since the download blocks the overwrite instead.
+  try {
+    const snap = await cloudSavebackSnapshot(serverId, relPath);
+    if (snap) cloudSaveback.watch(serverId, relPath, dest, snap);
+  } catch (e) {}
+  return { success: true, dest, mode: 'temp' };
 });
+
+// ---------- TechVision Cloud — Map network drive ----------
+ipcMain.handle('cloud-mapdrive-status', async () => {
+  try {
+    const state = getMapdriveState();
+    const cfg = getCloudConfig();
+    const free = await cloudMapDrive.listFreeLetters();
+    const out = [];
+    for (const m of state.mappings) {
+      const rec = cfg.clients.find((c) => c.id === m.serverId);
+      let status = 'not-mapped';
+      let error = null;
+      let remote = null;
+      if (!rec) { status = 'error'; error = 'This server was removed from the Client tab.'; }
+      else if (!rec.password) { status = 'password-needed'; }
+      else {
+        const st = await cloudMapDrive.getDriveStatus(m.letter);
+        if (st.success && st.mapped) {
+          status = (st.remote === cloudMapDrive.davUrl(m.host, m.port)) ? 'mapped' : 'not-mapped';
+          remote = st.remote || null;
+        } else if (!st.success) { status = 'error'; error = st.error; }
+      }
+      out.push({
+        serverId: m.serverId, letter: m.letter, host: m.host, port: m.port, user: m.user,
+        reconnect: !!m.reconnect, status, error, remote,
+        name: rec ? rec.name : m.serverId, hasPassword: !!(rec && rec.password),
+      });
+    }
+    return { success: true, mappings: out, freeLetters: free.success ? free.letters : [] };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) => {
+  try {
+    const cfg = getCloudConfig();
+    const rec = cfg.clients.find((c) => c.id === serverId);
+    if (!rec) return { success: false, error: 'Server not found.' };
+    if (!rec.password) return { success: false, error: 'password-needed' };
+    const l = String(letter || '').toUpperCase();
+    if (!/^[A-Z]$/.test(l)) return { success: false, error: 'Pick a drive letter (A–Z).' };
+    const state = getMapdriveState();
+    // One server per letter, one mapping per server: disconnect the
+    // old letter (or the old mapping on this letter) first.
+    const sameLetter = state.mappings.find((m) => m.letter === l && m.serverId !== serverId);
+    if (sameLetter) {
+      await cloudMapDrive.unmapDrive(l);
+      state.mappings = state.mappings.filter((m) => m.serverId !== sameLetter.serverId);
+    }
+    const sameServer = state.mappings.find((m) => m.serverId === serverId);
+    if (sameServer && sameServer.letter !== l) await cloudMapDrive.unmapDrive(sameServer.letter);
+    // Certificate trust (once per server, admin): the saved record
+    // holds certPem from the probe/trust flow. The fingerprint must
+    // match the saved record before anything is installed — never
+    // install any other certificate.
+    if (rec.certPem) {
+      const fp = cloudServerMod.fingerprintOfCertPem(rec.certPem);
+      if (rec.fingerprint && rec.fingerprint !== fp) {
+        return { success: false, error: 'The saved certificate does not match this server. Remove the server in the Client tab and add it again.' };
+      }
+      const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+      if (!trusted.success) return { success: false, error: trusted.error };
+      if (!trusted.trusted) {
+        const inst = await cloudMapDrive.installCert(rec.certPem);
+        if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
+      }
+    }
+    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+    if (!mapped.success) return { success: false, error: mapped.error };
+    state.mappings = state.mappings.filter((m) => m.serverId !== serverId && m.letter !== l);
+    state.mappings.push({ serverId, letter: l, host: rec.host, port: rec.port, user: rec.user, reconnect: !!reconnect });
+    saveMapdriveState(state);
+    appendAppLog('info', '[Cloud] Mapped ' + rec.host + ':' + rec.port + ' as drive ' + l + ':');
+    return { success: true, letter: l };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-mapdrive-disconnect', async (event, serverId) => {
+  try {
+    const state = getMapdriveState();
+    const m = state.mappings.find((x) => x.serverId === serverId);
+    if (!m) return { success: true, alreadyGone: true };
+    const r = await cloudMapDrive.unmapDrive(m.letter);
+    state.mappings = state.mappings.filter((x) => x.serverId !== serverId);
+    saveMapdriveState(state);
+    if (!r.success) return { success: false, error: r.error };
+    return { success: true, letter: m.letter };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+ipcMain.handle('cloud-mapdrive-open-explorer', async (event, letter) => {
+  try {
+    return await cloudMapDrive.openExplorer(letter);
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open a file straight from the mapped drive: no download, no temp
+// copy. The path is joined onto the letter in cloud-mapdrive.js and
+// proven to stay under the letter root.
+ipcMain.handle('cloud-mapdrive-open-mapped', async (event, serverId, relPath) => {
+  try {
+    const state = getMapdriveState();
+    const m = state.mappings.find((x) => x.serverId === serverId);
+    if (!m) return { success: false, error: 'not-mapped' };
+    const joined = cloudMapDrive.mappedPathFor(m.letter, relPath);
+    if (!joined.success) return { success: false, error: joined.error };
+    const st = await cloudMapDrive.getDriveStatus(m.letter);
+    if (!st.success || !st.mapped) return { success: false, error: 'not-mapped' };
+    if (st.remote && st.remote !== cloudMapDrive.davUrl(m.host, m.port)) return { success: false, error: 'not-mapped' };
+    let exists = false;
+    try { exists = fs.existsSync(joined.path); } catch (e) {}
+    if (!exists) return { success: false, error: 'File not found on the mapped drive.' };
+    const err = await require('electron').shell.openPath(joined.path);
+    if (err) return { success: false, error: 'Windows could not open it: ' + err };
+    return { success: true, path: joined.path };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open mode (browser toolbar): how a double-click opens a file.
+// 'direct' = mapped drive, then Office direct, then temp + save-back;
+// 'temp' = always temp + save-back. Persisted in cloud.json.
+ipcMain.handle('cloud-set-open-mode', async (event, mode) => {
+  try {
+    const m = mode === 'temp' ? 'temp' : 'direct';
+    const cfg = getCloudConfig();
+    cfg.openMode = m;
+    saveCloudConfig();
+    return { success: true, openMode: m };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Open an Office document straight from the server: ms-word:ofe|u|
+// (and friends) hand the WebDAV URL to Word/Excel/PowerPoint, which
+// opens it read-write with no temp copy; saves go back through
+// WebDAV. The server cert must be trusted first — the same one-time
+// install as the Map network tab (admin once); a decline falls
+// through to the temp open (the renderer tries the next method).
+// Returns { success: false } on any failure so the caller can fall
+// through silently — only the temp path shows an error to the user.
+// Round 2 #14: seed the Cloud credentials for an Office/media open
+// so no login prompt appears. The password comes from the live
+// session first (it is the one that just authenticated) and the
+// saved record second — a connected session may have no stored
+// password (e.g. after "Forget password"), and seeding with nothing
+// used to fail silently and leave Office prompting. The result is
+// LOGGED, never swallowed: a silent seed failure used to look
+// exactly like "the prompt is unavoidable". Best-effort: a failure
+// never blocks the open — Office then prompts once and Windows can
+// remember it. Never throws.
+async function seedCloudCredentialsForOpen(serverId, rec) {
+  try {
+    const conn = cloudSessions.get(serverId);
+    const user = (conn && conn.user) || rec.user;
+    const password = (conn && conn.password) || rec.password;
+    if (!user || !password) {
+      console.log(`[Cloud] No saved password for ${rec.host} — Office/media will prompt for the Cloud login once.`);
+      appendAppLog('warn', `[Cloud] Opening a file on ${rec.host} without a saved password — Windows will ask for the Cloud login.`);
+      return { success: false, error: 'No password saved for this server.' };
+    }
+    const r = await cloudMapDrive.seedCredentials(rec.host, rec.port, user, password);
+    if (r.success) console.log(`[Cloud] Credentials seeded for ${rec.host}:${rec.port} (${r.seeded || '?'} targets).`);
+    else {
+      console.log(`[Cloud] Credential seeding failed for ${rec.host}:${rec.port}: ${r.error}`);
+      appendAppLog('warn', `[Cloud] Could not store the login for ${rec.host} in Windows Credential Manager (${r.error || 'unknown error'}) — Office may ask for the Cloud user and password.`);
+    }
+    return r;
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+}
+
+ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
+  try {
+    const conn = cloudSessions.get(serverId);
+    if (!conn) return { success: false, error: 'Not connected to this server.' };
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === serverId);
+    if (!rec) return { success: false, error: 'Server not found.' };
+    const uri = cloudMapDrive.officeUriFor(rec.host, rec.port, relPath);
+    if (!uri) return { success: false, error: 'not-office' };
+    if (rec.certPem) {
+      const fp = cloudServerMod.fingerprintOfCertPem(rec.certPem);
+      if (rec.fingerprint && rec.fingerprint !== fp) {
+        return { success: false, error: 'The saved certificate does not match this server. Remove the server in the Client tab and add it again.' };
+      }
+      const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+      if (!trusted.success) return { success: false, error: trusted.error };
+      if (!trusted.trusted) {
+        const inst = await cloudMapDrive.installCert(rec.certPem);
+        if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
+      }
+    }
+    // Seed the credentials so Office does not prompt for a login
+    // (round 2 #14: generic URL targets + session-password fallback,
+    // result logged — see seedCloudCredentialsForOpen).
+    await seedCloudCredentialsForOpen(serverId, rec);
+    const err = await require('electron').shell.openExternal(uri);
+    if (err) return { success: false, error: String(err) };
+    return { success: true, mode: 'direct' };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Media in direct mode (round 2 #11): same shape as the Office open
+// above — the default player streams the WebDAV URL with Range
+// requests, so a video starts playing without downloading first.
+// Cert trust + credential seeding are identical to Office: the
+// player must trust the server cert, and must not be asked for a
+// login it cannot answer. Returns { success: false } on any failure
+// so the caller falls through to temp silently — only the temp path
+// shows an error. The built URL is returned even on failure (the
+// sandbox has no player, so the Windows-only cert step blocks the
+// open there — the caller/driver can still assert the exact URL).
+ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
+  try {
+    const conn = cloudSessions.get(serverId);
+    if (!conn) return { success: false, error: 'Not connected to this server.' };
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === serverId);
+    if (!rec) return { success: false, error: 'Server not found.' };
+    const url = cloudMapDrive.mediaUrlFor(rec.host, rec.port, relPath);
+    if (!url) return { success: false, error: 'not-media' };
+    if (rec.certPem) {
+      const fp = cloudServerMod.fingerprintOfCertPem(rec.certPem);
+      if (rec.fingerprint && rec.fingerprint !== fp) {
+        return { success: false, url, error: 'The saved certificate does not match this server. Remove the server in the Client tab and add it again.' };
+      }
+      const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+      if (!trusted.success) return { success: false, url, error: trusted.error };
+      if (!trusted.trusted) {
+        const inst = await cloudMapDrive.installCert(rec.certPem);
+        if (!inst.success) return { success: false, url, declined: !!inst.declined, error: inst.error };
+      }
+    }
+    // Seed the credentials so the player does not prompt for a login
+    // (round 2 #14: same generic URL targets as Office — players
+    // fetch over HTTPS the same way; result logged).
+    await seedCloudCredentialsForOpen(serverId, rec);
+    const err = await require('electron').shell.openExternal(url);
+    if (err) return { success: false, url, error: String(err) };
+    return { success: true, mode: 'direct', url };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
+// Reconnect at app start: only mappings the user marked "reconnect",
+// only when the password is saved, the letter is free and the server
+// answers a probe. Never installs a certificate at startup (no
+// surprise UAC prompt when the app opens) — a mapping whose cert is
+// not trusted yet simply waits for the user to map it by hand.
+async function reconnectMapDrives() {
+  try {
+    const state = getMapdriveState();
+    if (!state.mappings.length) return;
+    const cfg = getCloudConfig();
+    for (const m of state.mappings) {
+      if (!m.reconnect) continue;
+      const rec = cfg.clients.find((c) => c.id === m.serverId);
+      if (!rec || !rec.password) continue;
+      const st = await cloudMapDrive.getDriveStatus(m.letter);
+      if (st.success && st.mapped) continue;
+      let probeOk = true;
+      try { await cloudClient.probeServer(String(rec.host), parseInt(rec.port, 10)); }
+      catch (e) { probeOk = false; }
+      if (!probeOk) { appendAppLog('info', '[Cloud] Map drive ' + m.letter + ': server did not answer, skipping reconnect.'); continue; }
+      if (rec.certPem) {
+        const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+        if (trusted.success && !trusted.trusted) { appendAppLog('info', '[Cloud] Map drive ' + m.letter + ': certificate is not trusted yet, skipping reconnect.'); continue; }
+      }
+      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+      appendAppLog(r.success ? 'info' : 'error', '[Cloud] Map drive ' + m.letter + ': reconnect ' + (r.success ? 'ok' : ('failed — ' + (r.error || ''))));
+    }
+  } catch (e) {}
+}
 
 // ---------- TechVision Tailscale VPN (Tailscale client manager) ----------
 // The module only shells out to the Tailscale CLI that is already
@@ -2986,35 +3266,8 @@ ipcMain.handle('vault-store-job-password', async (event, jobId, jobPassword) => 
   } catch (e) { return { success: false, error: e.message }; }
 });
 
-// Settings window
-ipcMain.handle('window-show-settings', async () => {
-  if (!settingsWindow) {
-    settingsWindow = new BrowserWindow({
-      width: 400,
-      height: 500,
-      icon: APP_ICON,
-      webPreferences: {
-        preload: path.join(__dirname, 'preload.js'),
-        contextIsolation: true,
-        nodeIntegration: false
-      }
-    });
-    settingsWindow.loadFile(path.join(__dirname, 'settings.html'));
-    settingsWindow.on('closed', () => {
-      settingsWindow = null;
-    });
-  } else {
-    settingsWindow.show();
-  }
-  return { success: true };
-});
-
-ipcMain.handle('window-close-settings', async () => {
-  if (settingsWindow) {
-    settingsWindow.close();
-  }
-  return { success: true };
-});
+// Settings is a full page in the main window now (view-settings) —
+// the old separate settings window is gone.
 
 // Job detail actions
 ipcMain.handle('job-open-edit', async (event, jobId) => {
@@ -3107,7 +3360,8 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     files: result.files_backed_up,
     size: result.total_bytes,
     duration: result.duration_seconds,
-    result: result
+    result: result,
+    error: runErrorLine(result)
   };
   recordRun(jobName, jobRecord);
   saveJobHistory();
@@ -3148,28 +3402,75 @@ ipcMain.handle('job-restore', async (event, jobId) => {
 });
 
 ipcMain.handle('job-delete', async (event, jobId) => {
-  // Templates are saved by NAME (<name>.json) but their in-memory id is
-  // generated, so deleting by id alone never removed the file. Try id,
-  // then name, then a config file named after the id.
+  // Round 2 #13: the template file is NOT always named after the
+  // job's id or name. job-save-config names it <fileId>.json where
+  // fileId is the id the wizard generated — but a job folded from
+  // legacy run records (no jobId) carries the RUN's id, so neither
+  // `<id>.json` nor `<name>.json` matches and the template survived
+  // the delete, came back on the next start as a PENDING template,
+  // and the scheduler fired it for the missed daily slot. Scan the
+  // jobs dir and delete every template whose content matches this
+  // job by id or by name — except one that belongs to a different
+  // job still listed (same-name jobs stay separate tasks).
+  const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
+  function deleteTemplateFiles(id, name, source, destination) {
+    const removed = [];
+    try {
+      if (!fs.existsSync(jobsDir)) return removed;
+      // Ids of jobs other than the one being deleted: a template
+      // whose content id is one of these belongs to that other job
+      // and must survive even if the name matches.
+      const otherIds = new Set(jobHistory.filter(j => j.id !== id).map(j => j.id).filter(Boolean));
+      for (const file of fs.readdirSync(jobsDir)) {
+        if (!file.endsWith('.json') || file === 'history.json') continue;
+        const p = path.join(jobsDir, file);
+        let match = (file === `${id}.json` || file === `${name}.json`);
+        if (!match) {
+          try {
+            const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
+            const cid = content && content.id;
+            const cname = content && content.name;
+            if (cid && cid === id) match = true;
+            else if (cname && cname === name) {
+              // Same name, but the file may belong to a different job
+              // that happens to share the name — keep it, unless it
+              // is the same job by paths (a stale second template
+              // file for this job: an old <name>.json plus the
+              // current <id>.json both survive a delete otherwise).
+              const samePaths = source && destination && content.source && content.destination
+                && jobPathValue(content.source) === jobPathValue(source)
+                && jobPathValue(content.destination) === jobPathValue(destination);
+              if (!(cid && otherIds.has(cid)) || samePaths) match = true;
+            }
+          } catch (e) { /* unparseable file: only the filename guesses above apply */ }
+        }
+        if (match) {
+          try { fs.unlinkSync(p); removed.push(file); console.log(`[Main] Deleted job template file: ${p}`); } catch (e) { console.error('[Main] Failed to delete job template file:', e.message); }
+        }
+      }
+    } catch (e) { console.error('[Main] Failed to scan jobs dir for templates:', e.message); }
+    return removed;
+  }
   let idx = jobHistory.findIndex(j => j.id === jobId);
   if (idx < 0) idx = jobHistory.findIndex(j => j.name === jobId);
   if (idx >= 0) {
     const job = jobHistory[idx];
-    for (const fileName of [`${jobId}.json`, `${job.name}.json`]) {
-      try {
-        const jobPath = path.join(app.getPath('userData'), '.techvision', 'jobs', fileName);
-        if (fs.existsSync(jobPath)) { fs.unlinkSync(jobPath); console.log(`[Main] Deleted job config file: ${jobPath}`); }
-      } catch (e) { console.error(`[Main] Failed to delete job config file:`, e.message); }
-    }
+    deleteTemplateFiles(job.id, job.name, job.source, job.destination);
     jobHistory.splice(idx, 1);
     saveJobHistory();
     notifyJobsUpdated();
     return { success: true };
   }
-  const orphanPath = path.join(app.getPath('userData'), '.techvision', 'jobs', `${jobId}.json`);
+  // Orphan: no job in memory matches, but a template file may still
+  // exist on disk. Delete it (by content match) and persist the
+  // history — before this the handler returned success without ever
+  // saving, so any run records on disk came back on the next start.
+  const orphanPath = path.join(jobsDir, `${jobId}.json`);
+  const removed = deleteTemplateFiles(jobId, jobId);
   try {
-    if (jobId && fs.existsSync(orphanPath)) { fs.unlinkSync(orphanPath); return { success: true }; }
+    if (jobId && fs.existsSync(orphanPath) && !removed.includes(`${jobId}.json`)) { fs.unlinkSync(orphanPath); removed.push(`${jobId}.json`); }
   } catch (e) { /* fall through to not found */ }
+  if (removed.length) { saveJobHistory(); notifyJobsUpdated(); return { success: true }; }
   return { success: false, error: 'Job not found' };
 });
 

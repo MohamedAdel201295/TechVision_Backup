@@ -17,6 +17,7 @@ try {
   zipEncryptedAvailable = true;
 } catch (e) { /* encryption unavailable until npm install */ }
 const { EventEmitter } = require('events');
+const { Transform } = require('stream');
 
 /**
  * Job Configuration Class
@@ -399,6 +400,10 @@ class BackupEngine {
    * the user wants the backup to be the same files, not a ZIP.
    * Streamed (not copyFileSync) so a single huge file reports progress
    * per chunk through onProgress(chunkBytes) instead of jumping 0→100.
+   * Resolves { dest, hash, size }: the SHA-256 is computed from the
+   * very bytes that were written, so the state file and the integrity
+   * manifest record what is actually in the backup — a file edited
+   * mid-copy no longer leaves a stale pre-read hash behind.
    */
   _copyPlainFile(file, sourceDir, destRoot, onProgress) {
     const relativePath = path.relative(sourceDir, file).replace(/\\/g, '/');
@@ -407,6 +412,8 @@ class BackupEngine {
     return new Promise((resolve, reject) => {
       const rs = fs.createReadStream(file);
       const ws = fs.createWriteStream(dest);
+      const hash = crypto.createHash('sha256');
+      let bytesCopied = 0;
       let failed = false;
       const fail = (err) => {
         if (failed) return;
@@ -419,11 +426,13 @@ class BackupEngine {
         reject(err);
       };
       rs.on('data', chunk => {
+        hash.update(chunk);
+        bytesCopied += chunk.length;
         if (typeof onProgress === 'function') { try { onProgress(chunk.length); } catch (e) {} }
       });
       rs.on('error', fail);
       ws.on('error', fail);
-      ws.on('finish', () => resolve(dest));
+      ws.on('finish', () => resolve({ dest: dest, hash: hash.digest('hex'), size: bytesCopied }));
       rs.pipe(ws);
     });
   }
@@ -661,33 +670,79 @@ class BackupEngine {
             continue;
           }
 
-          // Hash the file BEFORE it is archived: the state must record
-          // the bytes that went into the ZIP. The old code re-hashed
-          // everything AFTER the run, so a file that changed mid-run
-          // got the NEW hash in the state while the ZIP held the OLD
-          // bytes — and the next incremental never repaired it.
-          const fileInfo = await this.getFileInfo(file);
+          // The state must record the hash of the bytes that actually
+          // went into the backup — not a separate pre-read. A file
+          // edited mid-run used to get the pre-read hash in the state
+          // while the archive held different bytes (and the next
+          // incremental then trusted the wrong hash). So the hash is
+          // computed from the same stream that feeds the archive /
+          // the plain copy: for a plain copy it is final as soon as
+          // the copy finishes; for a ZIP it resolves when the stream
+          // has been fully consumed (after finalize, below).
+          const fileInfo = { path: file, size: stats.size, mtime: stats.mtimeMs, hash: null };
+          const hashState = { hash: null };
 
           // File is readable: copy it as-is, or add it to the ZIP
           if (plainCopy) {
-            await this._copyPlainFile(file, sourceBase, copyDir, (n) => {
+            const copied = await this._copyPlainFile(file, sourceBase, copyDir, (n) => {
               bytesDone += n;
               fileCounted += n;
               emitLive(relativePath);
             });
+            // The plain copy finished here: its hash IS the hash of
+            // the backed-up bytes.
+            fileInfo.hash = copied.hash;
+            fileInfo.size = copied.size;
           } else {
             // Counted read stream: archiver reads the file through it
-            // while compressing, so 'data' events ARE the real work.
+            // while compressing, so the bytes that flow ARE the real
+            // work. The stream passes through a hashing Transform so
+            // the hash is of the exact bytes archiver received
+            // (pipe() applies backpressure, so a huge file cannot
+            // grow the buffer unboundedly).
+            const hash = crypto.createHash('sha256');
+            const tee = new Transform({
+              transform(chunk, encoding, callback) {
+                hash.update(chunk);
+                bytesDone += chunk.length;
+                fileCounted += chunk.length;
+                emitLive(relativePath);
+                callback(null, chunk);
+              },
+              flush(callback) { hashState.hash = hash.digest('hex'); callback(); }
+            });
             const rs = fs.createReadStream(file);
-            rs.on('data', chunk => { bytesDone += chunk.length; fileCounted += chunk.length; emitLive(relativePath); });
+            // Gate: wait until the stream has its first chunk (or EOF)
+            // BEFORE handing it to archiver. A file that fails to open
+            // or read at all (deleted mid-run, transient error) is then
+            // caught by the per-file catch below and counted as one
+            // failed file — instead of stalling archiver's queue and
+            // failing the whole run. The gate's error listener must
+            // CAPTURE the error into gateError (not just reject the
+            // gate promise): the stream fills its buffer synchronously
+            // after the first chunk, so an error can fire before the
+            // await continuation runs — a bare once('error', reject)
+            // would swallow it and the run would hang in finalize on
+            // the stalled stream.
+            let gateError = null;
+            const onGateError = (err) => { if (!gateError) gateError = err; };
+            rs.on('error', onGateError);
+            await new Promise((resolve) => {
+              rs.once('readable', resolve);
+              rs.once('error', resolve);
+              rs.once('end', resolve);
+            });
+            rs.removeListener('error', onGateError);
+            if (gateError) throw gateError;
             // A stream error needs its own listener (otherwise it is
             // an uncaught exception) and it must fail the run: see
             // onStreamError — archiver alone never reports it.
             rs.on('error', onStreamError);
-            rs.pause();
-            archive.append(rs, { name: relativePath, stats });
+            tee.on('error', onStreamError);
+            rs.pipe(tee);
+            archive.append(tee, { name: relativePath, stats });
           }
-          backedUpInfo.set(relativePath, fileInfo);
+          backedUpInfo.set(relativePath, { info: fileInfo, hashState: hashState });
           result.files_backed_up++;
           result.total_bytes += fileSize;
           this.log('info', `Backed up: ${relativePath}`);
@@ -737,18 +792,44 @@ class BackupEngine {
       const backupState = new BackupState(stateFile);
       backupState.state = {};
       backupState.setBaseDir(sourceBase);
-      for (const [relativePath, info] of backedUpInfo) {
-        backupState.state[relativePath] = info;
+      for (const [relativePath, entry] of backedUpInfo) {
+        // The ZIP-path hash resolves only once the stream was fully
+        // consumed (after finalize, which already happened above);
+        // the plain-copy hash was final at copy time. Either way the
+        // state now records the hash of the bytes that actually went
+        // into the backup. If a hash somehow never resolved (a stream
+        // that never flushed), fall back to one fresh read rather
+        // than recording a null hash the next incremental would
+        // misread as "unchanged".
+        if (entry.hashState.hash) entry.info.hash = entry.hashState.hash;
+        else entry.info.hash = await this.calculateHash(entry.info.path);
+        backupState.state[relativePath] = entry.info;
       }
       backupState.save();
 
+      // A plain-folder backup gets a SHA-256 manifest of the bytes
+      // that were actually written, so a restore can verify each
+      // file instead of trusting the copy. Written after the copy
+      // loop, so it describes the finished backup — never a
+      // half-written one. (ZIP backups need none: every entry
+      // already carries its own CRC32, checked at restore time.)
+      if (plainCopy) {
+        const manifest = { version: 1, files: {} };
+        for (const [relativePath, entry] of backedUpInfo) {
+          manifest.files[relativePath] = { sha256: entry.info.hash, size: entry.info.size };
+        }
+        fs.writeFileSync(path.join(copyDir, '.techvision-manifest.json'), JSON.stringify(manifest, null, 2));
+      }
+
       // A full backup that archived 0 files (empty source, everything
       // excluded, or all files locked) must not be reported COMPLETED —
-      // and neither must a run where any file failed: 99 of 100 files
-      // is a partial backup, not a completed one.
-      result.success = result.files_backed_up > 0 && result.files_failed === 0;
+      // and neither must a run where any file failed OR any file was
+      // skipped because it was locked: 99 of 100 files is a partial
+      // backup, not a completed one.
+      result.success = result.files_backed_up > 0 && result.files_failed === 0 && result.locked_files_skipped === 0;
       if (result.files_backed_up === 0) result.error_messages.push('No files were backed up (source empty, everything excluded, or all files locked).');
       if (result.files_failed > 0) result.error_messages.push(`${result.files_failed} file(s) failed to back up — see the log for details.`);
+      if (result.locked_files_skipped > 0) result.error_messages.push(`${result.locked_files_skipped} file(s) skipped because they were locked — the backup is incomplete, see the log for details.`);
       const duration = (Date.now() - startTime) / 1000;
       result.duration_seconds = duration;
       const mbSize = (result.total_bytes / 1024 / 1024).toFixed(2);
@@ -902,6 +983,10 @@ class BackupEngine {
       // Collect current files
       const currentFiles = this._collectFiles(sourceDir, excludePathsInc);
       let filesNeedingBackup = 0;
+      // Files actually backed up in THIS run (relative path -> { info, hashState }):
+      // the state and the integrity manifest are built from this after
+      // finalize, once every stream hash has resolved.
+      const incBackedUp = new Map();
       for (const f of currentFiles) { try { totalBytes += fs.statSync(f).size; } catch (e) {} }
       const emitLive = (name) => {
         this._emitProgress(99 * bytesDone / (totalBytes || 1), plainCopyInc ? 'copying' : 'writing', name, filesSeen, currentFiles.length, bytesDone, totalBytes);
@@ -977,38 +1062,67 @@ class BackupEngine {
               // No state update: the next run retries it.
               continue;
             }
+            // The state must record the hash of the bytes that
+            // actually went into this backup (same rule as full
+            // backups): the plain-copy hash is final when the copy
+            // finishes; the ZIP hash resolves after finalize.
+            const incHashState = { hash: null };
             if (plainCopyInc) {
-              await this._copyPlainFile(file, sourceBaseInc, copyDirInc, (n) => {
+              const copied = await this._copyPlainFile(file, sourceBaseInc, copyDirInc, (n) => {
                 bytesDone += n;
                 fileCounted += n;
                 emitLive(relativePath);
               });
+              currentInfo = { path: file, size: copied.size, mtime: stats.mtimeMs, hash: copied.hash };
               result.files_backed_up++;
               result.total_bytes += fileSize;
               filesNeedingBackup++;
               this.log('info', `Incremental update: ${relativePath}`);
               filesSeen++;
             } else {
+              const hash = crypto.createHash('sha256');
+              const tee = new Transform({
+                transform(chunk, encoding, callback) {
+                  hash.update(chunk);
+                  bytesDone += chunk.length;
+                  fileCounted += chunk.length;
+                  emitLive(relativePath);
+                  callback(null, chunk);
+                },
+                flush(callback) { incHashState.hash = hash.digest('hex'); callback(); }
+              });
               const rs = fs.createReadStream(file);
-              rs.on('data', chunk => { bytesDone += chunk.length; fileCounted += chunk.length; emitLive(relativePath); });
+              // Same gate as full backups: a file that fails to open
+              // or read at all is one failed file, not a failed run
+              // (the error is captured, never swallowed — see the
+              // full-backup gate comment).
+              let gateError = null;
+              const onGateError = (err) => { if (!gateError) gateError = err; };
+              rs.on('error', onGateError);
+              await new Promise((resolve) => {
+                rs.once('readable', resolve);
+                rs.once('error', resolve);
+                rs.once('end', resolve);
+              });
+              rs.removeListener('error', onGateError);
+              if (gateError) throw gateError;
               // See the full-backup loop: the stream error must fail
               // the run through onStreamError, archiver never does.
               rs.on('error', onStreamError);
-              rs.pause();
-              archive.append(rs, { name: relativePath, stats });
+              tee.on('error', onStreamError);
+              rs.pipe(tee);
+              archive.append(tee, { name: relativePath, stats });
+              currentInfo = { path: file, size: stats.size, mtime: stats.mtimeMs, hash: null };
               result.files_backed_up++;
               result.total_bytes += fileSize;
               filesNeedingBackup++;
               this.log('info', `Incremental update: ${relativePath}`);
               filesSeen++;
             }
-            // Hash for the state AFTER the backup (or reuse the hash
-            // from the unchanged check): the state must describe the
-            // bytes that actually went into this backup.
-            if (!currentInfo) {
-              try { currentInfo = await this.getFileInfo(file); } catch (e) { currentInfo = null; }
+            if (currentInfo) {
+              backupState.set(file, currentInfo);
+              incBackedUp.set(relativePath, { info: currentInfo, hashState: incHashState });
             }
-            if (currentInfo) backupState.set(file, currentInfo);
           } else {
             result.files_skipped++;
             this.log('debug', `Skipped (unchanged): ${relativePath}`);
@@ -1044,6 +1158,24 @@ class BackupEngine {
       result.backup_format = plainCopyInc ? 'folder' : (this.jobConfig.encryptionEnabled ? 'zip-encrypted' : 'zip');
       result.encrypted = this.jobConfig.encryptionEnabled;
 
+      // Resolve the streamed hashes now that every stream has been
+      // fully consumed (after finalize). A hash that never resolved
+      // falls back to one fresh read, never a null. The state entries
+      // were stored by reference, so mutating the info objects here
+      // updates what gets saved.
+      for (const [relativePath, entry] of incBackedUp) {
+        if (entry.hashState.hash) entry.info.hash = entry.hashState.hash;
+        else entry.info.hash = await this.calculateHash(entry.info.path);
+      }
+      // A plain-folder incremental gets the same SHA-256 manifest as
+      // a full one, covering just this run's files.
+      if (plainCopyInc) {
+        const manifest = { version: 1, files: {} };
+        for (const [relativePath, entry] of incBackedUp) {
+          manifest.files[relativePath] = { sha256: entry.info.hash, size: entry.info.size };
+        }
+        fs.writeFileSync(path.join(copyDirInc, '.techvision-manifest.json'), JSON.stringify(manifest, null, 2));
+      }
       // Prune the state: files deleted from the source drop out, so
       // the state file stops growing forever and cannot resurrect
       // deleted files into the next incremental's decisions.
@@ -1054,12 +1186,12 @@ class BackupEngine {
       // Save updated state
       backupState.save();
 
-      // An incremental that failed on any file must not report
-      // success — the old code returned success:true unconditionally,
-      // even with every file failed and an empty ZIP. Zero changed
+      // An incremental that failed on any file — or skipped any file
+      // because it was locked — must not report success. Zero changed
       // files is still a success (nothing to do).
-      result.success = result.files_failed === 0;
+      result.success = result.files_failed === 0 && result.locked_files_skipped === 0;
       if (result.files_failed > 0) result.error_messages.push(`${result.files_failed} file(s) failed to back up — see the log for details.`);
+      if (result.locked_files_skipped > 0) result.error_messages.push(`${result.locked_files_skipped} file(s) skipped because they were locked — the backup is incomplete, see the log for details.`);
       const duration = (Date.now() - startTime) / 1000;
       result.duration_seconds = duration;
       const mbSize = (result.total_bytes / 1024 / 1024).toFixed(2);

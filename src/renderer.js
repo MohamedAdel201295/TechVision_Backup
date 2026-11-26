@@ -84,6 +84,12 @@
   var currentLogTab = 'today';
   var logsTimer = null;
   var fullLogLines = [];
+  // Signatures of what the Logs view currently shows. The 10s
+  // auto-refresh re-renders the same data most of the time — when the
+  // signature matches, the DOM is left completely alone so the view
+  // never flashes. (Same pattern as the Cloud file-list poller.)
+  var lastLogsSig = '';
+  var lastFullLogSig = '';
 
   /* ---------- toasts (never alert()) ---------- */
   function toast(title, message, kind) {
@@ -164,10 +170,16 @@
 
   /* ---------- Yes/No confirm dialog ---------- */
   var confirmCallback = null;
-  function askConfirm(message, onYes) {
+  // opts: { title, yesLabel, noLabel } — the labels are restored to
+  // the delete-all defaults when the dialog closes, so callers that
+  // do not pass opts are unaffected.
+  function askConfirm(message, onYes, opts) {
     var modal = $('confirmModal'); var back = $('confirmBackdrop');
     if (!modal) { if (window.confirm(message)) onYes(); return; }
     $('confirmText').textContent = message;
+    if (opts && opts.title) $('confirmTitle').textContent = opts.title;
+    if (opts && opts.yesLabel) $('confirmYes').textContent = opts.yesLabel;
+    if (opts && opts.noLabel) $('confirmNo').textContent = opts.noLabel;
     confirmCallback = onYes;
     modal.style.display = 'block';
     if (back) back.classList.add('show');
@@ -176,29 +188,196 @@
     var modal = $('confirmModal'); var back = $('confirmBackdrop');
     if (modal) modal.style.display = 'none';
     if (back) back.classList.remove('show');
+    $('confirmTitle').textContent = 'Are you sure?';
+    $('confirmYes').textContent = 'Yes, delete all';
+    $('confirmNo').textContent = 'No, keep it';
     confirmCallback = null;
   }
 
-  /* ---------- stats from REAL history ---------- */
-  function renderStats() {
-    var runs = jobs.filter(function (j) { return j.type !== 'TEMPLATE'; });
-    var completed = runs.filter(function (j) { return j.status === 'COMPLETED'; });
-    var totalBytes = completed.reduce(function (sum, j) { return sum + j.size; }, 0);
+  /* ---------- dashboard 01: stats, status, recent, storage ---------- */
+  /* Time + day split out of formatDashboardTime: the LAST BACKUP stat
+     card is narrow, and "Today, 10:44 AM" clipped even at 17px. The
+     card shows just the time, and the day + type move to the sub
+     line — short, always fully visible. */
+  function formatTimeOnly(v) {
+    if (!v) return '—';
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d.getTime())) return safeStr(v);
+    var h = d.getHours(); var ampm = h >= 12 ? 'PM' : 'AM'; var h12 = h % 12; if (h12 === 0) h12 = 12;
+    return h12 + ':' + String(d.getMinutes()).padStart(2, '0') + ' ' + ampm;
+  }
+  function formatDayWord(v) {
+    if (!v) return '';
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d.getTime())) return '';
+    var now = new Date();
+    var sameDay = function (a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); };
+    var y = new Date(now); y.setDate(y.getDate() - 1);
+    if (sameDay(d, now)) return 'Today';
+    if (sameDay(d, y)) return 'Yesterday';
+    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+  }
+  function formatDashboardTime(v) {
+    if (!v) return '—';
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d.getTime())) return safeStr(v);
+    return formatDayWord(v) + ', ' + formatTimeOnly(v);
+  }
+  function formatHMS(sec) {
+    var n = Math.max(0, Math.round(safeNum(sec, 0)));
+    var h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60), s = n % 60;
+    var p = function (x) { return String(x).padStart(2, '0'); };
+    return p(h) + ':' + p(m) + ':' + p(s);
+  }
+  function lastCompletedRun(list) {
     var last = null;
-    completed.forEach(function (j) {
+    list.forEach(function (j) {
+      if (j.status !== 'COMPLETED') return;
       var d = j.timestamp ? new Date(j.timestamp) : null;
-      if (d && !isNaN(d.getTime()) && (!last || d > last)) last = d;
+      if (d && !isNaN(d.getTime()) && (!last || d > new Date(last.timestamp))) last = j;
     });
-    $('statTotal').textContent = String(completed.length);
-    $('statTotalSub').textContent = completed.length ? completed.length + ' completed backup' + (completed.length === 1 ? '' : 's') : 'No backups yet';
-    var mb = totalBytes / (1024 * 1024);
-    $('statData').innerHTML = escapeHtml(mb >= 100 ? String(Math.round(mb)) : mb.toFixed(1)) + ' <small>MB</small>';
-    $('statDataSub').textContent = formatBytes(totalBytes) + ' across all backups';
-    $('statLast').textContent = last ? formatDate(last) : '—';
-    $('statLastSub').textContent = last ? 'Most recent completed backup' : 'Never';
-    var rate = runs.length ? Math.round((completed.length / runs.length) * 100) : null;
-    $('statSuccess').textContent = rate === null ? '—' : rate + '%';
-    $('statSuccessSub').textContent = rate === null ? 'No runs yet' : completed.length + ' of ' + runs.length + ' runs completed';
+    return last;
+  }
+  function renderStats() {
+    var list = jobs.filter(function (j) { return j.type !== 'TEMPLATE'; });
+    var seven = new Date(); seven.setDate(seven.getDate() - 7);
+    var recent = list.filter(function (j) { var d = j.timestamp ? new Date(j.timestamp) : null; return d && !isNaN(d.getTime()) && d >= seven; });
+    var ok = recent.filter(function (j) { return j.status === 'COMPLETED'; });
+    var bad = recent.filter(function (j) { return j.status === 'FAILED'; });
+    var active = list.filter(function (j) { var s = j.schedule || (j.raw && j.raw.schedule); return s && s.enabled; }).length;
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    set('dashTotalJobs', String(list.length));
+    set('dashTotalJobsSub', active ? active + ' Active' : (list.length ? 'No schedules' : 'No jobs yet'));
+    set('dashSuccessJobs', String(ok.length));
+    set('dashFailedJobs', String(bad.length));
+    var last = lastCompletedRun(list);
+    set('dashLastBackup', last ? formatTimeOnly(last.timestamp) : '—');
+    set('dashLastBackupSub', last ? formatDayWord(last.timestamp) + ' · ' + (last.type === 'INCREMENTAL' ? 'Incremental' : 'Full') : 'No backups yet');
+    renderDashboardStatus(list, bad, last);
+    renderDashboardRecent(list);
+  }
+  function renderDashboardStatus(list, bad, last) {
+    var banner = $('dashBanner'); if (!banner) return;
+    var title = $('dashBannerTitle'), sub = $('dashBannerSub'), ico = $('dashBannerIco');
+    banner.classList.remove('warn', 'idle');
+    if (!list.length) {
+      banner.classList.add('idle');
+      if (ico) ico.textContent = 'ⓘ';
+      if (title) title.textContent = 'No backups yet';
+      if (sub) sub.textContent = 'Create your first backup job to protect your files.';
+    } else if (bad.length) {
+      banner.classList.add('warn');
+      if (ico) ico.textContent = '!';
+      if (title) title.textContent = 'Attention needed';
+      if (sub) sub.textContent = bad.length + (bad.length === 1 ? ' job failed' : ' jobs failed') + ' in the last 7 days — check the Jobs page.';
+    } else {
+      if (ico) ico.textContent = '✓';
+      if (title) title.textContent = 'System Protected';
+      if (sub) sub.textContent = 'All scheduled backups are running normally.';
+    }
+    var best = null, bestDate = null;
+    list.forEach(function (j) {
+      var d = nextRunDate(j);
+      if (d && (!bestDate || d < bestDate)) { bestDate = d; best = j; }
+    });
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    set('dashNextRun', bestDate ? formatDashboardTime(bestDate) : '—');
+    set('dashNextRunSub', best ? best.name + ' – ' + (best.type === 'INCREMENTAL' ? 'Incremental' : 'Full') : 'No scheduled jobs');
+    set('dashLastSize', last ? formatBytes(last.size) : '—');
+    set('dashLastDuration', last ? formatHMS(last.duration) : '—');
+  }
+  function renderDashboardRecent(list) {
+    var body = $('dashRecentBody'); if (!body) return;
+    var sorted = list.slice().sort(function (a, b) { return new Date(b.timestamp || 0) - new Date(a.timestamp || 0); }).slice(0, 5);
+    var empty = $('dashRecentEmpty');
+    if (empty) empty.style.display = sorted.length ? 'none' : 'block';
+    body.innerHTML = '';
+    sorted.forEach(function (job) {
+      var tr = document.createElement('tr');
+      var typePill = '<span class="pill ' + (job.type === 'INCREMENTAL' ? 'pill-incremental' : 'pill-full') + '">' + (job.type === 'INCREMENTAL' ? 'Incremental' : 'Full') + '</span>';
+      var statusPill = '<span class="pill ' + pillClass(job.status, job.type) + '">' + escapeHtml(job.status) + '</span>';
+      tr.innerHTML = '<td class="job-name-cell"></td><td>' + typePill + '</td><td>' + statusPill + '</td><td></td><td></td><td></td>';
+      tr.querySelector('.job-name-cell').textContent = job.name;
+      var tds = tr.querySelectorAll('td');
+      tds[3].textContent = formatBytes(job.size);
+      tds[4].textContent = formatHMS(job.duration);
+      tds[5].textContent = formatDashboardTime(job.timestamp);
+      tr.dataset.dest = job.destination || '';
+      tr.addEventListener('click', function () { openDrawer(job); });
+      body.appendChild(tr);
+    });
+  }
+  /* Storage donut: usage of the drive holding the latest backup's
+     destination. Re-reads only when the destination changes, or when
+     Check Storage is pressed (force). A failed read shows "—", never
+     a fake number. A request token keeps a slow hover read from
+     overwriting a newer revert (round 2 #6). */
+  var storageDest = '';
+  var storageReq = 0;
+  async function renderStorageFor(dest, req) {
+    var pctEl = $('dashStoragePct'); if (!pctEl) return;
+    var arc = $('dashDonutArc');
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    if (!dest) {
+      if (req !== storageReq) return;
+      set('dashStoragePct', '—');
+      set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
+      set('dashStorageDrive', 'No backups yet — run a job to see storage.');
+      if (arc) arc.setAttribute('stroke-dasharray', '0 339.292');
+      return;
+    }
+    set('dashStorageDrive', dest);
+    if (!api || typeof api.getDriveUsage !== 'function') return;
+    try {
+      var r = await api.getDriveUsage(dest);
+      if (req !== storageReq) return;
+      if (!r || !r.success) {
+        set('dashStoragePct', '—');
+        set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
+        set('dashStorageDrive', dest + ' — could not read drive usage.');
+        if (arc) arc.setAttribute('stroke-dasharray', '0 339.292');
+        return;
+      }
+      var total = r.total, free = r.free, used = Math.max(0, total - free);
+      var pct = total > 0 ? Math.round((used / total) * 100) : 0;
+      var C = 339.292;
+      if (arc) arc.setAttribute('stroke-dasharray', (pct / 100 * C).toFixed(1) + ' ' + C);
+      set('dashStoragePct', pct + '%');
+      set('dashUsed', formatBytes(used));
+      set('dashFree', formatBytes(free));
+      set('dashTotal', formatBytes(total));
+    } catch (e) {
+      if (req !== storageReq) return;
+      set('dashStoragePct', '—');
+    }
+  }
+  async function refreshStorageCard(force) {
+    var pctEl = $('dashStoragePct'); if (!pctEl) return;
+    var last = lastCompletedRun(jobs.filter(function (j) { return j.type !== 'TEMPLATE'; }));
+    var dest = last ? (last.destination || '') : '';
+    if (!force && dest === storageDest) return;
+    storageDest = dest;
+    var req = ++storageReq;
+    await renderStorageFor(dest, req);
+  }
+  /* Hover preview (round 2 #6): hovering a row in Recent Backup Jobs
+     shows THAT job's backup storage in the card at once — its
+     destination, donut %, Used/Free/Total. Leaving the list reverts
+     to the latest backup's destination. The hover never touches
+     storageDest (the default's cache), so the revert is a plain
+     forced refresh. */
+  var storageHoverDest = null;
+  async function showStorageHover(dest) {
+    if (dest === storageHoverDest) return;
+    storageHoverDest = dest;
+    var req = ++storageReq;
+    await renderStorageFor(dest, req);
+  }
+  function clearStorageHover() {
+    if (storageHoverDest === null) return;
+    storageHoverDest = null;
+    refreshStorageCard(true);
   }
 
   /* ---------- history list ---------- */
@@ -209,83 +388,25 @@
     if (status === 'TEMPLATE' || type === 'TEMPLATE') return 'pill-template';
     return 'pill-pending';
   }
-  function renderJobs() {
-    var list = $('jobList');
-    if (!list) return;
-    var q = ($('searchInput') ? $('searchInput').value : '').trim().toLowerCase();
-    var sf = $('statusFilter') ? $('statusFilter').value : 'all';
-    var tf = $('typeFilter') ? $('typeFilter').value : 'all';
-    var visible = jobs.filter(function (j) {
-      if (q && j.name.toLowerCase().indexOf(q) === -1 && (j.source || '').toLowerCase().indexOf(q) === -1) return false;
-      if (sf !== 'all' && j.status !== sf) return false;
-      if (tf !== 'all' && j.type !== tf) return false;
-      return true;
-    });
-    list.innerHTML = '';
-    $('emptyState').style.display = jobs.length === 0 ? 'block' : 'none';
-    if (jobs.length && visible.length === 0) {
-      list.innerHTML = '<div class="empty-state"><h3>No matching backups</h3><p>Try a different search or filter.</p></div>';
-      return;
-    }
-    visible.forEach(function (job, idx) {
-      var card = document.createElement('article');
-      card.className = 'job-card';
-      card.style.animationDelay = Math.min(idx * 0.05, 0.3) + 's';
-      var initial = escapeHtml((job.name || 'T').charAt(0).toUpperCase());
-      card.innerHTML =
-        '<div class="job-icon">' + initial + '</div>' +
-        '<div class="job-body">' +
-          '<h3 class="job-name"></h3>' +
-          '<div class="job-meta"><span>Type: <b></b></span><span>Files: <b></b></span><span>Size: <b></b></span><span>Duration: <b></b></span><span class="date"></span></div>' +
-          '<div class="job-path"></div>' +
-        '</div>' +
-        '<div class="job-actions"><span class="pill"></span><div class="job-actions-row">' +
-          '<button class="btn btn-sm" type="button" data-act="details">Details</button>' +
-          '<button class="btn btn-sm" type="button" data-act="run">▶ Run</button>' +
-        '</div></div>';
-      card.querySelector('.job-name').textContent = job.name;
-      var meta = card.querySelectorAll('.job-meta b');
-      meta[0].textContent = job.type;
-      meta[1].textContent = String(job.files);
-      meta[2].textContent = formatBytes(job.size);
-      meta[3].textContent = formatDuration(job.duration);
-      card.querySelector('.job-meta .date').textContent = formatDate(job.timestamp);
-      card.querySelector('.job-path').textContent = job.source ? job.source + '  →  ' + (job.destination || '—') : (job.destination || '');
-      var pill = card.querySelector('.pill');
-      pill.className = 'pill ' + pillClass(job.status, job.type);
-      pill.textContent = job.status;
-      card.querySelector('.job-body').addEventListener('click', function () { openDrawer(job); });
-      card.querySelectorAll('[data-act]').forEach(function (btn) {
-        btn.addEventListener('click', function (ev) {
-          ev.stopPropagation();
-          var act = btn.getAttribute('data-act');
-          if (act === 'details') openDrawer(job);
-          if (act === 'run') runBackup(job, false);
-          if (act === 'restore') openRestore(job);
-        });
-      });
-      list.appendChild(card);
-    });
-  }
+  /* ---------- history list (Jobs page, step 4) ---------- */
 
   /* ---------- views: Dashboard / Jobs ---------- */
   /* ---------- modules: Backup / Cloud / VPN / WireGuard ----------
-     The sidebar has four top-level modules. Backup owns Dashboard, Jobs,
-     Logs, New Job and Restore; Cloud owns Server and Client; VPN is a
-     single Tailscale view; WireGuard VPN is a single self-hosted
-     WireGuard view (server + client). Switching modules swaps the
-     visible nav group; going back to Backup returns to the last backup
+     The sidebar shows every module at once, grouped with section
+     labels (Dashboard / Backup / Cloud / VPN / WireGuard / System).
+     There is no module chooser screen: the app opens on the Dashboard
+     and the sidebar is the only navigation. Switching views only swaps
+     the visible view; going back to Backup returns to the last backup
      view instead of always resetting to Dashboard. */
   var currentModule = 'backup';
-  var lastBackupView = 'dashboard';
+  var lastBackupView = 'dashboard'; // the view Back / closing Settings returns to (any module)
+  var currentView = 'dashboard'; // the view currently shown in the main area
+  var wizardReturnView = 'dashboard'; // the view the wizard / restore returns to on Back or Cancel
 
   function applyModuleUI(mod) {
     currentModule = mod;
-    var gb = $('navGroupBackup'); if (gb) gb.style.display = mod === 'backup' ? '' : 'none';
-    var gc = $('navGroupCloud'); if (gc) gc.style.display = mod === 'cloud' ? '' : 'none';
-    var gv = $('navGroupVpn'); if (gv) gv.style.display = mod === 'vpn' ? '' : 'none';
-    var gw = $('navGroupWireguard'); if (gw) gw.style.display = mod === 'wireguard' ? '' : 'none';
-    document.querySelectorAll('.module-item').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-module') === mod); });
+    /* All nav groups stay visible: the sidebar lists every module. */
+    ['navGroupBackup', 'navGroupCloud', 'navGroupVpn', 'navGroupWireguard'].forEach(function (id) { var g = $(id); if (g) g.style.display = ''; });
   }
 
   function setModule(mod) {
@@ -297,79 +418,137 @@
   }
 
   function syncCloudNav() {
-    document.querySelectorAll('[data-nav="cloud-server"], [data-nav="cloud-client"]').forEach(function (b) { b.classList.remove('active'); });
-    if (cloudPanel === 'server' || cloudPanel === 'client') {
+    document.querySelectorAll('[data-nav="cloud-server"], [data-nav="cloud-client"], [data-nav="cloud-mapdrive"]').forEach(function (b) { b.classList.remove('active'); });
+    if (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive') {
       var btn = document.querySelector('[data-nav="cloud-' + cloudPanel + '"]');
       if (btn) btn.classList.add('active');
     }
+    /* The in-view tab bar mirrors the same panel. */
+    document.querySelectorAll('[data-cloud-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-cloud-tab') === cloudPanel); });
   }
 
   function setBackTitle(t) { var b = $('backBarTitle'); if (b) b.textContent = t; }
   function setAppTitle(t, s) { var h = $('appTitle'); if (h) h.textContent = t; var p = $('appSubtitle'); if (p) p.textContent = s; }
 
-  /* Back from the very top: from a Server/Client panel back to the
-     Cloud home, from anywhere else back to the module chooser. */
+  /* Back from the very top: from a Server/Client/Map panel back to the
+     Cloud home, from anywhere else back to the Dashboard. */
   function goBack() {
+    var settingsView = $('view-settings');
+    if (settingsView && settingsView.style.display !== 'none') { showView(lastBackupView || 'dashboard'); return; }
+    var wizView = $('view-wizard');
+    if (wizView && wizView.style.display !== 'none') { showView(wizardReturnView || 'dashboard'); return; }
+    var resView = $('view-restore');
+    if (resView && resView.style.display !== 'none') { showView(wizardReturnView || 'dashboard'); return; }
     var cloudView = $('view-cloud');
-    if (cloudView && cloudView.style.display !== 'none' && (cloudPanel === 'server' || cloudPanel === 'client')) { showCloudPanel('home'); return; }
-    showView('modules');
+    if (cloudView && cloudView.style.display !== 'none' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive')) { showCloudPanel('home'); return; }
+    showView('dashboard');
   }
 
+  /* The in-place wizard / restore close by going back — there is no
+     separate window any more, so the wizard scripts call this. */
+  window.__closeWizardView = function () { showView(wizardReturnView || 'dashboard'); };
+
   function showView(name) {
+    currentView = name;
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
     var wgView = $('view-wireguard');
-    var modulesView = $('view-modules');
+    var settingsView = $('view-settings');
+    var wizView = $('view-wizard');
+    var resView = $('view-restore');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
     if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
     if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
     if (vpnView) vpnView.style.display = name === 'vpn' ? '' : 'none';
     if (wgView) wgView.style.display = name === 'wireguard' ? '' : 'none';
-    if (modulesView) modulesView.style.display = name === 'modules' ? '' : 'none';
+    if (settingsView) settingsView.style.display = name === 'settings' ? '' : 'none';
+    if (wizView) wizView.style.display = name === 'wizard' ? '' : 'none';
+    if (resView) resView.style.display = name === 'restore' ? '' : 'none';
     /* One refresh per module, at the top — the same ⟳ icon-button
        pattern as the Tailscale one, shown only while its module is
-       active. The settings gear lives in the Backup module only:
-       it is hidden in Cloud, Tailscale VPN and WireGuard, and on
-       the module chooser (the drawer itself is unchanged — basic
-       Backup settings only). */
-    var isBackup = name === 'dashboard' || name === 'jobs' || name === 'logs';
-    var gb2 = $('settingsBtn'); if (gb2) gb2.style.display = isBackup ? '' : 'none';
+       active. The settings gear is always visible (the sidebar has
+       no Settings item — the gear at the top right is the only way
+       in, from any module). */
+    var isBackup = name === 'dashboard' || name === 'jobs' || name === 'logs' || name === 'wizard' || name === 'restore';
+    var gb2 = $('settingsBtn'); if (gb2) gb2.style.display = '';
     var brb = $('backupTopRefreshBtn'); if (brb) brb.style.display = isBackup ? '' : 'none';
     var crb2 = $('cloudTopRefreshBtn'); if (crb2) crb2.style.display = name === 'cloud' ? '' : 'none';
     var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
     var wrb = $('wgTopRefreshBtn'); if (wrb) wrb.style.display = name === 'wireguard' ? '' : 'none';
-    document.body.classList.toggle('modules-mode', name === 'modules');
-    var bb = $('backBar'); if (bb) bb.style.display = name === 'modules' ? 'none' : '';
-    var hdr = $('appHeader'); if (hdr) hdr.style.display = name === 'modules' ? 'none' : '';
-    /* Inside a module only that module's things show: the module
-       switcher (Backup / Cloud buttons) is hidden, the way back out
-       is the top Back button. */
-    var ms = $('moduleSwitcher'); if (ms) ms.style.display = name === 'modules' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
-    if (btn) btn.classList.add('active');
+    /* Inside Cloud the active item is the open panel, not Overview:
+       syncCloudNav() marks it (called by showView('cloud') below and
+       by showCloudPanel). Only mark Overview when the home panel is open. */
+    if (btn && !(name === 'cloud' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive'))) btn.classList.add('active');
+    /* The wizard / restore have no data-nav item — their sidebar
+       buttons are #navNewJob / #navRestore, marked active here. */
+    if (name === 'wizard') { var nw = $('navNewJob'); if (nw) nw.classList.add('active'); }
+    if (name === 'restore') { var nr = $('navRestore'); if (nr) nr.classList.add('active'); }
+    /* Groups open ONLY when the user clicks the group header — never
+       on navigation. A view reached from elsewhere (Back button, jump
+       button, Quick Action) shows in the main area on the right while
+       the sidebar stays exactly as the user left it. */
     if (name === 'jobs') renderJobsView();
     if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
     else stopLogsAutoRefresh();
+    /* The dashboard has nowhere to go back to — hiding its back bar
+       buys the tallest page ~48px so the whole page fits. The wizard
+       and restore have their own Cancel button that returns to the
+       origin view (the same destination as Back), so their back bar
+       is redundant too — hiding it buys the wizard card the same
+       ~30px, which is what finally lets the tallest steps fit with
+       no scroll at all (round 2 #5). */
+    var bb = $('backBar'); if (bb) bb.style.display = (name === 'dashboard' || name === 'wizard' || name === 'restore') ? 'none' : '';
+    /* The top-bar subtitle is redundant — every view carries its own
+       heading and description in the page — so it stays hidden and
+       every page gains ~15px of room. */
+    var asub = $('appSubtitle'); if (asub) asub.style.display = 'none';
     if (name === 'dashboard' || name === 'jobs' || name === 'logs') {
       lastBackupView = name; applyModuleUI('backup');
       setBackTitle('Backup');
-      setAppTitle('TechVision Backup', 'Your data, protected — full and incremental backups, fast streaming restore.');
+      setAppTitle('Backup Dashboard', 'Manage backups, monitor jobs, and protect your data.');
+    }
+    if (name === 'settings') {
+      /* A full page, not a drawer: it belongs to the Backup module
+         but is NOT a lastBackupView — Back returns to the view it was
+         opened from, and no sidebar item is ever active here. */
+      applyModuleUI('backup');
+      setBackTitle('Settings');
+      setAppTitle('Settings', 'Your preferences for TechVision Backup.');
+    }
+    if (name === 'wizard') {
+      /* In-place wizard: it belongs to the Backup module but is NOT
+         a lastBackupView — Back / Cancel returns to the view it was
+         opened from (wizardReturnView). */
+      applyModuleUI('backup');
+      setBackTitle('New Backup Job');
+      setAppTitle('New Backup Job', 'Five quick steps — pick folders, options and encryption.');
+    }
+    if (name === 'restore') {
+      /* Same rule as the wizard: Back / Cancel returns to
+         wizardReturnView, never to the dashboard unconditionally. */
+      applyModuleUI('backup');
+      setBackTitle('Restore');
+      setAppTitle('Restore Backup', 'Pick a .zip backup file and a folder to restore it into.');
     }
     if (name === 'cloud') {
+      lastBackupView = name;
       applyModuleUI('cloud'); syncCloudNav();
-      setBackTitle(cloudPanel === 'server' ? 'Cloud — Server' : cloudPanel === 'client' ? 'Cloud — Client' : 'Cloud');
+      setBackTitle(cloudPanel === 'server' ? 'Cloud — Server' : cloudPanel === 'client' ? 'Cloud — Client' : cloudPanel === 'mapdrive' ? 'Cloud — Map network' : 'Cloud');
       setAppTitle('TechVision Cloud', 'Your own remote drive — share a folder or open one, encrypted.');
       loadCloud();
     }
     if (name === 'vpn') {
+      lastBackupView = name;
       applyModuleUI('vpn');
       setBackTitle('VPN');
       setAppTitle('TechVision Tailscale VPN', 'Your private network — every device, anywhere, as if it were home.');
       loadVpn();
     }
     if (name === 'wireguard') {
+      lastBackupView = name;
       applyModuleUI('wireguard');
       setBackTitle('WireGuard VPN');
       setAppTitle('TechVision WireGuard VPN', 'Your own VPN server — no accounts, no middleman, one port on the router.');
@@ -471,6 +650,18 @@
       items.sort(function (a, b) { return new Date(b.run.timestamp || 0) - new Date(a.run.timestamp || 0); });
       if (emptyText) emptyText.textContent = 'No failed or waiting tasks. Everything ran fine.';
     }
+    // Silent background refresh: if the list would look exactly the
+    // same, do not touch the DOM at all — no flash, no scroll jump.
+    // A tab switch or a new/changed run changes the signature, so
+    // those still rebuild.
+    var sig = currentLogTab + '|' + items.map(function (it) {
+      var r = it.run;
+      return (it.job.id || it.job.name) + '|' + (r.timestamp || '') + '|' +
+        String(r.status || (r.success ? 'COMPLETED' : 'FAILED')).toUpperCase() + '|' +
+        safeNum(r.files, 0) + '|' + (r.size || 0) + '|' + (r.error || '') + '|' + (it.waiting ? 'W' : '');
+    }).join('\n');
+    if (sig === lastLogsSig) return;
+    lastLogsSig = sig;
     list.innerHTML = '';
     if (!items.length) { if (empty) empty.style.display = 'block'; return; }
     if (empty) empty.style.display = 'none';
@@ -500,6 +691,16 @@
       if (q && String(l).toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
+    // Silent background refresh: same filter + same lines means the
+    // box already shows exactly this — leave the DOM alone.
+    var sig = level + '|' + q + '|' + visible.join('\n');
+    if (sig === lastFullLogSig) return;
+    lastFullLogSig = sig;
+    // Keep the reader's place: only follow the tail when he was
+    // already at the bottom; otherwise restore his scroll position
+    // instead of yanking him to the end every 10 seconds.
+    var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 4;
+    var prevTop = box.scrollTop;
     box.innerHTML = '';
     if (!visible.length) {
       box.textContent = fullLogLines.length ? 'No log lines match this filter.' : 'No log lines yet. Run a backup or wait for a scheduled one to see activity here.';
@@ -511,7 +712,7 @@
       div.textContent = String(l);
       box.appendChild(div);
     });
-    box.scrollTop = box.scrollHeight;
+    box.scrollTop = atBottom ? box.scrollHeight : prevTop;
   }
   function compressionLabel(job) {
     var c = (job.compression || (job.raw && job.raw.compression) || 'standard').toLowerCase();
@@ -519,91 +720,164 @@
     if (c === 'advanced') return 'Advanced — Deflate level 9';
     return 'Standard — Deflate level 6';
   }
+  /* ---------- Jobs page 02: table + details panel ---------- */
+  var jobsSelectedId = null; // id of the job shown in the details panel
+  function selectedJob() {
+    if (!jobsSelectedId) return null;
+    var found = jobs.filter(function (j) { return j.id === jobsSelectedId; });
+    return found.length ? found[0] : null;
+  }
   function renderJobsView() {
-    var list = $('jobsList');
-    if (!list) return;
-    // Jobs page = the jobs whose turn it is to run: never run yet, or
-    // scheduled for a next run. A job that already ran and has no
-    // schedule is done — it stays in the Dashboard history only.
-    var upcoming = jobs.filter(function (j) {
-      var neverRun = !j.runs || j.runs.length === 0;
-      var sched = j.schedule && j.schedule.enabled;
-      return neverRun || sched;
+    var body = $('jobsTableBody');
+    if (!body) return;
+    /* Every job, including never-run templates: a template is a real
+       job with no runs yet, not a history entry to hide. */
+    var list = jobs.slice();
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    set('jobsChipTotal', String(list.length));
+    set('jobsChipCompleted', String(list.filter(function (j) { return j.status === 'COMPLETED'; }).length));
+    set('jobsChipRunning', String(list.filter(function (j) { return j.status === 'RUNNING'; }).length));
+    set('jobsChipFailed', String(list.filter(function (j) { return j.status === 'FAILED'; }).length));
+    var q = ($('jobsSearchInput') ? $('jobsSearchInput').value : '').trim().toLowerCase();
+    var sf = $('jobsStatusFilter') ? $('jobsStatusFilter').value : 'all';
+    var sort = $('jobsSortSelect') ? $('jobsSortSelect').value : 'newest';
+    var visible = list.filter(function (j) {
+      if (q && j.name.toLowerCase().indexOf(q) === -1 && (j.source || '').toLowerCase().indexOf(q) === -1) return false;
+      if (sf !== 'all' && j.status !== sf) return false;
+      return true;
     });
-    list.innerHTML = '';
+    visible.sort(function (a, b) {
+      if (sort === 'name') return a.name.localeCompare(b.name);
+      /* Never-run jobs have no last run: they sort last in "newest". */
+      var ts = function (j) { return j.runs && j.runs.length ? new Date(j.timestamp || 0).getTime() : 0; };
+      return sort === 'oldest' ? ts(a) - ts(b) : ts(b) - ts(a);
+    });
+    var sel = selectedJob();
+    if (sel && visible.indexOf(sel) === -1) sel = null;
+    if (!sel && visible.length) sel = visible[0];
+    jobsSelectedId = sel ? sel.id : null;
+    body.innerHTML = '';
     var empty = $('jobsEmptyState');
-    if (empty) empty.style.display = upcoming.length === 0 ? 'block' : 'none';
-    upcoming.forEach(function (job, idx) {
-      var card = document.createElement('article');
-      card.className = 'job-card';
-      card.style.animationDelay = Math.min(idx * 0.05, 0.3) + 's';
-      var initial = escapeHtml((job.name || 'T').charAt(0).toUpperCase());
-      card.innerHTML =
-        '<div class="job-icon">' + initial + '</div>' +
-        '<div class="job-body">' +
-          '<h3 class="job-name"></h3>' +
-          '<div class="job-meta"><span class="pill"></span><span>Last run: <b class="last-run"></b></span><span>Runs: <b class="run-count"></b></span></div>' +
-          '<div class="job-path"></div>' +
-          '<dl class="job-detail">' +
-            '<div><dt>Schedule</dt><dd class="d-schedule"></dd></div>' +
-            '<div><dt>Next run</dt><dd class="d-next"></dd></div>' +
-            '<div><dt>Compression</dt><dd class="d-compress"></dd></div>' +
-            '<div><dt>Last run files</dt><dd class="d-files"></dd></div>' +
-          '</dl>' +
-        '</div>' +
-        '<div class="job-actions"><div class="job-actions-row">' +
-          '<button class="btn btn-primary btn-sm" type="button" data-act="run">▶ Run now</button>' +
-          '<button class="btn btn-sm" type="button" data-act="details">Details</button>' +
-          '<button class="btn btn-sm" type="button" data-act="edit">✎ Edit</button>' +
-          '<button class="btn btn-sm" type="button" data-act="restore">↺ Restore</button>' +
-          '<button class="btn btn-danger btn-sm" type="button" data-act="delete">🗑 Delete</button>' +
-        '</div></div>';
-      card.querySelector('.job-name').textContent = job.name;
-      var pill = card.querySelector('.pill');
-      pill.className = 'pill ' + pillClass(job.status, job.type);
-      pill.textContent = job.status;
-      card.querySelector('.last-run').textContent = job.runs && job.runs.length ? formatDate(job.timestamp) : 'Never run';
-      card.querySelector('.run-count').textContent = String(job.runCount || 0);
-      card.querySelector('.job-path').textContent = job.source ? job.source + '  →  ' + (job.destination || '—') : (job.destination || '—');
+    if (empty) empty.style.display = list.length === 0 ? 'block' : 'none';
+    if (list.length && visible.length === 0) {
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:18px;">No matching jobs — try a different search or filter.</td></tr>';
+    }
+    visible.forEach(function (job) {
+      var tr = document.createElement('tr');
+      if (sel && job.id === sel.id) tr.classList.add('selected');
+      var sched = job.schedule || (job.raw && job.raw.schedule) || null;
+      tr.innerHTML = '<td class="job-name-cell"></td><td></td><td class="jobs-src-cell"></td><td></td><td></td><td></td>';
+      tr.querySelector('.job-name-cell').textContent = job.name;
+      var tds = tr.querySelectorAll('td');
+      tds[1].innerHTML = '<span class="pill ' + (job.type === 'TEMPLATE' ? 'pill-template' : job.type === 'INCREMENTAL' ? 'pill-incremental' : 'pill-full') + '">' + (job.type === 'TEMPLATE' ? 'Template' : job.type === 'INCREMENTAL' ? 'Incremental' : 'Full') + '</span>';
+      /* Sources shows just the folder name (full path on hover): the
+         full path is in the details panel and would push the Status
+         column off-screen. */
+      var srcName = job.source ? job.source.replace(/[/\\]+$/, '').split(/[/\\]/).pop() : '—';
+      tds[2].textContent = srcName;
+      if (job.source) tds[2].title = job.source;
+      tds[3].textContent = scheduleLabel(sched) || 'Manual only';
+      tds[4].textContent = job.runs && job.runs.length ? formatDate(job.timestamp) : 'Never run';
+      tds[5].innerHTML = '<span class="pill ' + pillClass(job.status, job.type) + '">' + escapeHtml(job.status) + '</span>';
+      tr.addEventListener('click', function () { jobsSelectedId = job.id; renderJobsView(); });
+      body.appendChild(tr);
+    });
+    renderJobsDetails(sel);
+    var dis = !sel;
+    ['jobsRunBtn', 'jobsEditBtn', 'jobsDeleteBtn', 'jobsDetailsRun', 'jobsDetailsRestore', 'jobsDetailsEdit'].forEach(function (id) { var b = $(id); if (b) b.disabled = dis; });
+  }
+  function renderJobsDetails(job) {
+    var panel = $('jobsDetails'); if (!panel) return;
+    var name = $('jobsDetailsName'), pill = $('jobsDetailsPill');
+    var banner = $('jobsDetailsBanner'), bIco = $('jobsDetailsBannerIco'), bTitle = $('jobsDetailsBannerTitle'), bSub = $('jobsDetailsBannerSub');
+    var listEl = $('jobsDetailsList'), waitEl = $('jobsDetailsWaiting');
+    if (!job) {
+      if (name) name.textContent = 'No job selected';
+      if (pill) { pill.className = 'pill'; pill.textContent = '—'; }
+      if (banner) { banner.classList.remove('warn', 'bad'); banner.classList.add('idle'); }
+      if (bIco) bIco.textContent = 'ⓘ';
+      if (bTitle) bTitle.textContent = 'No jobs yet';
+      if (bSub) bSub.textContent = 'Create your first backup job to protect your files.';
+      if (listEl) listEl.innerHTML = '';
+      if (waitEl) waitEl.innerHTML = '';
+      return;
+    }
+    if (name) name.textContent = job.name;
+    if (pill) { pill.className = 'pill ' + pillClass(job.status, job.type); pill.textContent = job.status; }
+    if (banner) {
+      banner.classList.remove('warn', 'bad', 'idle');
+      if (job.status === 'COMPLETED') {
+        if (bIco) bIco.textContent = '✓';
+        if (bTitle) bTitle.textContent = 'Last Backup: Completed';
+        if (bSub) bSub.textContent = formatDashboardTime(job.timestamp);
+      } else if (job.status === 'FAILED') {
+        banner.classList.add('bad');
+        if (bIco) bIco.textContent = '!';
+        if (bTitle) bTitle.textContent = 'Last Backup: Failed';
+        if (bSub) bSub.textContent = 'Failed at ' + formatDashboardTime(job.timestamp);
+      } else if (job.status === 'RUNNING') {
+        banner.classList.add('idle');
+        if (bIco) bIco.textContent = '◷';
+        if (bTitle) bTitle.textContent = 'Backup running';
+        if (bSub) bSub.textContent = 'Started ' + formatDashboardTime(job.timestamp);
+      } else {
+        banner.classList.add('idle');
+        if (bIco) bIco.textContent = 'ⓘ';
+        if (bTitle) bTitle.textContent = job.runs && job.runs.length ? 'Last Backup: ' + job.status : 'Never run yet';
+        if (bSub) bSub.textContent = job.runs && job.runs.length ? formatDashboardTime(job.timestamp) : 'Run this job to create its first backup.';
+      }
+    }
+    if (listEl) {
+      listEl.innerHTML = '';
+      var sched = job.schedule || (job.raw && job.raw.schedule) || null;
+      var enc = job.encryptionEnabled === true || (job.raw && job.raw.encryptionEnabled === true);
+      var rows = [
+        ['Backup Type', job.type === 'TEMPLATE' ? '—' : job.type === 'INCREMENTAL' ? 'Incremental' : 'Full'],
+        ['Sources', job.source || '—'],
+        ['Destination', job.destination || '—'],
+        ['Schedule', scheduleLabel(sched) || 'Manual only'],
+        ['Next run', nextRunText(job)],
+        ['Compression', compressionLabel(job)],
+        ['Encryption', enc ? 'Enabled (AES-256)' : 'Off'],
+        ['Last Run Result', job.runs && job.runs.length ? job.status + ' — ' + formatDate(job.timestamp) : 'Never run'],
+        ['Files Backed Up', job.runs && job.runs.length ? String(job.files) : '—'],
+        ['Total Size', job.runs && job.runs.length ? formatBytes(job.size) : '—']
+      ];
+      rows.forEach(function (r) {
+        var div = document.createElement('div');
+        var dt = document.createElement('dt'); dt.textContent = r[0];
+        var dd = document.createElement('dd'); dd.textContent = r[1]; dd.title = r[1];
+        div.appendChild(dt); div.appendChild(dd); listEl.appendChild(div);
+      });
+    }
+    if (waitEl) {
+      waitEl.innerHTML = '';
       var w = waitingOf(job);
       if (w) {
         var wdiv = document.createElement('div');
         wdiv.className = 'job-waiting';
         wdiv.textContent = '⏳ Waiting for the ' + (w.which || 'source') + ' drive since ' + formatDate(w.since) + ' — ' + (w.path || '') + (w.label ? ' (volume "' + w.label + '")' : '');
-        card.querySelector('.job-body').appendChild(wdiv);
+        waitEl.appendChild(wdiv);
       }
-      var sched = job.schedule || (job.raw && job.raw.schedule) || null;
-      card.querySelector('.d-schedule').textContent = scheduleLabel(sched) || 'Manual only';
-      card.querySelector('.d-next').textContent = nextRunText(job);
-      card.querySelector('.d-compress').textContent = compressionLabel(job);
-      card.querySelector('.d-files').textContent = job.runs && job.runs.length ? job.files + ' files · ' + formatBytes(job.size) : '—';
-      card.querySelectorAll('[data-act]').forEach(function (btn) {
-        btn.addEventListener('click', async function (ev) {
-          ev.stopPropagation();
-          var act = btn.getAttribute('data-act');
-          if (act === 'details') openDrawer(job);
-          if (act === 'run') runBackup(job, false);
-          if (act === 'edit') openJobWizard(job);
-          if (act === 'restore') openRestore(job);
-          if (act === 'delete') {
-            if (!api || typeof api.deleteJob !== 'function') return;
-            try {
-              var res = await api.deleteJob(job.id);
-              if (res && res.success) { toast('Job deleted', job.name + ' has been deleted.', 'success'); await refreshJobs(); }
-              else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
-            } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
-          }
-        });
-      });
-      list.appendChild(card);
-    });
+    }
+  }
+  async function deleteSelectedJob() {
+    var j = selectedJob();
+    if (!j || !api || typeof api.deleteJob !== 'function') return;
+    try {
+      var res = await api.deleteJob(j.id);
+      if (res && res.success) { toast('Job deleted', j.name + ' has been deleted.', 'success'); await refreshJobs(); }
+      else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
+    } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
   }
 
   /* ---------- TechVision Cloud ---------- */
   var cloudCfg = null;           // last cloud-get-config result
-  var cloudPanel = 'home';       // 'home' | 'server' | 'client'
+  var cloudPanel = 'home';       // 'home' | 'server' | 'client' | 'mapdrive'
+  var wgPanel = 'server';        // 'server' | 'nat' — WireGuard tabs
   var cloudSelected = null;      // saved server record being connected to
   var cloudPendingProbe = null;  // { fingerprint, certPem } awaiting trust
+  var cloudCertChanged = false; // the server's cert changed since it was trusted — re-trust pending
   var cloudConn = null;          // { serverId, info } while connected
   var cloudPath = '';            // current remote path, '' = root, '/' separators
   var cloudTransferTimer = null;
@@ -617,12 +891,23 @@
     if (!api || typeof api.cloudGetConfig !== 'function') return;
     try {
       cloudCfg = await api.cloudGetConfig();
+      renderCloudOpenMode();
       renderCloudHome();
       if (cloudPanel === 'server') renderCloudServer();
       if (cloudPanel === 'client') renderCloudClientList();
+      if (cloudPanel === 'mapdrive') renderMapdrivePanel();
     } catch (e) {
       toast('Cloud', e && e.message ? e.message : 'Could not load Cloud settings.', 'error');
     }
+  }
+
+  /* WireGuard tabs (Server / Site-to-Site): one card visible at a
+     time, like the Cloud tabs, so each tab fits the window height. */
+  function showWgPanel(panel) {
+    wgPanel = panel;
+    var server = $('wgServerCard'); if (server) server.style.display = panel === 'server' ? '' : 'none';
+    var nat = $('wgNatCard'); if (nat) nat.style.display = panel === 'nat' ? '' : 'none';
+    document.querySelectorAll('[data-wg-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-wg-tab') === panel); });
   }
 
   function showCloudPanel(panel) {
@@ -633,7 +918,9 @@
     var ht = $('cloudViewHeadText'); if (ht) ht.style.display = panel === 'home' ? '' : 'none';
     var sp = $('cloudServerPanel'); if (sp) sp.style.display = panel === 'server' ? '' : 'none';
     var cp = $('cloudClientPanel'); if (cp) cp.style.display = panel === 'client' ? '' : 'none';
+    var mp = $('cloudMapPanel'); if (mp) mp.style.display = panel === 'mapdrive' ? '' : 'none';
     if (panel === 'server') renderCloudServer();
+    if (panel === 'mapdrive') renderMapdrivePanel();
     if (panel === 'client') {
       // Open on the kind of server the user actually has: if the
       // current picker mode matches none of the saved servers, switch
@@ -648,16 +935,30 @@
       renderCloudClientList(); if (cloudClientAccess === 'tailscale') populateCloudPeers(); if (cloudClientAccess === 'wireguard') populateCloudWgPeers();
     }
     syncCloudNav();
-    setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : 'Cloud');
+    if (panel === 'home') {
+      var ov = document.querySelector('[data-nav="cloud"]');
+      if (ov) ov.classList.add('active');
+    }
+    setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : panel === 'mapdrive' ? 'Cloud — Map network' : 'Cloud');
   }
 
   function renderCloudHome() {
     if (!cloudCfg) return;
     var s = cloudCfg.server || {};
-    var ss = $('cloudServerModeStatus');
-    if (ss) ss.textContent = s.running ? ('Running — port ' + (s.port || 8443)) : 'Stopped';
-    var cs = $('cloudClientModeStatus');
-    if (cs) cs.textContent = cloudConn ? ('Connected as ' + (cloudConn.info.user || '') + ' @ ' + (cloudConn.name || '')) : 'Not connected';
+    var badge = $('cloudServerModeBadge');
+    if (badge) {
+      badge.textContent = s.running ? 'Running' : 'Stopped';
+      badge.className = 'pill ' + (s.running ? 'pill-completed' : 'pill-pending');
+    }
+    var sp = $('cloudServerModePort'); if (sp) sp.textContent = String(s.port || 8443);
+    var su = $('cloudServerModeUsers'); if (su) su.textContent = String((s.users || []).length);
+    var cb = $('cloudClientModeBadge');
+    if (cb) {
+      cb.textContent = cloudConn ? 'Connected' : 'Not connected';
+      cb.className = 'pill ' + (cloudConn ? 'pill-completed' : 'pill-pending');
+    }
+    var ca = $('cloudClientModeAddr'); if (ca) ca.textContent = cloudConn ? (cloudConn.name || '—') : '—';
+    var cc = $('cloudClientModeCount'); if (cc) cc.textContent = String(((cloudCfg.clients) || []).length);
   }
 
   /* ---------- Cloud access: Normal vs Tailscale VPN ----------
@@ -685,7 +986,7 @@
       if (!api || typeof api.cloudServerSave !== 'function') { cloudMissing(); return; }
       try {
         var port = parseInt(($('cloudServerPort') || {}).value, 10);
-        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess });
+        var r = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : false, port: port, accessMode: cloudServerAccess, ddnsHostname: ($('cloudServerDdns') || {}).value || '' });
         if (r && r.success) { await loadCloud(); }
         else toast('Save failed', (r && r.error) || 'Could not save Cloud settings.', 'error');
       } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save Cloud settings.', 'error'); }
@@ -761,13 +1062,19 @@
     document.querySelectorAll('#cloudClientAccessSeg .seg-btn').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-access') === cloudClientAccess); });
     var hint = $('cloudClientAccessHint');
     if (hint) hint.textContent = cloudClientAccess === 'tailscale'
-      ? 'Tailscale IP (100.x.x.x) of the server — pick a device below or type it.'
+      ? 'Tailscale IP (100.x.x.x) of the server — pick a device below.'
       : cloudClientAccess === 'wireguard'
-        ? 'WireGuard tunnel address (10.0.0.x) of the server — pick a device below or type it.'
+        ? 'WireGuard tunnel address (10.0.0.x) of the server — pick a device below.'
         : 'Public IP, DDNS hostname or LAN IP of the server.';
     var host = $('cloudClientHost');
     if (host) host.placeholder = cloudClientAccess === 'tailscale' ? '100.64.0.1' : cloudClientAccess === 'wireguard' ? '10.0.0.1' : '203.0.113.10';
     var pf = $('cloudClientPeerField'); if (pf) pf.style.display = cloudClientAccess === 'normal' ? 'none' : '';
+    /* Round 2 #7: the address field is the picker's output in VPN
+       modes — typing it is redundant — so it hides there and shows
+       only in Normal mode, where it is the only way to enter an
+       address. The hidden input still holds the picker's value, so
+       the connect logic reads it unchanged. */
+    var hf = $('cloudClientHostField'); if (hf) hf.style.display = cloudClientAccess === 'normal' ? '' : 'none';
     var apb = $('cloudClientWgAddPeerBtn'); if (apb) apb.style.display = cloudClientAccess === 'wireguard' ? '' : 'none';
     var pl = $('cloudClientPeerLabel');
     if (pl) pl.textContent = cloudClientAccess === 'wireguard' ? 'Pick a device from your WireGuard tunnel' : 'Pick a device from your Tailscale network';
@@ -862,7 +1169,10 @@
     }
     var en = $('cloudServerEnabled'); if (en) en.checked = !!s.enabled;
     var port = $('cloudServerPort'); if (port) port.value = String(s.port || 8443);
+    var dd = $('cloudServerDdns'); if (dd) dd.value = s.ddnsHostname || '';
     var gp = $('cloudGuidePort'); if (gp) gp.textContent = String(s.port || 8443);
+    var fp = $('cloudServerFactPort'); if (fp) fp.textContent = String(s.port || 8443);
+    var fu = $('cloudServerFactUsers'); if (fu) fu.textContent = String((s.users || []).length);
     setServerAccess(s.accessMode || 'normal');
     var startBtn = $('cloudServerStartBtn');
     if (startBtn) startBtn.textContent = s.running ? '■ Stop server' : '▶ Start server';
@@ -883,6 +1193,7 @@
         var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = u.name;
         var meta = document.createElement('div'); meta.className = 'job-meta';
         meta.textContent = (u.canWrite ? 'Read + write' : 'Read-only') + ' — ' + u.root;
+        meta.title = u.root;
         var acts = document.createElement('div'); acts.className = 'drawer-actions';
         var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete user';
         del.addEventListener('click', function () {
@@ -896,8 +1207,8 @@
           });
         });
         acts.appendChild(del);
-        body.appendChild(h); body.appendChild(meta); body.appendChild(acts);
-        card.appendChild(body);
+        body.appendChild(h); body.appendChild(meta);
+        card.appendChild(body); card.appendChild(acts);
         list.appendChild(card);
       });
     }
@@ -932,10 +1243,15 @@
       meta.textContent = (srv.accessMode === 'tailscale' ? '🛡️ Tailscale' : srv.accessMode === 'wireguard' ? '🔐 WireGuard' : '🌐 Normal') + ' — ' + srv.host + ':' + srv.port + ' — user ' + (srv.user || '—') + (srv.fingerprint ? ' — certificate trusted' : ' — not trusted yet') + (srv.hasPassword ? ' — password saved on this device' : '');
       var acts = document.createElement('div'); acts.className = 'drawer-actions';
       // Already connected to this server: say so instead of offering
-      // Connect again — Disconnect lives in the browser toolbar below.
+      // Connect again — Disconnect lives here on the card too (round
+      // 2 #8), next to the badge, so Connect / Disconnect / Forget
+      // are all together on the card.
       if (cloudConn && cloudConn.serverId === srv.id) {
         var badge = document.createElement('span'); badge.className = 'cloud-connected-badge'; badge.textContent = '● Connected';
         acts.appendChild(badge);
+        var disc = document.createElement('button'); disc.className = 'btn btn-ghost btn-sm'; disc.type = 'button'; disc.textContent = 'Disconnect';
+        disc.addEventListener('click', function () { cloudDisconnect(); });
+        acts.appendChild(disc);
       } else {
         // One click when the password is saved on this device: connect
         // straight in (the main process uses the stored password). Without
@@ -974,6 +1290,150 @@
     });
   }
 
+  /* ---------- Map network drive ---------- */
+  // The letter the connected server is mapped to, if any — cached
+  // per connection so a double-click does not run `net use` every
+  // time. Invalidated on Map/Disconnect and when the connection
+  // changes. A stale cache only ever falls back to the temp open.
+  var cloudMapLetterCache = { serverId: null, letter: null, at: 0 };
+  var cloudMapCurrentLetter = null; // letter of the mapping shown in the panel, if any
+  function cloudMapInvalidateCache() { cloudMapLetterCache = { serverId: null, letter: null, at: 0 }; }
+
+  async function cloudMapLetterFor(serverId) {
+    if (!serverId || !api || typeof api.cloudMapdriveStatus !== 'function') return null;
+    if (cloudMapLetterCache.serverId === serverId && Date.now() - cloudMapLetterCache.at < 30000) return cloudMapLetterCache.letter;
+    var letter = null;
+    try {
+      var r = await api.cloudMapdriveStatus();
+      if (r && r.success) {
+        var m = (r.mappings || []).find(function (x) { return x.serverId === serverId && x.status === 'mapped'; });
+        if (m) letter = m.letter;
+      }
+    } catch (e) {}
+    cloudMapLetterCache = { serverId: serverId, letter: letter, at: Date.now() };
+    return letter;
+  }
+
+  // The Map network panel: server picker (saved servers), letter
+  // picker (free letters, Z first), Map / Disconnect / Open in
+  // Explorer, status line, reconnect checkbox. Refreshes every time
+  // the panel opens and after every Map/Disconnect.
+  async function renderMapdrivePanel() {
+    var sel = $('cloudMapServer');
+    var letterSel = $('cloudMapLetter');
+    var statusEl = $('cloudMapStatus');
+    var mapBtn = $('cloudMapBtn');
+    var disBtn = $('cloudMapDisconnectBtn');
+    var expBtn = $('cloudMapExplorerBtn');
+    var recBox = $('cloudMapReconnect');
+    var recHint = $('cloudMapReconnectHint');
+    var srvHint = $('cloudMapServerHint');
+    if (!sel || !letterSel || !statusEl) return;
+    var servers = (cloudCfg && cloudCfg.clients) || [];
+    var prevServer = sel.value;
+    sel.innerHTML = '';
+    if (!servers.length) {
+      var o0 = document.createElement('option'); o0.value = ''; o0.textContent = 'No servers yet — add one in the Client tab first.';
+      sel.appendChild(o0);
+    }
+    servers.forEach(function (srv) {
+      var o = document.createElement('option');
+      o.value = srv.id;
+      o.textContent = srv.name + ' — ' + srv.host + ':' + srv.port + ' (' + (srv.accessMode === 'tailscale' ? 'Tailscale' : srv.accessMode === 'wireguard' ? 'WireGuard' : 'Normal') + ')';
+      sel.appendChild(o);
+    });
+    if (prevServer) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevServer) { sel.value = prevServer; break; } }
+    var serverId = sel.value || (servers[0] && servers[0].id) || '';
+    if (!servers.length) {
+      cloudMapCurrentLetter = null;
+      if (mapBtn) mapBtn.disabled = true;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'No servers yet — add one in the Client tab first.';
+      return;
+    }
+    if (mapBtn) mapBtn.disabled = false;
+    var status = null;
+    try {
+      if (api && typeof api.cloudMapdriveStatus === 'function') status = await api.cloudMapdriveStatus();
+    } catch (e) { status = null; }
+    if (!status || !status.success) {
+      cloudMapCurrentLetter = null;
+      statusEl.textContent = (status && status.error) || 'Mapping a network drive is available on Windows only.';
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      return;
+    }
+    var letters = (status.freeLetters && status.freeLetters.length) ? status.freeLetters : ['Z'];
+    var prevLetter = letterSel.value;
+    letterSel.innerHTML = '';
+    letters.forEach(function (l) {
+      var o = document.createElement('option'); o.value = l; o.textContent = l + ':';
+      letterSel.appendChild(o);
+    });
+    var mapping = (status.mappings || []).find(function (x) { return x.serverId === serverId; });
+    if (mapping && mapping.status === 'mapped') {
+      // The mapped letter is in use, so it is not among the free
+      // letters — show it selected at the top so the picker and the
+      // Explorer button agree on which drive this is.
+      var mo = document.createElement('option'); mo.value = mapping.letter; mo.textContent = mapping.letter + ': — mapped';
+      letterSel.insertBefore(mo, letterSel.firstChild);
+      letterSel.value = mapping.letter;
+      cloudMapCurrentLetter = mapping.letter;
+      if (disBtn) disBtn.style.display = '';
+      if (expBtn) expBtn.style.display = '';
+      statusEl.textContent = 'Mapped: ' + mapping.letter + ': → ' + (mapping.name || mapping.host) + ' (' + mapping.host + ':' + mapping.port + ')';
+    } else if (mapping && mapping.status === 'password-needed') {
+      cloudMapCurrentLetter = null;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'Not mapped — save the server password in the Client tab first (connect once with the password, and it is saved on this device).';
+    } else if (mapping && mapping.status === 'error') {
+      cloudMapCurrentLetter = null;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'Not mapped — ' + (mapping.error || 'could not check the drive.');
+    } else {
+      cloudMapCurrentLetter = null;
+      if (disBtn) disBtn.style.display = 'none';
+      if (expBtn) expBtn.style.display = 'none';
+      statusEl.textContent = 'Not mapped';
+    }
+    if (prevLetter && !mapping) { for (var j = 0; j < letterSel.options.length; j++) if (letterSel.options[j].value === prevLetter) { letterSel.value = prevLetter; break; } }
+    var chosen = servers.find(function (s) { return s.id === serverId; });
+    var hasPassword = !!(chosen && chosen.hasPassword);
+    if (recBox) recBox.disabled = !hasPassword;
+    if (recHint) recHint.textContent = hasPassword
+      ? 'Maps this drive again every time the app opens.'
+      : 'Save the server password in the Client tab to reconnect automatically.';
+    if (srvHint) srvHint.textContent = hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.';
+  }
+
+  async function cloudMapDriveAction() {
+    var sel = $('cloudMapServer');
+    var letterSel = $('cloudMapLetter');
+    var recBox = $('cloudMapReconnect');
+    var serverId = sel ? sel.value : '';
+    if (!serverId) { toast('No server', 'Add a server in the Client tab first.', 'error'); return; }
+    if (!api || typeof api.cloudMapdriveMap !== 'function') return cloudMissing();
+    var statusEl = $('cloudMapStatus');
+    if (statusEl) statusEl.textContent = 'Mapping… (Windows may ask for administrator permission once, to trust the server certificate.)';
+    try {
+      var r = await api.cloudMapdriveMap(serverId, letterSel ? letterSel.value : 'Z', !!(recBox && recBox.checked));
+      if (r && r.success) {
+        toast('Drive mapped', 'The server is now drive ' + r.letter + ': — open files straight from it.', 'success');
+        cloudMapInvalidateCache();
+      } else if (r && r.error === 'password-needed') {
+        toast('Password needed', 'Save the server password in the Client tab first — connect once with the password, and it is saved on this device.', 'error');
+      } else {
+        toast('Mapping failed', (r && r.error) || 'Could not map the drive.', 'error');
+      }
+    } catch (e) {
+      toast('Mapping error', e && e.message ? e.message : 'Could not map the drive.', 'error');
+    }
+    await renderMapdrivePanel();
+  }
+
   function openCloudConnect(srv, presetPassword) {
     cloudSelected = srv;
     cloudPendingProbe = null;
@@ -989,6 +1449,7 @@
     var box = $('cloudConnectBox'); if (box) box.style.display = 'none';
     cloudSelected = null;
     cloudPendingProbe = null;
+    cloudCertChanged = false;
   }
 
   // One click on a saved server: the password is already on this device
@@ -1044,9 +1505,25 @@
     var pass = $('cloudConnectPass');
     var password = passwordOverride !== undefined ? (passwordOverride || '') : (pass ? pass.value : '');
     var justTrusted = null; // fingerprint trusted in this very click
-    // No trusted certificate yet: probe the server first (nothing
-    // sensitive is sent to probe), then trust its fingerprint.
-    if (!cloudSelected.fingerprint) {
+    // The server's certificate changed since this record was trusted
+    // (round 2 #12: the cert was regenerated with SANs). Offer to
+    // trust the new fingerprint — the same manual box as first trust,
+    // with the new fingerprint to compare. Never silently accept a
+    // different certificate.
+    function offerCertRetrust(probe) {
+      cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
+      cloudCertChanged = true;
+      var title2 = $('cloudConnectTitle'); if (title2) title2.textContent = 'Connect to ' + cloudSelected.name + (cloudSelected.user ? ' as ' + cloudSelected.user : '');
+      var ft2 = $('cloudFingerprintText'); if (ft2) ft2.textContent = probe.fingerprint;
+      var fb2 = $('cloudFingerprintBox'); if (fb2) fb2.style.display = '';
+      var box2 = $('cloudConnectBox'); if (box2) box2.style.display = '';
+      var btn2 = $('cloudConnectBtn'); if (btn2) btn2.textContent = 'Trust & connect';
+      toast('Server certificate changed', 'Compare the new fingerprint with the fingerprint shown on the server, then press Trust & connect.', '');
+    }
+    // No trusted certificate yet (or the trusted one changed — see
+    // below): probe the server first (nothing sensitive is sent to
+    // probe), then trust its fingerprint.
+    if (!cloudSelected.fingerprint || cloudCertChanged) {
       if (!cloudPendingProbe) {
         try {
           if (btn) { btn.disabled = true; btn.textContent = 'Checking server…'; }
@@ -1089,6 +1566,7 @@
         cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
         cloudSelected.certPem = cloudPendingProbe.certPem;
         justTrusted = cloudPendingProbe.fingerprint;
+        cloudCertChanged = false;
         var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
         await loadCloud();
       } catch (e) {
@@ -1105,22 +1583,43 @@
       if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
       var certPem = cloudSelected.certPem;
       if (!certPem) {
-        // Fingerprint known but the PEM was saved before this build:
-        // re-probe once to get it (the fingerprint must match).
+        // Fingerprint known but the PEM was saved before this build, or
+        // the record came from the list (cloud-get-config does not send
+        // the PEM): re-probe once to get it. A different fingerprint
+        // means the server's certificate changed — offer to trust the
+        // new one instead of dead-ending with "remove and add again".
         var p2 = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-        if (!p2 || !p2.success || p2.fingerprint !== cloudSelected.fingerprint) {
-          toast('Certificate changed', 'The server certificate does not match the trusted fingerprint. Remove the server and add it again.', 'error');
-          return;
-        }
+        if (!p2 || !p2.success) { toast('Cannot reach server', (p2 && p2.error) || 'Check the address and port.', 'error'); return; }
+        if (p2.fingerprint !== cloudSelected.fingerprint) { offerCertRetrust(p2); return; }
         certPem = p2.certPem;
       }
       var r = await api.cloudClientConnect({
         serverId: cloudSelected.id, host: cloudSelected.host, port: cloudSelected.port,
         certPem: certPem, user: cloudSelected.user, password: password || null,
       });
-      if (!r || !r.success) { toast('Connection failed', (r && r.error) || 'Wrong user name or password.', 'error'); return; }
+      if (!r || !r.success) {
+        var connErr = (r && r.error) || 'Wrong user name or password.';
+        // The server's certificate changed since this record was
+        // trusted (round 2 #12: the cert was regenerated with SANs).
+        // The pinned cert no longer validates it, so the login fails
+        // with a certificate error. Probe for the new fingerprint and
+        // offer to trust it — the same manual box as first trust, with
+        // the new fingerprint to compare. Never silently accept a
+        // different certificate.
+        if (/certificat/i.test(connErr) && cloudSelected.fingerprint) {
+          try {
+            var pr = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
+            if (pr && pr.success && pr.fingerprint && pr.fingerprint !== cloudSelected.fingerprint) {
+              offerCertRetrust(pr);
+              return;
+            }
+          } catch (e) {}
+        }
+        toast('Connection failed', connErr, 'error'); return;
+      }
       // Keep the server name: closeCloudConnect() clears cloudSelected.
       cloudConn = { serverId: cloudSelected.id, info: r.info, name: cloudSelected.name };
+      cloudMapInvalidateCache();
       if (pass) pass.value = '';
       closeCloudConnect();
       cloudPath = '';
@@ -1136,7 +1635,14 @@
     } catch (e) {
       toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
     } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
+      if (btn) {
+        btn.disabled = false;
+        // A re-trust offer just set the label to "Trust & connect" —
+        // do not overwrite it on the way out (the fingerprint box
+        // being visible is the sign that the offer is on screen).
+        var fbox = $('cloudFingerprintBox');
+        if (!fbox || fbox.style.display === 'none') btn.textContent = 'Connect';
+      }
     }
   }
 
@@ -1150,6 +1656,7 @@
     cloudReloginTried = false;
     cloudSetConnBanner(false);
     cloudConn = null;
+    cloudMapInvalidateCache();
     cloudPath = '';
     cloudSelectedEntry = null;
     cloudClipboard = null;
@@ -1253,6 +1760,7 @@
       });
       if (r && r.success) {
         cloudConn = { serverId: srv.id, info: r.info, name: srv.name };
+        cloudMapInvalidateCache();
         cloudLinkDown = false;
         cloudSetConnBanner(false);
         cloudReloginTried = false;
@@ -1492,20 +2000,109 @@
     }
   }
 
-  // Open a file the way Windows would: music plays, pictures open, a
-  // game runs — the app downloads a copy to the temp folder and hands
-  // it to the OS. Folders are entered, as before.
+  /* ---------- Open mode (spec v2) ---------- */
+  // How a double-click opens a file: 'direct' (mapped drive, then
+  // Office direct, then temp + save-back) or 'temp' (always temp +
+  // save-back). Stored in cloud.json; default direct. No mode ever
+  // creates a drive letter — a visible drive appears only via the
+  // Map button in the Map network tab.
+  function cloudOpenMode() { return (cloudCfg && cloudCfg.openMode === 'temp') ? 'temp' : 'direct'; }
+  var CLOUD_PROGRAM_EXTS = ['exe', 'msi', 'bat', 'cmd', 'com', 'scr'];
+  var CLOUD_OFFICE_EXTS = ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
+  var CLOUD_MEDIA_EXTS = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma'];
+  function cloudFileExt(name) {
+    var i = String(name || '').lastIndexOf('.');
+    return i <= 0 ? '' : String(name).slice(i + 1).toLowerCase();
+  }
+  // Programs / games NEVER go through temp, in either mode: a game is
+  // a whole folder of files that call each other, and temp downloads
+  // ONE file only — the game would fail to start. Only the mapped
+  // drive works for them.
+  function cloudIsProgramFile(name) { return CLOUD_PROGRAM_EXTS.indexOf(cloudFileExt(name)) >= 0; }
+  function cloudIsOfficeDoc(name) { return CLOUD_OFFICE_EXTS.indexOf(cloudFileExt(name)) >= 0; }
+  function cloudIsMediaFile(name) { return CLOUD_MEDIA_EXTS.indexOf(cloudFileExt(name)) >= 0; }
+  // The mode indicator: how the last file actually opened.
+  function cloudSetLastOpenMode(mode) {
+    var el = $('cloudOpenModeStatus');
+    if (!el) return;
+    el.textContent = mode === 'direct' ? 'Last file: Direct' : mode === 'temp' ? 'Last file: temp' : 'Last file: —';
+  }
+  function renderCloudOpenMode() {
+    var sel = $('cloudOpenModeSel');
+    if (sel) sel.value = cloudOpenMode();
+    var st = $('cloudOpenModeStatus');
+    if (st && !st.textContent) st.textContent = 'Last file: —';
+  }
+  // Mapped-drive open (v1), shared by the program branch and direct
+  // mode. Returns true when the file opened from the drive.
+  async function cloudTryMappedOpen(entry) {
+    try {
+      var letter = await cloudMapLetterFor(cloudConn.serverId);
+      if (letter && api && typeof api.cloudMapdriveOpenMapped === 'function') {
+        var m = await api.cloudMapdriveOpenMapped(cloudConn.serverId, entry.rel);
+        if (m && m.success) return true;
+        // A stale cache (mapped, then unmapped outside the app) must
+        // not block the file: drop it and fall through.
+        cloudMapInvalidateCache();
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // Open a file the way Windows would: music plays, pictures open.
+  // Direct mode tries, in order: the mapped drive, then (for Office
+  // documents) the Office app straight from the server, then (for
+  // video/audio) the default player straight from the server, then
+  // temp + save-back. Temp mode goes straight to temp + save-back.
+  // Any step that fails falls through AUTOMATICALLY to the next one;
+  // only when every method fails does the user see an error. Programs
+  // never go through temp: without a mapped drive they get the Map prompt.
+  // Folders are entered, as before.
   async function cloudOpenFile(entry) {
     if (!entry) return;
     if (entry.isDir) { cloudBrowse(entry.rel); return; }
     if (!cloudConn || cloudTransferBusy) return;
     if (!api || typeof api.cloudClientOpen !== 'function') return cloudMissing();
+    // Programs / games: mapped drive or nothing.
+    if (cloudIsProgramFile(entry.name)) {
+      if (await cloudTryMappedOpen(entry)) { cloudSetLastOpenMode('direct'); return; }
+      askConfirm('"' + entry.name + '" is a program — it needs a mapped drive to run correctly. Without a map it will not run (temp downloads a single file only, and a game is a whole folder).', function () { showCloudPanel('mapdrive'); }, { title: 'This file is a program', yesLabel: 'Create Map', noLabel: 'Cancel' });
+      return;
+    }
+    if (cloudOpenMode() === 'direct') {
+      // (a) Mapped drive.
+      if (await cloudTryMappedOpen(entry)) { cloudSetLastOpenMode('direct'); return; }
+      // (b) Office document: open straight from the server in
+      // Word/Excel/PowerPoint — no temp copy, saves go back.
+      if (cloudIsOfficeDoc(entry.name) && api && typeof api.cloudOfficeOpen === 'function') {
+        try {
+          var o = await api.cloudOfficeOpen(cloudConn.serverId, entry.rel);
+          if (o && o.success) { cloudSetLastOpenMode('direct'); return; }
+        } catch (e) {}
+      }
+      // (b2) Media (round 2 #11): play it straight from the server —
+      // the player streams ranges over WebDAV, so a video starts
+      // without downloading first. Falls through to temp when the
+      // direct open is unavailable (certificate declined, no player).
+      if (cloudIsMediaFile(entry.name) && api && typeof api.cloudMediaOpen === 'function') {
+        try {
+          var md = await api.cloudMediaOpen(cloudConn.serverId, entry.rel);
+          if (md && md.success) { cloudSetLastOpenMode('direct'); return; }
+        } catch (e) {}
+      }
+    }
+    // (c) Temp + save-back: download once, open, and edits upload
+    // back to the server while the app is open.
     try {
       cloudTransferBusy = true;
       showCloudTransfer('Opening ' + entry.name + '…', 0);
       var r = await api.cloudClientOpen(cloudConn.serverId, entry.rel);
       hideCloudTransfer();
-      if (!r || !r.success) toast('Could not open', (r && r.error) || 'The file could not be opened.', 'error');
+      // r.dest is present exactly when the download succeeded, even
+      // when the OS open itself failed — the file still opened via
+      // temp, so the indicator says temp either way.
+      if (!r || (!r.success && !r.dest)) toast('Could not open', (r && r.error) || 'The file could not be opened.', 'error');
+      else cloudSetLastOpenMode('temp');
     } catch (e) {
       hideCloudTransfer();
       toast('Open error', e && e.message ? e.message : 'Could not open the file.', 'error');
@@ -1708,35 +2305,44 @@
     }
     return (s.frequency || 'Daily') + ' at ' + time;
   }
-  function nextRunText(job) {
+  /* Next run of a scheduled job as a Date (null when unscheduled or
+     unparseable). nextRunText() keeps its exact output for the Jobs
+     page; the Dashboard reuses the Date to find the earliest run. */
+  function nextRunDate(job) {
     var s = job.schedule || (job.raw && job.raw.schedule) || null;
-    if (!s || !s.enabled) return 'No schedule — manual only';
-    var freq = s.frequency || 'Daily';
+    if (!s || !s.enabled) return null;
     var time = s.time || '02:00';
     var m = /^(\d{1,2}):(\d{2})$/.exec(time);
-    if (!m) return scheduleLabel(s);
-    var next = new Date();
-    next.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
-    if (freq.toLowerCase() === 'custom') {
+    if (!m) return null;
+    var hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+    var now = new Date();
+    if ((s.frequency || '').toLowerCase() === 'custom') {
       var days = Array.isArray(s.days) ? s.days : [];
-      var found = null;
       for (var i = 0; i < 8; i++) {
         var c = new Date(); c.setDate(c.getDate() + i);
         if (days.indexOf(c.getDay()) < 0) continue;
-        c.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
-        if (c > new Date()) { found = c; break; }
-        if (i === 0) { found = c; break; } // due today
+        c.setHours(hh, mm, 0, 0);
+        if (c > now) return c;
+        if (i === 0) return c; // due today
       }
-      if (found) next = found;
-      return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
+      return null;
     }
-    if (freq.toLowerCase() === 'weekly') {
-      if (next <= new Date()) next.setDate(next.getDate() + 7);
-    } else if (freq.toLowerCase() === 'monthly') {
-      if (next <= new Date()) next.setMonth(next.getMonth() + 1);
-    } else if (next <= new Date()) {
+    var next = new Date();
+    next.setHours(hh, mm, 0, 0);
+    if ((s.frequency || '').toLowerCase() === 'weekly') {
+      if (next <= now) next.setDate(next.getDate() + 7);
+    } else if ((s.frequency || '').toLowerCase() === 'monthly') {
+      if (next <= now) next.setMonth(next.getMonth() + 1);
+    } else if (next <= now) {
       next.setDate(next.getDate() + 1);
     }
+    return next;
+  }
+  function nextRunText(job) {
+    var s = job.schedule || (job.raw && job.raw.schedule) || null;
+    if (!s || !s.enabled) return 'No schedule — manual only';
+    var next = nextRunDate(job);
+    if (!next) return scheduleLabel(s);
     return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
   }
 
@@ -1791,25 +2397,27 @@
     currentJob = null;
   }
   function showSettingsView(view) {
-    var home = $('settingsHomeView'), email = $('settingsEmailView');
-    if (!home || !email) return;
-    home.style.display = view === 'email' ? 'none' : '';
-    email.style.display = view === 'email' ? '' : 'none';
+    /* Settings is a full page now: the four tabs switch sections. The
+       old drawer view names still work: 'home' = General, 'email' = Email. */
+    var tab = view === 'email' ? 'email' : view === 'backup' ? 'backup' : view === 'security' ? 'security' : 'general';
+    var sections = { general: 'settingsGeneralSection', backup: 'settingsBackupSection', security: 'settingsSecuritySection', email: 'settingsEmailSection' };
+    Object.keys(sections).forEach(function (k) { var s = $(sections[k]); if (s) s.style.display = k === tab ? '' : 'none'; });
+    document.querySelectorAll('[data-settings-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-settings-tab') === tab); });
   }
   function refreshEmailMenuStatus() {
-    var el = $('emailMenuStatus'); if (!el) return;
+    var el = $('emailTabStatus'); if (!el) return;
     var enabled = $('settingEmailEnabled') ? $('settingEmailEnabled').checked : false;
     var to = $('settingEmailTo') ? $('settingEmailTo').value.trim() : '';
-    el.textContent = enabled ? ('On' + (to ? ' — ' + to : '')) : 'Off — tap to set up';
+    el.textContent = enabled ? ('On' + (to ? ' — ' + to : '')) : 'Off';
   }
   function openSettings() {
     showSettingsView('home');
-    $('settingsDrawer').classList.add('show');
-    $('settingsBackdrop').classList.add('show');
+    showView('settings');
   }
   function closeSettings() {
-    $('settingsDrawer').classList.remove('show');
-    $('settingsBackdrop').classList.remove('show');
+    /* The settings page is a view now, not a drawer: closing it goes
+       back to the view it was opened from. */
+    showView(lastBackupView || 'dashboard');
   }
 
   /* ---------- progress card ---------- */
@@ -1919,13 +2527,29 @@
     }
   }
   async function openRestore(job) {
-    if (!api || typeof api.showRestoreWizard !== 'function') { toast('Restore unavailable', 'Restore API is not available.', 'error'); return; }
-    try { await api.showRestoreWizard(job ? (job.raw || job) : null); }
+    /* In-place restore: the pending job goes to main (the restore
+       script reads it back with getJobConfig(null)), the view resets
+       to a blank state, and it opens in the main area — no second
+       window any more. */
+    if (!api || typeof api.setRestorePending !== 'function') { toast('Restore unavailable', 'Restore API is not available.', 'error'); return; }
+    try {
+      await api.setRestorePending(job ? (job.raw || job) : null);
+      wizardReturnView = lastBackupView || 'dashboard';
+      if (window.__restoreWizard && typeof window.__restoreWizard.reset === 'function') window.__restoreWizard.reset();
+      showView('restore');
+    }
     catch (e) { toast('Restore failed', e && e.message ? e.message : 'Could not open Restore.', 'error'); }
   }
   async function openJobWizard(job) {
-    if (!api || typeof api.showJobWizard !== 'function') { toast('New Job unavailable', 'Job wizard API is not available.', 'error'); return; }
-    try { await api.showJobWizard(job ? (job.raw || job) : null); }
+    /* In-place wizard: same pattern as openRestore — pending job to
+       main, reset the wizard view, open it in the main area. */
+    if (!api || typeof api.setWizardPending !== 'function') { toast('New Job unavailable', 'Job wizard API is not available.', 'error'); return; }
+    try {
+      await api.setWizardPending(job ? (job.raw || job) : null);
+      wizardReturnView = lastBackupView || 'dashboard';
+      if (window.__jobWizard && typeof window.__jobWizard.reset === 'function') window.__jobWizard.reset();
+      showView('wizard');
+    }
     catch (e) { toast('New Job failed', e && e.message ? e.message : 'Could not open the job wizard.', 'error'); }
   }
 
@@ -1934,7 +2558,7 @@
     if (!api || typeof api.getJobHistory !== 'function') {
       jobs = [];
       renderStats();
-      renderJobs();
+      refreshStorageCard();
       return;
     }
     try {
@@ -1946,13 +2570,23 @@
       jobs = [];
     }
     renderStats();
-    renderJobs();
+    refreshStorageCard();
     renderJobsView();
   }
   if (api && typeof api.onJobsUpdated === 'function') {
     api.onJobsUpdated(function () { loadJobs(); });
   }
+  // One visible spin on a refresh button the user pressed himself.
+  // The background auto-refresh never calls this, so it stays silent.
+  function spinOnce(el) {
+    if (!el) return;
+    el.classList.remove('spinning');
+    void el.offsetWidth;
+    el.classList.add('spinning');
+    el.addEventListener('animationend', function h() { el.classList.remove('spinning'); el.removeEventListener('animationend', h); });
+  }
   async function refreshJobs() {
+    spinOnce($('backupTopRefreshBtn'));
     if (api && typeof api.refreshJobs === 'function') {
       try { await api.refreshJobs(); } catch (e) { /* fall through to reload */ }
     }
@@ -2006,6 +2640,10 @@
     var st;
     try { st = await api.vpnGetStatus(); } catch (e) { st = { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
     vpnStatusCache = st || {};
+    /* The hero tints with the state (06 look): green while connected,
+       red on error, neutral otherwise — the dot and text say the same. */
+    var hero = $('vpnHero');
+    if (hero) hero.className = 'card vpn-hero ' + ((!st || !st.installed) ? 'vpn-hero-idle' : (st.error && !st.connected && !st.needsLogin) ? 'vpn-hero-bad' : st.connected ? 'vpn-hero-ok' : 'vpn-hero-idle');
     // Status dot + Connect button styling live here, in one place:
     // green pulsing dot while connected, grey otherwise; the button is
     // the primary (gradient) action whenever there is something to do
@@ -2340,16 +2978,17 @@
       var row = document.createElement('div');
       row.className = 'vpn-peer';
       var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
-      var body = document.createElement('div'); body.className = 'vpn-peer-body';
       var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name;
-      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
-      meta.textContent = (p.ip || '—') + (p.os ? ' — ' + p.os : '') + ' — ' + (p.online ? 'online' : 'offline');
-      body.appendChild(h); body.appendChild(meta);
-      row.appendChild(d); row.appendChild(body);
+      var ip = document.createElement('span'); ip.className = 'vpn-peer-ip'; ip.textContent = p.ip || '—';
+      var os = document.createElement('span'); os.className = 'vpn-peer-os'; os.textContent = p.os || '—';
+      var st = document.createElement('span'); st.className = 'pill ' + (p.online ? 'pill-completed' : 'pill-pending'); st.textContent = p.online ? 'online' : 'offline';
+      row.appendChild(d); row.appendChild(h); row.appendChild(ip); row.appendChild(os); row.appendChild(st);
       if (p.ip) {
         var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open in Cloud';
         open.addEventListener('click', function () { openCloudWithPeer(p); });
         row.appendChild(open);
+      } else {
+        var spacer = document.createElement('span'); row.appendChild(spacer);
       }
       list.appendChild(row);
     });
@@ -2391,6 +3030,9 @@
     var st;
     try { st = await api.wgGetStatus(); } catch (e) { st = { installed: false, serverRunning: false, clientRunning: false, error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
     wgStatusCache = st || {};
+    /* Same state tint as the Tailscale hero (06 look). */
+    var wh = $('wgHero');
+    if (wh) wh.className = 'card vpn-hero ' + (!st.installed ? 'vpn-hero-idle' : st.serverRunning ? 'vpn-hero-ok' : st.error ? 'vpn-hero-bad' : 'vpn-hero-idle');
     renderWgNat(st || {});
     var dot = $('wgStatusDot'); if (dot) dot.className = 'vpn-dot' + (st.serverRunning ? ' on' : '');
     var txt = $('wgStatusText'), sub = $('wgStatusSub');
@@ -2411,9 +3053,9 @@
       return;
     }
     if (ni) ni.style.display = 'none';
-    if (sc) sc.style.display = '';
+    if (sc) sc.style.display = wgPanel === 'server' ? '' : 'none';
     if (tl) {
-      if (st.transport === 'amneziawg') { tl.style.display = ''; tl.textContent = st.obfuscated ? 'Transport: AmneziaWG — traffic is obfuscated, so it doesn\u2019t look like WireGuard on the network.' : 'Transport: AmneziaWG.'; }
+      if (st.transport === 'amneziawg') { tl.style.display = ''; tl.textContent = st.obfuscated ? 'Transport: AmneziaWG (obfuscated)' : 'Transport: AmneziaWG.'; }
       else { tl.style.display = ''; tl.textContent = 'Transport: stock WireGuard (no obfuscation).'; }
     }
     if (st.serverRunning) {
@@ -2436,7 +3078,7 @@
     var sp = $('wgServerPort');
     if (sp && document.activeElement !== sp) sp.value = String((st.server && st.server.listenPort) || 51820);
     var ph = $('wgPortHint');
-    if (ph) ph.textContent = 'On your router, forward UDP ' + ((st.server && st.server.listenPort) || 51820) + ' to this machine — that is the only router step. Without it, nobody outside your home network can reach this server.';
+    if (ph) ph.textContent = 'On your router, forward UDP ' + ((st.server && st.server.listenPort) || 51820) + ' to this machine — the only router step.';
     var ep = $('wgEndpoint');
     if (ep && document.activeElement !== ep) ep.value = (st.server && st.server.endpoint) || '';
     renderWgPeers(st.peers || []);
@@ -2468,6 +3110,7 @@
     } else {
       ns.textContent = 'NAT service: stopped.' + (n.lastError ? (' ' + n.lastError) : '') + summary;
     }
+    ns.className = 't-sub vpn-note wg-nat-banner' + (n.running ? ' ok' : '');
     /* Start is available when the service is not running and the
        mode has what it needs: different-subnet needs only a peer
        picked (there is no configuration to save there); same-subnet
@@ -2515,7 +3158,7 @@
     var mk = function (cls, ph) {
       var el = document.createElement('input');
       el.type = 'text'; el.className = cls; el.placeholder = ph; el.autocomplete = 'off';
-      el.style.cssText = 'flex:1; min-width:130px;';
+      el.style.cssText = 'flex:1; min-width:100px;';
       el.addEventListener('input', function () { wgNatFormDirty = true; });
       return el;
     };
@@ -2660,20 +3303,30 @@
     if (!peers.length) {
       var empty = document.createElement('div');
       empty.className = 'empty-state';
-      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Add a device below and it will show up here.</p>';
+      empty.innerHTML = '<div class="big">🔐</div><h3>No devices yet</h3><p>Add a device above and it will show up here.</p>';
       list.appendChild(empty);
       return;
     }
     peers.forEach(function (p) {
       var row = document.createElement('div');
-      row.className = 'vpn-peer';
+      row.className = 'vpn-peer wg-peer';
       var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
-      var body = document.createElement('div'); body.className = 'vpn-peer-body';
-      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name + ' — ' + p.tunnelIp;
-      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
-      meta.textContent = (p.online ? ('online — last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected') + ' · ' + formatBytes(p.transferRx || 0) + ' down / ' + formatBytes(p.transferTx || 0) + ' up · ' + String(p.publicKey || '').slice(0, 12) + '…' + (p.endpoint ? (' · endpoint ' + p.endpoint) : '');
-      body.appendChild(h); body.appendChild(meta);
-      row.appendChild(d); row.appendChild(body);
+      var dev = document.createElement('div'); dev.className = 'wg-peer-dev';
+      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name;
+      var tip = document.createElement('div'); tip.className = 'vpn-peer-meta'; tip.textContent = (p.tunnelIp || '—') + (p.endpoint ? (' · endpoint ' + p.endpoint) : '');
+      dev.appendChild(h); dev.appendChild(tip);
+      var st = document.createElement('div'); st.className = 'wg-peer-status';
+      var pill = document.createElement('span'); pill.className = 'pill ' + (p.online ? 'pill-completed' : 'pill-pending'); pill.textContent = p.online ? 'online' : 'offline';
+      var hs = document.createElement('div'); hs.className = 'vpn-peer-meta'; hs.textContent = p.online ? ('last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected';
+      st.appendChild(pill); st.appendChild(hs);
+      var tr = document.createElement('div'); tr.className = 'wg-peer-transfer';
+      var dn = document.createElement('div'); dn.textContent = formatBytes(p.transferRx || 0) + ' down';
+      var up = document.createElement('div'); up.className = 'vpn-peer-meta'; up.textContent = formatBytes(p.transferTx || 0) + ' up';
+      tr.appendChild(dn); tr.appendChild(up);
+      var key = document.createElement('span'); key.className = 'wg-peer-key'; key.textContent = String(p.publicKey || '').slice(0, 12) + '…';
+      var ep = p.endpoint ? (' · ' + p.endpoint) : '';
+      key.title = (p.publicKey || '') + ep;
+      row.appendChild(d); row.appendChild(dev); row.appendChild(st); row.appendChild(tr); row.appendChild(key);
       var rm = document.createElement('button'); rm.className = 'btn btn-ghost btn-sm'; rm.type = 'button'; rm.textContent = 'Remove';
       rm.addEventListener('click', async function () {
         if (!api || typeof api.wgRemovePeer !== 'function') return wgMissing();
@@ -2699,14 +3352,53 @@
     var nnj = $('navNewJob'); if (nnj) nnj.addEventListener('click', function () { openJobWizard(null); });
     var jnb = $('jobsNewJobBtn'); if (jnb) jnb.addEventListener('click', function () { openJobWizard(null); });
     var jenb = $('jobsEmptyNewJobBtn'); if (jenb) jenb.addEventListener('click', function () { openJobWizard(null); });
-    $('emptyNewJobBtn').addEventListener('click', function () { openJobWizard(null); });
+    /* Jobs page 02 toolbar + details panel: everything acts on the
+       selected row (first row when nothing is picked yet). */
+    var jrb = $('jobsRunBtn'); if (jrb) jrb.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
+    var jeb = $('jobsEditBtn'); if (jeb) jeb.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
+    var jdb = $('jobsDeleteBtn'); if (jdb) jdb.addEventListener('click', deleteSelectedJob);
+    var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', refreshJobs);
+    var jch = $('jobsClearHistoryBtn'); if (jch) jch.addEventListener('click', function () {
+      if (!api || typeof api.clearJobHistory !== 'function') return;
+      askConfirm('Do you want to delete ALL backup history? This cannot be undone.', async function () {
+        try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
+        catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
+      });
+    });
+    var jsi = $('jobsSearchInput'); if (jsi) jsi.addEventListener('input', renderJobsView);
+    var jsf = $('jobsStatusFilter'); if (jsf) jsf.addEventListener('change', renderJobsView);
+    var jss = $('jobsSortSelect'); if (jss) jss.addEventListener('change', renderJobsView);
+    var jdr = $('jobsDetailsRun'); if (jdr) jdr.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
+    var jdrs = $('jobsDetailsRestore'); if (jdrs) jdrs.addEventListener('click', function () { var j = selectedJob(); if (j) openRestore(j); });
+    var jde = $('jobsDetailsEdit'); if (jde) jde.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
+    /* Dashboard 01 quick actions. */
+    var dnj = $('dashNewJob'); if (dnj) dnj.addEventListener('click', function () { openJobWizard(null); });
+    var denj = $('dashEmptyNewJobBtn'); if (denj) denj.addEventListener('click', function () { openJobWizard(null); });
+    var drs = $('dashRestore'); if (drs) drs.addEventListener('click', function () { openRestore(null); });
+    var dvj = $('dashViewJobs'); if (dvj) dvj.addEventListener('click', function () { showView('jobs'); });
+    var dval = $('dashViewAllJobs'); if (dval) dval.addEventListener('click', function () { showView('jobs'); });
+    var dol = $('dashOpenLogs'); if (dol) dol.addEventListener('click', function () { showView('logs'); });
+    /* Round 2 #10: Backup Settings and Check Storage were removed
+       from Quick Actions — the gear (top bar) opens Settings, and
+       the storage card re-reads on its own. */
+    /* Recent Backup Jobs hover (round 2 #6): the row under the mouse
+       drives the Backup Storage card; leaving the list reverts. */
+    var drb = $('dashRecentBody');
+    if (drb) {
+      drb.addEventListener('mouseover', function (e) {
+        var tr = e.target && e.target.closest ? e.target.closest('tr') : null;
+        if (!tr || !drb.contains(tr)) return;
+        showStorageHover(tr.dataset.dest || '');
+      });
+      drb.addEventListener('mouseleave', clearStorageHover);
+    }
+    var dopen = $('dashOpenLocation'); if (dopen) dopen.addEventListener('click', function () {
+      if (storageDest && api && typeof api.openPath === 'function') api.openPath(storageDest).catch(function () {});
+    });
 
     $('navRestore').addEventListener('click', function () { openRestore(null); });
     var brb = $('backupTopRefreshBtn');
     if (brb) brb.addEventListener('click', refreshJobs);
-    $('searchInput').addEventListener('input', renderJobs);
-    $('statusFilter').addEventListener('change', renderJobs);
-    $('typeFilter').addEventListener('change', renderJobs);
     $('themeToggle').addEventListener('click', async function () {
       var next = document.body.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
       applyTheme(next);
@@ -2757,12 +3449,9 @@
     if (vus) vus.addEventListener('click', hideVaultModal);
     var vup = $('vaultUnlockPass');
     if (vup) vup.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); $('vaultUnlockBtn').click(); } });
-    $('settingsClose').addEventListener('click', closeSettings);
-    $('settingsBackdrop').addEventListener('click', closeSettings);
-    var emr = $('emailMenuRow');
-    if (emr) emr.addEventListener('click', function () { showSettingsView('email'); });
-    var ebb = $('emailBackBtn');
-    if (ebb) ebb.addEventListener('click', function () { showSettingsView('home'); });
+    document.querySelectorAll('[data-settings-tab]').forEach(function (tab) {
+      tab.addEventListener('click', function () { showSettingsView(tab.getAttribute('data-settings-tab')); });
+    });
     $('settingsSave').addEventListener('click', async function () { await saveSettings(); closeSettings(); });
     var etb = $('emailTestBtn');
     if (etb) etb.addEventListener('click', async function () {
@@ -2784,35 +3473,46 @@
         try { await api.saveSettings(Object.assign({}, settings, { theme: next })); settings.theme = next; } catch (e) { /* theme already applied visually */ }
       }
     });
-    $('clearHistoryBtn').addEventListener('click', function () {
-      if (!api || typeof api.clearJobHistory !== 'function') return;
-      askConfirm('Do you want to delete ALL backup history? This cannot be undone.', async function () {
-        try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
-        catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
-      });
-    });
     var cy = $('confirmYes'); if (cy) cy.addEventListener('click', function () { var cb = confirmCallback; closeConfirm(); if (cb) cb(); });
     var cn = $('confirmNo'); if (cn) cn.addEventListener('click', closeConfirm);
     var cb2 = $('confirmBackdrop'); if (cb2) cb2.addEventListener('click', closeConfirm);
+    /* Collapsible nav groups: the arrow next to Backup / Cloud / VPN
+       folds its items away. All groups start collapsed and open only
+       when the user clicks the header — navigation never opens one. */
+    document.querySelectorAll('.nav-group-head').forEach(function (head) {
+      head.addEventListener('click', function () {
+        var g = head.closest('.nav-group');
+        if (g) g.classList.toggle('collapsed');
+      });
+    });
+    document.querySelectorAll('[data-wg-tab]').forEach(function (tab) {
+      tab.addEventListener('click', function () { showWgPanel(tab.getAttribute('data-wg-tab')); });
+    });
+    document.querySelectorAll('[data-cloud-tab]').forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        var panel = tab.getAttribute('data-cloud-tab');
+        showCloudPanel(panel); setModule('cloud');
+      });
+    });
     document.querySelectorAll('[data-nav]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var nav = btn.getAttribute('data-nav');
         document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
         btn.classList.add('active');
-        if (nav === 'settings') openSettings();
         if (nav === 'logs') toast('Logs', 'Open the Log Viewer from the Logs window.', '');
         if (nav === 'jobs') showView('jobs');
         if (nav === 'dashboard') showView('dashboard');
         if (nav === 'logs') showView('logs');
-        if (nav === 'cloud') showView('cloud');
+        if (nav === 'cloud') { showCloudPanel('home'); showView('cloud'); }
         if (nav === 'vpn') showView('vpn');
-        if (nav === 'wireguard') showView('wireguard');
-        if (nav === 'cloud-server') { setModule('cloud'); showCloudPanel('server'); }
-        if (nav === 'cloud-client') { setModule('cloud'); showCloudPanel('client'); }
+        if (nav === 'wireguard') { showView('wireguard'); showWgPanel('server'); }
+        if (nav === 'wireguard-site') { showView('wireguard'); showWgPanel('nat'); }
+        // (No 'wireguard-nat' item: it was a duplicate shortcut to the
+        // same Site-to-Site panel — removed in round 2 #2.)
+        if (nav === 'cloud-server') { showCloudPanel('server'); setModule('cloud'); }
+        if (nav === 'cloud-client') { showCloudPanel('client'); setModule('cloud'); }
+        if (nav === 'cloud-mapdrive') { showCloudPanel('mapdrive'); setModule('cloud'); }
       });
-    });
-    document.querySelectorAll('[data-module]').forEach(function (btn) {
-      btn.addEventListener('click', function () { setModule(btn.getAttribute('data-module')); });
     });
     document.querySelectorAll('#cloudServerAccessSeg .seg-btn').forEach(function (b) {
       b.addEventListener('click', function () { setServerAccess(b.getAttribute('data-access')); saveCloudServerSettings(); });
@@ -2826,6 +3526,7 @@
     var wgApb = $('cloudClientWgAddPeerBtn');
     if (wgApb) wgApb.addEventListener('click', function () {
       showView('wireguard');
+      showWgPanel('server'); // the Add-a-device form lives in the server card
       // Focus AFTER the status load finishes: it hides the server
       // card when the transport is not installed, and focusing
       // before that races it (the card hides under the focus).
@@ -3042,7 +3743,7 @@
     $('drawerBackdrop').addEventListener('click', closeDrawer);
     $('drawerRun').addEventListener('click', function () { if (currentJob) runBackup(currentJob, false); });
     $('drawerRestore').addEventListener('click', function () { if (currentJob) openRestore(currentJob); });
-    $('drawerEdit').addEventListener('click', function () { if (currentJob) { closeDrawer(); openJobWizard(currentJob); } });
+    $('drawerEdit').addEventListener('click', function () { var j = currentJob; if (j) { closeDrawer(); openJobWizard(j); } });
     $('drawerDelete').addEventListener('click', async function () {
       if (!currentJob) return;
       try {
@@ -3064,7 +3765,7 @@
       btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
     });
     var lrb = $('logsRefreshBtn');
-    if (lrb) lrb.addEventListener('click', function () { loadJobs().then(function () { renderLogs(currentLogTab); }); });
+    if (lrb) lrb.addEventListener('click', function () { spinOnce(lrb.querySelector('.refresh-glyph')); loadJobs().then(function () { renderLogs(currentLogTab); }); });
     var llf = $('logsLevelFilter');
     if (llf) llf.addEventListener('change', renderFullLog);
     var ls = $('logsSearch');
@@ -3094,7 +3795,7 @@
         // Starting applies the port shown in the field first — changing
         // the port and pressing Start must not silently start the old one.
         var port = parseInt(($('cloudServerPort') || {}).value, 10);
-        var saved = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : true, port: port, accessMode: cloudServerAccess });
+        var saved = await api.cloudServerSave({ enabled: $('cloudServerEnabled') ? $('cloudServerEnabled').checked : true, port: port, accessMode: cloudServerAccess, ddnsHostname: ($('cloudServerDdns') || {}).value || '' });
         if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save Cloud settings.', 'error'); return; }
         var r = await api.cloudServerStart();
         if (r && r.success) { toast('Server started', 'The Cloud server is running.', 'success'); await loadCloud(); }
@@ -3108,6 +3809,8 @@
     if (cse) cse.addEventListener('change', function () { saveCloudServerSettings(); });
     var csp = $('cloudServerPort');
     if (csp) csp.addEventListener('change', function () { saveCloudServerSettings(); });
+    var csd = $('cloudServerDdns');
+    if (csd) csd.addEventListener('change', function () { saveCloudServerSettings(); });
     var cdi = $('cloudDetectIpBtn');
     if (cdi) cdi.addEventListener('click', async function () {
       if (!api || typeof api.cloudDetectIP !== 'function') return cloudMissing();
@@ -3120,6 +3823,8 @@
           if (r.publicIP) lines.push('Public (from outside): ' + r.publicIP);
           else lines.push('Public: unknown (no internet or detection failed)');
           if (r.lanIPs && r.lanIPs.length) lines.push('LAN (same network): ' + r.lanIPs.join(', '));
+          var ddns = ($('cloudServerDdns') || {}).value || '';
+          if (ddns) lines.push('DDNS: ' + ddns);
           addrs.textContent = lines.join(' — ');
         }
       } catch (e) { toast('Detect error', e && e.message ? e.message : 'Could not detect addresses.', 'error'); }
@@ -3173,15 +3878,20 @@
           var u2 = $('cloudClientUser'); if (u2) u2.value = '';
           var p2 = $('cloudClientPass'); if (p2) p2.value = '';
           await loadCloud();
-          // Save & connect, one click: open the connect box with the
-          // password the user just typed (it is never stored), and do
-          // the whole thing at once — probe, trust the fingerprint,
-          // connect. Without a password the box stays open so the user
-          // can type it and press Connect there.
+          // Save & connect, one click: with a typed password go
+          // straight in — the box would only flash open and close
+          // again (it was pre-filled with the same password and the
+          // flow auto-connects). Without a password the box opens so
+          // the user can type it and press Connect there.
           var rec = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === r.id; });
           if (rec) {
-            openCloudConnect(rec, password);
-            if (password) cloudConnectFlow(true);
+            if (password) {
+              cloudSelected = rec;
+              cloudPendingProbe = null;
+              cloudConnectFlow(true, password);
+            } else {
+              openCloudConnect(rec);
+            }
           }
         } else toast('Save failed', (r && r.error) || 'Could not save server.', 'error');
       } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error'); }
@@ -3194,12 +3904,50 @@
     if (ccp) ccp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') cloudConnectFlow(); });
     var cdb = $('cloudDisconnectBtn');
     if (cdb) cdb.addEventListener('click', function () { cloudDisconnect(); });
+    var cmb2 = $('cloudMapBtn');
+    if (cmb2) cmb2.addEventListener('click', function () { cloudMapDriveAction(); });
+    var cmd = $('cloudMapDisconnectBtn');
+    if (cmd) cmd.addEventListener('click', async function () {
+      var sel = $('cloudMapServer');
+      if (!sel || !sel.value) return;
+      if (!api || typeof api.cloudMapdriveDisconnect !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudMapdriveDisconnect(sel.value);
+        if (r && r.success) { toast('Drive disconnected', 'The mapped drive was removed.', 'success'); cloudMapInvalidateCache(); }
+        else toast('Disconnect failed', (r && r.error) || 'Could not disconnect the drive.', 'error');
+      } catch (e) { toast('Disconnect error', e && e.message ? e.message : 'Could not disconnect the drive.', 'error'); }
+      await renderMapdrivePanel();
+    });
+    var cme = $('cloudMapExplorerBtn');
+    if (cme) cme.addEventListener('click', async function () {
+      if (!cloudMapCurrentLetter) return;
+      if (!api || typeof api.cloudMapdriveOpenExplorer !== 'function') return cloudMissing();
+      try {
+        var r2 = await api.cloudMapdriveOpenExplorer(cloudMapCurrentLetter);
+        if (!r2 || !r2.success) toast('Could not open Explorer', (r2 && r2.error) || 'The drive could not be opened.', 'error');
+      } catch (e) { toast('Explorer error', e && e.message ? e.message : 'The drive could not be opened.', 'error'); }
+    });
+    var cms2 = $('cloudMapServer');
+    if (cms2) cms2.addEventListener('change', function () { renderMapdrivePanel(); });
     var cub2 = $('cloudUploadBtn');
     if (cub2) cub2.addEventListener('click', function () { cloudUpload(); });
     var cmb = $('cloudMkdirBtn');
     if (cmb) cmb.addEventListener('click', function () { cloudNewFolder(cloudPath); });
     var cbr = $('cloudBrowserRefreshBtn');
     if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
+    // Open mode (spec v2): which way a double-click opens a file.
+    // The choice persists in cloud.json; no mode ever creates a
+    // drive letter.
+    var coms = $('cloudOpenModeSel');
+    if (coms) coms.addEventListener('change', async function () {
+      var next = coms.value === 'temp' ? 'temp' : 'direct';
+      if (!api || typeof api.cloudSetOpenMode !== 'function') return cloudMissing();
+      try {
+        var r = await api.cloudSetOpenMode(next);
+        if (r && r.success) { if (cloudCfg) cloudCfg.openMode = r.openMode; }
+        else { toast('Could not save the open mode', (r && r.error) || 'The choice was not saved.', 'error'); renderCloudOpenMode(); }
+      } catch (e) { toast('Could not save the open mode', e && e.message ? e.message : 'The choice was not saved.', 'error'); renderCloudOpenMode(); }
+    });
     // Explorer toolbar: the actions apply to the selected row.
     var cub3 = $('cloudUpBtn');
     if (cub3) cub3.addEventListener('click', function () { if (cloudPath) cloudBrowse(cloudParent(cloudPath)); });
@@ -3252,6 +4000,15 @@
         if (!p) return;
         var kind = p.kind === 'upload' ? 'Uploading' : 'Downloading';
         showCloudTransfer(kind + ' ' + (p.name || '') + ' — ' + Math.round(p.pct || 0) + '%', p.pct || 0);
+      });
+    }
+    // Temp + save-back results: a successful save-back stays silent
+    // (that is the point); a conflict or a failure warns the user.
+    if (api && typeof api.onCloudSaveback === 'function') {
+      api.onCloudSaveback(function (ev) {
+        if (!ev) return;
+        if (ev.kind === 'conflict') toast('Not saved back', '«' + (ev.name || '') + '» changed on the server since you opened it — your edits were NOT overwritten onto the server. They are still in the temp copy.', 'error');
+        else if (ev.kind === 'error') toast('Save-back failed', '«' + (ev.name || '') + '» could not be saved back to the server: ' + (ev.error || ''), 'error');
       });
     }
 
@@ -3426,13 +4183,10 @@
     } catch (e) { toast('Add failed', e && e.message ? e.message : 'Could not add the peer.', 'error'); }
     await loadWireGuard();
   });
-    document.querySelectorAll('[data-module-enter]').forEach(function (card) {
-      card.addEventListener('click', function () { setModule(card.getAttribute('data-module-enter')); });
-    });
     var tbb = $('topBackBtn');
     if (tbb) tbb.addEventListener('click', goBack);
 
     loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
-    showView('modules');
+    showView('dashboard');
   });
 })();

@@ -27,7 +27,150 @@ class RestoreResult extends EventEmitter {
     this.total_bytes = 0;
     this.duration_seconds = 0;
     this.errors = [];
+    // Non-fatal notes (e.g. a legacy backup restored without a
+    // manifest): the restore succeeded, but the user should know
+    // what was NOT verified.
+    this.warnings = [];
+    // The backup chain that was applied, oldest first (basenames) —
+    // empty for a plain single-artifact restore.
+    this.chain = [];
   }
+}
+
+// Name of the SHA-256 integrity manifest the engine writes into
+// plain-folder backups (see techvision-core.js). It is metadata, not
+// user data: never restored as a file, never listed in getZipInfo.
+const MANIFEST_NAME = '.techvision-manifest.json';
+
+// Write-then-commit: stream to a temp file in the SAME directory as the
+// final path (so the rename stays on one filesystem), then rename over
+// the destination only after verification. A failed write or verify
+// removes the TEMP file — the destination, and any good file already
+// there, is never touched. (A restore used to write straight to the
+// destination and delete it on a CRC mismatch, destroying a good file
+// that was already there.)
+let tempCounter = 0;
+function tempPathFor(dest) {
+  return dest + '.tvtmp-' + process.pid + '-' + (++tempCounter);
+}
+
+// Read a backup folder's integrity manifest, or null when there is
+// none (backups made before manifests were added) or it is unreadable
+// — a bad manifest must never fail a restore, it just means the files
+// are restored unverified.
+function readManifest(backupDir) {
+  try {
+    const raw = fs.readFileSync(path.join(backupDir, MANIFEST_NAME), 'utf8');
+    const m = JSON.parse(raw);
+    if (m && m.version === 1 && m.files && typeof m.files === 'object') return m;
+  } catch (e) {}
+  return null;
+}
+
+// Stream-copy src -> dest while computing the SHA-256 of the bytes
+// actually written. Resolves { hash, size }. A failed copy removes
+// the partial destination.
+function copyFileHashed(src, dest) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    let size = 0;
+    const rs = fs.createReadStream(src);
+    const ws = fs.createWriteStream(dest);
+    let failed = false;
+    const fail = (err) => {
+      if (failed) return;
+      failed = true;
+      try { rs.destroy(); } catch (e) {}
+      try { ws.destroy(); } catch (e) {}
+      try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch (e) {}
+      reject(err);
+    };
+    const tee = new Transform({
+      transform(chunk, encoding, callback) {
+        hash.update(chunk);
+        size += chunk.length;
+        callback(null, chunk);
+      }
+    });
+    rs.on('error', fail);
+    tee.on('error', fail);
+    ws.on('error', fail);
+    ws.on('finish', () => resolve({ hash: hash.digest('hex'), size: size }));
+    rs.pipe(tee).pipe(ws);
+  });
+}
+
+/**
+ * Incremental chain restore (P1-8).
+ *
+ * A job's artifacts live side by side in one folder as
+ * `<job>_full_<ISO-stamp>.zip` (or a plain folder without .zip)
+ * and `<job>_incremental_<ISO-stamp>.zip` (or folder). The ISO
+ * stamps sort lexicographically in chronological order. An
+ * incremental on its own is only a DELTA — restoring it alone
+ * silently drops every unchanged file (they live only in the
+ * base Full). So restoring any artifact restores its whole chain:
+ * the newest Full at or before it, then every incremental after
+ * that Full up to and including it, oldest first, so newer files
+ * overwrite older ones.
+ *
+ * Deletions are a known limitation: an incremental records no
+ * tombstones, so a file deleted from the source after the Full is
+ * still restored from the Full. Removing it would need deletion
+ * records in the backup state, which do not exist yet.
+ */
+
+// `<job>_full_<stamp>` / `<job>_incremental_<stamp>`, stamp =
+// new Date().toISOString().replace(/[:.]/g, '-') (see
+// techvision-core.js). The job name is greedy: a job literally
+// named `my_full_job` still parses as job `my_full_job`.
+const ARTIFACT_RE = /^(.*)_(full|incremental)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.zip)?$/;
+
+function parseArtifactName(fileName) {
+  const m = ARTIFACT_RE.exec(fileName);
+  if (!m) return null;
+  return { jobName: m[1], kind: m[2], stamp: m[3] };
+}
+
+// Resolve the chain for one artifact. Returns null when the path
+// is not a job artifact (or does not exist) — the caller then
+// restores just that artifact, as before. Otherwise returns
+// { chain, baseMissing }: `chain` is the artifact paths oldest
+// first ending with the selected one; `baseMissing` is true when
+// the selected artifact is an incremental whose base Full is not
+// in the folder (the chain is then just the selected artifact).
+function findBackupChain(artifactPath) {
+  let stat = null;
+  try { stat = fs.statSync(artifactPath); } catch (e) { return null; }
+  if (!stat.isFile() && !stat.isDirectory()) return null;
+  const dir = path.dirname(artifactPath);
+  const selected = parseArtifactName(path.basename(artifactPath));
+  if (!selected) return null;
+  let names = null;
+  try { names = fs.readdirSync(dir); } catch (e) { return null; }
+  const siblings = [];
+  for (const name of names) {
+    const parsed = parseArtifactName(name);
+    if (!parsed || parsed.jobName !== selected.jobName) continue;
+    const full = path.join(dir, name);
+    try {
+      const s = fs.statSync(full);
+      if (!s.isFile() && !s.isDirectory()) continue;
+    } catch (e) { continue; }
+    siblings.push({ path: full, kind: parsed.kind, stamp: parsed.stamp });
+  }
+  siblings.sort((a, b) => (a.stamp < b.stamp ? -1 : (a.stamp > b.stamp ? 1 : 0)));
+  const selIdx = siblings.findIndex((s) => path.resolve(s.path) === path.resolve(artifactPath));
+  if (selIdx < 0) return null;
+  if (selected.kind === 'full') return { chain: [artifactPath], baseMissing: false };
+  // Newest Full at or before the selected incremental is the base.
+  let baseIdx = -1;
+  for (let i = selIdx; i >= 0; i--) {
+    if (siblings[i].kind === 'full') { baseIdx = i; break; }
+  }
+  if (baseIdx < 0) return { chain: [artifactPath], baseMissing: true };
+  const chain = siblings.slice(baseIdx, selIdx + 1).map((s) => s.path);
+  return { chain: chain, baseMissing: false };
 }
 
 /**
@@ -52,9 +195,44 @@ class RestoreEngine {
   }
 
   /**
-   * Restore all files from ZIP using streaming (yauzl)
+   * Restore all files from one backup artifact, or from its whole
+   * incremental chain when it is an incremental (see findBackupChain
+   * above): the base Full plus every incremental up to it, oldest
+   * first. A Full on its own restores exactly as before.
    */
   async restore_all(zipPath, restoreDir, password) {
+    const chain = findBackupChain(zipPath);
+    if (!chain || (chain.chain.length === 1 && !chain.baseMissing)) {
+      return this._restoreSingle(zipPath, restoreDir, password);
+    }
+    const result = new RestoreResult();
+    const startTime = Date.now();
+    result.chain = chain.chain.map((p) => path.basename(p));
+    for (const artifact of chain.chain) {
+      const one = await this._restoreSingle(artifact, restoreDir, password);
+      result.files_restored += one.files_restored;
+      result.files_verified += one.files_verified;
+      result.files_mismatched += one.files_mismatched;
+      result.total_bytes += one.total_bytes;
+      result.errors.push(...one.errors);
+      result.warnings.push(...one.warnings);
+    }
+    if (chain.baseMissing) {
+      result.errors.push('Base full backup not found — this incremental backup is only a delta; files that did not change are missing from this restore.');
+    } else {
+      result.warnings.push('Restored a backup chain, oldest first: ' + result.chain.join(' + ') + '.');
+    }
+    result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+    result.success = result.files_restored > 0 && result.errors.length === 0 && result.files_mismatched === 0;
+    return result;
+  }
+
+  /**
+   * Restore all files from a SINGLE artifact (one ZIP or one plain
+   * folder). This is the old restore_all body, unchanged — the chain
+   * wrapper above calls it once per artifact.
+   */
+  async _restoreSingle(zipPath, restoreDir, password) {
     const result = new RestoreResult();
     const startTime = Date.now();
     // Encrypted backup (WinZip AES-256): yauzl cannot decrypt, so the
@@ -75,7 +253,7 @@ class RestoreEngine {
       try {
         if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
         if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
-        const extracted = zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
+        const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
           result.files_restored++;
           result.total_bytes += size;
         });
@@ -105,21 +283,55 @@ class RestoreEngine {
         if (dstAbs === srcAbs || dstAbs.startsWith(srcAbs + path.sep)) {
           throw new Error('Cannot restore into the backup folder itself.');
         }
-        const walk = (dir) => {
+        const walk = async (dir) => {
           for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
             const src = path.join(dir, entry.name);
             const rel = path.relative(zipPath, src);
             const dest = path.join(restoreDir, rel);
             try {
-              if (entry.isDirectory()) { fs.mkdirSync(dest, { recursive: true }); walk(src); }
+              if (entry.isDirectory()) { fs.mkdirSync(dest, { recursive: true }); await walk(src); }
               else if (entry.isSymbolicLink()) { result.errors.push('Skipped symbolic link: ' + rel); }
-              else { fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.copyFileSync(src, dest); result.files_restored++; result.total_bytes += fs.statSync(src).size; }
+              else if (rel === MANIFEST_NAME) {
+                // The integrity manifest is metadata, not user data —
+                // never restored as a file.
+                continue;
+              }
+              else {
+                fs.mkdirSync(path.dirname(dest), { recursive: true });
+                // Copy to a temp file, verify against the manifest,
+                // then rename: a corrupt backup file must never
+                // overwrite a good file at the destination.
+                const tmp = tempPathFor(dest);
+                const copied = await copyFileHashed(src, tmp);
+                if (manifest) {
+                  const want = manifest.files[rel.replace(/\\/g, '/')];
+                  if (!want) {
+                    try { fs.unlinkSync(tmp); } catch (e) {}
+                    result.errors.push(`No manifest entry for ${rel} — refusing to restore an unverified file`);
+                    result.files_mismatched++;
+                  } else if (copied.hash !== want.sha256 || copied.size !== want.size) {
+                    try { fs.unlinkSync(tmp); } catch (e) {}
+                    result.errors.push(`Hash mismatch (corrupt backup file): ${rel}`);
+                    result.files_mismatched++;
+                  } else {
+                    fs.renameSync(tmp, dest);
+                    result.files_restored++; result.files_verified++; result.total_bytes += copied.size;
+                  }
+                } else {
+                  fs.renameSync(tmp, dest);
+                  result.files_restored++; result.total_bytes += copied.size;
+                }
+              }
             } catch (e) {
               result.errors.push('Failed to restore ' + rel + ': ' + e.message);
             }
           }
         };
-        walk(zipPath);
+        const manifest = readManifest(zipPath);
+        await walk(zipPath);
+        if (!manifest) {
+          result.warnings.push('This backup has no integrity manifest (created before verification was added) — files were copied without hash verification.');
+        }
         result.success = result.files_restored > 0 && result.errors.length === 0;
         if (result.files_restored === 0 && result.errors.length === 0) {
           result.errors.push('Nothing to restore: the backup folder is empty.');
@@ -171,7 +383,14 @@ class RestoreEngine {
         if (finished) return;
         result.errors.push(err && err.message ? err.message : String(err));
         ended = true;
-        pendingEntries = 0;
+        // Do NOT zero pendingEntries or close the zipfile here: an
+        // entry whose stream is already open must be allowed to
+        // settle (verify + rename) instead of being discarded — a
+        // traversal entry later in the archive must not throw away a
+        // good file that was already streaming. maybeFinish fires
+        // once the in-flight entries settle; every opened stream
+        // settles on its own (finish or error), so this cannot hang
+        // the restore.
         maybeFinish();
       };
 
@@ -269,7 +488,12 @@ class RestoreEngine {
               return;
             }
 
-            const ws = fs.createWriteStream(writePath);
+            // Write to a temp file in the same folder and rename over
+            // the destination only after the CRC passes — a failed
+            // restore must never destroy a good file that was already
+            // at the destination.
+            const tmpPath = tempPathFor(writePath);
+            const ws = fs.createWriteStream(tmpPath);
             let crc = 0;
             let bytes = 0;
             let failed = false;
@@ -278,7 +502,7 @@ class RestoreEngine {
               failed = true;
               try { ReadStream.destroy(); } catch (e) {}
               try { ws.destroy(); } catch (e) {}
-              try { if (fs.existsSync(writePath)) fs.unlinkSync(writePath); } catch (e) {}
+              try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
               result.errors.push(msg);
               pendingEntries--;
               maybeFinish();
@@ -298,10 +522,21 @@ class RestoreEngine {
             ws.on('finish', () => {
               if (failed) return;
               if ((crc >>> 0) !== (entry.crc32 >>> 0)) {
-                try { if (fs.existsSync(writePath)) fs.unlinkSync(writePath); } catch (e) {}
+                try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                 result.errors.push(`CRC mismatch (corrupt data): ${entry.fileName}`);
                 result.files_mismatched++;
+              } else if (bytes !== entry.uncompressedSize) {
+                try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                result.errors.push(`Size mismatch (truncated data): ${entry.fileName}`);
+                result.files_mismatched++;
               } else {
+                try { fs.renameSync(tmpPath, writePath); } catch (e) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                  result.errors.push(`Failed to write ${entry.fileName}: ${e.message}`);
+                  pendingEntries--;
+                  maybeFinish();
+                  return;
+                }
                 result.files_restored++;
                 result.files_verified++;
                 result.total_bytes += bytes;
@@ -326,6 +561,7 @@ class RestoreEngine {
       const walk = (dir) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const full = path.join(dir, entry.name);
+          if (path.relative(zipPath, full) === MANIFEST_NAME) continue; // integrity manifest: metadata, not a restorable file
           if (entry.isDirectory()) walk(full);
           else entries.push({ path: path.relative(zipPath, full), size: fs.statSync(full).size, isDir: false, encrypted: false });
         }
@@ -379,9 +615,64 @@ class RestoreEngine {
   }
 
   /**
-   * Restore single file to specific location
+   * Restore a single file to a specific location. When the file is
+   * not in the picked artifact, the chain is searched backwards:
+   * an unchanged file lives only in the base Full, not in the
+   * incremental that was picked.
    */
   async restoreFile(zipPath, entryName, destPath, password) {
+    const chain = findBackupChain(zipPath);
+    try {
+      return await this._restoreFileSingle(zipPath, entryName, destPath, password);
+    } catch (e) {
+      if (e.code !== 'ENTRY_NOT_FOUND' || !chain || chain.chain.length < 2) throw e;
+      const earlier = chain.chain.slice(0, -1).reverse();
+      for (const artifact of earlier) {
+        try {
+          return await this._restoreFileSingle(artifact, entryName, destPath, password);
+        } catch (e2) {
+          if (e2.code !== 'ENTRY_NOT_FOUND') throw e2;
+          // Not in this one either — keep looking backwards.
+        }
+      }
+      throw e; // not in any artifact of the chain
+    }
+  }
+
+  /**
+   * Restore a single file from ONE artifact (ZIP or plain folder).
+   * Rejects with code 'ENTRY_NOT_FOUND' when the file is not in
+   * this artifact, so the chain wrapper above can keep looking.
+   */
+  async _restoreFileSingle(zipPath, entryName, destPath, password) {
+    // Plain-copy backup folder: the entry is a plain file inside
+    // it. (Single-file restore never supported folders before —
+    // yauzl cannot open a directory — so this branch also fixes
+    // that gap. The manifest check mirrors the bulk folder path.)
+    if (zipPath && fs.existsSync(zipPath) && fs.statSync(zipPath).isDirectory()) {
+      const rel = entryName.replace(/\\/g, '/');
+      const src = path.join(zipPath, rel);
+      if (rel === MANIFEST_NAME || rel.startsWith('../') || path.isAbsolute(rel) ||
+          !fs.existsSync(src) || !fs.statSync(src).isFile()) {
+        const e = new Error('Entry not found in backup: ' + entryName);
+        e.code = 'ENTRY_NOT_FOUND';
+        throw e;
+      }
+      const manifest = readManifest(zipPath);
+      const dir = path.dirname(destPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmpPath = tempPathFor(destPath);
+      const copied = await copyFileHashed(src, tmpPath);
+      if (manifest) {
+        const want = manifest.files[rel];
+        if (!want || copied.hash !== want.sha256 || copied.size !== want.size) {
+          try { fs.unlinkSync(tmpPath); } catch (e2) {}
+          throw new Error('Hash mismatch (corrupt backup file): ' + rel);
+        }
+      }
+      fs.renameSync(tmpPath, destPath);
+      return { files: 1 };
+    }
     // Encrypted entry: decrypt it directly with the AES reader.
     // Only an unreadable central directory falls through to yauzl
     // (e.g. Zip64); a decrypt failure (wrong password, tampered
@@ -397,12 +688,22 @@ class RestoreEngine {
         const hit = info.entries.find(function (e) { return e.name === wanted; });
         if (hit && hit.encrypted) {
           if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
-          const all = zipAes.parseCentralDirectory(fs.readFileSync(zipPath));
-          const full = all.find(function (e) { return e.name === wanted; });
-          const content = zipAes.decryptEntry(zipPath, full, password);
+          // The inspected entry already carries the full fields
+          // (localOffset, compressedSize, crc, ...) — stream-decrypt
+          // it straight into the temp file, never buffering the
+          // entry (see zip-aes.js decryptEntryToFile).
           const dir = path.dirname(destPath);
           if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(destPath, content);
+          // Write-then-rename (same rule as the plain path): a failed
+          // write must not leave a partial file at the destination.
+          const tmpPath = tempPathFor(destPath);
+          try {
+            await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
+            fs.renameSync(tmpPath, destPath);
+          } catch (e) {
+            try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+            throw e;
+          }
           return { files: 1 };
         }
         // The entry is plain (or not in this ZIP at all): the yauzl
@@ -428,7 +729,11 @@ class RestoreEngine {
         let found = false;
         zipfile.on('error', (e) => done(e));
         zipfile.on('end', () => {
-          if (!found) done(new Error('Entry not found in backup: ' + entryName));
+          if (!found) {
+            const e = new Error('Entry not found in backup: ' + entryName);
+            e.code = 'ENTRY_NOT_FOUND';
+            done(e);
+          }
         });
         zipfile.readEntry();
 
@@ -445,11 +750,54 @@ class RestoreEngine {
                 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
               } catch (e) { return done(e); }
 
-              const file = fs.createWriteStream(destPath);
-              ReadStream.on('error', (e) => done(e));
-              file.on('error', (e) => done(e));
-              file.on('finish', () => done(null, { files: 1 }));
-              ReadStream.pipe(file);
+              // Stream through a CRC check into a temp file and rename
+              // over the destination only when the CRC (and size)
+              // match: the old code piped straight to the destination
+              // and reported success on 'finish' with no check at
+              // all, so a corrupt entry was restored as if it were
+              // good — and a good file at the destination was
+              // overwritten with corrupt bytes.
+              const tmpPath = tempPathFor(destPath);
+              const file = fs.createWriteStream(tmpPath);
+              let crc = 0;
+              let bytes = 0;
+              let settled2 = false;
+              const fail = (e) => {
+                if (settled2) return;
+                settled2 = true;
+                try { ReadStream.destroy(); } catch (e2) {}
+                try { file.destroy(); } catch (e2) {}
+                try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                done(e);
+              };
+              const crcStream = new Transform({
+                transform(chunk, encoding, callback) {
+                  crc = zipAes.crc32(chunk, crc);
+                  bytes += chunk.length;
+                  callback(null, chunk);
+                }
+              });
+              crcStream.on('error', fail);
+              ReadStream.on('error', fail);
+              file.on('error', fail);
+              file.on('finish', () => {
+                if (settled2) return;
+                settled2 = true;
+                if ((crc >>> 0) !== (entry.crc32 >>> 0)) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                  return done(new Error(`CRC mismatch (corrupt data): ${entry.fileName}`));
+                }
+                if (bytes !== entry.uncompressedSize) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                  return done(new Error(`Size mismatch (truncated data): ${entry.fileName}`));
+                }
+                try { fs.renameSync(tmpPath, destPath); } catch (e) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                  return done(e);
+                }
+                done(null, { files: 1 });
+              });
+              ReadStream.pipe(crcStream).pipe(file);
             });
           }
         });
@@ -460,5 +808,6 @@ class RestoreEngine {
 
 module.exports = {
   RestoreEngine,
-  RestoreResult
+  RestoreResult,
+  findBackupChain
 };
