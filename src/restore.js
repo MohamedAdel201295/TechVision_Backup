@@ -142,7 +142,7 @@ class RestoreEngine {
       try {
         if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
         if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
-        const extracted = zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
+        const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
           result.files_restored++;
           result.total_bytes += size;
         });
@@ -522,16 +522,17 @@ class RestoreEngine {
         const hit = info.entries.find(function (e) { return e.name === wanted; });
         if (hit && hit.encrypted) {
           if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
-          const all = zipAes.parseCentralDirectory(fs.readFileSync(zipPath));
-          const full = all.find(function (e) { return e.name === wanted; });
-          const content = zipAes.decryptEntry(zipPath, full, password);
+          // The inspected entry already carries the full fields
+          // (localOffset, compressedSize, crc, ...) — stream-decrypt
+          // it straight into the temp file, never buffering the
+          // entry (see zip-aes.js decryptEntryToFile).
           const dir = path.dirname(destPath);
           if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
           // Write-then-rename (same rule as the plain path): a failed
           // write must not leave a partial file at the destination.
           const tmpPath = tempPathFor(destPath);
           try {
-            fs.writeFileSync(tmpPath, content);
+            await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
             fs.renameSync(tmpPath, destPath);
           } catch (e) {
             try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}

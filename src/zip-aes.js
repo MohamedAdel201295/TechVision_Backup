@@ -14,16 +14,30 @@
  *   + AES-CTR ciphertext + 10-byte HMAC-SHA1 auth code.
  *   keys: PBKDF2-HMAC-SHA1, 1000 rounds, key length 2*keyLen + 2.
  *   AES-CTR counter is a little-endian 16-byte integer starting at 1.
+ *
+ * Memory discipline (P1-5): the restore paths in this module NEVER
+ * hold a whole archive or a whole entry in memory. The central
+ * directory is read with bounded file-descriptor reads (tail +
+ * central-directory region only); entries are decrypted by streaming
+ * the ciphertext through a Transform into a temp file, with the HMAC
+ * checked incrementally and the rename committed only after it (and
+ * the AE-1 CRC) pass. The old synchronous `decryptEntry` is kept for
+ * compatibility but is documented as buffering the whole entry — the
+ * restore engine must not use it; use `decryptEntryToFile` instead.
  */
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const { Transform } = require('stream');
+const { pipeline } = require('stream/promises');
 
 const EOCD_SIG = 0x06054b50;
 const CD_SIG = 0x02014b50;
 const LFH_SIG = 0x04034b50;
 const AES_EXTRA_ID = 0x9901;
+// Ciphertext bytes read per stream chunk while decrypting.
+const DECRYPT_CHUNK = 64 * 1024;
 let tmpCounter = 0;
 
 // --- CRC32 (for AE-1 entries, whose central-directory CRC is real) ---
@@ -52,17 +66,32 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(a, b);
 }
 
+// Read exactly `length` bytes from `fd` at `position` (loops over
+// short reads); throws when the file ends first.
+function readFully(fd, length, position) {
+  const buf = Buffer.alloc(length);
+  let got = 0;
+  while (got < length) {
+    const n = fs.readSync(fd, buf, got, length - got, position + got);
+    if (n === 0) throw new Error('Unexpected end of file while reading ZIP structure.');
+    got += n;
+  }
+  return buf;
+}
+
 // --- Central directory parsing ---
+// Returns the offset of the end-of-central-directory record in `buf`,
+// or -1 when there is none. A signature inside file data is a false
+// positive unless the comment length matches the distance to the end
+// of the buffer.
 function findEOCD(buf) {
   const min = Math.max(0, buf.length - 65557);
   for (let i = buf.length - 22; i >= min; i--) {
     if (buf.readUInt32LE(i) === EOCD_SIG) {
-      // A signature inside file data is a false positive unless the
-      // comment length matches the distance to the end of the file.
       if (i + 22 + buf.readUInt16LE(i + 20) === buf.length) return i;
     }
   }
-  throw new Error('Not a ZIP file (end-of-central-directory record not found).');
+  return -1;
 }
 
 function parseExtra(extra, wantId) {
@@ -77,17 +106,12 @@ function parseExtra(extra, wantId) {
   return null;
 }
 
-function parseCentralDirectory(buf) {
-  const eocd = findEOCD(buf);
-  const count = buf.readUInt16LE(eocd + 10);
-  const cdSize = buf.readUInt32LE(eocd + 12);
-  const cdOffset = buf.readUInt32LE(eocd + 16);
-  if (count === 0xFFFF || cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF) {
-    throw new Error('Zip64 archives are not supported by the AES reader.');
-  }
-  if (cdOffset + cdSize > buf.length) throw new Error('Central directory is corrupt (extends past the end of the file).');
+// Walk `count` central-directory entries starting at `startOff` in
+// `buf` (which holds the central-directory bytes). Shared by the
+// whole-buffer parser and the file-descriptor reader below.
+function parseEntriesAt(buf, startOff, count) {
   const entries = [];
-  let off = cdOffset;
+  let off = startOff;
   for (let i = 0; i < count; i++) {
     if (off + 46 > buf.length) throw new Error('Central directory is corrupt (truncated entry).');
     if (buf.readUInt32LE(off) !== CD_SIG) throw new Error('Central directory is corrupt.');
@@ -142,14 +166,61 @@ function parseCentralDirectory(buf) {
   return entries;
 }
 
+function parseCentralDirectory(buf) {
+  const eocd = findEOCD(buf);
+  if (eocd < 0) throw new Error('Not a ZIP file (end-of-central-directory record not found).');
+  const count = buf.readUInt16LE(eocd + 10);
+  const cdSize = buf.readUInt32LE(eocd + 12);
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  if (count === 0xFFFF || cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF) {
+    throw new Error('Zip64 archives are not supported by the AES reader.');
+  }
+  if (cdOffset + cdSize > buf.length) throw new Error('Central directory is corrupt (extends past the end of the file).');
+  return parseEntriesAt(buf, cdOffset, count);
+}
+
+// Read only the central directory of a ZIP from disk: the last
+// 64 KiB + 22 bytes (the EOCD search window) to locate the EOCD,
+// then exactly the central-directory region. The file's data is
+// never loaded — this is what keeps inspectZip bounded on multi-GB
+// archives. Returns the full parsed entries (same objects as
+// parseCentralDirectory).
+function readEntries(zipPath) {
+  const fd = fs.openSync(zipPath, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size < 22) throw new Error('Not a ZIP file (end-of-central-directory record not found).');
+    const tailLen = Math.min(size, 65557);
+    const tail = readFully(fd, tailLen, size - tailLen);
+    const eocdRel = findEOCD(tail);
+    if (eocdRel < 0) throw new Error('Not a ZIP file (end-of-central-directory record not found).');
+    const count = tail.readUInt16LE(eocdRel + 10);
+    const cdSize = tail.readUInt32LE(eocdRel + 12);
+    const cdOffset = tail.readUInt32LE(eocdRel + 16);
+    if (count === 0xFFFF || cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF) {
+      throw new Error('Zip64 archives are not supported by the AES reader.');
+    }
+    if (cdOffset + cdSize > size) throw new Error('Central directory is corrupt (extends past the end of the file).');
+    const cdBuf = cdSize > 0 ? readFully(fd, cdSize, cdOffset) : Buffer.alloc(0);
+    return parseEntriesAt(cdBuf, 0, count);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** List entries + whether the archive is encrypted. Throws on bad ZIPs. */
 function inspectZip(zipPath) {
-  const buf = fs.readFileSync(zipPath);
-  const entries = parseCentralDirectory(buf);
+  const entries = readEntries(zipPath);
   return {
     entries: entries.map(function (e) {
       return { name: e.name, isDir: e.isDir, size: e.size, method: e.realMethod,
-               encrypted: e.encrypted, aesStrength: e.aesStrength };
+               encrypted: e.encrypted, aesStrength: e.aesStrength,
+               // Full entry fields, for the streaming decrypt path
+               // (restoreFile reuses the inspected entry directly
+               // instead of re-reading the archive).
+               localOffset: e.localOffset, compressedSize: e.compressedSize,
+               crc: e.crc, flags: e.flags, aeVersion: e.aeVersion,
+               realMethod: e.realMethod };
     }),
     encrypted: entries.some(function (e) { return e.encrypted; })
   };
@@ -176,6 +247,176 @@ function aesCtrDecrypt(key, data) {
     while (j < 16) { counter[j]++; if (counter[j] !== 0) break; j++; }
   }
   return out;
+}
+
+// --- Streaming AES-CTR decryption ---
+// WinZip AES uses AES-CTR with a LITTLE-endian 16-byte counter
+// starting at 1. Node's built-in CTR mode increments the counter
+// big-endian, so it cannot reproduce this counter — decrypt
+// block-by-block with AES-ECB keystream blocks instead, in bounded
+// chunks. `onCiphertext` (if given) is called with every raw
+// ciphertext chunk exactly once, so the caller can feed the HMAC
+// incrementally without buffering the ciphertext.
+function createAesCtrDecryptStream(key, onCiphertext) {
+  const ecb = crypto.createCipheriv('aes-' + (key.length * 8) + '-ecb', key, null);
+  ecb.setAutoPadding(false);
+  const counter = Buffer.alloc(16);
+  counter[0] = 1;
+  let leftover = Buffer.alloc(0); // carried partial block (< 16 bytes)
+  // Encrypt `blockCount` successive counter values in one call, and
+  // advance the counter past them.
+  function keystream(blockCount) {
+    const counters = Buffer.alloc(blockCount * 16);
+    for (let b = 0; b < blockCount; b++) {
+      counter.copy(counters, b * 16);
+      let j = 0;
+      while (j < 16) { counter[j]++; if (counter[j] !== 0) break; j++; }
+    }
+    return ecb.update(counters);
+  }
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      try {
+        if (typeof onCiphertext === 'function') onCiphertext(chunk);
+        const data = leftover.length ? Buffer.concat([leftover, chunk]) : chunk;
+        const fullLen = data.length - (data.length % 16);
+        leftover = data.subarray(fullLen);
+        if (fullLen === 0) return callback();
+        const out = Buffer.alloc(fullLen);
+        // Work in bounded sub-chunks so the keystream buffer stays
+        // small (4096 blocks = 64 KiB of keystream at a time).
+        const BLOCKS_PER_CHUNK = 4096;
+        for (let off = 0; off < fullLen; off += BLOCKS_PER_CHUNK * 16) {
+          const len = Math.min(BLOCKS_PER_CHUNK * 16, fullLen - off);
+          const ks = keystream(len / 16);
+          for (let i = 0; i < len; i++) out[off + i] = data[off + i] ^ ks[i];
+        }
+        callback(null, out);
+      } catch (e) { callback(e); }
+    },
+    flush(callback) {
+      try {
+        if (leftover.length) {
+          const ks = keystream(1);
+          const out = Buffer.alloc(leftover.length);
+          for (let i = 0; i < leftover.length; i++) out[i] = leftover[i] ^ ks[i];
+          this.push(out);
+        }
+        callback();
+      } catch (e) { callback(e); }
+    }
+  });
+}
+
+// Stream the SHA-256 of a file without loading it.
+function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const rs = fs.createReadStream(filePath);
+    rs.on('error', reject);
+    rs.on('data', (chunk) => hash.update(chunk));
+    rs.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+/**
+ * Stream-decrypt one entry to `tmpPath`. The plaintext is never held
+ * in memory: ciphertext streams from the archive through the CTR
+ * decryptor (and the inflater for deflated entries) into the file,
+ * while the HMAC (over the ciphertext) and the AE-1 CRC (over the
+ * plaintext) are computed incrementally. The HMAC and CRC are
+ * compared only once the stream has finished — on mismatch the temp
+ * file is deleted and the call rejects, so a tampered entry never
+ * reaches the destination. Resolves { bytes, sha256 } (the SHA-256
+ * of the plaintext written). Throws Error('Wrong password ...') on
+ * a bad password, before any byte is written.
+ */
+async function decryptEntryToFile(zipPath, entry, password, tmpPath) {
+  if (!entry.encrypted) throw new Error('Entry is not encrypted: ' + entry.name);
+  if (!entry.aesStrength) throw new Error('Unsupported encryption (not WinZip AES): ' + entry.name);
+  if (typeof password !== 'string' || !password) throw new Error('A password is required for this encrypted backup.');
+  // inspectZip exposes the real method as `method`; full entries
+  // carry it as `realMethod` — accept either shape.
+  const realMethod = entry.realMethod !== undefined ? entry.realMethod : entry.method;
+  if (realMethod !== 8 && realMethod !== 0) {
+    throw new Error('Unsupported compression method ' + realMethod + ' in ' + entry.name);
+  }
+  const fd = fs.openSync(zipPath, 'r');
+  try {
+    const fileSize = fs.fstatSync(fd).size;
+    // Local header: skip name + extra to reach the encrypted blob.
+    if (entry.localOffset + 30 > fileSize) throw new Error('Local file header not found for ' + entry.name);
+    const head = readFully(fd, 30, entry.localOffset);
+    if (head.readUInt32LE(0) !== LFH_SIG) throw new Error('Local file header not found for ' + entry.name);
+    const nameLen = head.readUInt16LE(26);
+    const extraLen = head.readUInt16LE(28);
+    const dataStart = entry.localOffset + 30 + nameLen + extraLen;
+    const keyLen = aesKeyLength(entry.aesStrength);
+    const saltLen = keyLen === 16 ? 8 : (keyLen === 24 ? 12 : 16);
+    // A truncated entry used to be misreported as "Wrong password":
+    // check the sizes first.
+    if (dataStart + saltLen + 2 + 10 > dataStart + entry.compressedSize) throw new Error('Backup is corrupt (truncated entry ' + entry.name + ').');
+    if (dataStart + entry.compressedSize > fileSize) throw new Error('Backup is corrupt (truncated entry ' + entry.name + ').');
+    const saltVerify = readFully(fd, saltLen + 2, dataStart);
+    const authCode = readFully(fd, 10, dataStart + entry.compressedSize - 10);
+    const salt = saltVerify.subarray(0, saltLen);
+    const verify = saltVerify.subarray(saltLen, saltLen + 2);
+    const derived = crypto.pbkdf2Sync(password, salt, 1000, 2 * keyLen + 2, 'sha1');
+    const aesKey = derived.subarray(0, keyLen);
+    const macKey = derived.subarray(keyLen, 2 * keyLen);
+    const expectedVerify = derived.subarray(2 * keyLen, 2 * keyLen + 2);
+    if (!timingSafeEqual(expectedVerify, verify)) throw new Error('Wrong password for this encrypted backup.');
+    const hmac = crypto.createHmac('sha1', macKey);
+    const cipherStart = dataStart + saltLen + 2;
+    const cipherEnd = dataStart + entry.compressedSize - 10; // exclusive
+    const decrypt = createAesCtrDecryptStream(aesKey, (chunk) => hmac.update(chunk));
+    const ws = fs.createWriteStream(tmpPath);
+    let crc = 0;
+    let bytes = 0;
+    const plainHash = crypto.createHash('sha256');
+    const tee = new Transform({
+      transform(chunk, encoding, callback) {
+        crc = crc32(chunk, crc);
+        bytes += chunk.length;
+        plainHash.update(chunk);
+        callback(null, chunk);
+      }
+    });
+    // An empty entry has no ciphertext bytes: stream from an empty
+    // source instead of a file range (createReadStream with
+    // end < start reads nothing, but only by accident — be explicit).
+    const { Readable } = require('stream');
+    const src = cipherEnd > cipherStart
+      ? fs.createReadStream(zipPath, { start: cipherStart, end: cipherEnd - 1, highWaterMark: DECRYPT_CHUNK })
+      : Readable.from([]);
+    try {
+      if (realMethod === 8) {
+        await pipeline(src, decrypt, zlib.createInflateRaw(), tee, ws);
+      } else {
+        await pipeline(src, decrypt, tee, ws);
+      }
+    } catch (e) {
+      try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+      throw e;
+    }
+    // The HMAC covers the ciphertext and can only be checked once
+    // every byte has streamed past; same for the AE-1 CRC over the
+    // plaintext. A failure here deletes the temp file — the
+    // destination is never touched.
+    const auth = hmac.digest().subarray(0, 10);
+    if (!timingSafeEqual(auth, authCode)) {
+      try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+      throw new Error('Backup is corrupt (authentication failed for ' + entry.name + ').');
+    }
+    // AE-1 stores a real CRC; AE-2 stores 0 and relies on the auth code.
+    if (entry.aeVersion === 1 && entry.crc !== 0 && crc !== entry.crc) {
+      try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+      throw new Error('Backup is corrupt (CRC mismatch for ' + entry.name + ').');
+    }
+    return { bytes: bytes, sha256: plainHash.digest('hex') };
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /** Decrypt + inflate one entry. Throws Error('Wrong password ...') on a bad password. */
@@ -224,9 +465,8 @@ function decryptEntry(zipPath, entry, password, zipBuf) {
 }
 
 /** Restore every file from an encrypted ZIP into destDir. */
-function extractEncrypted(zipPath, destDir, password, onFile) {
-  const buf = fs.readFileSync(zipPath);
-  const entries = parseCentralDirectory(buf);
+async function extractEncrypted(zipPath, destDir, password, onFile) {
+  const entries = readEntries(zipPath);
   const base = path.resolve(destDir);
   if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
   const realBase = fs.realpathSync(base);
@@ -242,7 +482,6 @@ function extractEncrypted(zipPath, destDir, password, onFile) {
       continue;
     }
     try {
-      const content = decryptEntry(zipPath, entry, password, buf);
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       const realParent = fs.realpathSync(path.dirname(dest));
       if (realParent !== realBase && !realParent.startsWith(realBase + path.sep)) {
@@ -252,16 +491,17 @@ function extractEncrypted(zipPath, destDir, password, onFile) {
       const realDest = path.join(realParent, path.basename(dest));
       // Write-then-rename: a failed verification must not destroy a
       // good file already at the destination (the old code wrote
-      // straight to it and deleted it on mismatch).
+      // straight to it and deleted it on mismatch). The decrypt
+      // streams straight into the temp file — no whole-entry buffer.
       const tmpDest = realDest + '.tvtmp-' + process.pid + '-' + (++tmpCounter);
-      fs.writeFileSync(tmpDest, content);
-      // Verify the write: read the file back and compare with the
-      // decrypted content (catches a bad disk write). On mismatch,
-      // delete the TEMP file and record the error.
+      const out = await decryptEntryToFile(zipPath, entry, password, tmpDest);
+      // Verify the write: stream-hash the temp file and compare with
+      // the hash of the plaintext the decrypt stream produced
+      // (catches a bad disk write). On mismatch, delete the TEMP
+      // file and record the error.
       let ok = false;
       try {
-        ok = crypto.createHash('sha256').update(fs.readFileSync(tmpDest)).digest('hex') ===
-             crypto.createHash('sha256').update(content).digest('hex');
+        ok = (await hashFile(tmpDest)) === out.sha256;
       } catch (e) { ok = false; }
       if (!ok) {
         try { fs.unlinkSync(tmpDest); } catch (e) {}
@@ -269,8 +509,8 @@ function extractEncrypted(zipPath, destDir, password, onFile) {
         continue;
       }
       fs.renameSync(tmpDest, realDest);
-      files++; bytes += content.length;
-      if (typeof onFile === 'function') onFile(entry.name, content.length);
+      files++; bytes += out.bytes;
+      if (typeof onFile === 'function') onFile(entry.name, out.bytes);
     } catch (e) {
       errors.push(entry.name + ': ' + e.message);
       if (e.message.indexOf('Wrong password') === 0) throw e; // one wrong password fails the whole restore
@@ -279,4 +519,4 @@ function extractEncrypted(zipPath, destDir, password, onFile) {
   return { files: files, bytes: bytes, errors: errors };
 }
 
-module.exports = { inspectZip, decryptEntry, extractEncrypted, parseCentralDirectory, crc32 };
+module.exports = { inspectZip, decryptEntry, decryptEntryToFile, extractEncrypted, parseCentralDirectory, crc32 };
