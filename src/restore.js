@@ -27,7 +27,74 @@ class RestoreResult extends EventEmitter {
     this.total_bytes = 0;
     this.duration_seconds = 0;
     this.errors = [];
+    // Non-fatal notes (e.g. a legacy backup restored without a
+    // manifest): the restore succeeded, but the user should know
+    // what was NOT verified.
+    this.warnings = [];
   }
+}
+
+// Name of the SHA-256 integrity manifest the engine writes into
+// plain-folder backups (see techvision-core.js). It is metadata, not
+// user data: never restored as a file, never listed in getZipInfo.
+const MANIFEST_NAME = '.techvision-manifest.json';
+
+// Write-then-commit: stream to a temp file in the SAME directory as the
+// final path (so the rename stays on one filesystem), then rename over
+// the destination only after verification. A failed write or verify
+// removes the TEMP file — the destination, and any good file already
+// there, is never touched. (A restore used to write straight to the
+// destination and delete it on a CRC mismatch, destroying a good file
+// that was already there.)
+let tempCounter = 0;
+function tempPathFor(dest) {
+  return dest + '.tvtmp-' + process.pid + '-' + (++tempCounter);
+}
+
+// Read a backup folder's integrity manifest, or null when there is
+// none (backups made before manifests were added) or it is unreadable
+// — a bad manifest must never fail a restore, it just means the files
+// are restored unverified.
+function readManifest(backupDir) {
+  try {
+    const raw = fs.readFileSync(path.join(backupDir, MANIFEST_NAME), 'utf8');
+    const m = JSON.parse(raw);
+    if (m && m.version === 1 && m.files && typeof m.files === 'object') return m;
+  } catch (e) {}
+  return null;
+}
+
+// Stream-copy src -> dest while computing the SHA-256 of the bytes
+// actually written. Resolves { hash, size }. A failed copy removes
+// the partial destination.
+function copyFileHashed(src, dest) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    let size = 0;
+    const rs = fs.createReadStream(src);
+    const ws = fs.createWriteStream(dest);
+    let failed = false;
+    const fail = (err) => {
+      if (failed) return;
+      failed = true;
+      try { rs.destroy(); } catch (e) {}
+      try { ws.destroy(); } catch (e) {}
+      try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch (e) {}
+      reject(err);
+    };
+    const tee = new Transform({
+      transform(chunk, encoding, callback) {
+        hash.update(chunk);
+        size += chunk.length;
+        callback(null, chunk);
+      }
+    });
+    rs.on('error', fail);
+    tee.on('error', fail);
+    ws.on('error', fail);
+    ws.on('finish', () => resolve({ hash: hash.digest('hex'), size: size }));
+    rs.pipe(tee).pipe(ws);
+  });
 }
 
 /**
@@ -105,21 +172,55 @@ class RestoreEngine {
         if (dstAbs === srcAbs || dstAbs.startsWith(srcAbs + path.sep)) {
           throw new Error('Cannot restore into the backup folder itself.');
         }
-        const walk = (dir) => {
+        const walk = async (dir) => {
           for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
             const src = path.join(dir, entry.name);
             const rel = path.relative(zipPath, src);
             const dest = path.join(restoreDir, rel);
             try {
-              if (entry.isDirectory()) { fs.mkdirSync(dest, { recursive: true }); walk(src); }
+              if (entry.isDirectory()) { fs.mkdirSync(dest, { recursive: true }); await walk(src); }
               else if (entry.isSymbolicLink()) { result.errors.push('Skipped symbolic link: ' + rel); }
-              else { fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.copyFileSync(src, dest); result.files_restored++; result.total_bytes += fs.statSync(src).size; }
+              else if (rel === MANIFEST_NAME) {
+                // The integrity manifest is metadata, not user data —
+                // never restored as a file.
+                continue;
+              }
+              else {
+                fs.mkdirSync(path.dirname(dest), { recursive: true });
+                // Copy to a temp file, verify against the manifest,
+                // then rename: a corrupt backup file must never
+                // overwrite a good file at the destination.
+                const tmp = tempPathFor(dest);
+                const copied = await copyFileHashed(src, tmp);
+                if (manifest) {
+                  const want = manifest.files[rel.replace(/\\/g, '/')];
+                  if (!want) {
+                    try { fs.unlinkSync(tmp); } catch (e) {}
+                    result.errors.push(`No manifest entry for ${rel} — refusing to restore an unverified file`);
+                    result.files_mismatched++;
+                  } else if (copied.hash !== want.sha256 || copied.size !== want.size) {
+                    try { fs.unlinkSync(tmp); } catch (e) {}
+                    result.errors.push(`Hash mismatch (corrupt backup file): ${rel}`);
+                    result.files_mismatched++;
+                  } else {
+                    fs.renameSync(tmp, dest);
+                    result.files_restored++; result.files_verified++; result.total_bytes += copied.size;
+                  }
+                } else {
+                  fs.renameSync(tmp, dest);
+                  result.files_restored++; result.total_bytes += copied.size;
+                }
+              }
             } catch (e) {
               result.errors.push('Failed to restore ' + rel + ': ' + e.message);
             }
           }
         };
-        walk(zipPath);
+        const manifest = readManifest(zipPath);
+        await walk(zipPath);
+        if (!manifest) {
+          result.warnings.push('This backup has no integrity manifest (created before verification was added) — files were copied without hash verification.');
+        }
         result.success = result.files_restored > 0 && result.errors.length === 0;
         if (result.files_restored === 0 && result.errors.length === 0) {
           result.errors.push('Nothing to restore: the backup folder is empty.');
@@ -171,7 +272,14 @@ class RestoreEngine {
         if (finished) return;
         result.errors.push(err && err.message ? err.message : String(err));
         ended = true;
-        pendingEntries = 0;
+        // Do NOT zero pendingEntries or close the zipfile here: an
+        // entry whose stream is already open must be allowed to
+        // settle (verify + rename) instead of being discarded — a
+        // traversal entry later in the archive must not throw away a
+        // good file that was already streaming. maybeFinish fires
+        // once the in-flight entries settle; every opened stream
+        // settles on its own (finish or error), so this cannot hang
+        // the restore.
         maybeFinish();
       };
 
@@ -269,7 +377,12 @@ class RestoreEngine {
               return;
             }
 
-            const ws = fs.createWriteStream(writePath);
+            // Write to a temp file in the same folder and rename over
+            // the destination only after the CRC passes — a failed
+            // restore must never destroy a good file that was already
+            // at the destination.
+            const tmpPath = tempPathFor(writePath);
+            const ws = fs.createWriteStream(tmpPath);
             let crc = 0;
             let bytes = 0;
             let failed = false;
@@ -278,7 +391,7 @@ class RestoreEngine {
               failed = true;
               try { ReadStream.destroy(); } catch (e) {}
               try { ws.destroy(); } catch (e) {}
-              try { if (fs.existsSync(writePath)) fs.unlinkSync(writePath); } catch (e) {}
+              try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
               result.errors.push(msg);
               pendingEntries--;
               maybeFinish();
@@ -298,10 +411,21 @@ class RestoreEngine {
             ws.on('finish', () => {
               if (failed) return;
               if ((crc >>> 0) !== (entry.crc32 >>> 0)) {
-                try { if (fs.existsSync(writePath)) fs.unlinkSync(writePath); } catch (e) {}
+                try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                 result.errors.push(`CRC mismatch (corrupt data): ${entry.fileName}`);
                 result.files_mismatched++;
+              } else if (bytes !== entry.uncompressedSize) {
+                try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                result.errors.push(`Size mismatch (truncated data): ${entry.fileName}`);
+                result.files_mismatched++;
               } else {
+                try { fs.renameSync(tmpPath, writePath); } catch (e) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                  result.errors.push(`Failed to write ${entry.fileName}: ${e.message}`);
+                  pendingEntries--;
+                  maybeFinish();
+                  return;
+                }
                 result.files_restored++;
                 result.files_verified++;
                 result.total_bytes += bytes;
@@ -326,6 +450,7 @@ class RestoreEngine {
       const walk = (dir) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const full = path.join(dir, entry.name);
+          if (path.relative(zipPath, full) === MANIFEST_NAME) continue; // integrity manifest: metadata, not a restorable file
           if (entry.isDirectory()) walk(full);
           else entries.push({ path: path.relative(zipPath, full), size: fs.statSync(full).size, isDir: false, encrypted: false });
         }
@@ -402,7 +527,16 @@ class RestoreEngine {
           const content = zipAes.decryptEntry(zipPath, full, password);
           const dir = path.dirname(destPath);
           if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(destPath, content);
+          // Write-then-rename (same rule as the plain path): a failed
+          // write must not leave a partial file at the destination.
+          const tmpPath = tempPathFor(destPath);
+          try {
+            fs.writeFileSync(tmpPath, content);
+            fs.renameSync(tmpPath, destPath);
+          } catch (e) {
+            try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+            throw e;
+          }
           return { files: 1 };
         }
         // The entry is plain (or not in this ZIP at all): the yauzl
@@ -445,11 +579,54 @@ class RestoreEngine {
                 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
               } catch (e) { return done(e); }
 
-              const file = fs.createWriteStream(destPath);
-              ReadStream.on('error', (e) => done(e));
-              file.on('error', (e) => done(e));
-              file.on('finish', () => done(null, { files: 1 }));
-              ReadStream.pipe(file);
+              // Stream through a CRC check into a temp file and rename
+              // over the destination only when the CRC (and size)
+              // match: the old code piped straight to the destination
+              // and reported success on 'finish' with no check at
+              // all, so a corrupt entry was restored as if it were
+              // good — and a good file at the destination was
+              // overwritten with corrupt bytes.
+              const tmpPath = tempPathFor(destPath);
+              const file = fs.createWriteStream(tmpPath);
+              let crc = 0;
+              let bytes = 0;
+              let settled2 = false;
+              const fail = (e) => {
+                if (settled2) return;
+                settled2 = true;
+                try { ReadStream.destroy(); } catch (e2) {}
+                try { file.destroy(); } catch (e2) {}
+                try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                done(e);
+              };
+              const crcStream = new Transform({
+                transform(chunk, encoding, callback) {
+                  crc = zipAes.crc32(chunk, crc);
+                  bytes += chunk.length;
+                  callback(null, chunk);
+                }
+              });
+              crcStream.on('error', fail);
+              ReadStream.on('error', fail);
+              file.on('error', fail);
+              file.on('finish', () => {
+                if (settled2) return;
+                settled2 = true;
+                if ((crc >>> 0) !== (entry.crc32 >>> 0)) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                  return done(new Error(`CRC mismatch (corrupt data): ${entry.fileName}`));
+                }
+                if (bytes !== entry.uncompressedSize) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                  return done(new Error(`Size mismatch (truncated data): ${entry.fileName}`));
+                }
+                try { fs.renameSync(tmpPath, destPath); } catch (e) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                  return done(e);
+                }
+                done(null, { files: 1 });
+              });
+              ReadStream.pipe(crcStream).pipe(file);
             });
           }
         });

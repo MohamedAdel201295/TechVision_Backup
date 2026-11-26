@@ -24,6 +24,7 @@ const EOCD_SIG = 0x06054b50;
 const CD_SIG = 0x02014b50;
 const LFH_SIG = 0x04034b50;
 const AES_EXTRA_ID = 0x9901;
+let tmpCounter = 0;
 
 // --- CRC32 (for AE-1 entries, whose central-directory CRC is real) ---
 const CRC_TABLE = (function () {
@@ -249,20 +250,25 @@ function extractEncrypted(zipPath, destDir, password, onFile) {
         continue;
       }
       const realDest = path.join(realParent, path.basename(dest));
-      fs.writeFileSync(realDest, content);
+      // Write-then-rename: a failed verification must not destroy a
+      // good file already at the destination (the old code wrote
+      // straight to it and deleted it on mismatch).
+      const tmpDest = realDest + '.tvtmp-' + process.pid + '-' + (++tmpCounter);
+      fs.writeFileSync(tmpDest, content);
       // Verify the write: read the file back and compare with the
       // decrypted content (catches a bad disk write). On mismatch,
-      // delete the bad file and record the error.
+      // delete the TEMP file and record the error.
       let ok = false;
       try {
-        ok = crypto.createHash('sha256').update(fs.readFileSync(realDest)).digest('hex') ===
+        ok = crypto.createHash('sha256').update(fs.readFileSync(tmpDest)).digest('hex') ===
              crypto.createHash('sha256').update(content).digest('hex');
       } catch (e) { ok = false; }
       if (!ok) {
-        try { fs.unlinkSync(realDest); } catch (e) {}
+        try { fs.unlinkSync(tmpDest); } catch (e) {}
         errors.push(entry.name + ': written file failed verification');
         continue;
       }
+      fs.renameSync(tmpDest, realDest);
       files++; bytes += content.length;
       if (typeof onFile === 'function') onFile(entry.name, content.length);
     } catch (e) {
