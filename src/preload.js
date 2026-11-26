@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     deleteFile: (filePath) => ipcRenderer.invoke('fs-delete', filePath),
     fileExists: (filePath) => ipcRenderer.invoke('fs-exists', filePath),
     getZipInfo: (zipPath) => ipcRenderer.invoke('zip-get-info', zipPath),
+    getDriveUsage: (targetPath) => ipcRenderer.invoke('fs-drive-usage', targetPath),
+    openPath: (targetPath) => ipcRenderer.invoke('fs-open-path', targetPath),
     getAppLog: () => ipcRenderer.invoke('logs-get'),
 
     // Dialog operations

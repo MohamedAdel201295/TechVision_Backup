@@ -188,26 +188,147 @@
     confirmCallback = null;
   }
 
-  /* ---------- stats from REAL history ---------- */
-  function renderStats() {
-    var runs = jobs.filter(function (j) { return j.type !== 'TEMPLATE'; });
-    var completed = runs.filter(function (j) { return j.status === 'COMPLETED'; });
-    var totalBytes = completed.reduce(function (sum, j) { return sum + j.size; }, 0);
+  /* ---------- dashboard 01: stats, status, recent, storage ---------- */
+  function formatDashboardTime(v) {
+    if (!v) return '—';
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d.getTime())) return safeStr(v);
+    var now = new Date();
+    var sameDay = function (a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); };
+    var y = new Date(now); y.setDate(y.getDate() - 1);
+    var h = d.getHours(); var ampm = h >= 12 ? 'PM' : 'AM'; var h12 = h % 12; if (h12 === 0) h12 = 12;
+    var hm = h12 + ':' + String(d.getMinutes()).padStart(2, '0') + ' ' + ampm;
+    if (sameDay(d, now)) return 'Today, ' + hm;
+    if (sameDay(d, y)) return 'Yesterday, ' + hm;
+    var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear() + ', ' + hm;
+  }
+  function formatHMS(sec) {
+    var n = Math.max(0, Math.round(safeNum(sec, 0)));
+    var h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60), s = n % 60;
+    var p = function (x) { return String(x).padStart(2, '0'); };
+    return p(h) + ':' + p(m) + ':' + p(s);
+  }
+  function lastCompletedRun(list) {
     var last = null;
-    completed.forEach(function (j) {
+    list.forEach(function (j) {
+      if (j.status !== 'COMPLETED') return;
       var d = j.timestamp ? new Date(j.timestamp) : null;
-      if (d && !isNaN(d.getTime()) && (!last || d > last)) last = d;
+      if (d && !isNaN(d.getTime()) && (!last || d > new Date(last.timestamp))) last = j;
     });
-    $('statTotal').textContent = String(completed.length);
-    $('statTotalSub').textContent = completed.length ? completed.length + ' completed backup' + (completed.length === 1 ? '' : 's') : 'No backups yet';
-    var mb = totalBytes / (1024 * 1024);
-    $('statData').innerHTML = escapeHtml(mb >= 100 ? String(Math.round(mb)) : mb.toFixed(1)) + ' <small>MB</small>';
-    $('statDataSub').textContent = formatBytes(totalBytes) + ' across all backups';
-    $('statLast').textContent = last ? formatDate(last) : '—';
-    $('statLastSub').textContent = last ? 'Most recent completed backup' : 'Never';
-    var rate = runs.length ? Math.round((completed.length / runs.length) * 100) : null;
-    $('statSuccess').textContent = rate === null ? '—' : rate + '%';
-    $('statSuccessSub').textContent = rate === null ? 'No runs yet' : completed.length + ' of ' + runs.length + ' runs completed';
+    return last;
+  }
+  function renderStats() {
+    var list = jobs.filter(function (j) { return j.type !== 'TEMPLATE'; });
+    var seven = new Date(); seven.setDate(seven.getDate() - 7);
+    var recent = list.filter(function (j) { var d = j.timestamp ? new Date(j.timestamp) : null; return d && !isNaN(d.getTime()) && d >= seven; });
+    var ok = recent.filter(function (j) { return j.status === 'COMPLETED'; });
+    var bad = recent.filter(function (j) { return j.status === 'FAILED'; });
+    var active = list.filter(function (j) { var s = j.schedule || (j.raw && j.raw.schedule); return s && s.enabled; }).length;
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    set('dashTotalJobs', String(list.length));
+    set('dashTotalJobsSub', active ? active + ' Active' : (list.length ? 'No schedules' : 'No jobs yet'));
+    set('dashSuccessJobs', String(ok.length));
+    set('dashFailedJobs', String(bad.length));
+    var last = lastCompletedRun(list);
+    set('dashLastBackup', last ? formatDashboardTime(last.timestamp) : '—');
+    set('dashLastBackupSub', last ? (last.type === 'INCREMENTAL' ? 'Incremental' : 'Full') + ' Backup – ' + last.name : 'No backups yet');
+    renderDashboardStatus(list, bad, last);
+    renderDashboardRecent(list);
+  }
+  function renderDashboardStatus(list, bad, last) {
+    var banner = $('dashBanner'); if (!banner) return;
+    var title = $('dashBannerTitle'), sub = $('dashBannerSub'), ico = $('dashBannerIco');
+    banner.classList.remove('warn', 'idle');
+    if (!list.length) {
+      banner.classList.add('idle');
+      if (ico) ico.textContent = 'ⓘ';
+      if (title) title.textContent = 'No backups yet';
+      if (sub) sub.textContent = 'Create your first backup job to protect your files.';
+    } else if (bad.length) {
+      banner.classList.add('warn');
+      if (ico) ico.textContent = '!';
+      if (title) title.textContent = 'Attention needed';
+      if (sub) sub.textContent = bad.length + (bad.length === 1 ? ' job failed' : ' jobs failed') + ' in the last 7 days — check the Jobs page.';
+    } else {
+      if (ico) ico.textContent = '✓';
+      if (title) title.textContent = 'System Protected';
+      if (sub) sub.textContent = 'All scheduled backups are running normally.';
+    }
+    var best = null, bestDate = null;
+    list.forEach(function (j) {
+      var d = nextRunDate(j);
+      if (d && (!bestDate || d < bestDate)) { bestDate = d; best = j; }
+    });
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    set('dashNextRun', bestDate ? formatDashboardTime(bestDate) : '—');
+    set('dashNextRunSub', best ? best.name + ' – ' + (best.type === 'INCREMENTAL' ? 'Incremental' : 'Full') : 'No scheduled jobs');
+    set('dashLastSize', last ? formatBytes(last.size) : '—');
+    set('dashLastDuration', last ? formatHMS(last.duration) : '—');
+  }
+  function renderDashboardRecent(list) {
+    var body = $('dashRecentBody'); if (!body) return;
+    var sorted = list.slice().sort(function (a, b) { return new Date(b.timestamp || 0) - new Date(a.timestamp || 0); }).slice(0, 5);
+    var empty = $('dashRecentEmpty');
+    if (empty) empty.style.display = sorted.length ? 'none' : 'block';
+    body.innerHTML = '';
+    sorted.forEach(function (job) {
+      var tr = document.createElement('tr');
+      var typePill = '<span class="pill ' + (job.type === 'INCREMENTAL' ? 'pill-incremental' : 'pill-full') + '">' + (job.type === 'INCREMENTAL' ? 'Incremental' : 'Full') + '</span>';
+      var statusPill = '<span class="pill ' + pillClass(job.status, job.type) + '">' + escapeHtml(job.status) + '</span>';
+      tr.innerHTML = '<td class="job-name-cell"></td><td>' + typePill + '</td><td>' + statusPill + '</td><td></td><td></td><td></td>';
+      tr.querySelector('.job-name-cell').textContent = job.name;
+      var tds = tr.querySelectorAll('td');
+      tds[3].textContent = formatBytes(job.size);
+      tds[4].textContent = formatHMS(job.duration);
+      tds[5].textContent = formatDashboardTime(job.timestamp);
+      tr.addEventListener('click', function () { openDrawer(job); });
+      body.appendChild(tr);
+    });
+  }
+  /* Storage donut: usage of the drive holding the latest backup's
+     destination. Re-reads only when the destination changes, or when
+     Check Storage is pressed (force). A failed read shows "—", never
+     a fake number. */
+  var storageDest = '';
+  async function refreshStorageCard(force) {
+    var pctEl = $('dashStoragePct'); if (!pctEl) return;
+    var last = lastCompletedRun(jobs.filter(function (j) { return j.type !== 'TEMPLATE'; }));
+    var dest = last ? (last.destination || '') : '';
+    var arc = $('dashDonutArc');
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    if (!dest) {
+      set('dashStoragePct', '—');
+      set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
+      set('dashStorageDrive', 'No backups yet — run a job to see storage.');
+      if (arc) arc.setAttribute('stroke-dasharray', '0 339.292');
+      storageDest = '';
+      return;
+    }
+    if (!force && dest === storageDest) return;
+    storageDest = dest;
+    set('dashStorageDrive', dest);
+    if (!api || typeof api.getDriveUsage !== 'function') return;
+    try {
+      var r = await api.getDriveUsage(dest);
+      if (!r || !r.success) {
+        set('dashStoragePct', '—');
+        set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
+        set('dashStorageDrive', dest + ' — could not read drive usage.');
+        if (arc) arc.setAttribute('stroke-dasharray', '0 339.292');
+        return;
+      }
+      var total = r.total, free = r.free, used = Math.max(0, total - free);
+      var pct = total > 0 ? Math.round((used / total) * 100) : 0;
+      var C = 339.292;
+      if (arc) arc.setAttribute('stroke-dasharray', (pct / 100 * C).toFixed(1) + ' ' + C);
+      set('dashStoragePct', pct + '%');
+      set('dashUsed', formatBytes(used));
+      set('dashFree', formatBytes(free));
+      set('dashTotal', formatBytes(total));
+    } catch (e) {
+      set('dashStoragePct', '—');
+    }
   }
 
   /* ---------- history list ---------- */
@@ -218,83 +339,23 @@
     if (status === 'TEMPLATE' || type === 'TEMPLATE') return 'pill-template';
     return 'pill-pending';
   }
-  function renderJobs() {
-    var list = $('jobList');
-    if (!list) return;
-    var q = ($('searchInput') ? $('searchInput').value : '').trim().toLowerCase();
-    var sf = $('statusFilter') ? $('statusFilter').value : 'all';
-    var tf = $('typeFilter') ? $('typeFilter').value : 'all';
-    var visible = jobs.filter(function (j) {
-      if (q && j.name.toLowerCase().indexOf(q) === -1 && (j.source || '').toLowerCase().indexOf(q) === -1) return false;
-      if (sf !== 'all' && j.status !== sf) return false;
-      if (tf !== 'all' && j.type !== tf) return false;
-      return true;
-    });
-    list.innerHTML = '';
-    $('emptyState').style.display = jobs.length === 0 ? 'block' : 'none';
-    if (jobs.length && visible.length === 0) {
-      list.innerHTML = '<div class="empty-state"><h3>No matching backups</h3><p>Try a different search or filter.</p></div>';
-      return;
-    }
-    visible.forEach(function (job, idx) {
-      var card = document.createElement('article');
-      card.className = 'job-card';
-      card.style.animationDelay = Math.min(idx * 0.05, 0.3) + 's';
-      var initial = escapeHtml((job.name || 'T').charAt(0).toUpperCase());
-      card.innerHTML =
-        '<div class="job-icon">' + initial + '</div>' +
-        '<div class="job-body">' +
-          '<h3 class="job-name"></h3>' +
-          '<div class="job-meta"><span>Type: <b></b></span><span>Files: <b></b></span><span>Size: <b></b></span><span>Duration: <b></b></span><span class="date"></span></div>' +
-          '<div class="job-path"></div>' +
-        '</div>' +
-        '<div class="job-actions"><span class="pill"></span><div class="job-actions-row">' +
-          '<button class="btn btn-sm" type="button" data-act="details">Details</button>' +
-          '<button class="btn btn-sm" type="button" data-act="run">▶ Run</button>' +
-        '</div></div>';
-      card.querySelector('.job-name').textContent = job.name;
-      var meta = card.querySelectorAll('.job-meta b');
-      meta[0].textContent = job.type;
-      meta[1].textContent = String(job.files);
-      meta[2].textContent = formatBytes(job.size);
-      meta[3].textContent = formatDuration(job.duration);
-      card.querySelector('.job-meta .date').textContent = formatDate(job.timestamp);
-      card.querySelector('.job-path').textContent = job.source ? job.source + '  →  ' + (job.destination || '—') : (job.destination || '');
-      var pill = card.querySelector('.pill');
-      pill.className = 'pill ' + pillClass(job.status, job.type);
-      pill.textContent = job.status;
-      card.querySelector('.job-body').addEventListener('click', function () { openDrawer(job); });
-      card.querySelectorAll('[data-act]').forEach(function (btn) {
-        btn.addEventListener('click', function (ev) {
-          ev.stopPropagation();
-          var act = btn.getAttribute('data-act');
-          if (act === 'details') openDrawer(job);
-          if (act === 'run') runBackup(job, false);
-          if (act === 'restore') openRestore(job);
-        });
-      });
-      list.appendChild(card);
-    });
-  }
+  /* ---------- history list (Jobs page, step 4) ---------- */
 
   /* ---------- views: Dashboard / Jobs ---------- */
   /* ---------- modules: Backup / Cloud / VPN / WireGuard ----------
-     The sidebar has four top-level modules. Backup owns Dashboard, Jobs,
-     Logs, New Job and Restore; Cloud owns Server and Client; VPN is a
-     single Tailscale view; WireGuard VPN is a single self-hosted
-     WireGuard view (server + client). Switching modules swaps the
-     visible nav group; going back to Backup returns to the last backup
+     The sidebar shows every module at once, grouped with section
+     labels (Dashboard / Backup / Cloud / VPN / WireGuard / System).
+     There is no module chooser screen: the app opens on the Dashboard
+     and the sidebar is the only navigation. Switching views only swaps
+     the visible view; going back to Backup returns to the last backup
      view instead of always resetting to Dashboard. */
   var currentModule = 'backup';
   var lastBackupView = 'dashboard';
 
   function applyModuleUI(mod) {
     currentModule = mod;
-    var gb = $('navGroupBackup'); if (gb) gb.style.display = mod === 'backup' ? '' : 'none';
-    var gc = $('navGroupCloud'); if (gc) gc.style.display = mod === 'cloud' ? '' : 'none';
-    var gv = $('navGroupVpn'); if (gv) gv.style.display = mod === 'vpn' ? '' : 'none';
-    var gw = $('navGroupWireguard'); if (gw) gw.style.display = mod === 'wireguard' ? '' : 'none';
-    document.querySelectorAll('.module-item').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-module') === mod); });
+    /* All nav groups stay visible: the sidebar lists every module. */
+    ['navGroupBackup', 'navGroupCloud', 'navGroupVpn', 'navGroupWireguard'].forEach(function (id) { var g = $(id); if (g) g.style.display = ''; });
   }
 
   function setModule(mod) {
@@ -311,60 +372,82 @@
       var btn = document.querySelector('[data-nav="cloud-' + cloudPanel + '"]');
       if (btn) btn.classList.add('active');
     }
+    /* The in-view tab bar mirrors the same panel. */
+    document.querySelectorAll('[data-cloud-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-cloud-tab') === cloudPanel); });
   }
 
   function setBackTitle(t) { var b = $('backBarTitle'); if (b) b.textContent = t; }
   function setAppTitle(t, s) { var h = $('appTitle'); if (h) h.textContent = t; var p = $('appSubtitle'); if (p) p.textContent = s; }
 
   /* Back from the very top: from a Server/Client/Map panel back to the
-     Cloud home, from anywhere else back to the module chooser. */
+     Cloud home, from anywhere else back to the Dashboard. */
   function goBack() {
+    var settingsView = $('view-settings');
+    if (settingsView && settingsView.style.display !== 'none') { showView(lastBackupView || 'dashboard'); return; }
     var cloudView = $('view-cloud');
     if (cloudView && cloudView.style.display !== 'none' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive')) { showCloudPanel('home'); return; }
-    showView('modules');
+    showView('dashboard');
+  }
+
+  /* Scroll to a card inside the WireGuard view AFTER the status load
+     finishes: loadWireGuard() hides/shows cards, and scrolling before
+     that races it (same pattern as the Cloud jump button). */
+  function wgScrollTo(cardId) {
+    var go = function () { var t = $(cardId); if (t) { try { t.scrollIntoView({ block: 'start' }); } catch (e) {} } };
+    if (typeof loadWireGuard === 'function') {
+      try { var p = loadWireGuard(); if (p && typeof p.then === 'function') { p.then(go); return; } } catch (e) {}
+    }
+    go();
   }
 
   function showView(name) {
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
     var wgView = $('view-wireguard');
-    var modulesView = $('view-modules');
+    var settingsView = $('view-settings');
     if (dash) dash.style.display = name === 'dashboard' ? '' : 'none';
     if (jobsView) jobsView.style.display = name === 'jobs' ? '' : 'none';
     if (logsView) logsView.style.display = name === 'logs' ? '' : 'none';
     if (cloudView) cloudView.style.display = name === 'cloud' ? '' : 'none';
     if (vpnView) vpnView.style.display = name === 'vpn' ? '' : 'none';
     if (wgView) wgView.style.display = name === 'wireguard' ? '' : 'none';
-    if (modulesView) modulesView.style.display = name === 'modules' ? '' : 'none';
+    if (settingsView) settingsView.style.display = name === 'settings' ? '' : 'none';
     /* One refresh per module, at the top — the same ⟳ icon-button
        pattern as the Tailscale one, shown only while its module is
-       active. The settings gear lives in the Backup module only:
-       it is hidden in Cloud, Tailscale VPN and WireGuard, and on
-       the module chooser (the drawer itself is unchanged — basic
-       Backup settings only). */
+       active. The settings gear is always visible (the sidebar has
+       no Settings item — the gear at the top right is the only way
+       in, from any module). */
     var isBackup = name === 'dashboard' || name === 'jobs' || name === 'logs';
-    var gb2 = $('settingsBtn'); if (gb2) gb2.style.display = isBackup ? '' : 'none';
+    var gb2 = $('settingsBtn'); if (gb2) gb2.style.display = '';
     var brb = $('backupTopRefreshBtn'); if (brb) brb.style.display = isBackup ? '' : 'none';
     var crb2 = $('cloudTopRefreshBtn'); if (crb2) crb2.style.display = name === 'cloud' ? '' : 'none';
     var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
     var wrb = $('wgTopRefreshBtn'); if (wrb) wrb.style.display = name === 'wireguard' ? '' : 'none';
-    document.body.classList.toggle('modules-mode', name === 'modules');
-    var bb = $('backBar'); if (bb) bb.style.display = name === 'modules' ? 'none' : '';
-    var hdr = $('appHeader'); if (hdr) hdr.style.display = name === 'modules' ? 'none' : '';
-    /* Inside a module only that module's things show: the module
-       switcher (Backup / Cloud buttons) is hidden, the way back out
-       is the top Back button. */
-    var ms = $('moduleSwitcher'); if (ms) ms.style.display = name === 'modules' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
-    if (btn) btn.classList.add('active');
+    /* Inside Cloud the active item is the open panel, not Overview:
+       syncCloudNav() marks it (called by showView('cloud') below and
+       by showCloudPanel). Only mark Overview when the home panel is open. */
+    if (btn && !(name === 'cloud' && (cloudPanel === 'server' || cloudPanel === 'client' || cloudPanel === 'mapdrive'))) btn.classList.add('active');
+    /* A view reached from elsewhere (Back button, jump button) must
+       never land on a hidden item: reopen the active item's group. */
+    var ab = document.querySelector('.nav-item.active');
+    if (ab) { var ag = ab.closest('.nav-group'); if (ag) ag.classList.remove('collapsed'); }
     if (name === 'jobs') renderJobsView();
     if (name === 'logs') { renderLogs(currentLogTab); startLogsAutoRefresh(); }
     else stopLogsAutoRefresh();
     if (name === 'dashboard' || name === 'jobs' || name === 'logs') {
       lastBackupView = name; applyModuleUI('backup');
       setBackTitle('Backup');
-      setAppTitle('TechVision Backup', 'Your data, protected — full and incremental backups, fast streaming restore.');
+      setAppTitle('Backup Dashboard', 'Manage backups, monitor jobs, and protect your data.');
+    }
+    if (name === 'settings') {
+      /* A full page, not a drawer: it belongs to the Backup module
+         but is NOT a lastBackupView — Back returns to the view it was
+         opened from, and no sidebar item is ever active here. */
+      applyModuleUI('backup');
+      setBackTitle('Settings');
+      setAppTitle('Settings', 'Your preferences for TechVision Backup.');
     }
     if (name === 'cloud') {
       applyModuleUI('cloud'); syncCloudNav();
@@ -528,84 +611,155 @@
     if (c === 'advanced') return 'Advanced — Deflate level 9';
     return 'Standard — Deflate level 6';
   }
+  /* ---------- Jobs page 02: table + details panel ---------- */
+  var jobsSelectedId = null; // id of the job shown in the details panel
+  function selectedJob() {
+    if (!jobsSelectedId) return null;
+    var found = jobs.filter(function (j) { return j.id === jobsSelectedId; });
+    return found.length ? found[0] : null;
+  }
   function renderJobsView() {
-    var list = $('jobsList');
-    if (!list) return;
-    // Jobs page = the jobs whose turn it is to run: never run yet, or
-    // scheduled for a next run. A job that already ran and has no
-    // schedule is done — it stays in the Dashboard history only.
-    var upcoming = jobs.filter(function (j) {
-      var neverRun = !j.runs || j.runs.length === 0;
-      var sched = j.schedule && j.schedule.enabled;
-      return neverRun || sched;
+    var body = $('jobsTableBody');
+    if (!body) return;
+    /* Every job, including never-run templates: a template is a real
+       job with no runs yet, not a history entry to hide. */
+    var list = jobs.slice();
+    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    set('jobsChipTotal', String(list.length));
+    set('jobsChipCompleted', String(list.filter(function (j) { return j.status === 'COMPLETED'; }).length));
+    set('jobsChipRunning', String(list.filter(function (j) { return j.status === 'RUNNING'; }).length));
+    set('jobsChipFailed', String(list.filter(function (j) { return j.status === 'FAILED'; }).length));
+    var q = ($('jobsSearchInput') ? $('jobsSearchInput').value : '').trim().toLowerCase();
+    var sf = $('jobsStatusFilter') ? $('jobsStatusFilter').value : 'all';
+    var sort = $('jobsSortSelect') ? $('jobsSortSelect').value : 'newest';
+    var visible = list.filter(function (j) {
+      if (q && j.name.toLowerCase().indexOf(q) === -1 && (j.source || '').toLowerCase().indexOf(q) === -1) return false;
+      if (sf !== 'all' && j.status !== sf) return false;
+      return true;
     });
-    list.innerHTML = '';
+    visible.sort(function (a, b) {
+      if (sort === 'name') return a.name.localeCompare(b.name);
+      /* Never-run jobs have no last run: they sort last in "newest". */
+      var ts = function (j) { return j.runs && j.runs.length ? new Date(j.timestamp || 0).getTime() : 0; };
+      return sort === 'oldest' ? ts(a) - ts(b) : ts(b) - ts(a);
+    });
+    var sel = selectedJob();
+    if (sel && visible.indexOf(sel) === -1) sel = null;
+    if (!sel && visible.length) sel = visible[0];
+    jobsSelectedId = sel ? sel.id : null;
+    body.innerHTML = '';
     var empty = $('jobsEmptyState');
-    if (empty) empty.style.display = upcoming.length === 0 ? 'block' : 'none';
-    upcoming.forEach(function (job, idx) {
-      var card = document.createElement('article');
-      card.className = 'job-card';
-      card.style.animationDelay = Math.min(idx * 0.05, 0.3) + 's';
-      var initial = escapeHtml((job.name || 'T').charAt(0).toUpperCase());
-      card.innerHTML =
-        '<div class="job-icon">' + initial + '</div>' +
-        '<div class="job-body">' +
-          '<h3 class="job-name"></h3>' +
-          '<div class="job-meta"><span class="pill"></span><span>Last run: <b class="last-run"></b></span><span>Runs: <b class="run-count"></b></span></div>' +
-          '<div class="job-path"></div>' +
-          '<dl class="job-detail">' +
-            '<div><dt>Schedule</dt><dd class="d-schedule"></dd></div>' +
-            '<div><dt>Next run</dt><dd class="d-next"></dd></div>' +
-            '<div><dt>Compression</dt><dd class="d-compress"></dd></div>' +
-            '<div><dt>Last run files</dt><dd class="d-files"></dd></div>' +
-          '</dl>' +
-        '</div>' +
-        '<div class="job-actions"><div class="job-actions-row">' +
-          '<button class="btn btn-primary btn-sm" type="button" data-act="run">▶ Run now</button>' +
-          '<button class="btn btn-sm" type="button" data-act="details">Details</button>' +
-          '<button class="btn btn-sm" type="button" data-act="edit">✎ Edit</button>' +
-          '<button class="btn btn-sm" type="button" data-act="restore">↺ Restore</button>' +
-          '<button class="btn btn-danger btn-sm" type="button" data-act="delete">🗑 Delete</button>' +
-        '</div></div>';
-      card.querySelector('.job-name').textContent = job.name;
-      var pill = card.querySelector('.pill');
-      pill.className = 'pill ' + pillClass(job.status, job.type);
-      pill.textContent = job.status;
-      card.querySelector('.last-run').textContent = job.runs && job.runs.length ? formatDate(job.timestamp) : 'Never run';
-      card.querySelector('.run-count').textContent = String(job.runCount || 0);
-      card.querySelector('.job-path').textContent = job.source ? job.source + '  →  ' + (job.destination || '—') : (job.destination || '—');
+    if (empty) empty.style.display = list.length === 0 ? 'block' : 'none';
+    if (list.length && visible.length === 0) {
+      body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:18px;">No matching jobs — try a different search or filter.</td></tr>';
+    }
+    visible.forEach(function (job) {
+      var tr = document.createElement('tr');
+      if (sel && job.id === sel.id) tr.classList.add('selected');
+      var sched = job.schedule || (job.raw && job.raw.schedule) || null;
+      tr.innerHTML = '<td class="job-name-cell"></td><td></td><td class="jobs-src-cell"></td><td></td><td></td><td></td>';
+      tr.querySelector('.job-name-cell').textContent = job.name;
+      var tds = tr.querySelectorAll('td');
+      tds[1].innerHTML = '<span class="pill ' + (job.type === 'TEMPLATE' ? 'pill-template' : job.type === 'INCREMENTAL' ? 'pill-incremental' : 'pill-full') + '">' + (job.type === 'TEMPLATE' ? 'Template' : job.type === 'INCREMENTAL' ? 'Incremental' : 'Full') + '</span>';
+      /* Sources shows just the folder name (full path on hover): the
+         full path is in the details panel and would push the Status
+         column off-screen. */
+      var srcName = job.source ? job.source.replace(/[/\\]+$/, '').split(/[/\\]/).pop() : '—';
+      tds[2].textContent = srcName;
+      if (job.source) tds[2].title = job.source;
+      tds[3].textContent = scheduleLabel(sched) || 'Manual only';
+      tds[4].textContent = job.runs && job.runs.length ? formatDate(job.timestamp) : 'Never run';
+      tds[5].innerHTML = '<span class="pill ' + pillClass(job.status, job.type) + '">' + escapeHtml(job.status) + '</span>';
+      tr.addEventListener('click', function () { jobsSelectedId = job.id; renderJobsView(); });
+      body.appendChild(tr);
+    });
+    renderJobsDetails(sel);
+    var dis = !sel;
+    ['jobsRunBtn', 'jobsEditBtn', 'jobsDeleteBtn', 'jobsDetailsRun', 'jobsDetailsRestore', 'jobsDetailsEdit'].forEach(function (id) { var b = $(id); if (b) b.disabled = dis; });
+  }
+  function renderJobsDetails(job) {
+    var panel = $('jobsDetails'); if (!panel) return;
+    var name = $('jobsDetailsName'), pill = $('jobsDetailsPill');
+    var banner = $('jobsDetailsBanner'), bIco = $('jobsDetailsBannerIco'), bTitle = $('jobsDetailsBannerTitle'), bSub = $('jobsDetailsBannerSub');
+    var listEl = $('jobsDetailsList'), waitEl = $('jobsDetailsWaiting');
+    if (!job) {
+      if (name) name.textContent = 'No job selected';
+      if (pill) { pill.className = 'pill'; pill.textContent = '—'; }
+      if (banner) { banner.classList.remove('warn', 'bad'); banner.classList.add('idle'); }
+      if (bIco) bIco.textContent = 'ⓘ';
+      if (bTitle) bTitle.textContent = 'No jobs yet';
+      if (bSub) bSub.textContent = 'Create your first backup job to protect your files.';
+      if (listEl) listEl.innerHTML = '';
+      if (waitEl) waitEl.innerHTML = '';
+      return;
+    }
+    if (name) name.textContent = job.name;
+    if (pill) { pill.className = 'pill ' + pillClass(job.status, job.type); pill.textContent = job.status; }
+    if (banner) {
+      banner.classList.remove('warn', 'bad', 'idle');
+      if (job.status === 'COMPLETED') {
+        if (bIco) bIco.textContent = '✓';
+        if (bTitle) bTitle.textContent = 'Last Backup: Completed';
+        if (bSub) bSub.textContent = formatDashboardTime(job.timestamp);
+      } else if (job.status === 'FAILED') {
+        banner.classList.add('bad');
+        if (bIco) bIco.textContent = '!';
+        if (bTitle) bTitle.textContent = 'Last Backup: Failed';
+        if (bSub) bSub.textContent = 'Failed at ' + formatDashboardTime(job.timestamp);
+      } else if (job.status === 'RUNNING') {
+        banner.classList.add('idle');
+        if (bIco) bIco.textContent = '◷';
+        if (bTitle) bTitle.textContent = 'Backup running';
+        if (bSub) bSub.textContent = 'Started ' + formatDashboardTime(job.timestamp);
+      } else {
+        banner.classList.add('idle');
+        if (bIco) bIco.textContent = 'ⓘ';
+        if (bTitle) bTitle.textContent = job.runs && job.runs.length ? 'Last Backup: ' + job.status : 'Never run yet';
+        if (bSub) bSub.textContent = job.runs && job.runs.length ? formatDashboardTime(job.timestamp) : 'Run this job to create its first backup.';
+      }
+    }
+    if (listEl) {
+      listEl.innerHTML = '';
+      var sched = job.schedule || (job.raw && job.raw.schedule) || null;
+      var enc = job.encryptionEnabled === true || (job.raw && job.raw.encryptionEnabled === true);
+      var rows = [
+        ['Backup Type', job.type === 'TEMPLATE' ? '—' : job.type === 'INCREMENTAL' ? 'Incremental' : 'Full'],
+        ['Sources', job.source || '—'],
+        ['Destination', job.destination || '—'],
+        ['Schedule', scheduleLabel(sched) || 'Manual only'],
+        ['Next run', nextRunText(job)],
+        ['Compression', compressionLabel(job)],
+        ['Encryption', enc ? 'Enabled (AES-256)' : 'Off'],
+        ['Last Run Result', job.runs && job.runs.length ? job.status + ' — ' + formatDate(job.timestamp) : 'Never run'],
+        ['Files Backed Up', job.runs && job.runs.length ? String(job.files) : '—'],
+        ['Total Size', job.runs && job.runs.length ? formatBytes(job.size) : '—']
+      ];
+      rows.forEach(function (r) {
+        var div = document.createElement('div');
+        var dt = document.createElement('dt'); dt.textContent = r[0];
+        var dd = document.createElement('dd'); dd.textContent = r[1];
+        div.appendChild(dt); div.appendChild(dd); listEl.appendChild(div);
+      });
+    }
+    if (waitEl) {
+      waitEl.innerHTML = '';
       var w = waitingOf(job);
       if (w) {
         var wdiv = document.createElement('div');
         wdiv.className = 'job-waiting';
         wdiv.textContent = '⏳ Waiting for the ' + (w.which || 'source') + ' drive since ' + formatDate(w.since) + ' — ' + (w.path || '') + (w.label ? ' (volume "' + w.label + '")' : '');
-        card.querySelector('.job-body').appendChild(wdiv);
+        waitEl.appendChild(wdiv);
       }
-      var sched = job.schedule || (job.raw && job.raw.schedule) || null;
-      card.querySelector('.d-schedule').textContent = scheduleLabel(sched) || 'Manual only';
-      card.querySelector('.d-next').textContent = nextRunText(job);
-      card.querySelector('.d-compress').textContent = compressionLabel(job);
-      card.querySelector('.d-files').textContent = job.runs && job.runs.length ? job.files + ' files · ' + formatBytes(job.size) : '—';
-      card.querySelectorAll('[data-act]').forEach(function (btn) {
-        btn.addEventListener('click', async function (ev) {
-          ev.stopPropagation();
-          var act = btn.getAttribute('data-act');
-          if (act === 'details') openDrawer(job);
-          if (act === 'run') runBackup(job, false);
-          if (act === 'edit') openJobWizard(job);
-          if (act === 'restore') openRestore(job);
-          if (act === 'delete') {
-            if (!api || typeof api.deleteJob !== 'function') return;
-            try {
-              var res = await api.deleteJob(job.id);
-              if (res && res.success) { toast('Job deleted', job.name + ' has been deleted.', 'success'); await refreshJobs(); }
-              else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
-            } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
-          }
-        });
-      });
-      list.appendChild(card);
-    });
+    }
+  }
+  async function deleteSelectedJob() {
+    var j = selectedJob();
+    if (!j || !api || typeof api.deleteJob !== 'function') return;
+    try {
+      var res = await api.deleteJob(j.id);
+      if (res && res.success) { toast('Job deleted', j.name + ' has been deleted.', 'success'); await refreshJobs(); }
+      else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
+    } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
   }
 
   /* ---------- TechVision Cloud ---------- */
@@ -661,16 +815,30 @@
       renderCloudClientList(); if (cloudClientAccess === 'tailscale') populateCloudPeers(); if (cloudClientAccess === 'wireguard') populateCloudWgPeers();
     }
     syncCloudNav();
+    if (panel === 'home') {
+      var ov = document.querySelector('[data-nav="cloud"]');
+      if (ov) ov.classList.add('active');
+    }
     setBackTitle(panel === 'server' ? 'Cloud — Server' : panel === 'client' ? 'Cloud — Client' : panel === 'mapdrive' ? 'Cloud — Map network' : 'Cloud');
   }
 
   function renderCloudHome() {
     if (!cloudCfg) return;
     var s = cloudCfg.server || {};
-    var ss = $('cloudServerModeStatus');
-    if (ss) ss.textContent = s.running ? ('Running — port ' + (s.port || 8443)) : 'Stopped';
-    var cs = $('cloudClientModeStatus');
-    if (cs) cs.textContent = cloudConn ? ('Connected as ' + (cloudConn.info.user || '') + ' @ ' + (cloudConn.name || '')) : 'Not connected';
+    var badge = $('cloudServerModeBadge');
+    if (badge) {
+      badge.textContent = s.running ? 'Running' : 'Stopped';
+      badge.className = 'pill ' + (s.running ? 'pill-completed' : 'pill-pending');
+    }
+    var sp = $('cloudServerModePort'); if (sp) sp.textContent = String(s.port || 8443);
+    var su = $('cloudServerModeUsers'); if (su) su.textContent = String((s.users || []).length);
+    var cb = $('cloudClientModeBadge');
+    if (cb) {
+      cb.textContent = cloudConn ? 'Connected' : 'Not connected';
+      cb.className = 'pill ' + (cloudConn ? 'pill-completed' : 'pill-pending');
+    }
+    var ca = $('cloudClientModeAddr'); if (ca) ca.textContent = cloudConn ? (cloudConn.name || '—') : '—';
+    var cc = $('cloudClientModeCount'); if (cc) cc.textContent = String(((cloudCfg.clients) || []).length);
   }
 
   /* ---------- Cloud access: Normal vs Tailscale VPN ----------
@@ -876,6 +1044,8 @@
     var en = $('cloudServerEnabled'); if (en) en.checked = !!s.enabled;
     var port = $('cloudServerPort'); if (port) port.value = String(s.port || 8443);
     var gp = $('cloudGuidePort'); if (gp) gp.textContent = String(s.port || 8443);
+    var fp = $('cloudServerFactPort'); if (fp) fp.textContent = String(s.port || 8443);
+    var fu = $('cloudServerFactUsers'); if (fu) fu.textContent = String((s.users || []).length);
     setServerAccess(s.accessMode || 'normal');
     var startBtn = $('cloudServerStartBtn');
     if (startBtn) startBtn.textContent = s.running ? '■ Stop server' : '▶ Start server';
@@ -1675,13 +1845,13 @@
   function cloudSetLastOpenMode(mode) {
     var el = $('cloudOpenModeStatus');
     if (!el) return;
-    el.textContent = mode === 'direct' ? 'آخر ملف: مباشر' : mode === 'temp' ? 'آخر ملف: temp' : 'آخر ملف: —';
+    el.textContent = mode === 'direct' ? 'Last file: Direct' : mode === 'temp' ? 'Last file: temp' : 'Last file: —';
   }
   function renderCloudOpenMode() {
     var sel = $('cloudOpenModeSel');
     if (sel) sel.value = cloudOpenMode();
     var st = $('cloudOpenModeStatus');
-    if (st && !st.textContent) st.textContent = 'آخر ملف: —';
+    if (st && !st.textContent) st.textContent = 'Last file: —';
   }
   // Mapped-drive open (v1), shared by the program branch and direct
   // mode. Returns true when the file opened from the drive.
@@ -1715,7 +1885,7 @@
     // Programs / games: mapped drive or nothing.
     if (cloudIsProgramFile(entry.name)) {
       if (await cloudTryMappedOpen(entry)) { cloudSetLastOpenMode('direct'); return; }
-      askConfirm('«' + entry.name + '» برنامج — لازم drive عشان يشتغل صح. من غير Map البرنامج مش هيشتغل (الـ temp بتنزّل ملف واحد بس، واللعبة فولدر كامل).', function () { showCloudPanel('mapdrive'); }, { title: 'الملف ده برنامج', yesLabel: 'اعمل Map', noLabel: 'إلغاء' });
+      askConfirm('"' + entry.name + '" is a program — it needs a mapped drive to run correctly. Without a map it will not run (temp downloads a single file only, and a game is a whole folder).', function () { showCloudPanel('mapdrive'); }, { title: 'This file is a program', yesLabel: 'Create Map', noLabel: 'Cancel' });
       return;
     }
     if (cloudOpenMode() === 'direct') {
@@ -1944,35 +2114,44 @@
     }
     return (s.frequency || 'Daily') + ' at ' + time;
   }
-  function nextRunText(job) {
+  /* Next run of a scheduled job as a Date (null when unscheduled or
+     unparseable). nextRunText() keeps its exact output for the Jobs
+     page; the Dashboard reuses the Date to find the earliest run. */
+  function nextRunDate(job) {
     var s = job.schedule || (job.raw && job.raw.schedule) || null;
-    if (!s || !s.enabled) return 'No schedule — manual only';
-    var freq = s.frequency || 'Daily';
+    if (!s || !s.enabled) return null;
     var time = s.time || '02:00';
     var m = /^(\d{1,2}):(\d{2})$/.exec(time);
-    if (!m) return scheduleLabel(s);
-    var next = new Date();
-    next.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
-    if (freq.toLowerCase() === 'custom') {
+    if (!m) return null;
+    var hh = parseInt(m[1], 10), mm = parseInt(m[2], 10);
+    var now = new Date();
+    if ((s.frequency || '').toLowerCase() === 'custom') {
       var days = Array.isArray(s.days) ? s.days : [];
-      var found = null;
       for (var i = 0; i < 8; i++) {
         var c = new Date(); c.setDate(c.getDate() + i);
         if (days.indexOf(c.getDay()) < 0) continue;
-        c.setHours(parseInt(m[1], 10), parseInt(m[2], 10), 0, 0);
-        if (c > new Date()) { found = c; break; }
-        if (i === 0) { found = c; break; } // due today
+        c.setHours(hh, mm, 0, 0);
+        if (c > now) return c;
+        if (i === 0) return c; // due today
       }
-      if (found) next = found;
-      return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
+      return null;
     }
-    if (freq.toLowerCase() === 'weekly') {
-      if (next <= new Date()) next.setDate(next.getDate() + 7);
-    } else if (freq.toLowerCase() === 'monthly') {
-      if (next <= new Date()) next.setMonth(next.getMonth() + 1);
-    } else if (next <= new Date()) {
+    var next = new Date();
+    next.setHours(hh, mm, 0, 0);
+    if ((s.frequency || '').toLowerCase() === 'weekly') {
+      if (next <= now) next.setDate(next.getDate() + 7);
+    } else if ((s.frequency || '').toLowerCase() === 'monthly') {
+      if (next <= now) next.setMonth(next.getMonth() + 1);
+    } else if (next <= now) {
       next.setDate(next.getDate() + 1);
     }
+    return next;
+  }
+  function nextRunText(job) {
+    var s = job.schedule || (job.raw && job.raw.schedule) || null;
+    if (!s || !s.enabled) return 'No schedule — manual only';
+    var next = nextRunDate(job);
+    if (!next) return scheduleLabel(s);
     return scheduleLabel(s) + ' — next: ' + formatDate(next.toISOString());
   }
 
@@ -2027,25 +2206,27 @@
     currentJob = null;
   }
   function showSettingsView(view) {
-    var home = $('settingsHomeView'), email = $('settingsEmailView');
-    if (!home || !email) return;
-    home.style.display = view === 'email' ? 'none' : '';
-    email.style.display = view === 'email' ? '' : 'none';
+    /* Settings is a full page now: the four tabs switch sections. The
+       old drawer view names still work: 'home' = General, 'email' = Email. */
+    var tab = view === 'email' ? 'email' : view === 'backup' ? 'backup' : view === 'security' ? 'security' : 'general';
+    var sections = { general: 'settingsGeneralSection', backup: 'settingsBackupSection', security: 'settingsSecuritySection', email: 'settingsEmailSection' };
+    Object.keys(sections).forEach(function (k) { var s = $(sections[k]); if (s) s.style.display = k === tab ? '' : 'none'; });
+    document.querySelectorAll('[data-settings-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-settings-tab') === tab); });
   }
   function refreshEmailMenuStatus() {
-    var el = $('emailMenuStatus'); if (!el) return;
+    var el = $('emailTabStatus'); if (!el) return;
     var enabled = $('settingEmailEnabled') ? $('settingEmailEnabled').checked : false;
     var to = $('settingEmailTo') ? $('settingEmailTo').value.trim() : '';
-    el.textContent = enabled ? ('On' + (to ? ' — ' + to : '')) : 'Off — tap to set up';
+    el.textContent = enabled ? ('On' + (to ? ' — ' + to : '')) : 'Off';
   }
   function openSettings() {
     showSettingsView('home');
-    $('settingsDrawer').classList.add('show');
-    $('settingsBackdrop').classList.add('show');
+    showView('settings');
   }
   function closeSettings() {
-    $('settingsDrawer').classList.remove('show');
-    $('settingsBackdrop').classList.remove('show');
+    /* The settings page is a view now, not a drawer: closing it goes
+       back to the view it was opened from. */
+    showView(lastBackupView || 'dashboard');
   }
 
   /* ---------- progress card ---------- */
@@ -2170,7 +2351,7 @@
     if (!api || typeof api.getJobHistory !== 'function') {
       jobs = [];
       renderStats();
-      renderJobs();
+      refreshStorageCard();
       return;
     }
     try {
@@ -2182,7 +2363,7 @@
       jobs = [];
     }
     renderStats();
-    renderJobs();
+    refreshStorageCard();
     renderJobsView();
   }
   if (api && typeof api.onJobsUpdated === 'function') {
@@ -2242,6 +2423,10 @@
     var st;
     try { st = await api.vpnGetStatus(); } catch (e) { st = { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
     vpnStatusCache = st || {};
+    /* The hero tints with the state (06 look): green while connected,
+       red on error, neutral otherwise — the dot and text say the same. */
+    var hero = $('vpnHero');
+    if (hero) hero.className = 'card vpn-hero ' + ((!st || !st.installed) ? 'vpn-hero-idle' : (st.error && !st.connected && !st.needsLogin) ? 'vpn-hero-bad' : st.connected ? 'vpn-hero-ok' : 'vpn-hero-idle');
     // Status dot + Connect button styling live here, in one place:
     // green pulsing dot while connected, grey otherwise; the button is
     // the primary (gradient) action whenever there is something to do
@@ -2576,16 +2761,17 @@
       var row = document.createElement('div');
       row.className = 'vpn-peer';
       var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
-      var body = document.createElement('div'); body.className = 'vpn-peer-body';
       var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name;
-      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
-      meta.textContent = (p.ip || '—') + (p.os ? ' — ' + p.os : '') + ' — ' + (p.online ? 'online' : 'offline');
-      body.appendChild(h); body.appendChild(meta);
-      row.appendChild(d); row.appendChild(body);
+      var ip = document.createElement('span'); ip.className = 'vpn-peer-ip'; ip.textContent = p.ip || '—';
+      var os = document.createElement('span'); os.className = 'vpn-peer-os'; os.textContent = p.os || '—';
+      var st = document.createElement('span'); st.className = 'pill ' + (p.online ? 'pill-completed' : 'pill-pending'); st.textContent = p.online ? 'online' : 'offline';
+      row.appendChild(d); row.appendChild(h); row.appendChild(ip); row.appendChild(os); row.appendChild(st);
       if (p.ip) {
         var open = document.createElement('button'); open.className = 'btn btn-primary btn-sm'; open.type = 'button'; open.textContent = 'Open in Cloud';
         open.addEventListener('click', function () { openCloudWithPeer(p); });
         row.appendChild(open);
+      } else {
+        var spacer = document.createElement('span'); row.appendChild(spacer);
       }
       list.appendChild(row);
     });
@@ -2627,6 +2813,9 @@
     var st;
     try { st = await api.wgGetStatus(); } catch (e) { st = { installed: false, serverRunning: false, clientRunning: false, error: e && e.message ? e.message : 'Could not read WireGuard status.' }; }
     wgStatusCache = st || {};
+    /* Same state tint as the Tailscale hero (06 look). */
+    var wh = $('wgHero');
+    if (wh) wh.className = 'card vpn-hero ' + (!st.installed ? 'vpn-hero-idle' : st.serverRunning ? 'vpn-hero-ok' : st.error ? 'vpn-hero-bad' : 'vpn-hero-idle');
     renderWgNat(st || {});
     var dot = $('wgStatusDot'); if (dot) dot.className = 'vpn-dot' + (st.serverRunning ? ' on' : '');
     var txt = $('wgStatusText'), sub = $('wgStatusSub');
@@ -2704,6 +2893,7 @@
     } else {
       ns.textContent = 'NAT service: stopped.' + (n.lastError ? (' ' + n.lastError) : '') + summary;
     }
+    ns.className = 't-sub vpn-note wg-nat-banner' + (n.running ? ' ok' : '');
     /* Start is available when the service is not running and the
        mode has what it needs: different-subnet needs only a peer
        picked (there is no configuration to save there); same-subnet
@@ -2902,14 +3092,24 @@
     }
     peers.forEach(function (p) {
       var row = document.createElement('div');
-      row.className = 'vpn-peer';
+      row.className = 'vpn-peer wg-peer';
       var d = document.createElement('span'); d.className = 'vpn-peer-dot' + (p.online ? ' on' : '');
-      var body = document.createElement('div'); body.className = 'vpn-peer-body';
-      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name + ' — ' + p.tunnelIp;
-      var meta = document.createElement('div'); meta.className = 'vpn-peer-meta';
-      meta.textContent = (p.online ? ('online — last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected') + ' · ' + formatBytes(p.transferRx || 0) + ' down / ' + formatBytes(p.transferTx || 0) + ' up · ' + String(p.publicKey || '').slice(0, 12) + '…' + (p.endpoint ? (' · endpoint ' + p.endpoint) : '');
-      body.appendChild(h); body.appendChild(meta);
-      row.appendChild(d); row.appendChild(body);
+      var dev = document.createElement('div'); dev.className = 'wg-peer-dev';
+      var h = document.createElement('h3'); h.className = 'vpn-peer-name'; h.textContent = p.name;
+      var tip = document.createElement('div'); tip.className = 'vpn-peer-meta'; tip.textContent = (p.tunnelIp || '—') + (p.endpoint ? (' · endpoint ' + p.endpoint) : '');
+      dev.appendChild(h); dev.appendChild(tip);
+      var st = document.createElement('div'); st.className = 'wg-peer-status';
+      var pill = document.createElement('span'); pill.className = 'pill ' + (p.online ? 'pill-completed' : 'pill-pending'); pill.textContent = p.online ? 'online' : 'offline';
+      var hs = document.createElement('div'); hs.className = 'vpn-peer-meta'; hs.textContent = p.online ? ('last handshake ' + wgHandshakeText(p.latestHandshake)) : 'never connected';
+      st.appendChild(pill); st.appendChild(hs);
+      var tr = document.createElement('div'); tr.className = 'wg-peer-transfer';
+      var dn = document.createElement('div'); dn.textContent = formatBytes(p.transferRx || 0) + ' down';
+      var up = document.createElement('div'); up.className = 'vpn-peer-meta'; up.textContent = formatBytes(p.transferTx || 0) + ' up';
+      tr.appendChild(dn); tr.appendChild(up);
+      var key = document.createElement('span'); key.className = 'wg-peer-key'; key.textContent = String(p.publicKey || '').slice(0, 12) + '…';
+      var ep = p.endpoint ? (' · ' + p.endpoint) : '';
+      key.title = (p.publicKey || '') + ep;
+      row.appendChild(d); row.appendChild(dev); row.appendChild(st); row.appendChild(tr); row.appendChild(key);
       var rm = document.createElement('button'); rm.className = 'btn btn-ghost btn-sm'; rm.type = 'button'; rm.textContent = 'Remove';
       rm.addEventListener('click', async function () {
         if (!api || typeof api.wgRemovePeer !== 'function') return wgMissing();
@@ -2935,14 +3135,41 @@
     var nnj = $('navNewJob'); if (nnj) nnj.addEventListener('click', function () { openJobWizard(null); });
     var jnb = $('jobsNewJobBtn'); if (jnb) jnb.addEventListener('click', function () { openJobWizard(null); });
     var jenb = $('jobsEmptyNewJobBtn'); if (jenb) jenb.addEventListener('click', function () { openJobWizard(null); });
-    $('emptyNewJobBtn').addEventListener('click', function () { openJobWizard(null); });
+    /* Jobs page 02 toolbar + details panel: everything acts on the
+       selected row (first row when nothing is picked yet). */
+    var jrb = $('jobsRunBtn'); if (jrb) jrb.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
+    var jeb = $('jobsEditBtn'); if (jeb) jeb.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
+    var jdb = $('jobsDeleteBtn'); if (jdb) jdb.addEventListener('click', deleteSelectedJob);
+    var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', refreshJobs);
+    var jch = $('jobsClearHistoryBtn'); if (jch) jch.addEventListener('click', function () {
+      if (!api || typeof api.clearJobHistory !== 'function') return;
+      askConfirm('Do you want to delete ALL backup history? This cannot be undone.', async function () {
+        try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
+        catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
+      });
+    });
+    var jsi = $('jobsSearchInput'); if (jsi) jsi.addEventListener('input', renderJobsView);
+    var jsf = $('jobsStatusFilter'); if (jsf) jsf.addEventListener('change', renderJobsView);
+    var jss = $('jobsSortSelect'); if (jss) jss.addEventListener('change', renderJobsView);
+    var jdr = $('jobsDetailsRun'); if (jdr) jdr.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
+    var jdrs = $('jobsDetailsRestore'); if (jdrs) jdrs.addEventListener('click', function () { var j = selectedJob(); if (j) openRestore(j); });
+    var jde = $('jobsDetailsEdit'); if (jde) jde.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
+    /* Dashboard 01 quick actions. */
+    var dnj = $('dashNewJob'); if (dnj) dnj.addEventListener('click', function () { openJobWizard(null); });
+    var denj = $('dashEmptyNewJobBtn'); if (denj) denj.addEventListener('click', function () { openJobWizard(null); });
+    var drs = $('dashRestore'); if (drs) drs.addEventListener('click', function () { openRestore(null); });
+    var dvj = $('dashViewJobs'); if (dvj) dvj.addEventListener('click', function () { showView('jobs'); });
+    var dval = $('dashViewAllJobs'); if (dval) dval.addEventListener('click', function () { showView('jobs'); });
+    var dol = $('dashOpenLogs'); if (dol) dol.addEventListener('click', function () { showView('logs'); });
+    var dst = $('dashSettings'); if (dst) dst.addEventListener('click', function () { openSettings(); refreshVaultStatus(); });
+    var dcs = $('dashCheckStorage'); if (dcs) dcs.addEventListener('click', function () { refreshStorageCard(true); });
+    var dopen = $('dashOpenLocation'); if (dopen) dopen.addEventListener('click', function () {
+      if (storageDest && api && typeof api.openPath === 'function') api.openPath(storageDest).catch(function () {});
+    });
 
     $('navRestore').addEventListener('click', function () { openRestore(null); });
     var brb = $('backupTopRefreshBtn');
     if (brb) brb.addEventListener('click', refreshJobs);
-    $('searchInput').addEventListener('input', renderJobs);
-    $('statusFilter').addEventListener('change', renderJobs);
-    $('typeFilter').addEventListener('change', renderJobs);
     $('themeToggle').addEventListener('click', async function () {
       var next = document.body.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
       applyTheme(next);
@@ -2993,12 +3220,9 @@
     if (vus) vus.addEventListener('click', hideVaultModal);
     var vup = $('vaultUnlockPass');
     if (vup) vup.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); $('vaultUnlockBtn').click(); } });
-    $('settingsClose').addEventListener('click', closeSettings);
-    $('settingsBackdrop').addEventListener('click', closeSettings);
-    var emr = $('emailMenuRow');
-    if (emr) emr.addEventListener('click', function () { showSettingsView('email'); });
-    var ebb = $('emailBackBtn');
-    if (ebb) ebb.addEventListener('click', function () { showSettingsView('home'); });
+    document.querySelectorAll('[data-settings-tab]').forEach(function (tab) {
+      tab.addEventListener('click', function () { showSettingsView(tab.getAttribute('data-settings-tab')); });
+    });
     $('settingsSave').addEventListener('click', async function () { await saveSettings(); closeSettings(); });
     var etb = $('emailTestBtn');
     if (etb) etb.addEventListener('click', async function () {
@@ -3020,36 +3244,42 @@
         try { await api.saveSettings(Object.assign({}, settings, { theme: next })); settings.theme = next; } catch (e) { /* theme already applied visually */ }
       }
     });
-    $('clearHistoryBtn').addEventListener('click', function () {
-      if (!api || typeof api.clearJobHistory !== 'function') return;
-      askConfirm('Do you want to delete ALL backup history? This cannot be undone.', async function () {
-        try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
-        catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
-      });
-    });
     var cy = $('confirmYes'); if (cy) cy.addEventListener('click', function () { var cb = confirmCallback; closeConfirm(); if (cb) cb(); });
     var cn = $('confirmNo'); if (cn) cn.addEventListener('click', closeConfirm);
     var cb2 = $('confirmBackdrop'); if (cb2) cb2.addEventListener('click', closeConfirm);
+    /* Collapsible nav groups: the arrow next to Backup / Cloud / VPN
+       folds its items away; the active item's group reopens on its
+       own whenever navigation lands on it (see showView). */
+    document.querySelectorAll('.nav-group-head').forEach(function (head) {
+      head.addEventListener('click', function () {
+        var g = head.closest('.nav-group');
+        if (g) g.classList.toggle('collapsed');
+      });
+    });
+    document.querySelectorAll('[data-cloud-tab]').forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        var panel = tab.getAttribute('data-cloud-tab');
+        showCloudPanel(panel); setModule('cloud');
+      });
+    });
     document.querySelectorAll('[data-nav]').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var nav = btn.getAttribute('data-nav');
         document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
         btn.classList.add('active');
-        if (nav === 'settings') openSettings();
         if (nav === 'logs') toast('Logs', 'Open the Log Viewer from the Logs window.', '');
         if (nav === 'jobs') showView('jobs');
         if (nav === 'dashboard') showView('dashboard');
         if (nav === 'logs') showView('logs');
-        if (nav === 'cloud') showView('cloud');
+        if (nav === 'cloud') { showCloudPanel('home'); showView('cloud'); }
         if (nav === 'vpn') showView('vpn');
         if (nav === 'wireguard') showView('wireguard');
-        if (nav === 'cloud-server') { setModule('cloud'); showCloudPanel('server'); }
-        if (nav === 'cloud-client') { setModule('cloud'); showCloudPanel('client'); }
-        if (nav === 'cloud-mapdrive') { setModule('cloud'); showCloudPanel('mapdrive'); }
+        if (nav === 'wireguard-site') { showView('wireguard'); wgScrollTo('wgServerCard'); }
+        if (nav === 'wireguard-nat') { showView('wireguard'); wgScrollTo('wgNatCard'); }
+        if (nav === 'cloud-server') { showCloudPanel('server'); setModule('cloud'); }
+        if (nav === 'cloud-client') { showCloudPanel('client'); setModule('cloud'); }
+        if (nav === 'cloud-mapdrive') { showCloudPanel('mapdrive'); setModule('cloud'); }
       });
-    });
-    document.querySelectorAll('[data-module]').forEach(function (btn) {
-      btn.addEventListener('click', function () { setModule(btn.getAttribute('data-module')); });
     });
     document.querySelectorAll('#cloudServerAccessSeg .seg-btn').forEach(function (b) {
       b.addEventListener('click', function () { setServerAccess(b.getAttribute('data-access')); saveCloudServerSettings(); });
@@ -3710,13 +3940,10 @@
     } catch (e) { toast('Add failed', e && e.message ? e.message : 'Could not add the peer.', 'error'); }
     await loadWireGuard();
   });
-    document.querySelectorAll('[data-module-enter]').forEach(function (card) {
-      card.addEventListener('click', function () { setModule(card.getAttribute('data-module-enter')); });
-    });
     var tbb = $('topBackBtn');
     if (tbb) tbb.addEventListener('click', goBack);
 
     loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
-    showView('modules');
+    showView('dashboard');
   });
 })();

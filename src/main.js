@@ -851,10 +851,10 @@ function createJobWizardWindow() {
 
 function createRestoreWindow() {
   restoreWindow = new BrowserWindow({
-    width: 780,
-    height: 760,
-    minWidth: 700,
-    minHeight: 620,
+    width: 960,
+    height: 840,
+    minWidth: 860,
+    minHeight: 640,
     icon: APP_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -1548,6 +1548,27 @@ ipcMain.handle('fs-delete', async (event, filePath) => {
 
 ipcMain.handle('fs-exists', async (event, filePath) => {
   return { exists: fs.existsSync(filePath) };
+});
+
+// Drive usage + open a path in Explorer (Dashboard storage card)
+ipcMain.handle('fs-drive-usage', async (event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath) return { success: false, error: 'No path' };
+    var st = fs.statfsSync(targetPath);
+    var total = st.blocks * st.bsize;
+    var free = st.bfree * st.bsize;
+    if (!Number.isFinite(total) || total <= 0) return { success: false, error: 'Unknown drive' };
+    return { success: true, total: total, free: free };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read drive' }; }
+});
+
+ipcMain.handle('fs-open-path', async (event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath) return { success: false, error: 'No path' };
+    var err = await require('electron').shell.openPath(targetPath);
+    if (err) return { success: false, error: err };
+    return { success: true };
+  } catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not open path' }; }
 });
 
 // ZIP operations
