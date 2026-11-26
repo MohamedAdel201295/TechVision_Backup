@@ -3,7 +3,7 @@
  * Electron main process for backup application
  */
 
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, safeStorage } = require('electron');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
@@ -27,6 +27,148 @@ const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
 // the vault is unlocked. Nothing about the master password or any job
 // password is ever written to disk in the clear.
 let vaultKey = null;
+
+// Round 3 — vault overhaul: the vault now also holds the Cloud
+// client, SMTP and Tailscale secrets (generic secrets), the master
+// password is remembered per-device via safeStorage (DPAPI on
+// Windows), and legacy plaintext passwords are migrated into the
+// vault on first unlock. Machine keys (Cloud TLS private key,
+// WireGuard private keys) stay plaintext by design — auto-start —
+// and are NOT vault secrets.
+
+// After any successful unlock: remember this device (best-effort,
+// safeStorage may be unavailable) and migrate any plaintext
+// passwords still sitting in cloud.json / settings.json into the
+// vault. Never throws — a failure here must never block the app.
+function afterVaultUnlocked() {
+  try {
+    if (vaultKey) {
+      const saved = vault.saveUnlockBlob(app.getPath('userData'), safeStorage, vaultKey);
+      if (!saved.saved) console.log('[Vault] Remember-me not saved: ' + (saved.reason || 'unknown'));
+    }
+  } catch (e) { console.log('[Vault] Remember-me failed: ' + (e && e.message ? e.message : e)); }
+  try {
+    if (vaultKey) {
+      const moved = vault.migrateLegacySecrets(app.getPath('userData'), vaultKey);
+      if (moved.cloud || moved.smtp || moved.apiToken || moved.oauthSecret) {
+        console.log('[Vault] Migrated plaintext passwords into the vault: ' + JSON.stringify(moved));
+        appendAppLog('info', 'Moved saved passwords (Cloud, email, Tailscale) into the encrypted vault — they no longer sit in plain text in the settings files.');
+        // The in-memory cloud config may still hold a legacy password
+        // field that migration just deleted from disk: drop it so the
+        // record reads from the vault from now on.
+        try { const cfg = getCloudConfig(); for (const c of (cfg.clients || [])) { if (c.passwordInVault) delete c.password; } } catch (e) {}
+      }
+    }
+  } catch (e) { console.log('[Vault] Migration failed: ' + (e && e.message ? e.message : e)); }
+}
+
+// Try the saved safeStorage unlock blob at startup. Returns true when
+// the vault is now unlocked. Never throws — a missing/stale blob just
+// means the master password is asked for, as before.
+function tryRememberedUnlock() {
+  try {
+    if (vaultKey || !vault.vaultExists(app.getPath('userData'))) return false;
+    const key = vault.tryAutoUnlock(app.getPath('userData'), safeStorage);
+    if (!key) return false;
+    vaultKey = key;
+    afterVaultUnlocked();
+    console.log('[Vault] Auto-unlocked from the remembered device unlock.');
+    return true;
+  } catch (e) { return false; }
+}
+
+// Saved password for a Cloud server record: the vault secret when the
+// record was migrated (passwordInVault), else the legacy plaintext
+// field until migration runs. Never throws.
+function getClientPassword(rec) {
+  if (!rec) return null;
+  try {
+    if (rec.passwordInVault && vaultKey) {
+      const pw = vault.getSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + rec.id);
+      if (pw) return pw;
+    }
+  } catch (e) {}
+  return rec.password || null;
+}
+
+function readSettingsFile() {
+  try {
+    const p = path.join(app.getPath('userData'), '.techvision', 'settings.json');
+    if (fs.existsSync(p)) { const s = JSON.parse(fs.readFileSync(p, 'utf-8')); return (s && typeof s === 'object') ? s : {}; }
+  } catch (e) {}
+  return {};
+}
+
+// Tailscale credentials for the vpn.* API calls: the renderer only
+// ever sends the non-secret client id (secrets no longer reach it).
+// Fill the secrets in here, from the vault when unlocked, else from
+// the legacy plaintext fields until migration runs. The renderer
+// value wins when it actually carries a secret (it never should).
+function resolveVpnAuth(auth) {
+  const a = (auth && typeof auth === 'object') ? Object.assign({}, auth) : {};
+  const settings = readSettingsFile();
+  const legacy = (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {};
+  try {
+    if (vaultKey) {
+      if (!a.apiToken) a.apiToken = vault.getSecret(app.getPath('userData'), vaultKey, 'tailscale-api-token') || a.apiToken;
+      if (!a.clientSecret) a.clientSecret = vault.getSecret(app.getPath('userData'), vaultKey, 'tailscale-oauth-secret') || a.clientSecret;
+    }
+  } catch (e) {}
+  if (!a.apiToken && legacy.apiToken) a.apiToken = legacy.apiToken;
+  if (!a.clientSecret && legacy.oauthClientSecret) a.clientSecret = legacy.oauthClientSecret;
+  if (!a.clientId && legacy.oauthClientId) a.clientId = legacy.oauthClientId;
+  return a;
+}
+
+// Email settings with the SMTP password resolved: vault secret when
+// unlocked, else the legacy plaintext field until migration runs.
+// mailer.js itself only ever reads the file — it never touches the
+// vault — so callers that send mail go through here.
+function resolveEmailSettings() {
+  const settings = readSettingsFile();
+  const email = (settings.email && typeof settings.email === 'object') ? Object.assign({}, settings.email) : {};
+  try {
+    if (vaultKey) {
+      const pw = vault.getSecret(app.getPath('userData'), vaultKey, 'smtp');
+      if (pw) email.smtpPass = pw;
+    }
+  } catch (e) {}
+  return email;
+}
+
+// Strip plaintext secrets out of a settings object before it leaves
+// main (settings-get): the renderer never receives a password or
+// token. Instead it gets *InVault flags so the fields can show
+// "saved — leave blank to keep it". A legacy plaintext field still
+// on disk also counts as saved until migration moves it.
+function stripSecretsFromSettings(settings) {
+  const s = (settings && typeof settings === 'object') ? JSON.parse(JSON.stringify(settings)) : {};
+  if (!s.email || typeof s.email !== 'object') s.email = {};
+  if (!s.vpn || typeof s.vpn !== 'object') s.vpn = {};
+  let smtpSaved = false, tokenSaved = false, oauthSaved = false;
+  try {
+    if (vaultKey) {
+      smtpSaved = vault.hasSecret(app.getPath('userData'), vaultKey, 'smtp');
+      tokenSaved = vault.hasSecret(app.getPath('userData'), vaultKey, 'tailscale-api-token');
+      oauthSaved = vault.hasSecret(app.getPath('userData'), vaultKey, 'tailscale-oauth-secret');
+    }
+  } catch (e) {}
+  if (s.email.smtpPass) smtpSaved = true;
+  if (s.vpn.apiToken) tokenSaved = true;
+  if (s.vpn.oauthClientSecret) oauthSaved = true;
+  // A flag already on disk stays true even while the vault is locked
+  // (the secret is in the vault, just unreadable right now).
+  if (s.email.smtpPassInVault) smtpSaved = true;
+  if (s.vpn.apiTokenInVault) tokenSaved = true;
+  if (s.vpn.oauthClientSecretInVault) oauthSaved = true;
+  delete s.email.smtpPass;
+  delete s.vpn.apiToken;
+  delete s.vpn.oauthClientSecret;
+  s.email.smtpPassInVault = smtpSaved;
+  s.vpn.apiTokenInVault = tokenSaved;
+  s.vpn.oauthClientSecretInVault = oauthSaved;
+  return s;
+}
 
 // ---------- TechVision Cloud ----------
 // Config file: <userData>/.techvision/cloud.json — { server, clients }.
@@ -494,7 +636,9 @@ function notifyJobsUpdated() {
 // break or delay a backup. Logs the outcome, nothing else.
 function notifyEmail(kind, job, extra) {
   try {
-    mailer.notify(app.getPath('userData'), kind, job, extra).then(function (r) {
+    // Pass the vault-resolved SMTP settings so notifications keep
+    // working after the password moved out of settings.json.
+    mailer.notify(app.getPath('userData'), kind, job, extra, resolveEmailSettings()).then(function (r) {
       if (r && !r.sent && r.reason !== 'off') console.log('[Mail] Notification not sent (' + kind + '): ' + r.reason);
       else if (r && r.sent) console.log('[Mail] Notification sent (' + kind + ')');
     }).catch(function (e) { console.log('[Mail] Notification error:', e.message); });
@@ -849,6 +993,12 @@ function createMainWindow() {
 // App lifecycle
 app.whenReady().then(() => {
   migrateLegacyUserData(); // Bring old settings/jobs into the pinned folder
+  // Remember-me: if this device saved a safeStorage unlock blob, the
+  // vault opens here — before schedules/missed-mail run — so the
+  // master password is never asked again while the app is installed.
+  // Best-effort: without a blob (or without safeStorage) the vault
+  // simply stays locked and the renderer asks, as before.
+  tryRememberedUnlock();
   loadStoredJobs(); // Load stored jobs on startup
   checkMissedSchedules(); // Email if the app was closed and a schedule was missed
   startScheduler(); // Run scheduled jobs while the app is open
@@ -1373,28 +1523,30 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
 });
 
 // Restore operations
-ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password) => {
+// options is optional: { overwrite: true } replaces existing files;
+// default (no option) leaves them alone and reports files_skipped.
+ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password, options) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null);
+    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null, options || {});
     // restore_all reports failures in its result object instead of
     // throwing (wrong password, hash mismatch) — honour it, or a
     // failed restore would be reported as success. Its counters are
     // files_restored/total_bytes, not files/size.
     if (result && result.success === false) {
-      return { success: false, error: (result.errors && result.errors[0]) || 'Restore failed.' };
+      return { success: false, error: (result.errors && result.errors[0]) || 'Restore failed.', files_skipped: (result && result.files_skipped) || 0 };
     }
-    return { success: true, files: (result && result.files_restored) || 0, size: (result && result.total_bytes) || 0 };
+    return { success: true, files: (result && result.files_restored) || 0, size: (result && result.total_bytes) || 0, files_skipped: (result && result.files_skipped) || 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
   }
 });
 
-ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, password) => {
+ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, password, options) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath, password || null);
-    return { success: true, files: result && result.files ? result.files : 0 };
+    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath, password || null, options || {});
+    return { success: true, files: result && result.files ? result.files : 0, skipped: result && result.skipped ? result.skipped : 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
   }
@@ -1511,7 +1663,15 @@ ipcMain.handle('fs-exists', async (event, filePath) => {
 ipcMain.handle('fs-drive-usage', async (event, targetPath) => {
   try {
     if (typeof targetPath !== 'string' || !targetPath) return { success: false, error: 'No path' };
-    var st = fs.statfsSync(targetPath);
+    // Async on purpose (round 3): the sync statfs ran on the main
+    // process, so a dead network share / removed USB / sleeping drive
+    // blocked everything and the window went "Not Responding". The
+    // async call still waits for a slow drive, but the UI stays alive
+    // — and it gives up after 8s instead of hanging the hover forever.
+    var st = await Promise.race([
+      fs.promises.statfs(targetPath),
+      new Promise(function (_, reject) { setTimeout(function () { reject(new Error('Drive read timed out')); }, 8000); })
+    ]);
     var total = st.blocks * st.bsize;
     var free = st.bfree * st.bsize;
     if (!Number.isFinite(total) || total <= 0) return { success: false, error: 'Unknown drive' };
@@ -1630,9 +1790,20 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     fs.renameSync(tmpPath, jobPath);
     // Migration: old configs were saved by name (<name>.json). If one
     // exists for this job, remove it so it is not loaded as a second job.
+    // Same-name guard: <name>.json may be ANOTHER live job's legacy
+    // template (same name, different id) — only remove it when its
+    // stored id is this job's, or it carries no id and no other live
+    // job shares the name. An unreadable file is left alone.
     const oldNamePath = path.join(jobsDir, `${jobConfig.name}.json`);
     if (oldNamePath !== jobPath && fs.existsSync(oldNamePath)) {
-      try { fs.unlinkSync(oldNamePath); } catch (e) {}
+      let ownLegacy = true;
+      try {
+        const old = JSON.parse(fs.readFileSync(oldNamePath, 'utf-8'));
+        const oldId = old && old.id;
+        if (oldId && oldId !== fileId) ownLegacy = false;
+        else if (!oldId && jobHistory.some(j => j.loaded && j.name === jobConfig.name && j.id !== fileId)) ownLegacy = false;
+      } catch (e) { ownLegacy = false; console.error(`[Main] Skipping unreadable legacy job file during save: ${oldNamePath} (${e.message})`); }
+      if (ownLegacy) { try { fs.unlinkSync(oldNamePath); } catch (e) {} }
     }
     console.log(`[Main] Job saved to: ${jobPath}`);
     // The template only entered the list on the next startup before:
@@ -1643,7 +1814,15 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     }));
     if (tpl) {
       let existing = jobHistory.findIndex(j => j.id === tpl.id);
-      if (existing < 0) existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
+      // Same-name jobs are separate tasks: a save carrying a real id
+      // must never fall through to the name match, or saving job B
+      // (name X, id B) would replace job A (name X, id A) in the
+      // list. The name fallback is only for a legacy template that
+      // genuinely has no id: its id IS the fallback form 'job-<name>'
+      // (fileId above), so a save carrying that id may still adopt
+      // the loaded template — e.g. one whose in-memory id came from
+      // a run record instead — and keep its run history.
+      if (existing < 0 && tpl.id === ('job-' + tpl.name)) existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
       if (existing >= 0) {
         // Keep the job's run history: a re-save must not wipe its runs.
         tpl.runs = jobHistory[existing].runs || [];
@@ -1727,7 +1906,9 @@ ipcMain.handle('settings-get', async () => {
   const settingsPath = path.join(app.getPath('userData'), '.techvision', 'settings.json');
   try {
     if (fs.existsSync(settingsPath)) {
-      return JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      // Secrets never leave main: the renderer gets *InVault flags
+      // instead of the passwords/tokens themselves.
+      return stripSecretsFromSettings(JSON.parse(fs.readFileSync(settingsPath, 'utf-8')));
     }
   } catch (e) {}
   return {
@@ -1743,18 +1924,66 @@ ipcMain.handle('settings-save', async (event, settings) => {
     fs.mkdirSync(settingsDir, { recursive: true });
   }
   const settingsPath = path.join(settingsDir, 'settings.json');
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  // Round 3: a typed password/token must never land in settings.json
+  // in plain text. When the vault is unlocked it goes straight into
+  // the vault; when there is NO master password yet the rest of the
+  // settings still save, the secret is dropped, and the renderer is
+  // told (needsMasterKey) so it can offer "Create a master key" and
+  // retry. A blank field means "keep whatever is already saved" —
+  // the renderer never sends a stored secret back, so blank cannot
+  // mean "delete" here.
+  const notSaved = [];
+  let needsMasterKey = false;
+  let needsUnlock = false;
+  const next = (settings && typeof settings === 'object') ? JSON.parse(JSON.stringify(settings)) : {};
+  if (!next.email || typeof next.email !== 'object') next.email = {};
+  if (!next.vpn || typeof next.vpn !== 'object') next.vpn = {};
+  // Carry the saved-secret flags from disk: a save while the vault
+  // is locked sends blank password fields ("keep what is saved"),
+  // and the flags must not be lost just because nothing was typed.
+  const prevSettings = readSettingsFile();
+  if (prevSettings.email && prevSettings.email.smtpPassInVault) next.email.smtpPassInVault = true;
+  if (prevSettings.vpn) {
+    if (prevSettings.vpn.apiTokenInVault) next.vpn.apiTokenInVault = true;
+    if (prevSettings.vpn.oauthClientSecretInVault) next.vpn.oauthClientSecretInVault = true;
+  }
+  const vaultExists = vault.vaultExists(app.getPath('userData'));
+  function takeSecret(obj, field, secretName, label) {
+    const value = obj[field];
+    delete obj[field];
+    if (typeof value === 'string' && value) {
+      if (vaultKey) {
+        try {
+          vault.storeSecret(app.getPath('userData'), vaultKey, secretName, value);
+          obj[field + 'InVault'] = true;
+        } catch (e) { notSaved.push(label); needsUnlock = true; }
+      } else {
+        notSaved.push(label);
+        if (!vaultExists) needsMasterKey = true; else needsUnlock = true;
+      }
+    } else if (vaultKey) {
+      // Blank field, secret already in the vault: keep the flag so
+      // the renderer still shows it as saved.
+      try { if (vault.hasSecret(app.getPath('userData'), vaultKey, secretName)) obj[field + 'InVault'] = true; } catch (e) {}
+    }
+  }
+  takeSecret(next.email, 'smtpPass', 'smtp', 'smtp');
+  takeSecret(next.vpn, 'apiToken', 'tailscale-api-token', 'apiToken');
+  takeSecret(next.vpn, 'oauthClientSecret', 'tailscale-oauth-secret', 'oauthSecret');
+  fs.writeFileSync(settingsPath, JSON.stringify(next, null, 2));
   // Apply Start-with-Windows right away: saving the setting must
   // register/unregister the app at login without needing a restart.
   applyAutoStart();
-  return { success: true };
+  return { success: true, secretsNotSaved: notSaved, needsMasterKey, needsUnlock };
 });
 
-// Send a test notification with the saved email settings.
+// Send a test notification with the saved email settings — the SMTP
+// password is resolved from the vault (or the legacy field) here, so
+// mailer never sees a settings object without it.
 ipcMain.handle('email-test', async () => {
   const r = await mailer.sendMail(app.getPath('userData'),
     'Test email from TechVision Backup',
-    'This is a test notification from TechVision Backup.\n\nIf you got this, email notifications are set up correctly.\nTime: ' + new Date().toLocaleString());
+    'This is a test notification from TechVision Backup.\n\nIf you got this, email notifications are set up correctly.\nTime: ' + new Date().toLocaleString(), resolveEmailSettings());
   return { success: r.sent, error: r.sent ? undefined : r.reason };
 });
 
@@ -1765,18 +1994,24 @@ ipcMain.handle('vault-status', async () => {
 ipcMain.handle('vault-setup', async (event, masterPassword) => {
   try {
     vaultKey = vault.setupVault(app.getPath('userData'), masterPassword);
+    afterVaultUnlocked();
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
 ipcMain.handle('vault-unlock', async (event, masterPassword) => {
   try {
     vaultKey = vault.unlockVault(app.getPath('userData'), masterPassword);
+    afterVaultUnlocked();
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
 ipcMain.handle('vault-lock', async () => {
   if (vaultKey) vault.lockVault(vaultKey);
   vaultKey = null;
+  // An explicit lock also forgets the remembered device unlock, so
+  // the next launch asks for the master password again. (Uninstall
+  // removes the blob as well, via the app-data folder.)
+  try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
   return { success: true };
 });
 
@@ -1809,7 +2044,7 @@ ipcMain.handle('cloud-get-config', async () => {
       accessMode: cloudAccessMode(cfg.server.accessMode),
       ddnsHostname: cfg.server.ddnsHostname || '',
     },
-    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: cloudAccessMode(c.accessMode) })),
+    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password || !!c.passwordInVault, accessMode: cloudAccessMode(c.accessMode) })),
   };
 });
 
@@ -1910,14 +2145,19 @@ ipcMain.handle('cloud-user-set-password', async (event, name, password) => {
   }
 });
 
-// Saved servers (client side). The password for a server IS stored on
-// this device, in cloud.json next to the server record — the user asked
-// for one-click reconnect instead of typing it every time (same choice
-// as the SMTP password in settings.json). It never leaves main: the
+// Saved servers (client side). The password for a server is stored
+// in the master-password vault (secret 'cloud-client:<id>') when the
+// vault is unlocked — never in plain text in cloud.json. The record
+// keeps passwordInVault:true so the connect flow reads the vault.
+// A legacy plaintext `password` still in the file is honoured until
+// migration moves it (first unlock). It never leaves main: the
 // renderer only sees hasPassword, and connect uses the stored password
 // when none is typed. Remove it any time with "Forget saved password"
 // on the server card; changing the password on the server just means
-// the next connect asks for the new one.
+// the next connect asks for the new one. When there is NO master
+// password yet, the server still saves — just without the password —
+// and the renderer is told (needsMasterKey) so it can offer to
+// create one and retry; the app is never blocked on this.
 ipcMain.handle('cloud-client-save', async (event, s) => {
   try {
     const cfg = getCloudConfig();
@@ -1936,8 +2176,34 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     // not silently become Normal on re-save.
     const accessMode = s.accessMode ? cloudAccessMode(s.accessMode)
       : (existing ? cloudAccessMode(existing.accessMode) : 'normal');
-    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode, password: (s.password && String(s.password)) || (existing && existing.password) || null };
-    if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
+    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode };
+    // Update-in-place keeps the pre-existing id — resolve it BEFORE
+    // storing any secret, or the vault key would name a fresh id the
+    // record is never stored under.
+    if (i >= 0) rec.id = cfg.clients[i].id;
+    // Keep a previously migrated/vault password marker, and a legacy
+    // plaintext password, when no new password was sent.
+    if (existing && existing.passwordInVault) rec.passwordInVault = true;
+    if (existing && existing.password) rec.password = existing.password;
+    let passwordNotSaved = false;
+    let needsMasterKey = false;
+    let needsUnlock = false;
+    const newPassword = (s.password && String(s.password)) || '';
+    if (newPassword) {
+      if (vaultKey) {
+        try {
+          vault.storeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + rec.id, newPassword);
+          rec.passwordInVault = true;
+          delete rec.password;
+        } catch (e) { passwordNotSaved = true; needsUnlock = true; }
+      } else {
+        // No vault to store it in: save the server without the
+        // password and let the renderer offer to create a master key.
+        passwordNotSaved = true;
+        if (!vault.vaultExists(app.getPath('userData'))) needsMasterKey = true; else needsUnlock = true;
+      }
+    }
+    if (i >= 0) { if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
     else cfg.clients.push(rec);
     saveCloudConfig();
     // Return the id the record is actually stored under: on an
@@ -1945,7 +2211,7 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     // 'srv-…' id generated above — callers (connect, join) look the
     // record up by the returned id, and a wrong one made reconnects
     // fail with "Password needed" on every re-save.
-    return { success: true, id: rec.id };
+    return { success: true, id: rec.id, passwordNotSaved, needsMasterKey, needsUnlock };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -1956,6 +2222,8 @@ ipcMain.handle('cloud-client-forget-password', async (event, id) => {
   const rec = (cfg.clients || []).find((c) => c.id === id);
   if (!rec) return { success: false, error: 'Server not found.' };
   rec.password = null;
+  rec.passwordInVault = false;
+  try { if (vaultKey) vault.removeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + id); } catch (e) {}
   saveCloudConfig();
   return { success: true };
 });
@@ -2017,7 +2285,7 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     // successful login with it remembers it for next time.
     const cfg = getCloudConfig();
     const rec = (cfg.clients || []).find((c) => c.id === opts.serverId);
-    const password = (opts.password && String(opts.password)) || (rec && rec.password) || '';
+    const password = (opts.password && String(opts.password)) || getClientPassword(rec) || '';
     if (!password) return { success: false, error: 'Password needed — enter the password for user ' + (opts.user || '') + '.' };
     /* WireGuard mode: the tunnel has to be up first — a down tunnel
        fails fast here with a clear message instead of waiting out
@@ -2034,8 +2302,26 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     // one — e.g. after "Forget password" while still connected — and
     // Office/media opens need a password to seed or they prompt.
     cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite, password }));
-    if (rec && opts.password && String(opts.password)) { rec.password = String(opts.password); saveCloudConfig(); }
-    return { success: true, info };
+    // A typed password that just authenticated is remembered for next
+    // time — in the vault when it is unlocked. When there is no
+    // master password yet it is NOT written to cloud.json in plain
+    // text; the renderer is told so it can offer to create one.
+    let passwordNotSaved = false;
+    let needsMasterKey = false;
+    if (rec && opts.password && String(opts.password)) {
+      if (vaultKey) {
+        try {
+          vault.storeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + rec.id, String(opts.password));
+          rec.passwordInVault = true;
+          delete rec.password;
+          saveCloudConfig();
+        } catch (e) { passwordNotSaved = true; }
+      } else {
+        passwordNotSaved = true;
+        if (!vault.vaultExists(app.getPath('userData'))) needsMasterKey = true;
+      }
+    }
+    return { success: true, info, passwordNotSaved, needsMasterKey };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -2229,7 +2515,7 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
       let error = null;
       let remote = null;
       if (!rec) { status = 'error'; error = 'This server was removed from the Client tab.'; }
-      else if (!rec.password) { status = 'password-needed'; }
+      else if (!getClientPassword(rec)) { status = 'password-needed'; }
       else {
         const st = await cloudMapDrive.getDriveStatus(m.letter);
         if (st.success && st.mapped) {
@@ -2240,7 +2526,7 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
       out.push({
         serverId: m.serverId, letter: m.letter, host: m.host, port: m.port, user: m.user,
         reconnect: !!m.reconnect, status, error, remote,
-        name: rec ? rec.name : m.serverId, hasPassword: !!(rec && rec.password),
+        name: rec ? rec.name : m.serverId, hasPassword: !!(rec && getClientPassword(rec)),
       });
     }
     return { success: true, mappings: out, freeLetters: free.success ? free.letters : [] };
@@ -2254,7 +2540,7 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
     const cfg = getCloudConfig();
     const rec = cfg.clients.find((c) => c.id === serverId);
     if (!rec) return { success: false, error: 'Server not found.' };
-    if (!rec.password) return { success: false, error: 'password-needed' };
+    if (!getClientPassword(rec)) return { success: false, error: 'password-needed' };
     const l = String(letter || '').toUpperCase();
     if (!/^[A-Z]$/.test(l)) return { success: false, error: 'Pick a drive letter (A–Z).' };
     const state = getMapdriveState();
@@ -2283,7 +2569,7 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
         if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
       }
     }
-    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
     if (!mapped.success) return { success: false, error: mapped.error };
     state.mappings = state.mappings.filter((m) => m.serverId !== serverId && m.letter !== l);
     state.mappings.push({ serverId, letter: l, host: rec.host, port: rec.port, user: rec.user, reconnect: !!reconnect });
@@ -2379,7 +2665,7 @@ async function seedCloudCredentialsForOpen(serverId, rec) {
   try {
     const conn = cloudSessions.get(serverId);
     const user = (conn && conn.user) || rec.user;
-    const password = (conn && conn.password) || rec.password;
+    const password = (conn && conn.password) || getClientPassword(rec);
     if (!user || !password) {
       console.log(`[Cloud] No saved password for ${rec.host} — Office/media will prompt for the Cloud login once.`);
       appendAppLog('warn', `[Cloud] Opening a file on ${rec.host} without a saved password — Windows will ask for the Cloud login.`);
@@ -2486,7 +2772,7 @@ async function reconnectMapDrives() {
     for (const m of state.mappings) {
       if (!m.reconnect) continue;
       const rec = cfg.clients.find((c) => c.id === m.serverId);
-      if (!rec || !rec.password) continue;
+      if (!rec || !getClientPassword(rec)) continue;
       const st = await cloudMapDrive.getDriveStatus(m.letter);
       if (st.success && st.mapped) continue;
       let probeOk = true;
@@ -2497,7 +2783,7 @@ async function reconnectMapDrives() {
         const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
         if (trusted.success && !trusted.trusted) { appendAppLog('info', '[Cloud] Map drive ' + m.letter + ': certificate is not trusted yet, skipping reconnect.'); continue; }
       }
-      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
       appendAppLog(r.success ? 'info' : 'error', '[Cloud] Map drive ' + m.letter + ': reconnect ' + (r.success ? 'ok' : ('failed — ' + (r.error || ''))));
     }
   } catch (e) {}
@@ -2529,31 +2815,33 @@ ipcMain.handle('vpn-set-connected', async (event, on) => {
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
 });
 ipcMain.handle('vpn-set-routes', async (event, on, auth) => {
-  try { return await vpn.setSubnetRouter(!!on, auth); }
+  // Secrets come from the vault here, not the renderer: the renderer
+  // only ever sends the OAuth client id.
+  try { return await vpn.setSubnetRouter(!!on, resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
 ipcMain.handle('vpn-get-routes', async (event, auth) => {
-  try { return await vpn.getDeviceRoutes(auth); }
+  try { return await vpn.getDeviceRoutes(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read routes.' }; }
 });
 ipcMain.handle('vpn-approve-routes', async (event, auth, routes) => {
-  try { return await vpn.approveRoutes(auth, routes); }
+  try { return await vpn.approveRoutes(resolveVpnAuth(auth), routes); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not approve routes.' }; }
 });
 ipcMain.handle('vpn-disable-key-expiry', async (event, auth) => {
-  try { return await vpn.disableKeyExpiry(auth); }
+  try { return await vpn.disableKeyExpiry(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }
 });
 ipcMain.handle('vpn-enable-key-expiry', async (event, auth) => {
-  try { return await vpn.enableKeyExpiry(auth); }
+  try { return await vpn.enableKeyExpiry(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not enable key expiry.' }; }
 });
 ipcMain.handle('vpn-key-expiry-state', async (event, auth) => {
-  try { return await vpn.getKeyExpiryState(auth); }
+  try { return await vpn.getKeyExpiryState(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read key expiry state.' }; }
 });
 ipcMain.handle('vpn-verify-api', async (event, auth) => {
-  try { return await vpn.verifyApiAuth(auth); }
+  try { return await vpn.verifyApiAuth(resolveVpnAuth(auth)); }
   catch (e) { return { valid: false, error: e && e.message ? e.message : 'Could not check the credentials.' }; }
 });
 ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
@@ -3254,6 +3542,10 @@ ipcMain.handle('wg-install-amneziawg', async (event) => {
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {
     vaultKey = vault.changeMasterPassword(app.getPath('userData'), oldPassword, newPassword);
+    // The remembered unlock blob holds the OLD key: re-save it under
+    // the new key (and migrate anything still plaintext) so the next
+    // launch still auto-unlocks.
+    afterVaultUnlocked();
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
@@ -3428,25 +3720,33 @@ ipcMain.handle('job-delete', async (event, jobId) => {
       for (const file of fs.readdirSync(jobsDir)) {
         if (!file.endsWith('.json') || file === 'history.json') continue;
         const p = path.join(jobsDir, file);
-        let match = (file === `${id}.json` || file === `${name}.json`);
-        if (!match) {
-          try {
-            const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
-            const cid = content && content.id;
-            const cname = content && content.name;
-            if (cid && cid === id) match = true;
-            else if (cname && cname === name) {
-              // Same name, but the file may belong to a different job
-              // that happens to share the name — keep it, unless it
-              // is the same job by paths (a stale second template
-              // file for this job: an old <name>.json plus the
-              // current <id>.json both survive a delete otherwise).
-              const samePaths = source && destination && content.source && content.destination
-                && jobPathValue(content.source) === jobPathValue(source)
-                && jobPathValue(content.destination) === jobPathValue(destination);
-              if (!(cid && otherIds.has(cid)) || samePaths) match = true;
-            }
-          } catch (e) { /* unparseable file: only the filename guesses above apply */ }
+        // Read the template FIRST: the filename alone cannot tell
+        // whose job it is — a legacy <name>.json may belong to a
+        // different live job that happens to share the name, and a
+        // file named <id>.json may carry another job's content. An
+        // unreadable or locked file is skipped (logged), never
+        // deleted, and never allowed to fail the whole delete.
+        let content;
+        try {
+          content = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        } catch (e) {
+          console.error(`[Main] Skipping unreadable job template file during delete: ${p} (${e.message})`);
+          continue;
+        }
+        const cid = content && content.id;
+        const cname = content && content.name;
+        let match = false;
+        if (cid && cid === id) match = true;
+        else if (cname && cname === name) {
+          // Same name, but the file may belong to a different job
+          // that happens to share the name — keep it, unless it
+          // is the same job by paths (a stale second template
+          // file for this job: an old <name>.json plus the
+          // current <id>.json both survive a delete otherwise).
+          const samePaths = source && destination && content.source && content.destination
+            && jobPathValue(content.source) === jobPathValue(source)
+            && jobPathValue(content.destination) === jobPathValue(destination);
+          if (!(cid && otherIds.has(cid)) || samePaths) match = true;
         }
         if (match) {
           try { fs.unlinkSync(p); removed.push(file); console.log(`[Main] Deleted job template file: ${p}`); } catch (e) { console.error('[Main] Failed to delete job template file:', e.message); }
@@ -3469,11 +3769,10 @@ ipcMain.handle('job-delete', async (event, jobId) => {
   // exist on disk. Delete it (by content match) and persist the
   // history — before this the handler returned success without ever
   // saving, so any run records on disk came back on the next start.
-  const orphanPath = path.join(jobsDir, `${jobId}.json`);
   const removed = deleteTemplateFiles(jobId, jobId);
-  try {
-    if (jobId && fs.existsSync(orphanPath) && !removed.includes(`${jobId}.json`)) { fs.unlinkSync(orphanPath); removed.push(`${jobId}.json`); }
-  } catch (e) { /* fall through to not found */ }
+  // No blind fallback unlink of <jobId>.json here: if the content
+  // scan skipped that file it either belongs to a different live job
+  // or is unreadable, and both must survive the delete.
   if (removed.length) { saveJobHistory(); notifyJobsUpdated(); return { success: true }; }
   return { success: false, error: 'Job not found' };
 });

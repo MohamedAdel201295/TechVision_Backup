@@ -279,7 +279,7 @@
       if (saved && saved.success === false) {
         toast('Save failed', saved.error ? ('Could not save the job: ' + saved.error) : 'Could not save the job.', 'error');
         $('createBtn').disabled = false;
-        $('createBtn').textContent = 'Create Job';
+        $('createBtn').textContent = createBtnLabel();
         return;
       }
       if (job.encryptionEnabled) {
@@ -288,7 +288,25 @@
           try {
             var stored = await api.vaultStoreJobPassword(job.id, pw);
             if (!stored || stored.success === false) {
-              toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+              // No master key yet: offer to create one — the retry
+              // stores the same password so scheduled encrypted
+              // backups of this job can run. Skipping keeps the job
+              // usable for manual runs, which ask for the password.
+              var noVault = false;
+              try { noVault = !(await window.__vaultExists()); } catch (e) {}
+              if (noVault && typeof window.__askCreateMasterKey === 'function') {
+                window.__askCreateMasterKey('the backup password', async function () {
+                  try {
+                    var retry = await api.vaultStoreJobPassword(job.id, pw);
+                    if (retry && retry.success) toast('Password saved', 'The backup password is now saved in the vault.', 'success');
+                    else toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+                  } catch (e) {}
+                }, function () {
+                  toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+                });
+              } else {
+                toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+              }
             }
           } catch (e) {}
         } else if (!pw && !hasSavedPassword) {
@@ -301,7 +319,7 @@
     } catch (e) {
       toast('Create failed', e && e.message ? e.message : 'Could not save the job.', 'error');
       $('createBtn').disabled = false;
-      $('createBtn').textContent = 'Create Job';
+      $('createBtn').textContent = createBtnLabel();
     }
   }
   function closeWizard() {
@@ -310,6 +328,18 @@
        any more. The old closeJobWizard IPC is kept as a fallback. */
     if (typeof window.__closeWizardView === 'function') { window.__closeWizardView(); return; }
     if (api && typeof api.closeJobWizard === 'function') { api.closeJobWizard(); }
+  }
+  /* The footer button (and the step-5 note) say "Save changes" when an
+     existing job is being edited and "Create Job" for a new job
+     (round 3). `editing` is set by loadExisting once the pending job
+     loads, so the label is applied there and reset here. */
+  function createBtnLabel() { return editing ? 'Save changes' : 'Create Job'; }
+  function applyCreateLabel() {
+    var btn = $('createBtn'); if (btn) btn.textContent = createBtnLabel();
+    var note = $('reviewNote');
+    if (note) note.innerHTML = editing
+      ? '<strong>Ready?</strong> Click <strong>Save changes</strong> to save your changes to this job.'
+      : '<strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.';
   }
   /* Reset the wizard to a blank new job (or the pending edit job) and
      show step 1. Called every time the wizard view opens — the old
@@ -346,7 +376,7 @@
     $('encPasswordConfirmError').classList.remove('show');
     var evn = $('encVaultNote'); if (evn) evn.style.display = 'none';
     $('reviewBox').innerHTML = '';
-    $('createBtn').disabled = false; $('createBtn').textContent = 'Create Job';
+    $('createBtn').disabled = false; applyCreateLabel();
     showStep(1);
     loadExisting().catch(function () { /* start blank */ });
   }
@@ -369,6 +399,7 @@
           editing = cfg;
           if (keepId) editing.id = keepId;
           $('wizardTitle').textContent = 'Edit Backup Job';
+          applyCreateLabel();
           $('jobName').value = cfg.name || cfg.jobName || '';
           $('sourceDir').value = cfg.source || cfg.sourceDirectory || '';
           $('destDir').value = cfg.destination || cfg.destinationDirectory || '';

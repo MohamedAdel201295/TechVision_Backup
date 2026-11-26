@@ -305,7 +305,8 @@
     </div>
     <div id="settingsSecuritySection" class="card cloud-section" style="display:none;">
       <h3 style="margin:0 0 4px;font-size:14px;">Master password</h3>
-      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where job passwords for encrypted backups are stored. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
+      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where passwords are stored — for encrypted backups, saved Cloud servers, email notifications and the Tailscale API. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
+      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">Once you enter it, this device remembers it — you will not be asked again unless you lock the vault or reinstall the app. There is no way to recover a forgotten master password.</p>
       <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
       <div id="vaultSetupBox">
         <div class="field">
@@ -1032,7 +1033,7 @@
       <section class="step-panel" data-panel="5">
         <h3 style="margin:0 0 6px;">Review your job</h3>
         <div class="review" id="reviewBox"></div>
-        <div class="note info" style="margin-top:8px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
+        <div class="note info" id="reviewNote" style="margin-top:8px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
       </section>
     </div>
     <div class="modal-foot">
@@ -1100,11 +1101,10 @@
             <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
           </div>
           <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>
-          <div id="restoreAdvanced" style="display:none; margin-top:10px;">
+          <div id="restoreAdvanced" style="display:none; margin-top:4px;">
             <label class="check"><input type="checkbox" id="optOverwrite"> Overwrite existing files</label>
-            <label class="check"><input type="checkbox" id="restoreOptVerify" checked> Verify restored files</label>
           </div>
-          <div class="note" style="margin-top:14px;">
+          <div class="note" style="margin-top:8px;">
             <strong>Phase 2</strong><br>
             Streaming restore with yauzl is implemented.<br>
             VSS (Volume Shadow Copy) is NOT implemented. Locked files will be skipped during backup.
@@ -1212,6 +1212,16 @@
     <button class="btn btn-ghost" type="button" id="vaultUnlockSkip">Skip for now</button>
   </div>
   <p style="font-size:12px; color:var(--muted); margin:10px 0 0;">Skipping leaves the vault locked: scheduled encrypted backups will not run, and manual runs will ask for the job password instead.</p>
+</div>
+<div class="backdrop" id="masterKeyBackdrop"></div>
+<div class="confirm-modal" id="masterKeyModal" role="alertdialog" aria-labelledby="masterKeyTitle" style="display:none;">
+  <h3 id="masterKeyTitle">🔑 Create a master key</h3>
+  <p id="masterKeyText">This password can only be saved if you create a master key first. One master password protects every saved password in the app — encrypted backups, Cloud servers, email and Tailscale.</p>
+  <div class="confirm-actions">
+    <button class="btn btn-primary" type="button" id="masterKeyGoBtn">Create a master key</button>
+    <button class="btn btn-ghost" type="button" id="masterKeySkipBtn">Continue without saving it</button>
+  </div>
+  <p style="font-size:12px; color:var(--muted); margin:10px 0 0;">Continuing without a master key still works — the password just will not be remembered, and you will be asked for it each time.</p>
 </div>
 <div class="backdrop" id="jobPwBackdrop"></div>
 <div class="confirm-modal" id="jobPwModal" role="alertdialog" aria-labelledby="jobPwTitle" style="display:none;">

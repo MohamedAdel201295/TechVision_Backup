@@ -184,16 +184,28 @@
     var pct = 0;
     timer = setInterval(function () { pct = Math.min(92, pct + Math.random() * 9 + 3); setProgress(pct); }, 350);
     try {
-      var result = await api.restoreAll(zipPath, dest, isEncryptedBackup ? $('restorePassword').value : null);
+      // Overwrite is OFF unless the checkbox is ticked: existing
+      // files are then skipped, never replaced. Verification always
+      // runs (manifest/CRC) — there is no toggle for it any more.
+      var ow = $('optOverwrite');
+      var result = await api.restoreAll(zipPath, dest, isEncryptedBackup ? $('restorePassword').value : null, { overwrite: !!(ow && ow.checked) });
       clearInterval(timer);
       var files = result ? Number(result.files ?? result.restoredFiles ?? result.fileCount ?? 0) : 0;
+      var skipped = result ? Number(result.files_skipped ?? result.filesSkipped ?? result.skipped ?? 0) : 0;
       setProgress(100, files, '');
       if (result && result.success === false) {
         showResult(false, 'Restore failed', result.error || result.message || 'The restore did not complete.');
         toast('Restore failed', result.error || result.message || 'The restore did not complete.', 'error');
       } else {
         showResult(true, 'Restore completed', files + ' file' + (files === 1 ? '' : 's') + ' restored to ' + dest + '.');
-        toast('Restore completed', files + ' file' + (files === 1 ? '' : 's') + ' restored.', 'success');
+        if (skipped > 0) {
+          // Clear skipped line in the result box: these files were
+          // left alone because they already exist (overwrite OFF).
+          var line = document.createElement('div');
+          line.textContent = skipped + ' file' + (skipped === 1 ? '' : 's') + ' skipped — already exist.';
+          $('resultBox').appendChild(line);
+        }
+        toast('Restore completed', files + ' file' + (files === 1 ? '' : 's') + ' restored.' + (skipped > 0 ? ' ' + skipped + ' skipped — already exist.' : ''), 'success');
       }
       if (typeof api.refreshJobs === 'function') { try { await api.refreshJobs(); } catch (e) {} }
     } catch (e) {
@@ -258,6 +270,7 @@
     var orig = $('restoreDestOriginal'), cust = $('restoreDestCustom');
     if (orig) orig.checked = false;
     if (cust) cust.checked = true;
+    var ow = $('optOverwrite'); if (ow) ow.checked = false;
     var hint = $('restoreOriginalHint'); if (hint) hint.style.display = '';
     var adv = $('restoreAdvanced'); if (adv) adv.style.display = 'none';
     var abtn = $('restoreAdvancedBtn');

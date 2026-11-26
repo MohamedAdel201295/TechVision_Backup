@@ -14,8 +14,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   runIncrementalBackup: (jobConfig) => ipcRenderer.invoke('backup-run-incremental', jobConfig),
 
   // Restore operations
-  restoreAll: (zipPath, restoreDir, password) => ipcRenderer.invoke('restore-all', zipPath, restoreDir, password),
-  restoreSingle: (zipPath, entryName, destPath, password) => ipcRenderer.invoke('restore-single', zipPath, entryName, destPath, password),
+  restoreAll: (zipPath, restoreDir, password, options) => ipcRenderer.invoke('restore-all', zipPath, restoreDir, password, options),
+  restoreSingle: (zipPath, entryName, destPath, password, options) => ipcRenderer.invoke('restore-single', zipPath, entryName, destPath, password, options),
 
   // File system operations
     readDir: (dirPath) => ipcRenderer.invoke('fs-readdir', dirPath),

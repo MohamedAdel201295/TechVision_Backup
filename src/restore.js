@@ -24,6 +24,11 @@ class RestoreResult extends EventEmitter {
     this.files_restored = 0;
     this.files_verified = 0;
     this.files_mismatched = 0;
+    // Destination files left untouched because they already exist
+    // and overwrite was OFF (the default) — never replaced, counted
+    // here and listed in skipped_files (entry paths, '/'-separated).
+    this.files_skipped = 0;
+    this.skipped_files = [];
     this.total_bytes = 0;
     this.duration_seconds = 0;
     this.errors = [];
@@ -41,6 +46,27 @@ class RestoreResult extends EventEmitter {
 // plain-folder backups (see techvision-core.js). It is metadata, not
 // user data: never restored as a file, never listed in getZipInfo.
 const MANIFEST_NAME = '.techvision-manifest.json';
+
+// Overwrite option (restore): default OFF — an existing destination
+// file is SKIPPED, never replaced, unless the caller passes
+// { overwrite: true }. The option is optional everywhere so older
+// callers keep the safe default.
+function restoreOptions(options) {
+  // chainWritten (a Set of resolved destination paths written by
+  // earlier artifacts of THIS chain restore) passes through: a
+  // later artifact must overwrite files the chain itself wrote,
+  // while files that existed before the restore are still skipped.
+  return { overwrite: !!(options && options.overwrite), chainWritten: (options && options.chainWritten) || null };
+}
+
+// Skip decision for overwrite OFF: only an existing regular FILE is
+// skipped. A directory at the destination path must NOT count as a
+// skip — e.g. a zip holding both `a` and `a/b.txt`: the `a/b.txt`
+// entry creates dir `a`, and the `a` entry must fail on the rename
+// (reported as an error), not vanish silently as "skipped".
+function destIsFile(dest) {
+  try { return fs.statSync(dest).isFile(); } catch (e) { return false; }
+}
 
 // Write-then-commit: stream to a temp file in the SAME directory as the
 // final path (so the rename stays on one filesystem), then rename over
@@ -200,30 +226,46 @@ class RestoreEngine {
    * above): the base Full plus every incremental up to it, oldest
    * first. A Full on its own restores exactly as before.
    */
-  async restore_all(zipPath, restoreDir, password) {
+  async restore_all(zipPath, restoreDir, password, options) {
+    const opts = restoreOptions(options);
     const chain = findBackupChain(zipPath);
     if (!chain || (chain.chain.length === 1 && !chain.baseMissing)) {
-      return this._restoreSingle(zipPath, restoreDir, password);
+      return this._restoreSingle(zipPath, restoreDir, password, opts);
     }
     const result = new RestoreResult();
     const startTime = Date.now();
     result.chain = chain.chain.map((p) => path.basename(p));
+    const skippedNames = new Set();
+    // Files this chain restore writes itself: a later artifact must
+    // overwrite them (newest version wins), while files that existed
+    // before the restore started are still skipped when overwrite is
+    // OFF. Without this set the incremental's changed files were
+    // skipped as "already exist" and the restore came back stale.
+    const chainWritten = new Set();
+    const chainOpts = Object.assign({}, opts, { chainWritten: chainWritten });
     for (const artifact of chain.chain) {
-      const one = await this._restoreSingle(artifact, restoreDir, password);
+      const one = await this._restoreSingle(artifact, restoreDir, password, chainOpts);
       result.files_restored += one.files_restored;
       result.files_verified += one.files_verified;
       result.files_mismatched += one.files_mismatched;
       result.total_bytes += one.total_bytes;
       result.errors.push(...one.errors);
       result.warnings.push(...one.warnings);
+      // A file skipped in two chain artifacts is one skipped file,
+      // not two — dedupe by entry name.
+      for (const name of (one.skipped_files || [])) skippedNames.add(name);
     }
+    result.skipped_files = [...skippedNames];
+    result.files_skipped = result.skipped_files.length;
     if (chain.baseMissing) {
       result.errors.push('Base full backup not found — this incremental backup is only a delta; files that did not change are missing from this restore.');
     } else {
       result.warnings.push('Restored a backup chain, oldest first: ' + result.chain.join(' + ') + '.');
     }
     result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
-    result.success = result.files_restored > 0 && result.errors.length === 0 && result.files_mismatched === 0;
+    // A restore that only skipped (every file already exists) still
+    // succeeded — nothing was lost and nothing failed.
+    result.success = (result.files_restored > 0 || result.files_skipped > 0) && result.errors.length === 0 && result.files_mismatched === 0;
     return result;
   }
 
@@ -232,9 +274,25 @@ class RestoreEngine {
    * folder). This is the old restore_all body, unchanged — the chain
    * wrapper above calls it once per artifact.
    */
-  async _restoreSingle(zipPath, restoreDir, password) {
+  async _restoreSingle(zipPath, restoreDir, password, options) {
+    const opts = restoreOptions(options);
     const result = new RestoreResult();
     const startTime = Date.now();
+    // Overwrite OFF (default): an existing destination file is
+    // skipped, never replaced. Callers check this AFTER the entry
+    // verified (CRC / manifest hash) — a corrupt backup file still
+    // errors instead of silently skipping. Returns true when the
+    // entry was counted as skipped (temp file already removed).
+    function skipIfExists(tmp, dest, rel) {
+      if (opts.overwrite || !destIsFile(dest)) return false;
+      // Written by an earlier artifact of this same chain restore:
+      // the newer version must replace it, not be skipped.
+      if (opts.chainWritten && opts.chainWritten.has(path.resolve(dest))) return false;
+      try { fs.unlinkSync(tmp); } catch (e) {}
+      result.files_skipped++;
+      result.skipped_files.push(rel);
+      return true;
+    }
     // Encrypted backup (WinZip AES-256): yauzl cannot decrypt, so the
     // AES reader handles the whole restore. Wrong password fails fast.
     // Only the INSPECT may fall through to the yauzl path below (a
@@ -256,12 +314,14 @@ class RestoreEngine {
         const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
           result.files_restored++;
           result.total_bytes += size;
-        });
+        }, opts);
         result.errors = extracted.errors;
+        result.files_skipped = extracted.skipped || 0;
+        result.skipped_files = extracted.skipped_files || [];
         // Every file was authenticated by HMAC at decrypt time and
         // verified after writing, so restored == verified here.
         result.files_verified = result.files_restored;
-        result.success = result.files_mismatched === 0 && result.errors.length === 0 && result.files_restored > 0;
+        result.success = result.files_mismatched === 0 && result.errors.length === 0 && (result.files_restored > 0 || result.files_skipped > 0);
         result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
         return result;
       } catch (e) {
@@ -314,12 +374,21 @@ class RestoreEngine {
                     result.errors.push(`Hash mismatch (corrupt backup file): ${rel}`);
                     result.files_mismatched++;
                   } else {
-                    fs.renameSync(tmp, dest);
-                    result.files_restored++; result.files_verified++; result.total_bytes += copied.size;
+                    // Verified: rename over the destination — unless
+                    // it already exists and overwrite is OFF, in
+                    // which case the good file there is left alone.
+                    if (!skipIfExists(tmp, dest, rel.replace(/\\/g, '/'))) {
+                      fs.renameSync(tmp, dest);
+                      if (opts.chainWritten) opts.chainWritten.add(path.resolve(dest));
+                      result.files_restored++; result.files_verified++; result.total_bytes += copied.size;
+                    }
                   }
                 } else {
-                  fs.renameSync(tmp, dest);
-                  result.files_restored++; result.total_bytes += copied.size;
+                  if (!skipIfExists(tmp, dest, rel.replace(/\\/g, '/'))) {
+                    fs.renameSync(tmp, dest);
+                    if (opts.chainWritten) opts.chainWritten.add(path.resolve(dest));
+                    result.files_restored++; result.total_bytes += copied.size;
+                  }
                 }
               }
             } catch (e) {
@@ -332,8 +401,8 @@ class RestoreEngine {
         if (!manifest) {
           result.warnings.push('This backup has no integrity manifest (created before verification was added) — files were copied without hash verification.');
         }
-        result.success = result.files_restored > 0 && result.errors.length === 0;
-        if (result.files_restored === 0 && result.errors.length === 0) {
+        result.success = (result.files_restored > 0 || result.files_skipped > 0) && result.errors.length === 0;
+        if (result.files_restored === 0 && result.files_skipped === 0 && result.errors.length === 0) {
           result.errors.push('Nothing to restore: the backup folder is empty.');
         }
         result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
@@ -369,11 +438,12 @@ class RestoreEngine {
         result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
         // A restore that restored nothing, or failed on any entry, is
         // a failure — the old code reported success whenever no hash
-        // mismatched, even with 0 files and a list of errors.
-        if (result.files_restored === 0 && result.errors.length === 0) {
+        // mismatched, even with 0 files and a list of errors. (A
+        // restore that only skipped existing files still succeeded.)
+        if (result.files_restored === 0 && result.files_skipped === 0 && result.errors.length === 0) {
           result.errors.push('Nothing to restore: the backup contains no files.');
         }
-        result.success = result.files_restored > 0 && result.errors.length === 0 && result.files_mismatched === 0;
+        result.success = (result.files_restored > 0 || result.files_skipped > 0) && result.errors.length === 0 && result.files_mismatched === 0;
         resolve(result);
       };
       // A zipfile-level error (bad entry name, corrupt central
@@ -530,6 +600,14 @@ class RestoreEngine {
                 result.errors.push(`Size mismatch (truncated data): ${entry.fileName}`);
                 result.files_mismatched++;
               } else {
+                // CRC and size passed: rename over the destination —
+                // unless it already exists and overwrite is OFF, in
+                // which case the good file there is left alone.
+                if (skipIfExists(tmpPath, writePath, entry.fileName)) {
+                  pendingEntries--;
+                  maybeFinish();
+                  return;
+                }
                 try { fs.renameSync(tmpPath, writePath); } catch (e) {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
                   result.errors.push(`Failed to write ${entry.fileName}: ${e.message}`);
@@ -537,6 +615,7 @@ class RestoreEngine {
                   maybeFinish();
                   return;
                 }
+                if (opts.chainWritten) opts.chainWritten.add(path.resolve(writePath));
                 result.files_restored++;
                 result.files_verified++;
                 result.total_bytes += bytes;
@@ -620,16 +699,17 @@ class RestoreEngine {
    * an unchanged file lives only in the base Full, not in the
    * incremental that was picked.
    */
-  async restoreFile(zipPath, entryName, destPath, password) {
+  async restoreFile(zipPath, entryName, destPath, password, options) {
+    const opts = restoreOptions(options);
     const chain = findBackupChain(zipPath);
     try {
-      return await this._restoreFileSingle(zipPath, entryName, destPath, password);
+      return await this._restoreFileSingle(zipPath, entryName, destPath, password, opts);
     } catch (e) {
       if (e.code !== 'ENTRY_NOT_FOUND' || !chain || chain.chain.length < 2) throw e;
       const earlier = chain.chain.slice(0, -1).reverse();
       for (const artifact of earlier) {
         try {
-          return await this._restoreFileSingle(artifact, entryName, destPath, password);
+          return await this._restoreFileSingle(artifact, entryName, destPath, password, opts);
         } catch (e2) {
           if (e2.code !== 'ENTRY_NOT_FOUND') throw e2;
           // Not in this one either — keep looking backwards.
@@ -644,7 +724,18 @@ class RestoreEngine {
    * Rejects with code 'ENTRY_NOT_FOUND' when the file is not in
    * this artifact, so the chain wrapper above can keep looking.
    */
-  async _restoreFileSingle(zipPath, entryName, destPath, password) {
+  async _restoreFileSingle(zipPath, entryName, destPath, password, options) {
+    const opts = restoreOptions(options);
+    // Overwrite OFF (default): an existing destination file is
+    // skipped, never replaced — reported as { files: 0, skipped: 1 }.
+    // Checked AFTER the entry verified, like the bulk path.
+    function skippedResult(tmp) {
+      if (!opts.overwrite && destIsFile(destPath)) {
+        try { if (tmp && fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e2) {}
+        return { files: 0, skipped: 1 };
+      }
+      return null;
+    }
     // Plain-copy backup folder: the entry is a plain file inside
     // it. (Single-file restore never supported folders before —
     // yauzl cannot open a directory — so this branch also fixes
@@ -670,6 +761,8 @@ class RestoreEngine {
           throw new Error('Hash mismatch (corrupt backup file): ' + rel);
         }
       }
+      const skipped = skippedResult(tmpPath);
+      if (skipped) return skipped;
       fs.renameSync(tmpPath, destPath);
       return { files: 1 };
     }
@@ -699,6 +792,8 @@ class RestoreEngine {
           const tmpPath = tempPathFor(destPath);
           try {
             await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
+            const skipped = skippedResult(tmpPath);
+            if (skipped) return skipped;
             fs.renameSync(tmpPath, destPath);
           } catch (e) {
             try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
@@ -790,6 +885,12 @@ class RestoreEngine {
                 if (bytes !== entry.uncompressedSize) {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                   return done(new Error(`Size mismatch (truncated data): ${entry.fileName}`));
+                }
+                // Verified: rename over the destination — unless it
+                // already exists and overwrite is OFF.
+                if (!opts.overwrite && destIsFile(destPath)) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                  return done(null, { files: 0, skipped: 1 });
                 }
                 try { fs.renameSync(tmpPath, destPath); } catch (e) {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}

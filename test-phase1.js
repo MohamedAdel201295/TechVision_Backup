@@ -19,7 +19,7 @@ console.log('=== Phase 1 Verification Test ===\n');
 
 async function run() {
   // Verify test file exists
-  const testFile = path.join(SOURCE_DIR, 'large_random_50mb.bin');
+  const testFile = path.join(SOURCE_DIR, 'large_file_50mb.bin');
   const size = fs.statSync(testFile).size;
   console.log('Test file exists:', testFile);
   console.log('Test file size:', (size/1024/1024).toFixed(2), 'MB');
