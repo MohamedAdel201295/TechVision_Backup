@@ -7,15 +7,12 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const archiver = require('archiver');
-// WinZip AES-256 ZIPs, standard format (7-Zip / WinRAR can open them
-// with the same password). Guarded: if the user has not run
-// `npm install` yet, the app still starts and encryption just reports
-// a clear error instead of crashing the backup engine.
-let zipEncryptedAvailable = false;
-try {
-  archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
-  zipEncryptedAvailable = true;
-} catch (e) { /* encryption unavailable until npm install */ }
+// TechVision-only encrypted backups (.tvb): AES-256-GCM + scrypt,
+// per-file encryption in a proprietary container (see src/tvb.js).
+// No outside program can open a .tvb — that is the point. There is
+// no ZIP-AES anymore: the old 'zip-encrypted' format (which 7-Zip
+// could open) was removed in the batch-3 encryption redesign.
+const tvb = require('./tvb.js');
 const { EventEmitter } = require('events');
 const { Transform } = require('stream');
 
@@ -60,11 +57,12 @@ class JobConfig {
       this.compression = 'standard';
     }
     this.options = data.options || {};
-    // Encryption is INDEPENDENT of compression: encrypt only (stored,
-    // level 0) or compression + encryption. `encryptionEnabled` is a
-    // job setting and may be saved; `encryptionPassword` is runtime-only
-    // and must NEVER be written to a job file or history — the vault
-    // holds it encrypted, main.js strips it before any save.
+    // Encryption is INDEPENDENT of compression: encrypt only (stored)
+    // or compression + encryption — both make a .tvb file (see
+    // src/tvb.js), never a ZIP. `encryptionEnabled` is a job setting
+    // and may be saved; `encryptionPassword` is runtime-only and must
+    // NEVER be written to a job file or history — the vault holds it
+    // encrypted, main.js strips it before any save.
     this.encryptionEnabled = data.encryptionEnabled === true ||
       (data.encryption && data.encryption.enabled === true);
     this.encryptionPassword = typeof data.encryptionPassword === 'string' ? data.encryptionPassword :
@@ -101,24 +99,12 @@ class JobConfig {
   }
 
   /**
-   * Build the archiver for this job: plain 'zip', or 'zip-encrypted'
-   * (WinZip AES-256) when encryption is on. Encryption always makes a
-   * ZIP — even with compression 'none' (stored entries + AES), because
-   * a plain folder copy cannot be encrypted.
+   * Build the archiver for this job: plain 'zip' only. Encryption
+   * never goes through archiver anymore — an encrypted job writes a
+   * .tvb file with the TVB writer (see run_full_backup /
+   * run_incremental_backup), never a ZIP.
    */
   createArchive() {
-    if (this.encryptionEnabled) {
-      if (!zipEncryptedAvailable) {
-        throw new Error('Encryption needs archiver-zip-encrypted — run `npm install` in the project folder first.');
-      }
-      if (!this.encryptionPassword) {
-        throw new Error('Encryption is on but no password was provided for this job.');
-      }
-      return archiver('zip-encrypted', Object.assign({}, this.getArchiveOptions(), {
-        encryptionMethod: 'aes256',
-        password: this.encryptionPassword
-      }));
-    }
     return archiver('zip', this.getArchiveOptions());
   }
 
@@ -216,7 +202,7 @@ class BackupResult extends EventEmitter {
     this.total_bytes = 0;
     this.duration_seconds = 0;
     this.backup_path = '';  // Path to the created ZIP file or plain-copy folder
-    this.backup_format = 'zip'; // 'zip' or 'folder' (plain copy, same files)
+    this.backup_format = 'zip'; // 'zip', 'folder' (plain copy, same files) or 'tvb' (TechVision-only encrypted)
     this.log_file = '';
     this.error_messages = [];
     this.timestamp = new Date().toISOString();
@@ -327,14 +313,16 @@ class BackupEngine {
     // requestCancel() sets it; the run loops and the finalize race
     // check it. _activeStreams is the stream of the file currently
     // being read (gate / plain copy), _activeArchive/_activeOutput
-    // are the ZIP being written — requestCancel() tears all of them
-    // down so a stop lands promptly, not just between files.
+    // are the ZIP being written, _activeTvb is the .tvb writer —
+    // requestCancel() tears all of them down so a stop lands
+    // promptly, not just between files.
     this._cancelRequested = false;
     this._cancelWait = null;
     this._cancelResolve = null;
     this._activeStreams = null;
     this._activeArchive = null;
     this._activeOutput = null;
+    this._activeTvb = null;
     const destPath = (this.jobConfig.destination && this.jobConfig.destination.path) || '';
     this.logsDir = destPath ? path.join(destPath, 'logs') : './logs';
     this.backupDir = destPath || './backup';
@@ -379,9 +367,10 @@ class BackupEngine {
    * engine just records the flag). Mid-file: destroying the active
    * read stream with a BackupCancelled error settles the gate /
    * plain-copy await at once; a stream already handed to archiver is
-   * stopped by archive.abort() instead, and the finalize race (which
-   * also listens on the cancel waiter) plus the post-race flag check
-   * end the run even if the archive never reports the abort.
+   * stopped by archive.abort() instead, and a .tvb writer is stopped
+   * by its destroy(); the finalize race (which also listens on the
+   * cancel waiter) plus the post-race flag check end the run even if
+   * the archive never reports the abort.
    */
   requestCancel() {
     this._cancelRequested = true;
@@ -396,6 +385,7 @@ class BackupEngine {
     }
     try { if (this._activeArchive && typeof this._activeArchive.abort === 'function') this._activeArchive.abort(); } catch (e) {}
     try { if (this._activeOutput) this._activeOutput.destroy(); } catch (e) {}
+    try { if (this._activeTvb && typeof this._activeTvb.destroy === 'function') this._activeTvb.destroy(); } catch (e) {}
   }
 
   /**
@@ -564,11 +554,17 @@ class BackupEngine {
 
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const zipPath = path.join(backupSubDir, `${backupName}_full_${stamp}.zip`);
-    // No compression at all means: no ZIP. The backup is a plain folder
-    // with the same files, same names, same folder structure — unless
-    // encryption is on, which always needs a ZIP (stored + AES-256).
-    const plainCopy = this.jobConfig.compression === 'none' && !this.jobConfig.encryptionEnabled;
+    const tvbPath = path.join(backupSubDir, `${backupName}_full_${stamp}.tvb`);
+    // Encryption is on: the backup is a .tvb file (TechVision-only
+    // AES-256-GCM, see src/tvb.js), never a ZIP. No compression at
+    // all means: no ZIP either — a plain folder with the same files,
+    // same names, same folder structure — unless encryption is on.
+    const useTvb = this.jobConfig.encryptionEnabled === true;
+    const plainCopy = this.jobConfig.compression === 'none' && !useTvb;
     const copyDir = path.join(backupSubDir, `${backupName}_full_${stamp}`);
+    // The artifact this run writes, whichever kind it is — the catch
+    // below deletes it on failure/cancel, whatever the format.
+    const artifactPath = plainCopy ? copyDir : (useTvb ? tvbPath : zipPath);
     if (plainCopy) fs.mkdirSync(copyDir, { recursive: true });
     // Never back the backup up into itself: when the destination
     // lives inside the source, the backup folder, the logs folder and
@@ -578,7 +574,7 @@ class BackupEngine {
 
     this.log('info', `Starting FULL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
-    this.log('info', `Destination: ${plainCopy ? copyDir + ' (plain files, no ZIP)' : zipPath + (this.jobConfig.encryptionEnabled ? ' (AES-256 encrypted)' : '')}`);
+    this.log('info', `Destination: ${plainCopy ? copyDir + ' (plain files, no ZIP)' : artifactPath + (useTvb ? ' (TechVision-only AES-256-GCM encrypted)' : '')}`);
 
     try {
       // Stop support: a waiter the finalize race listens on, so a
@@ -623,7 +619,15 @@ class BackupEngine {
           try { if (outputStream) outputStream.destroy(); } catch (e) {}
         }
       };
-      if (!plainCopy) {
+      let tvbWriter = null;
+      if (useTvb) {
+        // Encrypted backup: a .tvb file, written by the TVB writer
+        // (streaming AES-256-GCM per file). No archiver, no ZIP.
+        // Throws here (inside the try) when no password was provided
+        // for the job — the outer catch reports it as a failed run.
+        tvbWriter = new tvb.TvbWriter(tvbPath, this.jobConfig.encryptionPassword, this.jobConfig.compression);
+        this._activeTvb = tvbWriter;
+      } else if (!plainCopy) {
         const output = fs.createWriteStream(zipPath);
         outputStream = output;
         archive = this.jobConfig.createArchive();
@@ -753,7 +757,8 @@ class BackupEngine {
           const fileInfo = { path: file, size: stats.size, mtime: stats.mtimeMs, hash: null };
           const hashState = { hash: null };
 
-          // File is readable: copy it as-is, or add it to the ZIP
+          // File is readable: copy it as-is, add it to the ZIP, or
+          // encrypt it into the .tvb
           if (plainCopy) {
             const copied = await this._copyPlainFile(file, sourceBase, copyDir, (n) => {
               bytesDone += n;
@@ -764,6 +769,22 @@ class BackupEngine {
             // the backed-up bytes.
             fileInfo.hash = copied.hash;
             fileInfo.size = copied.size;
+          } else if (useTvb) {
+            // Encrypted backup: the TVB writer streams the file
+            // (hash tee -> deflate? -> cipher -> .tvb) and returns
+            // the hash of the original bytes for the state file —
+            // final as soon as the file is written, like a plain
+            // copy. A source error fails ONE file (the writer
+            // accounts for the partial entry so the container stays
+            // valid); an output error (disk full) fails the whole
+            // run (see the per-file catch).
+            const added = await tvbWriter.addFile(relativePath, file, stats, (n) => {
+              bytesDone += n;
+              fileCounted += n;
+              emitLive(relativePath);
+            });
+            hashState.hash = added.hash;
+            fileInfo.hash = added.hash;
           } else {
             // Counted read stream: archiver reads the file through it
             // while compressing, so the bytes that flow ARE the real
@@ -829,6 +850,9 @@ class BackupEngine {
           // A stop turns into a cancelled run, not a failed file:
           // rethrow so the outer catch handles the cleanup.
           if (this._cancelRequested || (err && err.code === 'BACKUP_CANCELLED')) throw new BackupCancelled();
+          // An output error (disk full, dead drive) fails the whole
+          // run — it is not one failed file.
+          if (err && err.code === 'TVB_OUTPUT_FAILED') throw err;
           // A file that fails on the actual read (locked between the
           // probe and the read, deleted mid-run, I/O error) is a
           // locked skip when the OS says so, a failure otherwise —
@@ -847,7 +871,14 @@ class BackupEngine {
         }
       }
 
-      if (!plainCopy) {
+      if (useTvb) {
+        // The TVB writer finishes the file: index + trailer. A stop
+        // that lands here is caught by the cancel check below; the
+        // writer's own errors (disk full) fail the run.
+        await tvbWriter.finish();
+        this._activeTvb = null;
+        if (this._cancelRequested) throw new BackupCancelled();
+      } else if (!plainCopy) {
         // Race the normal completion against a source-stream failure:
         // archiver never reports a failing stream, so without this
         // race the run would hang here forever. The loser's rejection
@@ -867,8 +898,8 @@ class BackupEngine {
       }
 
       // Set the backup path on result
-      result.backup_path = plainCopy ? copyDir : zipPath;
-      result.backup_format = plainCopy ? 'folder' : (this.jobConfig.encryptionEnabled ? 'zip-encrypted' : 'zip');
+      result.backup_path = artifactPath;
+      result.backup_format = plainCopy ? 'folder' : (useTvb ? 'tvb' : 'zip');
       result.encrypted = this.jobConfig.encryptionEnabled;
 
       // Save state for incremental backups: a FRESH state built only
@@ -888,9 +919,10 @@ class BackupEngine {
         if (this._cancelRequested) throw new BackupCancelled();
         // The ZIP-path hash resolves only once the stream was fully
         // consumed (after finalize, which already happened above);
-        // the plain-copy hash was final at copy time. Either way the
-        // state now records the hash of the bytes that actually went
-        // into the backup. If a hash somehow never resolved (a stream
+        // the plain-copy hash was final at copy time, and the .tvb
+        // hash was final when addFile returned. Either way the state
+        // now records the hash of the bytes that actually went into
+        // the backup. If a hash somehow never resolved (a stream
         // that never flushed), fall back to one fresh read rather
         // than recording a null hash the next incremental would
         // misread as "unchanged".
@@ -905,7 +937,8 @@ class BackupEngine {
       // file instead of trusting the copy. Written after the copy
       // loop, so it describes the finished backup — never a
       // half-written one. (ZIP backups need none: every entry
-      // already carries its own CRC32, checked at restore time.)
+      // already carries its own CRC32, checked at restore time —
+      // and .tvb entries carry their own GCM tag + SHA-256.)
       if (plainCopy) {
         const manifest = { version: 1, files: {} };
         for (const [relativePath, entry] of backedUpInfo) {
@@ -944,22 +977,24 @@ class BackupEngine {
         if (plainCopy) {
           try { if (fs.existsSync(copyDir)) fs.rmSync(copyDir, { recursive: true, force: true }); } catch (e) {}
         } else {
-          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+          try { if (fs.existsSync(artifactPath)) fs.unlinkSync(artifactPath); } catch (e) {}
         }
       } else {
         result.error_messages.push(err.message);
         this.log('error', `Full backup failed: ${err.message}`);
-        // A failed ZIP is truncated (no central directory) — delete it
-        // so it can never be mistaken for a valid backup. A failed
-        // plain-copy folder keeps the files that did copy (only the
-        // failed file's partial is removed, in _copyPlainFile).
+        // A failed ZIP/.tvb is truncated (no central directory /
+        // no index) — delete it so it can never be mistaken for a
+        // valid backup. A failed plain-copy folder keeps the files
+        // that did copy (only the failed file's partial is removed,
+        // in _copyPlainFile).
         if (!plainCopy) {
-          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+          try { if (fs.existsSync(artifactPath)) fs.unlinkSync(artifactPath); } catch (e) {}
         }
       }
     } finally {
       this._activeArchive = null;
       this._activeOutput = null;
+      this._activeTvb = null;
       this._activeStreams = null;
     }
 
@@ -1027,8 +1062,12 @@ class BackupEngine {
 
     const stampInc = new Date().toISOString().replace(/[:.]/g, '-');
     const zipPath = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.zip`);
-    const plainCopyInc = this.jobConfig.compression === 'none' && !this.jobConfig.encryptionEnabled;
+    const tvbPathInc = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.tvb`);
+    // See the full backup: encryption means .tvb, never a ZIP.
+    const useTvbInc = this.jobConfig.encryptionEnabled === true;
+    const plainCopyInc = this.jobConfig.compression === 'none' && !useTvbInc;
     const copyDirInc = path.join(backupSubDir, `${backupName}_incremental_${stampInc}`);
+    const artifactPathInc = plainCopyInc ? copyDirInc : (useTvbInc ? tvbPathInc : zipPath);
     if (plainCopyInc) fs.mkdirSync(copyDirInc, { recursive: true });
     // Same exclusion as full backups: never back the backup up into
     // itself when the destination lives inside the source.
@@ -1036,7 +1075,7 @@ class BackupEngine {
 
     this.log('info', `Starting INCREMENTAL backup for job: ${this.jobConfig.name}`);
     this.log('info', `Source: ${sourceDir}`);
-    this.log('info', `Destination: ${plainCopyInc ? copyDirInc + ' (plain files, no ZIP)' : zipPath + (this.jobConfig.encryptionEnabled ? ' (AES-256 encrypted)' : '')}`);
+    this.log('info', `Destination: ${plainCopyInc ? copyDirInc + ' (plain files, no ZIP)' : artifactPathInc + (useTvbInc ? ' (TechVision-only AES-256-GCM encrypted)' : '')}`);
 
     try {
       // Stop support: a waiter the finalize race listens on (see the
@@ -1071,7 +1110,12 @@ class BackupEngine {
           try { if (outputStream) outputStream.destroy(); } catch (e) {}
         }
       };
-      if (!plainCopyInc) {
+      let tvbWriterInc = null;
+      if (useTvbInc) {
+        // See the full backup: encrypted runs write a .tvb.
+        tvbWriterInc = new tvb.TvbWriter(tvbPathInc, this.jobConfig.encryptionPassword, this.jobConfig.compression);
+        this._activeTvb = tvbWriterInc;
+      } else if (!plainCopyInc) {
         const output = fs.createWriteStream(zipPath);
         outputStream = output;
         archive = this.jobConfig.createArchive();
@@ -1190,7 +1234,8 @@ class BackupEngine {
             // The state must record the hash of the bytes that
             // actually went into this backup (same rule as full
             // backups): the plain-copy hash is final when the copy
-            // finishes; the ZIP hash resolves after finalize.
+            // finishes; the ZIP hash resolves after finalize; the
+            // .tvb hash is final when addFile returns.
             const incHashState = { hash: null };
             if (plainCopyInc) {
               const copied = await this._copyPlainFile(file, sourceBaseInc, copyDirInc, (n) => {
@@ -1199,6 +1244,22 @@ class BackupEngine {
                 emitLive(relativePath);
               });
               currentInfo = { path: file, size: copied.size, mtime: stats.mtimeMs, hash: copied.hash };
+              result.files_backed_up++;
+              result.total_bytes += fileSize;
+              filesNeedingBackup++;
+              this.log('info', `Incremental update: ${relativePath}`);
+              filesSeen++;
+            } else if (useTvbInc) {
+              // See the full-backup loop: one streamed, encrypted
+              // entry; a source error fails one file, an output
+              // error fails the whole run.
+              const added = await tvbWriterInc.addFile(relativePath, file, stats, (n) => {
+                bytesDone += n;
+                fileCounted += n;
+                emitLive(relativePath);
+              });
+              incHashState.hash = added.hash;
+              currentInfo = { path: file, size: stats.size, mtime: stats.mtimeMs, hash: added.hash };
               result.files_backed_up++;
               result.total_bytes += fileSize;
               filesNeedingBackup++;
@@ -1267,6 +1328,9 @@ class BackupEngine {
           // A stop turns into a cancelled run, not a failed file:
           // rethrow so the outer catch handles the cleanup.
           if (this._cancelRequested || (err && err.code === 'BACKUP_CANCELLED')) throw new BackupCancelled();
+          // An output error (disk full, dead drive) fails the whole
+          // run — it is not one failed file (see the full backup).
+          if (err && err.code === 'TVB_OUTPUT_FAILED') throw err;
           if (err && (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EBUSY')) {
             result.locked_files_skipped++;
             result.files_skipped++;
@@ -1281,7 +1345,12 @@ class BackupEngine {
         }
       }
 
-      if (!plainCopyInc) {
+      if (useTvbInc) {
+        // See the full backup: index + trailer, then the cancel check.
+        await tvbWriterInc.finish();
+        this._activeTvb = null;
+        if (this._cancelRequested) throw new BackupCancelled();
+      } else if (!plainCopyInc) {
         const normalPath = (async () => { await archive.finalize(); await outputClosed; })();
         normalPath.catch(() => {});
         // The cancel waiter joins the race so a stop during finalize
@@ -1297,8 +1366,8 @@ class BackupEngine {
       }
 
       // Set the backup path on result
-      result.backup_path = plainCopyInc ? copyDirInc : zipPath;
-      result.backup_format = plainCopyInc ? 'folder' : (this.jobConfig.encryptionEnabled ? 'zip-encrypted' : 'zip');
+      result.backup_path = artifactPathInc;
+      result.backup_format = plainCopyInc ? 'folder' : (useTvbInc ? 'tvb' : 'zip');
       result.encrypted = this.jobConfig.encryptionEnabled;
 
       // Resolve the streamed hashes now that every stream has been
@@ -1360,18 +1429,19 @@ class BackupEngine {
         if (plainCopyInc) {
           try { if (fs.existsSync(copyDirInc)) fs.rmSync(copyDirInc, { recursive: true, force: true }); } catch (e) {}
         } else {
-          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+          try { if (fs.existsSync(artifactPathInc)) fs.unlinkSync(artifactPathInc); } catch (e) {}
         }
       } else {
         result.error_messages.push(err.message);
         this.log('error', `Incremental backup failed: ${err.message}`);
         if (!plainCopyInc) {
-          try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) {}
+          try { if (fs.existsSync(artifactPathInc)) fs.unlinkSync(artifactPathInc); } catch (e) {}
         }
       }
     } finally {
       this._activeArchive = null;
       this._activeOutput = null;
+      this._activeTvb = null;
       this._activeStreams = null;
     }
 

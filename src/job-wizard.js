@@ -108,6 +108,19 @@
     $('createBtn').style.display = n === 5 ? '' : 'none';
     if (n === 5) renderReview();
   }
+  // Same strength rule as vault.js validateStrongPassword (the
+  // wizard runs in the renderer without require(), so the small
+  // check is duplicated here — keep the copies in sync). Returns
+  // null when the password is strong enough, or the reason it is not.
+  function strongPasswordError(pw) {
+    if (!pw || typeof pw !== 'string') return 'Enter a password of at least 12 characters with uppercase, lowercase, numbers and symbols.';
+    if (pw.length < 12) return 'Password must be at least 12 characters long.';
+    if (!/[A-Z]/.test(pw)) return 'Password must contain at least one uppercase letter.';
+    if (!/[a-z]/.test(pw)) return 'Password must contain at least one lowercase letter.';
+    if (!/[0-9]/.test(pw)) return 'Password must contain at least one number.';
+    if (!/[^A-Za-z0-9]/.test(pw)) return 'Password must contain at least one symbol.';
+    return null;
+  }
   function validateStep(n) {
     if (n === 1) {
       var ok = true;
@@ -143,11 +156,16 @@
       // A saved vault password counts: blank fields keep it.
       if (hasSavedPassword && !$('encPassword').value && !$('encPasswordConfirm').value) return true;
       var pw = $('encPassword').value;
-      var pwOk = pw.length >= 8;
+      // Batch 3: at least 12 characters with uppercase, lowercase,
+      // a number and a symbol — for the backup password, same as
+      // the master password.
+      var pwError = strongPasswordError(pw);
+      var pwOk = !pwError;
+      $('encPasswordError').textContent = pwError || '';
       $('encPasswordError').classList.toggle('show', !pwOk);
       var matchOk = pwOk && $('encPasswordConfirm').value === pw;
       $('encPasswordConfirmError').classList.toggle('show', pwOk && !matchOk);
-      if (!pwOk) { toast('Password too short', 'The backup password must be at least 8 characters.', 'warning'); $('encPassword').focus(); return false; }
+      if (!pwOk) { toast('Password too weak', pwError, 'warning'); $('encPassword').focus(); return false; }
       if (!matchOk) { toast('Passwords do not match', 'Please repeat the same password.', 'warning'); $('encPasswordConfirm').focus(); return false; }
       return true;
     }
@@ -195,7 +213,12 @@
       sched.days = Array.prototype.map.call(document.querySelectorAll('input[name="customDay"]:checked'), function (c) { return parseInt(c.value, 10); });
     }
     var levelRadio = document.querySelector('input[name="compressLevel"]:checked');
-    var level = levelRadio && levelRadio.value === 'advanced' ? 'advanced' : 'standard';
+    // Four compression choices: standard / advanced, each plain or
+    // "with password" (the -pw radios). The -pw suffix is the
+    // ENCRYPTION choice, not a level: strip it for the compression
+    // level — encryption itself comes from the step-4 toggle, which
+    // the radios keep in sync (see syncLevelRadios).
+    var level = ((levelRadio && levelRadio.value) || 'standard').replace(/-pw$/, '');
     return {
       // Every job gets a unique id. Two jobs may share a name, but they
       // must stay two separate tasks — the old code keyed everything by
@@ -230,8 +253,8 @@
       ['Find destination drive', matchSummary('dest')],
       ['Include patterns', j.includePatterns.length ? j.includePatterns.join(', ') : 'All files'],
       ['Incremental', j.allowIncremental ? 'Yes' : 'No'],
-      ['Compress with ZIP', j.compress ? (j.compression === 'advanced' ? 'Yes — Advanced (Deflate level 9)' : 'Yes — Standard (Deflate level 6)') : 'No'],
-      ['Encryption', j.encryptionEnabled ? 'AES-256' + (j.compress ? ' (compression + encryption)' : ' (encryption only, files stored uncompressed)') : 'Off'],
+      ['Compression', j.compress ? (j.compression === 'advanced' ? 'Advanced (Deflate level 9)' : 'Standard (Deflate level 6)') : 'None — files stored as-is'],
+      ['Encryption', j.encryptionEnabled ? 'TechVision-only AES-256-GCM' + (j.compress ? ' (compression + encryption)' : ' (encryption only, files stored uncompressed)') : 'Off'],
       ['Verify after backup', j.verify ? 'Yes' : 'No'],
       ['Schedule', j.schedule.enabled ? scheduleSummary(j.schedule) : 'Manual only']
     ];
@@ -427,7 +450,13 @@
           if (Array.isArray(cfg.includePatterns)) { patterns = cfg.includePatterns.slice(); renderChips(); }
           if (cfg.allowIncremental === false) $('optIncremental').checked = false;
           if (cfg.compress === false) { $('optCompress').checked = false; var clf = $('compressLevelField'); if (clf) clf.style.display = 'none'; }
-          if (cfg.compression === 'advanced') { var adv = document.querySelector('input[name="compressLevel"][value="advanced"]'); if (adv) adv.checked = true; }
+          // The level radio follows the saved compression AND the
+          // saved encryption: an encrypted job shows the -pw variant
+          // of its level (the step-4 toggle is set below).
+          if (cfg.compression === 'advanced' || cfg.compression === 'standard') {
+            var lvlVal = cfg.compression + (cfg.encryptionEnabled === true ? '-pw' : '');
+            var lvl = document.querySelector('input[name="compressLevel"][value="' + lvlVal + '"]'); if (lvl) lvl.checked = true;
+          }
           if (cfg.schedule && cfg.schedule.enabled) {
             $('optSchedule').checked = true;
             $('scheduleFields').style.display = 'block';
@@ -465,9 +494,40 @@
     b.textContent = $('optCompress').checked ? 'Compression + encryption: ' : 'Encryption only: ';
     var s = document.createElement('span');
     s.textContent = $('optCompress').checked
-      ? 'files are compressed and then encrypted (AES-256).'
-      : 'files are stored uncompressed inside the encrypted ZIP (AES-256) — same files, just protected.';
+      ? 'files are compressed and then encrypted (TechVision-only AES-256-GCM — no other program can open this backup).'
+      : 'files are stored uncompressed and encrypted (TechVision-only AES-256-GCM — no other program can open this backup).';
     note.appendChild(b); note.appendChild(s);
+  }
+  // Two-way sync between the step-3 compression radios and the
+  // step-4 encryption toggle. The four radios are standard /
+  // advanced, each plain or "with password" (-pw suffix). Picking a
+  // -pw radio turns encryption ON (and shows the password fields);
+  // picking a plain radio turns it OFF. Toggling encryption in step
+  // 4 switches the radio to the -pw variant of the current level
+  // (or back to the plain variant). Called only from the radio /
+  // toggle change handlers — loadExisting and resetWizard set the
+  // controls directly.
+  function syncLevelRadios(fromRadio) {
+    var checked = document.querySelector('input[name="compressLevel"]:checked');
+    if (!checked) return;
+    var enc = $('optEncrypt');
+    if (fromRadio) {
+      // The user picked a radio: the toggle follows it.
+      var wantsPw = checked.value.slice(-3) === '-pw';
+      if (enc.checked !== wantsPw) {
+        enc.checked = wantsPw;
+        $('encFields').style.display = wantsPw ? 'block' : 'none';
+        if (wantsPw) updateEncNote();
+      }
+    } else {
+      // The user toggled encryption: the radio follows it.
+      var base = checked.value.replace(/-pw$/, '');
+      var want = enc.checked ? base + '-pw' : base;
+      if (checked.value !== want) {
+        var target = document.querySelector('input[name="compressLevel"][value="' + want + '"]');
+        if (target) target.checked = true;
+      }
+    }
   }
   function wireWizard() {
     if (wireWizard.done) return; wireWizard.done = true;
@@ -486,8 +546,11 @@
     on('addPatternBtn', 'click', addPattern);
     on('patternInput', 'keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
     on('optSchedule', 'change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });
-    on('optEncrypt', 'change', function (ev) { $('encFields').style.display = ev.target.checked ? 'block' : 'none'; if (ev.target.checked) updateEncNote(); });
+    on('optEncrypt', 'change', function (ev) { $('encFields').style.display = ev.target.checked ? 'block' : 'none'; if (ev.target.checked) updateEncNote(); syncLevelRadios(false); });
     on('optCompress', 'change', function () { var clf = $('compressLevelField'); if (clf) clf.style.display = $('optCompress').checked ? '' : 'none'; if ($('optEncrypt').checked) updateEncNote(); });
+    // The four compression radios (standard / advanced, plain or
+    // "with password") keep the step-4 encryption toggle in sync.
+    document.querySelectorAll('input[name="compressLevel"]').forEach(function (r) { r.addEventListener('change', function () { syncLevelRadios(true); }); });
     on('nextBtn', 'click', function () { if (validateStep(step)) showStep(Math.min(5, step + 1)); });
     on('backBtn', 'click', function () { showStep(Math.max(1, step - 1)); });
     on('createBtn', 'click', createJob);

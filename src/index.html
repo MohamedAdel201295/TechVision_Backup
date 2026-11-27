@@ -319,7 +319,7 @@
       <div id="vaultSetupBox">
         <div class="field">
           <label for="vaultNewPass">New master password</label>
-          <input type="password" id="vaultNewPass" placeholder="At least 8 characters" autocomplete="new-password">
+          <input type="password" id="vaultNewPass" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
         </div>
         <div class="field">
           <label for="vaultNewPassConfirm">Confirm master password</label>
@@ -335,7 +335,7 @@
         </div>
         <div class="field">
           <label for="vaultChangeNew">New master password</label>
-          <input type="password" id="vaultChangeNew" placeholder="At least 8 characters" autocomplete="new-password">
+          <input type="password" id="vaultChangeNew" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
         </div>
         <div class="field">
           <label for="vaultChangeConfirm">Confirm new master password</label>
@@ -965,7 +965,7 @@
           <label class="switch"><input type="checkbox" id="optIncremental" checked><span class="slider"></span></label>
         </div>
         <div class="toggle-row">
-          <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Store the backup as a compressed .zip file.</div></div>
+          <div><div class="t-label">Compress backup</div><div class="t-sub">Compress the files before storing them. Off means the backup stores the files as-is.</div></div>
           <label class="switch"><input type="checkbox" id="optCompress" checked><span class="slider"></span></label>
         </div>
         <div id="compressLevelField" style="margin:2px 0 0;">
@@ -973,13 +973,17 @@
             <label><input type="radio" name="compressLevel" value="standard" checked> Standard <span style="color:var(--muted-2);font-size:12px;">— Deflate level 6, faster</span></label>
             <label><input type="radio" name="compressLevel" value="advanced"> Advanced <span style="color:var(--muted-2);font-size:12px;">— Deflate level 9, smaller</span></label>
           </div>
-          <div class="hint">The level the ZIP will actually use — Standard compresses faster, Advanced squeezes smaller.</div>
+          <div class="radio-row">
+            <label><input type="radio" name="compressLevel" value="standard-pw"> Standard with password <span style="color:var(--muted-2);font-size:12px;">— level 6, encrypted</span></label>
+            <label><input type="radio" name="compressLevel" value="advanced-pw"> Advanced with password <span style="color:var(--muted-2);font-size:12px;">— level 9, encrypted</span></label>
+          </div>
+          <div class="hint">Picking a "with password" choice turns encryption on — you set the password on the next step.</div>
         </div>
         <div class="toggle-row">
           <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
           <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
         </div>
-        <h3 style="margin:10px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
+        <h3 style="margin:6px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
         <div class="toggle-row">
           <div><div class="t-label">Run on schedule</div><div class="t-sub">Run this job automatically.</div></div>
           <label class="switch"><input type="checkbox" id="optSchedule"><span class="slider"></span></label>
@@ -1020,14 +1024,14 @@
       <section class="step-panel" data-panel="4">
         <h3 style="margin:0 0 6px;">Encryption</h3>
         <div class="toggle-row">
-          <div><div class="t-label">Encrypt backup (AES-256)</div><div class="t-sub">Protect the backup with a password. Standard WinZip AES — 7-Zip and WinRAR can open it too.</div></div>
+          <div><div class="t-label">Encrypt backup (TechVision-only)</div><div class="t-sub">Protect the backup with a password. Only this program can open it — no other program can decrypt it.</div></div>
           <label class="switch"><input type="checkbox" id="optEncrypt"><span class="slider"></span></label>
         </div>
         <div id="encFields" style="display:none; margin-top:12px;">
           <div class="field">
             <label for="encPassword">Backup password</label>
-            <input type="password" id="encPassword" placeholder="At least 8 characters" autocomplete="new-password">
-            <div class="field-error" id="encPasswordError">Please enter a password of at least 8 characters.</div>
+            <input type="password" id="encPassword" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
+            <div class="field-error" id="encPasswordError">Password must be at least 12 characters with uppercase, lowercase, numbers and symbols.</div>
           </div>
           <div class="field">
             <label for="encPasswordConfirm">Confirm password</label>
@@ -1111,7 +1115,7 @@
           <div class="field" id="restorePasswordField" style="display:none;">
             <label for="restorePassword">Backup password</label>
             <input type="password" id="restorePassword" placeholder="Password for this encrypted backup" autocomplete="off">
-            <div class="hint">This backup is encrypted (AES-256). Enter its backup password — the same one used when it was created. Without it, the files cannot be restored.</div>
+            <div class="hint">This backup is encrypted (TechVision-only). Enter its backup password — the same one used when it was created. Without it, the files cannot be restored.</div>
             <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
           </div>
           <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>

@@ -1,6 +1,6 @@
 /**
  * TechVision Restore Engine
- * Restore from ZIP with hash verification
+ * Restore from ZIP / .tvb with hash verification
  * Uses yauzl for streaming extraction (memory efficient)
  */
 
@@ -10,9 +10,30 @@ const crypto = require('crypto');
 const yauzl = require('yauzl');
 const EventEmitter = require('events');
 const { Transform } = require('stream');
-// WinZip AES-256 reader (pure JS, Node crypto). yauzl cannot decrypt,
-// so encrypted backups go through this module instead.
-const zipAes = require('./zip-aes.js');
+// TechVision-only encrypted backups (.tvb): yauzl cannot decrypt,
+// so encrypted backups go through this module instead. A .tvb is
+// NOT a ZIP — no outside program can open it.
+const tvb = require('./tvb.js');
+
+// --- CRC32 (for the plain-ZIP restore paths below, which verify each
+// entry against its central-directory CRC) ---
+const CRC_TABLE = (function () {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c;
+  }
+  return table;
+})();
+function crc32(buf, prev) {
+  // Chainable: crc32(chunk2, crc32(chunk1)) === crc32(Buffer.concat([chunk1, chunk2])).
+  // `prev` is a previously returned value; with no prev it behaves
+  // exactly as before (single-shot CRC of the whole buffer).
+  let c = (prev === undefined ? 0xFFFFFFFF : (prev ^ 0xFFFFFFFF)) >>> 0;
+  for (let i = 0; i < buf.length; i++) c = (CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
 
 /**
  * Restore Result Class
@@ -150,7 +171,7 @@ function copyFileHashed(src, dest) {
 // new Date().toISOString().replace(/[:.]/g, '-') (see
 // techvision-core.js). The job name is greedy: a job literally
 // named `my_full_job` still parses as job `my_full_job`.
-const ARTIFACT_RE = /^(.*)_(full|incremental)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.zip)?$/;
+const ARTIFACT_RE = /^(.*)_(full|incremental)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.(zip|tvb))?$/;
 
 function parseArtifactName(fileName) {
   const m = ARTIFACT_RE.exec(fileName);
@@ -293,35 +314,40 @@ class RestoreEngine {
       result.skipped_files.push(rel);
       return true;
     }
-    // Encrypted backup (WinZip AES-256): yauzl cannot decrypt, so the
-    // AES reader handles the whole restore. Wrong password fails fast.
-    // Only the INSPECT may fall through to the yauzl path below (a
-    // Zip64 or otherwise unreadable central directory is still a ZIP
-    // yauzl can open); a failure inside the AES extraction itself is
-    // a real failure and is reported, not retried through yauzl.
-    let encryptedInfo = null;
-    try {
-      if (zipPath && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
-        encryptedInfo = zipAes.inspectZip(zipPath);
-      }
-    } catch (e) {
-      encryptedInfo = null; // fall through to the yauzl path below
-    }
-    if (encryptedInfo && encryptedInfo.encrypted) {
+    // TechVision-only encrypted backup (.tvb): yauzl cannot decrypt,
+    // so the TVB reader handles the whole restore. A wrong password
+    // fails fast on the first entry; a truncated file fails at
+    // inspect time with "corrupt or truncated", never as a wrong
+    // password. This branch runs only for .tvb files — a plain ZIP
+    // goes to the yauzl path below.
+    if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
       try {
         if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
         if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
-        const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
-          result.files_restored++;
-          result.total_bytes += size;
-        }, opts);
+        const extracted = await tvb.extractTvb(zipPath, restoreDir, password, {
+          onFile: function (name, size) {
+            result.files_restored++;
+            result.total_bytes += size;
+          },
+          commit: function (rel, tmp, dest) {
+            // Verified already (GCM tag + SHA-256 inside the reader):
+            // rename over the destination — unless it already exists
+            // and overwrite is OFF, in which case the good file
+            // there is left alone.
+            if (skipIfExists(tmp, dest, rel)) return false;
+            fs.renameSync(tmp, dest);
+            if (opts.chainWritten) opts.chainWritten.add(path.resolve(dest));
+            return true;
+          }
+        });
         result.errors = extracted.errors;
-        result.files_skipped = extracted.skipped || 0;
-        result.skipped_files = extracted.skipped_files || [];
-        // Every file was authenticated by HMAC at decrypt time and
-        // verified after writing, so restored == verified here.
+        // Every file was authenticated by its GCM tag at decrypt
+        // time and SHA-256-verified after writing, so restored ==
+        // verified here. An empty .tvb (a 0-file incremental) restores
+        // as success with 0 files — deliberately different from the
+        // yauzl path, which errors on an empty ZIP.
         result.files_verified = result.files_restored;
-        result.success = result.files_mismatched === 0 && result.errors.length === 0 && (result.files_restored > 0 || result.files_skipped > 0);
+        result.success = result.files_mismatched === 0 && result.errors.length === 0;
         result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
         return result;
       } catch (e) {
@@ -486,7 +512,7 @@ class RestoreEngine {
           // the Unix mode down and compared it with 0x10, so a real
           // `subdir/` was written as an empty FILE named `subdir`
           // and `subdir/a.txt` then failed with ENOTDIR. A trailing
-          // slash is the reliable test (same as zip-aes).
+          // slash is the reliable test (same as the TVB reader).
           if (entry.fileName.endsWith('/') || (entry.externalAttributes & 0x10) !== 0) {
             return;
           }
@@ -581,7 +607,7 @@ class RestoreEngine {
             // (a 'data' listener + pipe would buffer unboundedly).
             const crcStream = new Transform({
               transform(chunk, encoding, callback) {
-                crc = zipAes.crc32(chunk, crc);
+                crc = crc32(chunk, crc);
                 bytes += chunk.length;
                 callback(null, chunk);
               }
@@ -648,15 +674,21 @@ class RestoreEngine {
       walk(zipPath);
       return entries;
     }
-    // ZIP: the AES inspector lists entries AND flags encrypted ones, so
-    // the restore wizard knows when to ask for a password. If its
-    // parser cannot read the file, fall back to yauzl (no flag).
-    try {
-      const info = zipAes.inspectZip(zipPath);
-      return info.entries.filter(function (e) { return !e.isDir; }).map(function (e) {
-        return { path: e.name.replace(/\//g, path.sep), size: e.size, isDir: false, encrypted: e.encrypted };
+    // .tvb: the TVB inspector lists entries AND flags them encrypted,
+    // so the restore wizard knows when to ask for a password. A
+    // corrupt/truncated .tvb throws here — a clear error, never a
+    // silent fallback to yauzl (which cannot read a .tvb at all).
+    if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
+      const info = tvb.inspectTvb(zipPath);
+      return info.entries.map(function (e) {
+        return { path: e.name.replace(/\//g, path.sep), size: e.size, isDir: false, encrypted: true };
       });
-    } catch (e) { /* fall through to yauzl below */ }
+    }
+    // Plain ZIP: yauzl lists the entries (no `encrypted` flag on
+    // yauzl, but bit 0 of the general-purpose flag is the encryption
+    // bit — a legacy encrypted ZIP still shows as encrypted so the
+    // wizard asks for a password, even though only .tvb backups are
+    // created anymore).
     return new Promise((resolve, reject) => {
       yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
         if (err) return reject(err);
@@ -766,47 +798,40 @@ class RestoreEngine {
       fs.renameSync(tmpPath, destPath);
       return { files: 1 };
     }
-    // Encrypted entry: decrypt it directly with the AES reader.
-    // Only an unreadable central directory falls through to yauzl
-    // (e.g. Zip64); a decrypt failure (wrong password, tampered
-    // ciphertext, bad CRC) is reported as-is, never retried through
-    // yauzl — which cannot decrypt and would either fail confusingly
-    // or write garbage.
-    let inspected = false;
-    try {
-      if (zipPath && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
-        const info = zipAes.inspectZip(zipPath);
-        inspected = true;
-        const wanted = entryName.replace(/\\/g, '/');
-        const hit = info.entries.find(function (e) { return e.name === wanted; });
-        if (hit && hit.encrypted) {
-          if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
-          // The inspected entry already carries the full fields
-          // (localOffset, compressedSize, crc, ...) — stream-decrypt
-          // it straight into the temp file, never buffering the
-          // entry (see zip-aes.js decryptEntryToFile).
-          const dir = path.dirname(destPath);
-          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          // Write-then-rename (same rule as the plain path): a failed
-          // write must not leave a partial file at the destination.
-          const tmpPath = tempPathFor(destPath);
-          try {
-            await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
-            const skipped = skippedResult(tmpPath);
-            if (skipped) return skipped;
-            fs.renameSync(tmpPath, destPath);
-          } catch (e) {
-            try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
-            throw e;
-          }
-          return { files: 1 };
-        }
-        // The entry is plain (or not in this ZIP at all): the yauzl
-        // path below handles both — a missing entry rejects there.
+    // TechVision-only encrypted backup (.tvb): decrypt the entry
+    // directly with the TVB reader. A decrypt failure (wrong
+    // password, tampered ciphertext) is reported as-is, never
+    // retried through yauzl — which cannot decrypt and would either
+    // fail confusingly or write garbage.
+    if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
+      const info = tvb.inspectTvb(zipPath);
+      const wanted = entryName.replace(/\\/g, '/');
+      const hit = info.entries.find(function (e) { return e.name === wanted; });
+      if (!hit) {
+        const e = new Error('Entry not found in backup: ' + entryName);
+        e.code = 'ENTRY_NOT_FOUND';
+        throw e;
       }
-    } catch (e) {
-      if (inspected) throw e; // the inspector read the file; the failure is real
-      // Inspector could not read the file: fall through to yauzl.
+      if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
+      // The inspected entry already carries the full fields
+      // (dataOffset, storedSize, iv, sha256, ...) — stream-decrypt
+      // it straight into the temp file, never buffering the entry
+      // (see tvb.js decryptEntryToFile).
+      const dir = path.dirname(destPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // Write-then-rename (same rule as the plain path): a failed
+      // write must not leave a partial file at the destination.
+      const tmpPath = tempPathFor(destPath);
+      try {
+        await tvb.decryptEntryToFile(zipPath, hit, password, tmpPath);
+        const skipped = skippedResult(tmpPath);
+        if (skipped) return skipped;
+        fs.renameSync(tmpPath, destPath);
+      } catch (e) {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+        throw e;
+      }
+      return { files: 1 };
     }
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -867,7 +892,7 @@ class RestoreEngine {
               };
               const crcStream = new Transform({
                 transform(chunk, encoding, callback) {
-                  crc = zipAes.crc32(chunk, crc);
+                  crc = crc32(chunk, crc);
                   bytes += chunk.length;
                   callback(null, chunk);
                 }

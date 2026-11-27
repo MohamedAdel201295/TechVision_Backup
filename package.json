@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "archiver": "^7.0.1",
-    "archiver-zip-encrypted": "^2.0.0",
     "bytenode": "^2.1.0",
     "crypto-js": "^4.2.0",
     "date-fns": "^3.6.0",

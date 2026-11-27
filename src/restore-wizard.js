@@ -54,7 +54,7 @@
       var c = String(jobInfo.compression).toLowerCase();
       rows.push(['Compression', c === 'none' ? 'No compression — plain files' : c === 'advanced' ? 'Advanced — Deflate level 9' : 'Standard — Deflate level 6']);
     }
-    rows.push(['Encryption', encrypted ? 'AES-256' : 'Off']);
+    rows.push(['Encryption', encrypted ? 'TechVision-only AES-256-GCM' : 'Off']);
     list.innerHTML = '';
     rows.forEach(function (r) {
       var div = document.createElement('div');
@@ -69,11 +69,13 @@
     if (ok === true) {
       el.style.display = '';
       el.classList.remove('bad');
-      el.textContent = zipPath && zipPath.toLowerCase().endsWith('.zip') ? '✓ Valid backup file (.zip)' : '✓ Valid backup folder';
+      var lower = (zipPath || '').toLowerCase();
+      el.textContent = lower.endsWith('.tvb') ? '✓ Valid backup file (.tvb — TechVision encrypted)'
+        : lower.endsWith('.zip') ? '✓ Valid backup file (.zip)' : '✓ Valid backup folder';
     } else if (ok === false) {
       el.style.display = '';
       el.classList.add('bad');
-      el.textContent = 'Could not read this backup file — is it a .zip backup?';
+      el.textContent = 'Could not read this backup file — is it a .zip or .tvb backup?';
     } else {
       el.style.display = 'none';
     }
@@ -99,7 +101,7 @@
   async function pickFile() {
     if (!api || typeof api.showOpenDialog !== 'function') { toast('Browse unavailable', 'File picker API is not available.', 'error'); return; }
     try {
-      var result = await api.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'Backup files', extensions: ['zip'] }] });
+      var result = await api.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'Backup files', extensions: ['zip', 'tvb'] }] });
       var path = null;
       if (typeof result === 'string') path = result;
       else if (result && Array.isArray(result.filePaths) && result.filePaths.length) path = result.filePaths[0];

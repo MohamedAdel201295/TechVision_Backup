@@ -1030,7 +1030,7 @@
         ['Schedule', scheduleLabel(sched) || 'Manual only'],
         ['Next run', nextRunText(job)],
         ['Compression', compressionLabel(job)],
-        ['Encryption', enc ? 'Enabled (AES-256)' : 'Off'],
+        ['Encryption', enc ? 'Enabled (TechVision-only AES-256-GCM)' : 'Off'],
         ['Last Run Result', job.runs && job.runs.length ? job.status + ' — ' + formatDate(job.timestamp) : 'Never run'],
         ['Files Backed Up', job.runs && job.runs.length ? String(job.files) : '—'],
         ['Total Size', job.runs && job.runs.length ? formatBytes(job.size) : '—']
@@ -2642,7 +2642,7 @@
     $('drawerDest').textContent = job.destination || '—';
     $('drawerType').textContent = job.type;
     var enc = job.encryptionEnabled === true || (job.raw && job.raw.encryptionEnabled === true);
-    if ($('drawerEncryption')) $('drawerEncryption').textContent = enc ? 'AES-256 🔒' : 'Off';
+    if ($('drawerEncryption')) $('drawerEncryption').textContent = enc ? 'TechVision-only 🔒' : 'Off';
     $('drawerStatus').textContent = job.status;
     $('drawerFiles').textContent = String(job.files);
     $('drawerSize').textContent = formatBytes(job.size);
@@ -4010,10 +4010,29 @@
       }
     });
     $('settingsBtn').addEventListener('click', function () { openSettings(); refreshVaultStatus(); });
+    // Same strength rule as vault.js validateStrongPassword (the
+    // renderer runs without require(), so the small check is
+    // duplicated here — keep the copies in sync). Used for the
+    // master password create/change below; the backup password
+    // check lives in job-wizard.js.
+    function strongPasswordError(pw) {
+      if (!pw || typeof pw !== 'string') return 'Enter a password of at least 12 characters with uppercase, lowercase, numbers and symbols.';
+      if (pw.length < 12) return 'Password must be at least 12 characters long.';
+      if (!/[A-Z]/.test(pw)) return 'Password must contain at least one uppercase letter.';
+      if (!/[a-z]/.test(pw)) return 'Password must contain at least one lowercase letter.';
+      if (!/[0-9]/.test(pw)) return 'Password must contain at least one number.';
+      if (!/[^A-Za-z0-9]/.test(pw)) return 'Password must contain at least one symbol.';
+      return null;
+    }
     var vsb = $('vaultSetupBtn');
     if (vsb) vsb.addEventListener('click', async function () {
       var p1 = $('vaultNewPass').value, p2 = $('vaultNewPassConfirm').value;
-      if (p1.length < 8) { toast('Password too short', 'The master password must be at least 8 characters.', 'warning'); return; }
+      // Batch 3: at least 12 characters with uppercase, lowercase,
+      // a number and a symbol. (The master password already has
+      // two fields — Password + Confirm — with a match check below;
+      // only the strength rule changes here.)
+      var weak = strongPasswordError(p1);
+      if (weak) { toast('Password too weak', weak, 'warning'); return; }
       if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same master password.', 'warning'); return; }
       try {
         // Reset mode (started from the startup unlock modal): the Set
@@ -4047,7 +4066,8 @@
     var vcb = $('vaultChangeBtn');
     if (vcb) vcb.addEventListener('click', async function () {
       var oldP = $('vaultOldPass').value, p1 = $('vaultChangeNew').value, p2 = $('vaultChangeConfirm').value;
-      if (p1.length < 8) { toast('Password too short', 'The new master password must be at least 8 characters.', 'warning'); return; }
+      var weak = strongPasswordError(p1);
+      if (weak) { toast('Password too weak', weak, 'warning'); return; }
       if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same new master password.', 'warning'); return; }
       try {
         var r = await api.vaultChangePassword(oldP, p1);

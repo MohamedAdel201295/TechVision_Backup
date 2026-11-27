@@ -37,8 +37,8 @@
  *
  * The derived key is held in memory only (main.js keeps it while the
  * vault is unlocked). Forgetting the master password means the stored
- * job passwords are unrecoverable — the backup ZIPs themselves are
- * unaffected and still open with their own job password.
+ * job passwords are unrecoverable — the backups themselves are
+ * unaffected and still open with their own backup password.
  */
 const fs = require('fs');
 const path = require('path');
@@ -97,6 +97,26 @@ function deriveKey(masterPassword, saltB64) {
   return crypto.scryptSync(masterPassword, Buffer.from(saltB64, 'base64'), 32, SCRYPT_OPTS);
 }
 
+// Password strength rule (batch 3, the user's decision): a password
+// that protects anything must be at least 12 characters and contain
+// an uppercase letter, a lowercase letter, a digit AND a symbol.
+// Applies to the Master Password (creation/change) and to the
+// encryption (backup) password in the wizard — enforced at
+// CREATION/CHANGE only, never at unlock (an old, weaker password
+// must still unlock what it locked). Returns null when the password
+// is strong enough, or a plain-English reason it is not.
+// The same rule lives in the renderer (job-wizard.js, renderer.js)
+// because those run without require() — keep the three in sync.
+function validateStrongPassword(pw) {
+  if (!pw || typeof pw !== 'string') return 'Enter a password of at least 12 characters with uppercase, lowercase, numbers and symbols.';
+  if (pw.length < 12) return 'Password must be at least 12 characters long.';
+  if (!/[A-Z]/.test(pw)) return 'Password must contain at least one uppercase letter.';
+  if (!/[a-z]/.test(pw)) return 'Password must contain at least one lowercase letter.';
+  if (!/[0-9]/.test(pw)) return 'Password must contain at least one number.';
+  if (!/[^A-Za-z0-9]/.test(pw)) return 'Password must contain at least one symbol.';
+  return null;
+}
+
 function encryptWithKey(key, plaintext) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -117,9 +137,8 @@ function decryptWithKey(key, blobB64) {
 }
 
 function setupVault(userDataDir, masterPassword) {
-  if (!masterPassword || masterPassword.length < 8) {
-    throw new Error('Master password must be at least 8 characters.');
-  }
+  const weak = validateStrongPassword(masterPassword);
+  if (weak) throw new Error(weak);
   if (vaultExists(userDataDir)) throw new Error('A vault already exists. Use change instead.');
   const salt = crypto.randomBytes(16).toString('base64');
   const key = deriveKey(masterPassword, salt);
@@ -136,9 +155,8 @@ function setupVault(userDataDir, masterPassword) {
    unlocks the old vault only. setupVault's "already exists" guard is
    bypassed here on purpose: replacing is the whole point. */
 function resetVault(userDataDir, masterPassword) {
-  if (!masterPassword || masterPassword.length < 8) {
-    throw new Error('Master password must be at least 8 characters.');
-  }
+  const weak = validateStrongPassword(masterPassword);
+  if (weak) throw new Error(weak);
   try { fs.unlinkSync(getVaultPath(userDataDir)); } catch (e) { /* no old vault */ }
   try { clearUnlockBlob(userDataDir); } catch (e) { /* no old blob */ }
   return setupVault(userDataDir, masterPassword);
@@ -344,9 +362,8 @@ function clearUnlockBlob(userDataDir) {
 }
 
 function changeMasterPassword(userDataDir, oldPassword, newPassword) {
-  if (!newPassword || newPassword.length < 8) {
-    throw new Error('New master password must be at least 8 characters.');
-  }
+  const weak = validateStrongPassword(newPassword);
+  if (weak) throw new Error(weak);
   const oldKey = unlockVault(userDataDir, oldPassword); // throws on wrong old password
   try {
     const data = readVault(userDataDir);
@@ -374,6 +391,7 @@ function changeMasterPassword(userDataDir, oldPassword, newPassword) {
 
 module.exports = {
   getVaultPath, vaultExists, setupVault, resetVault, unlockVault, lockVault,
+  validateStrongPassword,
   storeJobPassword, getJobPassword, hasJobPassword,
   removeJobPassword, changeMasterPassword,
   storeSecret, getSecret, hasSecret, removeSecret,
