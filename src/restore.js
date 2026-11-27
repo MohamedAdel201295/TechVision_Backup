@@ -1055,6 +1055,36 @@ class RestoreEngine {
                 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
               } catch (e) { return done(e); }
 
+              // Containment (same policy as the TVB single-file path
+              // and the bulk restore): the destination is the restore
+              // folder + the entry's path inside the backup, so the
+              // root is destPath with the entry's path segments
+              // removed. A pre-existing symlink (or Windows junction)
+              // in between must not redirect the write outside that
+              // root — resolve the REAL parent and write through it.
+              // (When the caller renames the file, the derived root
+              // is wider than the real folder — the check then
+              // passes, and the write still goes through the real
+              // parent.)
+              const wanted = entry.fileName;
+              let realDest = destPath;
+              try {
+                const parts = wanted.split('/').filter(function (p) { return p && p !== '.'; });
+                let root = destPath;
+                for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+                const realRoot = fs.realpathSync(root);
+                const realParent = fs.realpathSync(dir);
+                if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+                  try { ReadStream.destroy(); } catch (e2) {}
+                  return done(new Error('Skipped unsafe path: ' + entry.fileName));
+                }
+                realDest = path.join(realParent, path.basename(destPath));
+              } catch (e) {
+                try { ReadStream.destroy(); } catch (e2) {}
+                if (/Skipped unsafe path/.test(e.message)) return done(e);
+                return done(new Error('Failed to create folder for ' + entry.fileName + ': ' + e.message));
+              }
+
               // Stream through a CRC check into a temp file and rename
               // over the destination only when the CRC (and size)
               // match: the old code piped straight to the destination
@@ -1062,7 +1092,7 @@ class RestoreEngine {
               // all, so a corrupt entry was restored as if it were
               // good — and a good file at the destination was
               // overwritten with corrupt bytes.
-              const tmpPath = tempPathFor(destPath);
+              const tmpPath = tempPathFor(realDest);
               const file = fs.createWriteStream(tmpPath);
               let crc = 0;
               let bytes = 0;
@@ -1102,7 +1132,7 @@ class RestoreEngine {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                   return done(null, { files: 0, skipped: 1 });
                 }
-                try { fs.renameSync(tmpPath, destPath); } catch (e) {
+                try { fs.renameSync(tmpPath, realDest); } catch (e) {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
                   return done(e);
                 }
