@@ -448,6 +448,34 @@ let mainWindow;
 let pendingWizardJob = null;
 let pendingRestoreJob = null;
 
+// Single instance: a second launch must NOT open a second copy of
+// the app — two processes would write the same jobs/history/vault
+// files, both schedulers could fire the same backup at once, and the
+// Cloud server port would clash. The lock is keyed by the userData
+// folder, which was pinned to %APPDATA%\TechVision Backup above, so
+// it covers both source and packaged runs. Requested here — early,
+// before app.whenReady() creates any state — so a second process
+// quits before it can touch anything. A second launch just brings
+// the running window forward.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    // The window may be minimized, hidden to the tray (X hides it),
+    // or gone — bring it back in front in every case. Never open a
+    // second window.
+    console.log('[Main] Second instance launch — bringing the running window forward');
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    } else {
+      createMainWindow();
+    }
+  });
+}
+
 // Active jobs tracking (Map for tracking in-progress operations)
 const activeJobs = new Map();
 // Live engine per active run, keyed the same way as activeJobs, so
