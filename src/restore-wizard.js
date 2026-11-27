@@ -48,13 +48,20 @@
     if (jobInfo && jobInfo.timestamp) rows.push(['Created', formatDate(jobInfo.timestamp)]);
     var total = 0, encrypted = false;
     info.entries.forEach(function (e) { total += Number(e.size) || 0; if (e.encrypted) encrypted = true; });
-    rows.push(['Size', formatBytes(total)]);
-    rows.push(['Files', String(info.entries.length)]);
+    // A layered .tvb's single entry is a whole ZIP, not a file —
+    // report that instead of a misleading "1 file" + the ZIP's size.
+    var isLayered = !!(info && info.layered);
+    rows.push(['Size', isLayered ? 'Inside the encrypted archive' : formatBytes(total)]);
+    rows.push(['Files', isLayered ? 'Inside the encrypted archive' : String(info.entries.length)]);
     if (jobInfo && jobInfo.compression) {
       var c = String(jobInfo.compression).toLowerCase();
       rows.push(['Compression', c === 'none' ? 'No compression — plain files' : c === 'advanced' ? 'Advanced — Deflate level 9' : 'Standard — Deflate level 6']);
     }
-    rows.push(['Encryption', encrypted ? 'TechVision-only AES-256-GCM' : 'Off']);
+    // The encryption text must say WHICH password: a .zip's is a
+    // WinZip AES password (7-Zip can open it), a .tvb's is the
+    // program-only backup password.
+    var isZip = (zipPath || '').toLowerCase().endsWith('.zip');
+    rows.push(['Encryption', encrypted ? (isZip ? 'ZIP password (WinZip AES-256 — 7-Zip can open it)' : 'TechVision-only AES-256-GCM') : 'Off']);
     list.innerHTML = '';
     rows.forEach(function (r) {
       var div = document.createElement('div');
@@ -115,6 +122,8 @@
   async function checkEncrypted(zipPath) {
     isEncryptedBackup = false;
     $('restorePasswordField').style.display = 'none';
+    var zf0 = $('restoreZipPasswordField'); if (zf0) zf0.style.display = 'none';
+    var zp0 = $('restoreZipPassword'); if (zp0) zp0.value = '';
     if (!api || typeof api.getZipInfo !== 'function') { showValid(zipPath, null); return; }
     try {
       var info = await api.getZipInfo(zipPath);
@@ -123,6 +132,18 @@
         fillRestoreInfo(zipPath, info);
         if (info.entries.some(function (e) { return e.encrypted; })) {
           isEncryptedBackup = true;
+          // The first password field is the ZIP password for a .zip
+          // and the backup (encryption) password for a .tvb — label
+          // it so the two can never be confused.
+          var isZip = (zipPath || '').toLowerCase().endsWith('.zip');
+          var pwLabel = $('restorePasswordLabel'), pwHint = $('restorePasswordHint');
+          if (isZip) {
+            if (pwLabel) pwLabel.textContent = 'ZIP password';
+            if (pwHint) pwHint.textContent = 'This ZIP is password-protected (WinZip AES-256). Enter its ZIP password — 7-Zip can open it with this password.';
+          } else {
+            if (pwLabel) pwLabel.textContent = 'Backup password';
+            if (pwHint) pwHint.textContent = 'This backup is encrypted (TechVision-only). Enter its backup password to restore it.';
+          }
           $('restorePasswordField').style.display = 'block';
         }
       } else {
@@ -173,6 +194,13 @@
     var pw = $('restorePassword').value;
     if (isEncryptedBackup && !pw) { $('restorePasswordError').classList.add('show'); ok = false; }
     else $('restorePasswordError').classList.remove('show');
+    // A layered backup's second password: the field is only shown
+    // after a ZIP_PASSWORD_REQUIRED result, and is then required.
+    var zipField = $('restoreZipPasswordField');
+    var zipFieldVisible = !!(zipField && zipField.style.display !== 'none');
+    var zipPw = $('restoreZipPassword') ? $('restoreZipPassword').value : '';
+    if (zipFieldVisible && !zipPw) { $('restoreZipPasswordError').classList.add('show'); ok = false; }
+    else $('restoreZipPasswordError').classList.remove('show');
     if (!ok) { toast('Missing information', 'Please choose a backup file and a destination folder.', 'warning'); return; }
     if (!api || typeof api.restoreAll !== 'function') { toast('Restore unavailable', 'Restore API is not available.', 'error'); return; }
     $('startBtn').disabled = true;
@@ -190,14 +218,32 @@
       // files are then skipped, never replaced. Verification always
       // runs (manifest/CRC) — there is no toggle for it any more.
       var ow = $('optOverwrite');
-      var result = await api.restoreAll(zipPath, dest, isEncryptedBackup ? $('restorePassword').value : null, { overwrite: !!(ow && ow.checked) });
+      // The first password opens the .tvb (or a plain encrypted
+      // ZIP); the second opens the ZIP inside a layered .tvb.
+      var result = await api.restoreAll(zipPath, dest, isEncryptedBackup ? $('restorePassword').value : null, { overwrite: !!(ow && ow.checked), zipPassword: zipPw || null });
       clearInterval(timer);
       var files = result ? Number(result.files ?? result.restoredFiles ?? result.fileCount ?? 0) : 0;
       var skipped = result ? Number(result.files_skipped ?? result.filesSkipped ?? result.skipped ?? 0) : 0;
       setProgress(100, files, '');
       if (result && result.success === false) {
-        showResult(false, 'Restore failed', result.error || result.message || 'The restore did not complete.');
-        toast('Restore failed', result.error || result.message || 'The restore did not complete.', 'error');
+        var errMsg = result.error || result.message || 'The restore did not complete.';
+        if (errMsg.indexOf('ZIP_PASSWORD_REQUIRED') === 0) {
+          // Layered backup: the .tvb opened with the backup
+          // password, but the ZIP inside is also password-protected.
+          // Show the second (ZIP) password field — the backup
+          // password stays as typed — and ask for the ZIP one.
+          // The field's error line stays hidden until the user
+          // actually submits without a password (the validation
+          // below shows it then); showing it here as well would
+          // push the page past the no-scroll limit.
+          var zf = $('restoreZipPasswordField');
+          if (zf) zf.style.display = 'block';
+          showResult(false, 'ZIP password needed', 'Enter the ZIP password for the backup inside, then press Start Restore again.');
+          toast('ZIP password needed', 'Enter the ZIP password and press Start Restore again.', 'warning');
+        } else {
+          showResult(false, 'Restore failed', errMsg);
+          toast('Restore failed', errMsg, 'error');
+        }
       } else {
         showResult(true, 'Restore completed', files + ' file' + (files === 1 ? '' : 's') + ' restored to ' + dest + '.');
         if (skipped > 0) {
@@ -262,6 +308,8 @@
     $('restoreTo').value = '';
     $('restorePassword').value = '';
     $('restorePasswordField').style.display = 'none';
+    var zp = $('restoreZipPassword'); if (zp) zp.value = '';
+    var zf = $('restoreZipPasswordField'); if (zf) zf.style.display = 'none';
     showValid(null, null);
     var ei = $('restoreInfoEmpty'); if (ei) ei.style.display = '';
     var il = $('restoreInfoList'); if (il) { il.style.display = 'none'; il.innerHTML = ''; }

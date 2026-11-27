@@ -54,7 +54,11 @@
     </div>
     <header class="topbar" id="appHeader">
       <div>
-        <h1 id="appTitle">TechVision Backup</h1>
+        <div class="title-row">
+          <button class="back-btn title-back-btn" type="button" id="wizardBackBtn" style="display:none;">‹ Back</button>
+          <button class="back-btn title-back-btn" type="button" id="restoreBackBtn" style="display:none;">‹ Back</button>
+          <h1 id="appTitle">TechVision Backup</h1>
+        </div>
         <p id="appSubtitle">Your data, protected — full and incremental backups, fast streaming restore.</p>
       </div>
       <div class="topbar-actions">
@@ -883,7 +887,6 @@
       <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
       <div>
         <div class="title-row">
-          <button class="back-btn title-back-btn" type="button" id="wizardBackBtn">‹ Back</button>
           <h1 id="wizardTitle">New Backup Job</h1>
         </div>
         <p>Five quick steps — the wizard stays open while you pick folders.</p>
@@ -959,7 +962,7 @@
 
       <!-- Step 3: Options & Schedule -->
       <section class="step-panel" data-panel="3">
-        <h3 style="margin:0 0 6px;">Backup Options</h3>
+        <h3 style="margin:0 0 2px;">Backup Options</h3>
         <div class="toggle-row">
           <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Back up only files that changed since the last backup.</div></div>
           <label class="switch"><input type="checkbox" id="optIncremental" checked><span class="slider"></span></label>
@@ -968,27 +971,43 @@
           <div><div class="t-label">Compress backup</div><div class="t-sub">Compress the files before storing them. Off means the backup stores the files as-is.</div></div>
           <label class="switch"><input type="checkbox" id="optCompress" checked><span class="slider"></span></label>
         </div>
-        <div id="compressLevelField" style="margin:2px 0 0;">
+        <div id="compressLevelField" style="margin:0;">
           <div class="radio-row">
             <label><input type="radio" name="compressLevel" value="standard" checked> Standard <span style="color:var(--muted-2);font-size:12px;">— Deflate level 6, faster</span></label>
             <label><input type="radio" name="compressLevel" value="advanced"> Advanced <span style="color:var(--muted-2);font-size:12px;">— Deflate level 9, smaller</span></label>
           </div>
           <div class="radio-row">
-            <label><input type="radio" name="compressLevel" value="standard-pw"> Standard with password <span style="color:var(--muted-2);font-size:12px;">— level 6, encrypted</span></label>
-            <label><input type="radio" name="compressLevel" value="advanced-pw"> Advanced with password <span style="color:var(--muted-2);font-size:12px;">— level 9, encrypted</span></label>
+            <label><input type="radio" name="compressLevel" value="standard-pw"> Standard with password <span style="color:var(--muted-2);font-size:12px;">— level 6, ZIP password</span></label>
+            <label><input type="radio" name="compressLevel" value="advanced-pw"> Advanced with password <span style="color:var(--muted-2);font-size:12px;">— level 9, ZIP password</span></label>
           </div>
-          <div class="hint">Picking a "with password" choice turns encryption on — you set the password on the next step.</div>
+          <div class="hint">"With password" sets a ZIP password (WinZip AES) — not encryption; that's the next step.</div>
+          <div id="zipPwFields" style="display:none; margin-top:2px;">
+            <div class="input-row">
+              <div class="field">
+                <label for="zipPassword">ZIP password</label>
+                <input type="password" id="zipPassword" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
+                <div class="field-error" id="zipPasswordError">Password must be at least 12 characters with uppercase, lowercase, numbers and symbols.</div>
+              </div>
+              <div class="field">
+                <label for="zipPasswordConfirm">Repeat ZIP password</label>
+                <input type="password" id="zipPasswordConfirm" placeholder="Repeat the ZIP password" autocomplete="new-password">
+                <div class="field-error" id="zipPasswordConfirmError">Passwords do not match.</div>
+              </div>
+            </div>
+            <div class="note" id="zipVaultNote" style="display:none;"><strong>Password saved:</strong> this job already has a ZIP password in the vault — leave the fields blank to keep it.</div>
+            <div class="hint">Never written into the job file — encrypted in the vault when unlocked.</div>
+          </div>
         </div>
         <div class="toggle-row">
           <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
           <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
         </div>
-        <h3 style="margin:6px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
+        <h3 style="margin:2px 0 2px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
         <div class="toggle-row">
           <div><div class="t-label">Run on schedule</div><div class="t-sub">Run this job automatically.</div></div>
           <label class="switch"><input type="checkbox" id="optSchedule"><span class="slider"></span></label>
         </div>
-        <div id="scheduleFields" style="display:none; margin-top:12px;">
+        <div id="scheduleFields" style="display:none; margin-top:6px;">
           <div class="field">
             <label>Frequency</label>
             <div class="radio-row">
@@ -1010,7 +1029,6 @@
                 <label><input type="checkbox" name="customDay" value="4"> Thu</label>
                 <label><input type="checkbox" name="customDay" value="5"> Fri</label>
               </div>
-              <div class="hint">Pick the days this job runs, at the time below.</div>
             </div>
             <div class="field" style="flex:0 0 150px;">
               <label for="scheduleTime">Time</label>
@@ -1068,7 +1086,6 @@
       <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
       <div>
         <div class="title-row">
-          <button class="back-btn title-back-btn" type="button" id="restoreBackBtn">‹ Back</button>
           <h1>Restore Backup</h1>
         </div>
         <p>Pick a .zip backup file and a folder to restore it into.</p>
@@ -1113,10 +1130,15 @@
             <div class="field-error" id="restoreDestError">Please choose a destination folder.</div>
           </div>
           <div class="field" id="restorePasswordField" style="display:none;">
-            <label for="restorePassword">Backup password</label>
+            <label for="restorePassword" id="restorePasswordLabel">Backup password</label>
             <input type="password" id="restorePassword" placeholder="Password for this encrypted backup" autocomplete="off">
-            <div class="hint">This backup is encrypted (TechVision-only). Enter its backup password to restore it.</div>
+            <div class="hint" id="restorePasswordHint">This backup is encrypted (TechVision-only). Enter its backup password to restore it.</div>
             <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
+          </div>
+          <div class="field" id="restoreZipPasswordField" style="display:none;">
+            <label for="restoreZipPassword">ZIP password (WinZip AES)</label>
+            <input type="password" id="restoreZipPassword" placeholder="ZIP password for the backup inside this file" autocomplete="off">
+            <div class="field-error" id="restoreZipPasswordError">Please enter the ZIP password.</div>
           </div>
           <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>
           <div id="restoreAdvanced" style="display:none; margin-top:2px;">

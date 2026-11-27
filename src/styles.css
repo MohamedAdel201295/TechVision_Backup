@@ -546,6 +546,15 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 }
 
 .confirm-modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 60; width: min(420px, calc(100vw - 32px)); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); padding: 20px; }
+/* The Yes/No dialog is always the topmost question when shown: it
+   must paint above every other modal, including #vaultModal, which
+   shares .confirm-modal (z-index 60) but sits LATER in the DOM —
+   a confirm opened over the startup unlock modal (the "I forgot
+   it" reset) used to be invisible and unclickable behind it. The
+   backdrop goes above the other modals too, so the vault modal is
+   dimmed while the question is up. Toasts (100) stay on top. */
+#confirmModal { z-index: 70; }
+#confirmBackdrop.show { z-index: 65; }
 .confirm-modal h3 { margin: 0 0 8px; font-size: 18px; }
 .confirm-modal p { margin: 0; color: var(--muted); font-size: 14px; }
 .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
@@ -841,13 +850,38 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
    removed — the note keeps all its facts, the hint keeps its message.
    Every rule here is scoped to #view-restore, so no other page
    changes. */
-#view-restore .modal-body { padding: 8px 22px 12px; }
+#view-restore .modal-body { padding: 8px 22px 10px; }
 #view-restore .field { margin-bottom: 4px; }
 #view-restore .field label { margin-bottom: 4px; }
 #view-restore .field input[type="text"], #view-restore .field input[type="password"] { padding: 6px 10px; }
 #restorePasswordField .hint { line-height: 1.35; }
 #view-restore .note { padding: 8px 15px; margin: 4px 0 8px; font-size: 12.5px; }
+/* The result box (a .note) also shows the "ZIP password needed"
+   message in the layered flow — it shares the page with the second
+   password field, so it is a touch tighter than the other notes. */
+#view-restore #resultBox { padding: 4px 12px; margin: 2px 0 4px; }
 #restoreAdvancedBtn { padding-top: 6px; padding-bottom: 6px; }
+/* Wizard step 3, ZIP password fields (item 6): the two fields + hint
+   add ~183px to the Options step, which pushed it 38px past the
+   no-scroll limit at the real 1200x800 window (615 vs 577). The
+   hint is one line now and the field spacing is tightened — scoped
+   to #zipPwFields only, so no other step changes. */
+#zipPwFields .field { margin-bottom: 4px; }
+#zipPwFields .field label { margin-bottom: 4px; }
+#zipPwFields .field input[type="password"] { padding: 6px 12px; }
+/* The two ZIP fields sit side by side (one row instead of two
+   stacked) so the Options step stays compact when they are shown. */
+#zipPwFields .input-row .field { flex: 1; min-width: 0; margin-bottom: 0; }
+/* Wizard body padding (same as the restore page): the Options step
+   with the ZIP fields shown needs a few more pixels at the real
+   1200x800 window — this also gives step 5 (the tightest step)
+   a little more room. */
+#view-wizard .modal-body { padding: 8px 22px 12px; }
+/* The wizard's toggle rows are two lines of text (label + sub).
+   A slightly tighter line-height keeps the tallest step (Options +
+   Schedule, both sections expanded) inside the no-scroll budget. */
+#view-wizard .toggle-row .t-label { line-height: 1.25; }
+#view-wizard .toggle-row .t-sub { line-height: 1.25; }
 @media (max-width: 860px) {
   .restore-layout { grid-template-columns: 1fr; }
   .restore-side { position: static; }

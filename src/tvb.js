@@ -7,7 +7,8 @@
  *
  * Format (all integers little-endian, all offsets absolute):
  *   Header (28 bytes):
- *     magic 'TVB1' (4), version u16 = 1, flags u16 (bit 0 = encrypted),
+ *     magic 'TVB1' (4), version u16 = 2, flags u16 (bit 0 = encrypted,
+ *     bit 1 = layered: the single entry is a whole ZIP — see below)
  *     salt (16 bytes, scrypt salt), reserved u32 = 0.
  *   Entries (data only, in the order they were written):
  *     ciphertext || GCM tag (16 bytes). Plaintext = the file's bytes,
@@ -18,8 +19,30 @@
  *       originalSize u64, storedSize u64 (ciphertext + tag),
  *       dataOffset u64, mtimeMs u64, method u8 (0 = stored, 1 = deflate),
  *       iv (12 bytes), sha256 (32 bytes, of the ORIGINAL content).
- *   Trailer (16 bytes):
- *     indexOffset u64, indexLen u32, magic 'TVBX' (4).
+ *   Trailer (48 bytes):
+ *     indexOffset u64, indexLen u32, indexTag (32 bytes), magic 'TVBX' (4).
+ *
+ * Version 2 authenticates the index: indexTag is HMAC-SHA256 over
+ * (indexOffset || indexLen || index bytes) under a domain-separated
+ * key derived from the backup key, so renaming, removing, reordering
+ * or altering any index entry is detected before any restore uses
+ * it. Names stay readable without a password (like a ZIP central
+ * directory); inspectTvb verifies the tag whenever a password is
+ * given, and the restore paths always give it. Version 1 files
+ * (unauthenticated index, 16-byte trailer) are rejected as
+ * unsupported — no old .tvb is silently trusted.
+ *
+ * Layered backups (both passwords): when a job ALSO has a ZIP
+ * password, the backup is a password-protected ZIP (WinZip AES)
+ * encrypted inside the .tvb as a SINGLE entry named 'archive.zip'
+ * (TVB_LAYERED_ENTRY), stored uncompressed — the ZIP is already
+ * compressed and encrypted. The header flag bit 1 (TVB_FLAG_LAYERED)
+ * marks it, so a restore can tell a layered .tvb from a per-file
+ * .tvb that happens to hold one file of that name. The .tvb layer
+ * is still streamed (the archiver output feeds addFile as a stream,
+ * never a temp file) and the index is still authenticated the same
+ * way. Restore: the encryption password decrypts the .tvb, the
+ * inner ZIP is then restored with the ZIP password (see restore.js).
  *
  * The key is scrypt(password, salt, N=16384, r=8, p=1, 32 bytes) —
  * the same parameters as the vault. Every entry gets its own random
@@ -49,10 +72,13 @@ const { Transform } = require('stream');
 
 const TVB_MAGIC = Buffer.from('TVB1', 'ascii');
 const TVB_TRAILER_MAGIC = Buffer.from('TVBX', 'ascii');
-const TVB_VERSION = 1;
+const TVB_VERSION = 2;
 const TVB_FLAG_ENCRYPTED = 0x0001;
+const TVB_FLAG_LAYERED = 0x0002; // single entry is a whole ZIP (see the doc comment)
+const TVB_LAYERED_ENTRY = 'archive.zip'; // the inner ZIP's name inside a layered .tvb
 const TVB_HEADER_SIZE = 28; // magic(4) + version(2) + flags(2) + salt(16) + reserved(4)
-const TVB_TRAILER_SIZE = 16; // indexOffset(8) + indexLen(4) + magic(4)
+const TVB_TRAILER_SIZE = 48; // indexOffset(8) + indexLen(4) + indexTag HMAC-SHA256(32) + magic(4)
+const TVB_INDEX_TAG_LEN = 32;
 const TVB_TAG_LEN = 16;
 const TVB_IV_LEN = 12;
 const TVB_SALT_LEN = 16;
@@ -87,6 +113,30 @@ function authError(message) {
   return e;
 }
 
+// Cancellation: a recognizable condition the engine already treats
+// as "stopped by user" (result.cancelled, partial artifact deleted).
+function cancelledError() {
+  const e = new Error('Backup stopped by user');
+  e.code = 'BACKUP_CANCELLED';
+  return e;
+}
+
+// Index authentication (v2): HMAC-SHA256 over (indexOffset ||
+// indexLen || index bytes) under a domain-separated key — the entry
+// cipher key must never double as the MAC key.
+function indexMacKey(key) {
+  return crypto.createHmac('sha256', key).update('tvb-index-auth-v2').digest();
+}
+function indexTag(key, indexOffset, indexLen, indexBuf) {
+  const h = crypto.createHmac('sha256', indexMacKey(key));
+  const head = Buffer.alloc(12);
+  head.writeBigUInt64LE(BigInt(indexOffset), 0);
+  head.writeUInt32LE(indexLen, 8);
+  h.update(head);
+  h.update(indexBuf);
+  return h.digest();
+}
+
 /**
  * Writer: streams one .tvb file. One entry per file, in the order
  * addFile is called; finish() writes the index + trailer and closes.
@@ -101,11 +151,17 @@ function authError(message) {
  *   engine rethrows it past the per-file handler.
  */
 class TvbWriter {
-  constructor(outPath, password, compression) {
+  constructor(outPath, password, compression, options) {
     if (!password) throw new Error('Encryption is on but no password was provided for this job.');
     this.outPath = outPath;
     this.compress = compression !== 'none';
     this.level = compression === 'advanced' ? 9 : 6;
+    // Layered backup (both passwords): the .tvb holds ONE entry —
+    // a whole password-protected ZIP streamed in as a source stream
+    // (see addFile). The flag marks it so a restore never mistakes
+    // a per-file .tvb of one file called 'archive.zip' for a
+    // layered one.
+    this._layered = !!(options && options.layered);
     this.salt = crypto.randomBytes(TVB_SALT_LEN);
     this.key = deriveTvbKey(password, this.salt);
     this.output = fs.createWriteStream(outPath);
@@ -116,7 +172,33 @@ class TvbWriter {
     this._currentStored = 0; // ciphertext bytes streamed for the entry in progress
     this._active = null; // streams of the entry in progress (for destroy)
     this._destroyed = false;
+    // Settles the moment destroy() runs: every await in this writer
+    // races against it, so a stop can never leave a promise pending
+    // (a destroyed stream emits 'close', not 'error'/'end' — the
+    // waits below used to listen for those only, and a stop
+    // mid-file hung the run forever).
+    this._destroyResolve = null;
+    this._destroyedPromise = new Promise((resolve) => { this._destroyResolve = resolve; });
     this._headerWritten = false;
+  }
+
+  // Write a buffer to the output, resolving when it is flushed —
+  // and rejecting with the cancel error if the writer is destroyed
+  // while the write is in flight (a destroyed stream's write
+  // callback alone is not a reliable settler).
+  _write(buf) {
+    if (this._destroyed) return Promise.reject(cancelledError());
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      this._destroyedPromise.then(() => {
+        if (!settled) { settled = true; reject(cancelledError()); }
+      });
+      this.output.write(buf, (err) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err); else resolve();
+      });
+    });
   }
 
   async _writeHeader() {
@@ -124,23 +206,27 @@ class TvbWriter {
     const header = Buffer.alloc(TVB_HEADER_SIZE);
     TVB_MAGIC.copy(header, 0);
     header.writeUInt16LE(TVB_VERSION, 4);
-    header.writeUInt16LE(TVB_FLAG_ENCRYPTED, 6);
+    header.writeUInt16LE(TVB_FLAG_ENCRYPTED | (this._layered ? TVB_FLAG_LAYERED : 0), 6);
     this.salt.copy(header, 8);
     header.writeUInt32LE(0, 24);
-    await writeToStream(this.output, header);
+    await this._write(header);
     this.position += TVB_HEADER_SIZE;
     this._headerWritten = true;
   }
 
   /**
    * Add one file. `onBytes(n)` reports original bytes read (progress).
-   * Resolves { hash, size } — the SHA-256 of the ORIGINAL bytes and
-   * the original size, for the engine's backup state. Throws on a
-   * source error (one failed file) or TVB_OUTPUT_FAILED (whole run).
+   * `filePath` is normally a file path; for a layered backup it is a
+   * readable stream (the archiver output) and `stats` is null — the
+   * entry size then comes from the bytes actually read (bytesIn),
+   * and mtime is 0. Resolves { hash, size } — the SHA-256 of the
+   * ORIGINAL bytes and the original size, for the engine's backup
+   * state. Throws on a source error (one failed file) or
+   * TVB_OUTPUT_FAILED (whole run).
    */
   async addFile(name, filePath, stats, onBytes) {
     await this._writeHeader();
-    if (this._destroyed) throw new Error('Backup stopped by user');
+    if (this._destroyed) throw cancelledError();
     if (this._outputError) throw outputFailed(this._outputError);
     const method = this.compress ? 1 : 0;
     const iv = crypto.randomBytes(TVB_IV_LEN);
@@ -169,7 +255,12 @@ class TvbWriter {
     });
     countOut._stored = 0;
     const cipher = crypto.createCipheriv('aes-256-gcm', this.key, iv);
-    const rs = fs.createReadStream(filePath);
+    // Layered case: the source is a readable stream (the archiver),
+    // not a path. The gate below works the same on either — a stream
+    // emits readable/error/end/close just like a file stream.
+    const rs = (filePath && typeof filePath === 'object' && typeof filePath.pipe === 'function')
+      ? filePath
+      : fs.createReadStream(filePath);
     const deflate = this.compress ? zlib.createDeflate({ level: this.level }) : null;
     this._active = { rs: rs, tee: tee, deflate: deflate, cipher: cipher, countOut: countOut };
     try {
@@ -179,12 +270,17 @@ class TvbWriter {
       let gateError = null;
       const onGateError = (err) => { if (!gateError) gateError = err; };
       rs.on('error', onGateError);
+      // 'close' is the backstop: a destroyed stream emits 'close',
+      // not 'readable'/'error'/'end', so without it a stop during
+      // the gate would hang this await forever.
       await new Promise((resolve) => {
         rs.once('readable', resolve);
         rs.once('error', resolve);
         rs.once('end', resolve);
+        rs.once('close', resolve);
       });
       rs.removeListener('error', onGateError);
+      if (this._destroyed) throw cancelledError();
       if (gateError) throw gateError;
       // Pipe the chain into the shared output stream (never ending
       // it — the writer owns it until finish()). This is a manual
@@ -208,8 +304,9 @@ class TvbWriter {
       await new Promise((resolve, reject) => {
         let settled = false;
         const cleanup = () => {
-          for (const s of stages) s.removeListener('error', onErr);
+          for (const s of stages) { s.removeListener('error', onErr); s.removeListener('close', onClosed); }
           this.output.removeListener('error', onErr);
+          this.output.removeListener('close', onClosed);
           countOut.removeListener('end', onDrained);
         };
         const done = (err) => {
@@ -224,14 +321,21 @@ class TvbWriter {
         };
         const onErr = (err) => done(err);
         const onDrained = () => done(null);
-        for (const s of stages) s.on('error', onErr);
+        // 'close' settles a stop: destroy() tears the stages down
+        // without an error, so 'error'/'end' alone never fire. The
+        // _destroyed guard keeps normal closes (a stage ending and
+        // auto-destroying while bytes are still flowing downstream)
+        // from ending the wait early — 'end' always settles first.
+        const onClosed = () => { if (this._destroyed) done(cancelledError()); };
+        for (const s of stages) { s.on('error', onErr); s.on('close', onClosed); }
         this.output.on('error', onErr);
+        this.output.on('close', onClosed);
         countOut.on('end', onDrained);
       });
       this._currentStored = countOut._stored;
       // The GCM tag goes right after the ciphertext, inside the entry.
       const tag = cipher.getAuthTag();
-      await writeToStream(this.output, tag);
+      await this._write(tag);
       this.position += this._currentStored + TVB_TAG_LEN;
       const storedSize = this._currentStored + TVB_TAG_LEN;
       this._currentStored = 0;
@@ -256,34 +360,55 @@ class TvbWriter {
       this.position += (countOut && countOut._stored) || 0;
       this._currentStored = 0;
       this._active = null;
+      if (this._destroyed) throw cancelledError();
       if (this._outputError) throw outputFailed(this._outputError);
       throw e;
     }
   }
 
   async finish() {
-    if (this._destroyed) throw new Error('Backup stopped by user');
+    if (this._destroyed) throw cancelledError();
     if (this._outputError) throw outputFailed(this._outputError);
     await this._writeHeader();
     const indexOffset = this.position;
     const index = buildIndexBuffer(this.entries);
-    await writeToStream(this.output, index);
+    // Authenticate the whole index before it is written: a later
+    // rename/remove/reorder of any entry must fail verification.
+    const tag = indexTag(this.key, indexOffset, index.length, index);
+    await this._write(index);
     const trailer = Buffer.alloc(TVB_TRAILER_SIZE);
     trailer.writeBigUInt64LE(BigInt(indexOffset), 0);
     trailer.writeUInt32LE(index.length, 8);
-    TVB_TRAILER_MAGIC.copy(trailer, 12);
-    await writeToStream(this.output, trailer);
-    await new Promise((resolve, reject) => {
-      this.output.end((err) => { if (err) reject(err); else resolve(); });
-    });
+    tag.copy(trailer, 12);
+    TVB_TRAILER_MAGIC.copy(trailer, 12 + TVB_INDEX_TAG_LEN);
+    await this._write(trailer);
+    // A stop during finalization must settle too: race the end
+    // against the destroy signal (the .catch() swallows the late
+    // rejection when the end wins and destroy comes later).
+    const onDestroy = this._destroyedPromise.then(() => { throw cancelledError(); });
+    onDestroy.catch(() => {});
+    await Promise.race([
+      new Promise((resolve, reject) => {
+        this.output.end((err) => { if (err) reject(err); else resolve(); });
+      }),
+      onDestroy
+    ]);
     if (this._outputError) throw outputFailed(this._outputError);
   }
 
   // Stop support: tear down the live streams so a stop lands
   // promptly. The engine deletes the partial .tvb afterwards.
+  // The stages are destroyed WITHOUT an error on purpose: destroying
+  // with an error would emit 'error' on a stage whose listeners the
+  // completion promise already removed (the tag-write window after
+  // it settles) — an unhandled 'error' event that crashes the
+  // process. A plain destroy emits 'close', which every wait in
+  // this writer listens for (gate, completion, _write race), so the
+  // stop still settles everywhere with the cancel error.
   destroy() {
     if (this._destroyed) return;
     this._destroyed = true;
+    if (this._destroyResolve) { try { this._destroyResolve(); } catch (e) {} }
     const a = this._active;
     this._active = null;
     try { if (a && a.rs) a.rs.destroy(); } catch (e) {}
@@ -329,11 +454,17 @@ function buildIndexBuffer(entries) {
  * what is encrypted. Throws on a file that is not a .tvb, an
  * unsupported version, or a corrupt/truncated index — never with
  * "wrong password".
- * Returns { encrypted: true, version, salt, entries } where each
- * entry is { name, size, storedSize, dataOffset, mtimeMs, method,
- * iv (Buffer), sha256 (hex) }.
+ * With a password, the index tag is verified FIRST: a renamed,
+ * removed, reordered or otherwise altered index entry is rejected
+ * here, before any restore trusts it. A wrong password and a
+ * tampered index fail the same way ("Wrong password or the backup
+ * file is damaged") — the two cannot be told apart by design, and
+ * neither reveals which it was.
+ * Returns { encrypted: true, version, salt, entries, indexVerified }
+ * where each entry is { name, size, storedSize, dataOffset, mtimeMs,
+ * method, iv (Buffer), sha256 (hex) }.
  */
-function inspectTvb(filePath) {
+function inspectTvb(filePath, password) {
   const fd = fs.openSync(filePath, 'r');
   try {
     const fileSize = fs.fstatSync(fd).size;
@@ -356,7 +487,7 @@ function inspectTvb(filePath) {
     const salt = Buffer.from(header.subarray(8, 24));
     const trailer = Buffer.alloc(TVB_TRAILER_SIZE);
     readFully(fd, trailer, TVB_TRAILER_SIZE, fileSize - TVB_TRAILER_SIZE);
-    if (!trailer.subarray(12, 16).equals(TVB_TRAILER_MAGIC)) {
+    if (!trailer.subarray(12 + TVB_INDEX_TAG_LEN, TVB_TRAILER_SIZE).equals(TVB_TRAILER_MAGIC)) {
       throw new Error('Backup file is corrupt or truncated (missing index).');
     }
     const indexOffset = Number(trailer.readBigUInt64LE(0));
@@ -366,6 +497,19 @@ function inspectTvb(filePath) {
     }
     const indexBuf = Buffer.alloc(indexLen);
     readFully(fd, indexBuf, indexLen, indexOffset);
+    if (password) {
+      // The tag covers the complete index (and its position/length):
+      // any rename, removal, reorder or altered field fails here.
+      // Without a password the index is display-only — the restore
+      // paths always pass one, so unverified entries are never used
+      // to write files.
+      const key = deriveTvbKey(password, salt);
+      const expected = indexTag(key, indexOffset, indexLen, indexBuf);
+      const stored = Buffer.from(trailer.subarray(12, 12 + TVB_INDEX_TAG_LEN));
+      if (!crypto.timingSafeEqual(expected, stored)) {
+        throw authError('Wrong password or the backup file is damaged.');
+      }
+    }
     let off = 0;
     const count = indexBuf.readUInt32LE(off); off += 4;
     const entries = [];
@@ -390,7 +534,16 @@ function inspectTvb(filePath) {
       entries.push({ name: name, size: originalSize, storedSize: storedSize, dataOffset: dataOffset, mtimeMs: mtimeMs, method: method, iv: iv, sha256: sha256 });
     }
     if (off !== indexBuf.length) throw new Error('Backup file is corrupt or truncated (bad index).');
-    return { encrypted: true, version: version, salt: salt, entries: entries };
+    // A layered .tvb's single entry is a whole ZIP, not a file —
+    // the restore needs to know before it treats archive.zip as a
+    // file to extract. The flag is part of the header (not the
+    // index), so it is covered by the index tag only indirectly —
+    // but a flipped flag is harmless either way: with the flag
+    // cleared the inner ZIP restores as a plain file (the user gets
+    // archive.zip, still decryptable with the same password), and
+    // with the flag set on a per-file .tvb the restore fails
+    // cleanly because the entry is not a ZIP.
+    return { encrypted: true, version: version, salt: salt, entries: entries, indexVerified: !!password, layered: (flags & TVB_FLAG_LAYERED) !== 0 };
   } finally {
     fs.closeSync(fd);
   }
@@ -476,7 +629,9 @@ async function decryptEntryStream(fd, entry, key, ws) {
  * on a wrong password / tampered ciphertext, a plain Error otherwise.
  */
 async function decryptEntryToFile(tvbPath, entry, password, tmpPath) {
-  const info = inspectTvb(tvbPath);
+  // The password is passed so the index tag is verified BEFORE the
+  // entry is trusted for a restore.
+  const info = inspectTvb(tvbPath, password);
   if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
   const key = deriveTvbKey(password, info.salt);
   const fd = fs.openSync(tvbPath, 'r');
@@ -507,7 +662,9 @@ async function extractTvb(tvbPath, restoreDir, password, callbacks) {
   const onFile = (callbacks && callbacks.onFile) || function () {};
   const commit = (callbacks && callbacks.commit) || null;
   const errors = [];
-  const info = inspectTvb(tvbPath);
+  // The password is passed so the index tag is verified BEFORE any
+  // entry is trusted for a restore.
+  const info = inspectTvb(tvbPath, password);
   if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
   const key = deriveTvbKey(password, info.salt);
   const fd = fs.openSync(tvbPath, 'r');
@@ -527,13 +684,33 @@ async function extractTvb(tvbPath, restoreDir, password, callbacks) {
         errors.push('Failed to create folder for ' + rel + ': ' + e.message);
         continue;
       }
-      const tmp = dest + '.tvtmp-' + process.pid + '-' + (++extractCounter);
+      // A pre-existing symlink (or Windows junction) inside the
+      // restore folder could redirect this write outside it — the
+      // lexical check above cannot see it. Resolve the REAL parent
+      // and check it against the REAL restore root before writing
+      // anything (same policy as the plain-ZIP restore path), and
+      // write the temp file and the commit through the real path, so
+      // a link swapped after this check cannot redirect the write.
+      let realDest = dest;
+      try {
+        const realBase = fs.realpathSync(restoreBase);
+        const realParent = fs.realpathSync(path.dirname(dest));
+        if (realParent !== realBase && !realParent.startsWith(realBase + path.sep)) {
+          errors.push('Skipped unsafe path: ' + rel);
+          continue;
+        }
+        realDest = path.join(realParent, path.basename(dest));
+      } catch (e) {
+        errors.push('Failed to create folder for ' + rel + ': ' + e.message);
+        continue;
+      }
+      const tmp = realDest + '.tvtmp-' + process.pid + '-' + (++extractCounter);
       const ws = fs.createWriteStream(tmp);
       attempted++;
       try {
         await decryptEntryStream(fd, entry, key, ws);
         let committed = true;
-        if (commit) committed = commit(rel, tmp, dest);
+        if (commit) committed = commit(rel, tmp, realDest);
         if (committed) onFile(rel, entry.size);
       } catch (e) {
         try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e2) {}
@@ -563,5 +740,7 @@ module.exports = {
   deriveTvbKey,
   TVB_MAGIC,
   TVB_TRAILER_MAGIC,
-  TVB_VERSION
+  TVB_VERSION,
+  TVB_FLAG_LAYERED,
+  TVB_LAYERED_ENTRY
 };

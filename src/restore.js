@@ -14,6 +14,11 @@ const { Transform } = require('stream');
 // so encrypted backups go through this module instead. A .tvb is
 // NOT a ZIP — no outside program can open it.
 const tvb = require('./tvb.js');
+// ZIP-password layer (WinZip AES): yauzl cannot decrypt, so a
+// password-protected ZIP goes through this module instead. The
+// format is standard, so 7-Zip opens the same file with the same
+// password — deliberately unlike the .tvb layer above.
+const zipAes = require('./zip-aes.js');
 
 // --- CRC32 (for the plain-ZIP restore paths below, which verify each
 // entry against its central-directory CRC) ---
@@ -77,8 +82,22 @@ function restoreOptions(options) {
   // earlier artifacts of THIS chain restore) passes through: a
   // later artifact must overwrite files the chain itself wrote,
   // while files that existed before the restore are still skipped.
-  return { overwrite: !!(options && options.overwrite), chainWritten: (options && options.chainWritten) || null };
+  // zipPassword is the ZIP-layer password (a layered .tvb's inner
+  // ZIP, or a plain password-protected ZIP) — a non-string or empty
+  // value is treated as "no ZIP password given".
+  return {
+    overwrite: !!(options && options.overwrite),
+    chainWritten: (options && options.chainWritten) || null,
+    zipPassword: (options && typeof options.zipPassword === 'string' && options.zipPassword) ? options.zipPassword : null
+  };
 }
+
+// The error a layered restore returns (as the first error string)
+// when the inner ZIP is password-protected and no ZIP password was
+// given. The restore page watches for this prefix and shows the
+// second (ZIP) password field; the backup password stays the one
+// that opened the .tvb.
+const ZIP_PASSWORD_REQUIRED = 'ZIP_PASSWORD_REQUIRED';
 
 // Skip decision for overwrite OFF: only an existing regular FILE is
 // skipped. A directory at the destination path must NOT count as a
@@ -324,6 +343,42 @@ class RestoreEngine {
       try {
         if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
         if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
+        // Layered backup (both passwords): the .tvb holds ONE entry
+        // — a whole password-protected ZIP — not files. Decrypt it
+        // to a temp file inside the restore folder, then restore
+        // THAT as a ZIP (the encrypted-ZIP branch below, or the
+        // plain yauzl path). The temp file is always removed
+        // afterwards. The encryption password opens the .tvb; the
+        // ZIP password (opts.zipPassword) opens the ZIP inside.
+        // A layered .tvb is recognised by the header flag, not by
+        // the entry name alone — a per-file .tvb that happens to
+        // hold one file called 'archive.zip' is not layered.
+        const layeredInfo = tvb.inspectTvb(zipPath, password);
+        if (layeredInfo.layered) {
+          if (layeredInfo.entries.length !== 1 || layeredInfo.entries[0].name !== tvb.TVB_LAYERED_ENTRY) {
+            throw new Error('This backup is damaged: a layered backup must hold exactly one archive entry.');
+          }
+          const innerZip = path.join(restoreDir, '.' + path.basename(zipPath, path.extname(zipPath)) + '-inner.zip');
+          try {
+            await tvb.decryptEntryToFile(zipPath, layeredInfo.entries[0], password, innerZip);
+            // The inner ZIP is a whole artifact: restore it through
+            // the same single-artifact path. The recursion cannot
+            // loop — innerZip is a .zip, never a .tvb.
+            const inner = await this._restoreSingle(innerZip, restoreDir, opts.zipPassword, opts);
+            result.files_restored = inner.files_restored;
+            result.files_verified = inner.files_verified;
+            result.files_mismatched = inner.files_mismatched;
+            result.files_skipped = inner.files_skipped;
+            result.skipped_files = inner.skipped_files;
+            result.total_bytes = inner.total_bytes;
+            result.errors = inner.errors;
+            result.success = inner.success;
+            result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+            return result;
+          } finally {
+            try { fs.unlinkSync(innerZip); } catch (e) {}
+          }
+        }
         const extracted = await tvb.extractTvb(zipPath, restoreDir, password, {
           onFile: function (name, size) {
             result.files_restored++;
@@ -439,6 +494,46 @@ class RestoreEngine {
       result.errors.push(e.message);
       result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
       return result;
+    }
+    // Password-protected ZIP (WinZip AES): yauzl cannot decrypt, so
+    // the ZIP-AES reader handles the whole restore. This is the
+    // ZIP-password layer — a plain .zip whose entries are AES
+    // encrypted (7-Zip opens the same file with the same password),
+    // or the inner ZIP of a layered .tvb (see the .tvb branch
+    // above). A ZIP whose central directory cannot be read at all
+    // falls through to the yauzl path below (it may be a plain ZIP
+    // the reader could not parse); a wrong password fails the whole
+    // restore, and no partial file is left behind — the reader
+    // checks the password verification value BEFORE it streams any
+    // plaintext, and every entry is hash-verified before the rename.
+    let encryptedInfo = null;
+    try { encryptedInfo = zipAes.inspectZip(zipPath); } catch (e) { encryptedInfo = null; }
+    if (encryptedInfo && encryptedInfo.encrypted) {
+      try {
+        if (!password) {
+          throw new Error(ZIP_PASSWORD_REQUIRED + ': This backup is password-protected. Enter its ZIP password and try again.');
+        }
+        if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
+        const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, (rel, size) => {
+          result.files_restored++;
+          result.total_bytes += size;
+        }, {
+          overwrite: opts.overwrite,
+          chainWritten: opts.chainWritten
+        });
+        result.files_skipped = extracted.skipped;
+        result.skipped_files = extracted.skipped_files;
+        result.errors = extracted.errors;
+        result.files_verified = result.files_restored;
+        result.success = result.files_mismatched === 0 && result.errors.length === 0;
+        result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+        return result;
+      } catch (e) {
+        result.success = false;
+        result.errors.push(e.message);
+        result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+        return result;
+      }
     }
     return new Promise((resolve, reject) => {
       let pendingEntries = 0;
@@ -680,9 +775,15 @@ class RestoreEngine {
     // silent fallback to yauzl (which cannot read a .tvb at all).
     if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
       const info = tvb.inspectTvb(zipPath);
-      return info.entries.map(function (e) {
+      const entries = info.entries.map(function (e) {
         return { path: e.name.replace(/\//g, path.sep), size: e.size, isDir: false, encrypted: true };
       });
+      // A layered .tvb's single entry is a whole ZIP, not a file —
+      // the info card must not report "1 file" and the ZIP's size.
+      // Carried as a property on the array so the return shape (an
+      // array of entries) does not change for other callers.
+      entries.layered = !!info.layered;
+      return entries;
     }
     // Plain ZIP: yauzl lists the entries (no `encrypted` flag on
     // yauzl, but bit 0 of the general-purpose flag is the encryption
@@ -804,26 +905,110 @@ class RestoreEngine {
     // retried through yauzl — which cannot decrypt and would either
     // fail confusingly or write garbage.
     if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
-      const info = tvb.inspectTvb(zipPath);
+      // The password is passed so the index tag is verified BEFORE
+      // the entry is trusted for a restore (a null password only
+      // happens when the caller did not give one — the explicit
+      // check below then refuses, before anything is written).
+      const info = tvb.inspectTvb(zipPath, password);
       const wanted = entryName.replace(/\\/g, '/');
+      if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
+      // Layered backup (both passwords): the .tvb holds ONE entry —
+      // a whole password-protected ZIP. Any entry other than the
+      // ZIP itself lives INSIDE it: decrypt the ZIP to a temp file
+      // and restore the entry from there. (The ZIP itself, asked
+      // for by name, falls through to the direct path below — it
+      // IS an entry of the .tvb.)
+      if (info.layered && wanted !== tvb.TVB_LAYERED_ENTRY) {
+        if (info.entries.length !== 1 || info.entries[0].name !== tvb.TVB_LAYERED_ENTRY) {
+          throw new Error('This backup is damaged: a layered backup must hold exactly one archive entry.');
+        }
+        const innerDir = path.dirname(destPath);
+        if (!fs.existsSync(innerDir)) fs.mkdirSync(innerDir, { recursive: true });
+        const innerZip = path.join(innerDir, '.' + path.basename(zipPath, path.extname(zipPath)) + '-inner.zip');
+        try {
+          await tvb.decryptEntryToFile(zipPath, info.entries[0], password, innerZip);
+          // The recursion cannot loop — innerZip is a .zip, never a
+          // .tvb — and it routes to the encrypted-ZIP or plain-ZIP
+          // single-file path below.
+          return await this._restoreFileSingle(innerZip, entryName, destPath, opts.zipPassword, opts);
+        } finally {
+          try { fs.unlinkSync(innerZip); } catch (e) {}
+        }
+      }
       const hit = info.entries.find(function (e) { return e.name === wanted; });
       if (!hit) {
         const e = new Error('Entry not found in backup: ' + entryName);
         e.code = 'ENTRY_NOT_FOUND';
         throw e;
       }
-      if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
       // The inspected entry already carries the full fields
       // (dataOffset, storedSize, iv, sha256, ...) — stream-decrypt
       // it straight into the temp file, never buffering the entry
       // (see tvb.js decryptEntryToFile).
       const dir = path.dirname(destPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // Containment (same policy as the bulk restore): the
+      // destination is the restore folder + the entry's path inside
+      // the backup, so the root is destPath with the entry's path
+      // segments removed. A pre-existing symlink (or Windows
+      // junction) in between must not redirect the write outside
+      // that root — resolve the REAL parent and write through it.
+      // (When the caller renames the file, the derived root is
+      // wider than the real folder — the check then passes, and
+      // the write still goes through the real parent.)
+      let realDest = destPath;
+      try {
+        const parts = wanted.split('/').filter(function (p) { return p && p !== '.'; });
+        let root = destPath;
+        for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+        const realRoot = fs.realpathSync(root);
+        const realParent = fs.realpathSync(dir);
+        if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+          throw new Error('Skipped unsafe path: ' + entryName);
+        }
+        realDest = path.join(realParent, path.basename(destPath));
+      } catch (e) {
+        if (/Skipped unsafe path/.test(e.message)) throw e;
+        throw new Error('Failed to create folder for ' + entryName + ': ' + e.message);
+      }
       // Write-then-rename (same rule as the plain path): a failed
       // write must not leave a partial file at the destination.
-      const tmpPath = tempPathFor(destPath);
+      const tmpPath = tempPathFor(realDest);
       try {
         await tvb.decryptEntryToFile(zipPath, hit, password, tmpPath);
+        const skipped = skippedResult(tmpPath);
+        if (skipped) return skipped;
+        fs.renameSync(tmpPath, realDest);
+      } catch (e) {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+        throw e;
+      }
+      return { files: 1 };
+    }
+    // Password-protected ZIP (WinZip AES), single file: yauzl
+    // cannot decrypt, so the ZIP-AES reader decrypts the entry
+    // straight into the temp file. A wrong password fails before
+    // any byte is written (the reader checks the password
+    // verification value first), and the HMAC + CRC are checked
+    // before the rename.
+    let encInfo = null;
+    try { encInfo = zipAes.inspectZip(zipPath); } catch (e) { encInfo = null; }
+    if (encInfo && encInfo.encrypted) {
+      const wanted = entryName.replace(/\\/g, '/');
+      const hit = encInfo.entries.find(function (e) { return e.name === wanted; });
+      if (!hit) {
+        const e = new Error('Entry not found in backup: ' + entryName);
+        e.code = 'ENTRY_NOT_FOUND';
+        throw e;
+      }
+      if (!password) {
+        throw new Error(ZIP_PASSWORD_REQUIRED + ': This backup is password-protected. Enter its ZIP password and try again.');
+      }
+      const dir = path.dirname(destPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmpPath = tempPathFor(destPath);
+      try {
+        await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
         const skipped = skippedResult(tmpPath);
         if (skipped) return skipped;
         fs.renameSync(tmpPath, destPath);

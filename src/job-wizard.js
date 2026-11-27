@@ -8,7 +8,8 @@
   var step = 1;
   var patterns = [];
   var editing = null;
-  var hasSavedPassword = false; // vault already holds a password for this job
+  var hasSavedPassword = false; // vault already holds a backup (encryption) password for this job
+  var hasSavedZipPassword = false; // vault already holds a ZIP password for this job
 
   function $(id) { return document.getElementById(id); }
   function driveLetterOf(p) {
@@ -149,6 +150,28 @@
           return false;
         }
       }
+      // ZIP password (the -pw radios): the same strength rule as
+      // the backup password (12+ chars, upper + lower + number +
+      // symbol). A saved vault password counts: blank fields keep
+      // it. Only when compression is on — with compression off
+      // there is no ZIP at all, so the -pw choice is dropped
+      // (see collectJob).
+      var levelRadio = document.querySelector('input[name="compressLevel"]:checked');
+      var wantsZipPw = $('optCompress').checked && !!(levelRadio && levelRadio.value.slice(-3) === '-pw');
+      if (wantsZipPw) {
+        if (hasSavedZipPassword && !$('zipPassword').value && !$('zipPasswordConfirm').value) { /* keep the saved one */ }
+        else {
+          var zpw = $('zipPassword').value;
+          var zpwError = strongPasswordError(zpw);
+          var zpwOk = !zpwError;
+          $('zipPasswordError').textContent = zpwError || '';
+          $('zipPasswordError').classList.toggle('show', !zpwOk);
+          var zmatchOk = zpwOk && $('zipPasswordConfirm').value === zpw;
+          $('zipPasswordConfirmError').classList.toggle('show', zpwOk && !zmatchOk);
+          if (!zpwOk) { toast('Password too weak', zpwError, 'warning'); $('zipPassword').focus(); return false; }
+          if (!zmatchOk) { toast('Passwords do not match', 'Please repeat the same ZIP password.', 'warning'); $('zipPasswordConfirm').focus(); return false; }
+        }
+      }
       return true;
     }
     if (n === 4) {
@@ -214,11 +237,14 @@
     }
     var levelRadio = document.querySelector('input[name="compressLevel"]:checked');
     // Four compression choices: standard / advanced, each plain or
-    // "with password" (the -pw radios). The -pw suffix is the
-    // ENCRYPTION choice, not a level: strip it for the compression
-    // level — encryption itself comes from the step-4 toggle, which
-    // the radios keep in sync (see syncLevelRadios).
+    // "with password" (the -pw radios). The -pw suffix is the ZIP
+    // PASSWORD choice, not a level and not the encryption choice:
+    // strip it for the compression level. Encryption itself comes
+    // from the step-4 toggle, which is INDEPENDENT — picking a
+    // -pw radio never turns it on, and toggling it never changes
+    // the radio. (The old sync between the two is gone.)
     var level = ((levelRadio && levelRadio.value) || 'standard').replace(/-pw$/, '');
+    var wantsZipPw = !!(levelRadio && levelRadio.value.slice(-3) === '-pw');
     return {
       // Every job gets a unique id. Two jobs may share a name, but they
       // must stay two separate tasks — the old code keyed everything by
@@ -235,6 +261,10 @@
       allowIncremental: $('optIncremental').checked,
       compress: $('optCompress').checked,
       compression: $('optCompress').checked ? level : 'none',
+      // The ZIP password only exists when compression is on: with
+      // compression off there is no ZIP at all (plain folder), so
+      // the -pw choice is dropped.
+      zipPasswordEnabled: $('optCompress').checked && wantsZipPw,
       encryptionEnabled: $('optEncrypt').checked,
       verify: $('optVerify').checked,
       use_vss: false,
@@ -254,6 +284,10 @@
       ['Include patterns', j.includePatterns.length ? j.includePatterns.join(', ') : 'All files'],
       ['Incremental', j.allowIncremental ? 'Yes' : 'No'],
       ['Compression', j.compress ? (j.compression === 'advanced' ? 'Advanced (Deflate level 9)' : 'Standard (Deflate level 6)') : 'None — files stored as-is'],
+      // The two passwords are shown as two distinct rows so they
+      // can never be confused. A ZIP password on an encrypted job
+      // lives INSIDE the .tvb (layered) — the row says so.
+      ['ZIP password', !j.zipPasswordEnabled ? 'Not set' : (j.encryptionEnabled ? 'Set — the ZIP is encrypted inside the .tvb (WinZip AES-256)' : 'Set (WinZip AES-256 — 7-Zip can open it with the password)')],
       ['Encryption', j.encryptionEnabled ? 'TechVision-only AES-256-GCM' + (j.compress ? ' (compression + encryption)' : ' (encryption only, files stored uncompressed)') : 'Off'],
       ['Verify after backup', j.verify ? 'Yes' : 'No'],
       ['Schedule', j.schedule.enabled ? scheduleSummary(j.schedule) : 'Manual only']
@@ -353,6 +387,49 @@
           toast('No password saved', 'Job saved, but no backup password was stored. Manual runs will ask for the password each time; scheduled runs need a saved password.', 'warning');
         }
       }
+      // ZIP password: the same store flow as the backup password
+      // above (vault, master-key offer, unlock offer), but a
+      // SEPARATE secret — the two passwords are independent and
+      // must never be mixed up.
+      if (job.zipPasswordEnabled) {
+        var zpw2 = $('zipPassword').value;
+        if (zpw2 && typeof api.vaultStoreJobZipPassword === 'function') {
+          try {
+            var zstored = await api.vaultStoreJobZipPassword(job.id, zpw2);
+            if (!zstored || zstored.success === false) {
+              var zNoVault = false;
+              try { zNoVault = !(await window.__vaultExists()); } catch (e) {}
+              if (zNoVault && typeof window.__askCreateMasterKey === 'function') {
+                window.__askCreateMasterKey('the ZIP password', async function () {
+                  try {
+                    var zretry = await api.vaultStoreJobZipPassword(job.id, zpw2);
+                    if (zretry && zretry.success) toast('Password saved', 'The ZIP password is now saved in the vault.', 'success');
+                    else toast('Password not saved', 'Job saved, but the ZIP password was not stored' + ((zretry && zretry.error) ? ': ' + zretry.error : '.') + ' Manual runs will ask for the ZIP password.', 'warning');
+                  } catch (e) {}
+                }, function () {
+                  toast('Password not saved', 'Job saved, but the ZIP password was not stored. Manual runs will ask for the ZIP password; create a master password later to save it for scheduled runs.', 'warning');
+                });
+              } else {
+                var zOffered = false;
+                try {
+                  if (typeof window.__offerVaultUnlockThen === 'function') {
+                    zOffered = await window.__offerVaultUnlockThen(async function () {
+                      try {
+                        var zretry2 = await api.vaultStoreJobZipPassword(job.id, zpw2);
+                        if (zretry2 && zretry2.success) toast('Password saved', 'The ZIP password is now saved in the vault.', 'success');
+                        else toast('Password not saved', 'Job saved, but the ZIP password was not stored. Manual runs will ask for the ZIP password.', 'warning');
+                      } catch (e) {}
+                    }, 'Unlock the vault to save the ZIP password for this job.');
+                  }
+                } catch (e) {}
+                if (!zOffered) toast('Password not saved', 'Job saved, but the ZIP password was not stored. Manual runs will ask for the ZIP password.', 'warning');
+              }
+            }
+          } catch (e) {}
+        } else if (!zpw2 && !hasSavedZipPassword) {
+          toast('No password saved', 'Job saved, but no ZIP password was stored. Manual runs will ask for the ZIP password each time; scheduled runs need a saved password.', 'warning');
+        }
+      }
       if (typeof api.refreshJobs === 'function') { try { await api.refreshJobs(); } catch (e) {} }
       toast('Job created', job.name + ' has been saved.', 'success');
       setTimeout(function () { closeWizard(); }, 500);
@@ -386,7 +463,7 @@
      separate window reloaded its page on every open, so this is the
      in-place equivalent of that fresh start. Exposed for renderer.js. */
   function resetWizard() {
-    step = 1; patterns = []; editing = null; hasSavedPassword = false;
+    step = 1; patterns = []; editing = null; hasSavedPassword = false; hasSavedZipPassword = false;
     $('wizardTitle').textContent = 'New Backup Job';
     $('jobName').value = 'My Backup';
     $('jobNameError').classList.remove('show');
@@ -402,6 +479,11 @@
     $('optCompress').checked = true;
     var clf = $('compressLevelField'); if (clf) clf.style.display = '';
     var std = document.querySelector('input[name="compressLevel"][value="standard"]'); if (std) std.checked = true;
+    $('zipPassword').value = ''; $('zipPasswordConfirm').value = '';
+    $('zipPasswordError').classList.remove('show');
+    $('zipPasswordConfirmError').classList.remove('show');
+    var zvn = $('zipVaultNote'); if (zvn) zvn.style.display = 'none';
+    var zpf = $('zipPwFields'); if (zpf) zpf.style.display = 'none';
     $('optVerify').checked = true;
     $('optSchedule').checked = false;
     $('scheduleFields').style.display = 'none';
@@ -451,11 +533,22 @@
           if (cfg.allowIncremental === false) $('optIncremental').checked = false;
           if (cfg.compress === false) { $('optCompress').checked = false; var clf = $('compressLevelField'); if (clf) clf.style.display = 'none'; }
           // The level radio follows the saved compression AND the
-          // saved encryption: an encrypted job shows the -pw variant
-          // of its level (the step-4 toggle is set below).
+          // saved ZIP password: a job with a ZIP password shows the
+          // -pw variant of its level. (The step-4 encryption toggle
+          // is independent — it follows encryptionEnabled alone,
+          // set below.)
           if (cfg.compression === 'advanced' || cfg.compression === 'standard') {
-            var lvlVal = cfg.compression + (cfg.encryptionEnabled === true ? '-pw' : '');
+            var lvlVal = cfg.compression + (cfg.zipPasswordEnabled === true ? '-pw' : '');
             var lvl = document.querySelector('input[name="compressLevel"][value="' + lvlVal + '"]'); if (lvl) lvl.checked = true;
+            if (cfg.zipPasswordEnabled === true) {
+              var zpf = $('zipPwFields'); if (zpf) zpf.style.display = 'block';
+              if (typeof api.vaultHasJobZipPassword === 'function') {
+                try {
+                  var hzp = await api.vaultHasJobZipPassword(editing.id);
+                  if (hzp && hzp.has) { hasSavedZipPassword = true; $('zipVaultNote').style.display = 'block'; }
+                } catch (e) {}
+              }
+            }
           }
           if (cfg.schedule && cfg.schedule.enabled) {
             $('optSchedule').checked = true;
@@ -498,37 +591,6 @@
       : 'files are stored uncompressed and encrypted (TechVision-only AES-256-GCM — no other program can open this backup).';
     note.appendChild(b); note.appendChild(s);
   }
-  // Two-way sync between the step-3 compression radios and the
-  // step-4 encryption toggle. The four radios are standard /
-  // advanced, each plain or "with password" (-pw suffix). Picking a
-  // -pw radio turns encryption ON (and shows the password fields);
-  // picking a plain radio turns it OFF. Toggling encryption in step
-  // 4 switches the radio to the -pw variant of the current level
-  // (or back to the plain variant). Called only from the radio /
-  // toggle change handlers — loadExisting and resetWizard set the
-  // controls directly.
-  function syncLevelRadios(fromRadio) {
-    var checked = document.querySelector('input[name="compressLevel"]:checked');
-    if (!checked) return;
-    var enc = $('optEncrypt');
-    if (fromRadio) {
-      // The user picked a radio: the toggle follows it.
-      var wantsPw = checked.value.slice(-3) === '-pw';
-      if (enc.checked !== wantsPw) {
-        enc.checked = wantsPw;
-        $('encFields').style.display = wantsPw ? 'block' : 'none';
-        if (wantsPw) updateEncNote();
-      }
-    } else {
-      // The user toggled encryption: the radio follows it.
-      var base = checked.value.replace(/-pw$/, '');
-      var want = enc.checked ? base + '-pw' : base;
-      if (checked.value !== want) {
-        var target = document.querySelector('input[name="compressLevel"][value="' + want + '"]');
-        if (target) target.checked = true;
-      }
-    }
-  }
   function wireWizard() {
     if (wireWizard.done) return; wireWizard.done = true;
     function on(id, ev, fn) { var el = $(id); if (el) el.addEventListener(ev, fn); }
@@ -546,11 +608,13 @@
     on('addPatternBtn', 'click', addPattern);
     on('patternInput', 'keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); addPattern(); } });
     on('optSchedule', 'change', function (ev) { $('scheduleFields').style.display = ev.target.checked ? 'block' : 'none'; });
-    on('optEncrypt', 'change', function (ev) { $('encFields').style.display = ev.target.checked ? 'block' : 'none'; if (ev.target.checked) updateEncNote(); syncLevelRadios(false); });
+    on('optEncrypt', 'change', function (ev) { $('encFields').style.display = ev.target.checked ? 'block' : 'none'; if (ev.target.checked) updateEncNote(); });
     on('optCompress', 'change', function () { var clf = $('compressLevelField'); if (clf) clf.style.display = $('optCompress').checked ? '' : 'none'; if ($('optEncrypt').checked) updateEncNote(); });
     // The four compression radios (standard / advanced, plain or
-    // "with password") keep the step-4 encryption toggle in sync.
-    document.querySelectorAll('input[name="compressLevel"]').forEach(function (r) { r.addEventListener('change', function () { syncLevelRadios(true); }); });
+    // "with password"): a -pw radio shows the ZIP password fields
+    // in this step. It does NOT touch the step-4 encryption toggle
+    // — the two passwords are independent.
+    document.querySelectorAll('input[name="compressLevel"]').forEach(function (r) { r.addEventListener('change', function () { var zpf = $('zipPwFields'); if (zpf) zpf.style.display = (r.value.slice(-3) === '-pw') ? 'block' : 'none'; }); });
     on('nextBtn', 'click', function () { if (validateStep(step)) showStep(Math.min(5, step + 1)); });
     on('backBtn', 'click', function () { showStep(Math.max(1, step - 1)); });
     on('createBtn', 'click', createJob);

@@ -9,9 +9,21 @@ const crypto = require('crypto');
 const archiver = require('archiver');
 // TechVision-only encrypted backups (.tvb): AES-256-GCM + scrypt,
 // per-file encryption in a proprietary container (see src/tvb.js).
-// No outside program can open a .tvb — that is the point. There is
-// no ZIP-AES anymore: the old 'zip-encrypted' format (which 7-Zip
-// could open) was removed in the batch-3 encryption redesign.
+// No outside program can open a .tvb — that is the point.
+// The ZIP-password layer is a SEPARATE, independent password: a job
+// with a ZIP password writes a normal WinZip AES ZIP (which 7-Zip
+// CAN open with the password) — either on its own, or encrypted
+// inside the .tvb when the job ALSO has an encryption password
+// (layered: the ZIP streams into the .tvb as one 'archive.zip'
+// entry). The 'zip-encrypted' archiver format is registered once
+// at load; if the optional plugin is missing, a ZIP password is
+// refused with a clear error instead of silently writing an
+// unprotected ZIP (see createArchive).
+let zipEncryptedAvailable = false;
+try {
+  archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
+  zipEncryptedAvailable = true;
+} catch (e) { /* optional plugin missing — createArchive reports it */ }
 const tvb = require('./tvb.js');
 const { EventEmitter } = require('events');
 const { Transform } = require('stream');
@@ -67,6 +79,13 @@ class JobConfig {
       (data.encryption && data.encryption.enabled === true);
     this.encryptionPassword = typeof data.encryptionPassword === 'string' ? data.encryptionPassword :
       (data.encryption && typeof data.encryption.password === 'string' ? data.encryption.password : null);
+    // The ZIP password is a SECOND, INDEPENDENT password (WinZip
+    // AES — 7-Zip can open such a ZIP). It is set in the wizard's
+    // Options step and never sets, or is set by, the encryption
+    // password. Same runtime-only rule as the encryption password:
+    // never written to a job file or history, the vault holds it.
+    this.zipPasswordEnabled = data.zipPasswordEnabled === true;
+    this.zipPassword = typeof data.zipPassword === 'string' ? data.zipPassword : null;
   }
 
   static fromJson(filePath) {
@@ -99,12 +118,22 @@ class JobConfig {
   }
 
   /**
-   * Build the archiver for this job: plain 'zip' only. Encryption
-   * never goes through archiver anymore — an encrypted job writes a
-   * .tvb file with the TVB writer (see run_full_backup /
-   * run_incremental_backup), never a ZIP.
+   * Build the archiver for this job. With a ZIP password the ZIP is
+   * WinZip AES-256 (archiver-zip-encrypted) — a normal ZIP any
+   * archiver can open with the password; without one it is a plain
+   * 'zip'. The .tvb encryption never goes through archiver: an
+   * encrypted job writes a .tvb file with the TVB writer (see
+   * run_full_backup / run_incremental_backup), and a layered job
+   * (both passwords) streams this archiver into the TVB writer as
+   * one 'archive.zip' entry.
    */
   createArchive() {
+    if (this.zipPasswordEnabled && this.zipPassword) {
+      if (!zipEncryptedAvailable) {
+        throw new Error('ZIP password is set but the WinZip AES plugin (archiver-zip-encrypted) is not installed — run npm install and try again.');
+      }
+      return archiver('zip-encrypted', Object.assign({}, this.getArchiveOptions(), { encryptionMethod: 'aes256', password: this.zipPassword }));
+    }
     return archiver('zip', this.getArchiveOptions());
   }
 
@@ -558,9 +587,17 @@ class BackupEngine {
     // Encryption is on: the backup is a .tvb file (TechVision-only
     // AES-256-GCM, see src/tvb.js), never a ZIP. No compression at
     // all means: no ZIP either — a plain folder with the same files,
-    // same names, same folder structure — unless encryption is on.
+    // same names, same folder structure — unless encryption is on,
+    // or a ZIP password is set (a ZIP password forces a ZIP even
+    // with compression 'none': stored entries + WinZip AES).
     const useTvb = this.jobConfig.encryptionEnabled === true;
-    const plainCopy = this.jobConfig.compression === 'none' && !useTvb;
+    // The ZIP password is independent of the encryption password:
+    // either, both or neither may be set. When BOTH are set, the
+    // ZIP streams into the .tvb as one 'archive.zip' entry
+    // (layered) — the .tvb is still the artifact, the ZIP is inside.
+    const hasZipPw = this.jobConfig.zipPasswordEnabled === true && !!this.jobConfig.zipPassword;
+    const useLayered = useTvb && hasZipPw;
+    const plainCopy = this.jobConfig.compression === 'none' && !useTvb && !hasZipPw;
     const copyDir = path.join(backupSubDir, `${backupName}_full_${stamp}`);
     // The artifact this run writes, whichever kind it is — the catch
     // below deletes it on failure/cancel, whatever the format.
@@ -620,13 +657,42 @@ class BackupEngine {
         }
       };
       let tvbWriter = null;
+      let layeredAdd = null; // promise for the single archive.zip entry (layered only)
       if (useTvb) {
-        // Encrypted backup: a .tvb file, written by the TVB writer
-        // (streaming AES-256-GCM per file). No archiver, no ZIP.
-        // Throws here (inside the try) when no password was provided
-        // for the job — the outer catch reports it as a failed run.
-        tvbWriter = new tvb.TvbWriter(tvbPath, this.jobConfig.encryptionPassword, this.jobConfig.compression);
-        this._activeTvb = tvbWriter;
+        if (useLayered) {
+          // Both passwords: the ZIP (possibly WinZip AES) streams
+          // into the .tvb as ONE entry. The archiver is the writer's
+          // source — start its addFile now, WITHOUT awaiting it:
+          // the file loop drives the ZIP (and the writer) forward,
+          // and the post-loop finalize waits for it. The writer
+          // compresses nothing here ('none') — the ZIP is already
+          // compressed and encrypted.
+          archive = this.jobConfig.createArchive();
+          archive.on('progress', prog => {
+            this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
+          });
+          // An archiver error must fail the run through archiveFailed
+          // (see onStreamError) — the writer's addFile would
+          // otherwise wait forever for ZIP bytes that never come.
+          archive.on('error', onStreamError);
+          tvbWriter = new tvb.TvbWriter(tvbPath, this.jobConfig.encryptionPassword, 'none', { layered: true });
+          this._activeTvb = tvbWriter;
+          this._activeArchive = archive;
+          // The writer's per-file progress callback is a no-op here:
+          // the ZIP bytes are not original bytes, and the file loop
+          // already counts the real bytes as they flow into the ZIP.
+          layeredAdd = tvbWriter.addFile(tvb.TVB_LAYERED_ENTRY, archive, null, () => {});
+          // The post-loop race reports this promise; a rejection
+          // before then must not be unhandled.
+          layeredAdd.catch(() => {});
+        } else {
+          // Encrypted backup: a .tvb file, written by the TVB writer
+          // (streaming AES-256-GCM per file). No archiver, no ZIP.
+          // Throws here (inside the try) when no password was provided
+          // for the job — the outer catch reports it as a failed run.
+          tvbWriter = new tvb.TvbWriter(tvbPath, this.jobConfig.encryptionPassword, this.jobConfig.compression);
+          this._activeTvb = tvbWriter;
+        }
       } else if (!plainCopy) {
         const output = fs.createWriteStream(zipPath);
         outputStream = output;
@@ -769,7 +835,7 @@ class BackupEngine {
             // the backed-up bytes.
             fileInfo.hash = copied.hash;
             fileInfo.size = copied.size;
-          } else if (useTvb) {
+          } else if (useTvb && !useLayered) {
             // Encrypted backup: the TVB writer streams the file
             // (hash tee -> deflate? -> cipher -> .tvb) and returns
             // the hash of the original bytes for the state file —
@@ -777,7 +843,9 @@ class BackupEngine {
             // copy. A source error fails ONE file (the writer
             // accounts for the partial entry so the container stays
             // valid); an output error (disk full) fails the whole
-            // run (see the per-file catch).
+            // run (see the per-file catch). A layered backup does
+            // NOT take this branch — its files go into the ZIP
+            // (the else below), which streams into the .tvb.
             const added = await tvbWriter.addFile(relativePath, file, stats, (n) => {
               bytesDone += n;
               fileCounted += n;
@@ -871,7 +939,30 @@ class BackupEngine {
         }
       }
 
-      if (useTvb) {
+      if (useLayered) {
+        // Both passwords: finish the ZIP, wait for its bytes to
+        // land in the .tvb, then finish the .tvb (index + trailer).
+        // The cancel waiter joins the race so a stop during
+        // finalize ends the run at once; the writer's own errors
+        // (disk full) fail the run. layeredAdd was started in the
+        // setup without awaiting it — the file loop drove it.
+        const layeredDone = (async () => { await archive.finalize(); await layeredAdd; })();
+        layeredDone.catch(() => {});
+        await Promise.race([layeredDone, archiveFailed, this._cancelWait]);
+        if (this._cancelRequested) throw new BackupCancelled();
+        if (streamError) {
+          // A failed source stream stalled the archiver, so the
+          // writer is still waiting for ZIP bytes that will never
+          // come — destroy it so layeredAdd settles and the .tvb
+          // output handle is released for the failure cleanup.
+          try { tvbWriter.destroy(); } catch (e) {}
+          throw streamError;
+        }
+        await tvbWriter.finish();
+        this._activeTvb = null;
+        this._activeArchive = null;
+        if (this._cancelRequested) throw new BackupCancelled();
+      } else if (useTvb) {
         // The TVB writer finishes the file: index + trailer. A stop
         // that lands here is caught by the cancel check below; the
         // writer's own errors (disk full) fail the run.
@@ -1063,9 +1154,14 @@ class BackupEngine {
     const stampInc = new Date().toISOString().replace(/[:.]/g, '-');
     const zipPath = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.zip`);
     const tvbPathInc = path.join(backupSubDir, `${backupName}_incremental_${stampInc}.tvb`);
-    // See the full backup: encryption means .tvb, never a ZIP.
+    // See the full backup: encryption means .tvb, never a ZIP. A
+    // ZIP password forces a ZIP even with compression 'none', and
+    // when encryption is ALSO on the ZIP streams into the .tvb as
+    // one 'archive.zip' entry (layered).
     const useTvbInc = this.jobConfig.encryptionEnabled === true;
-    const plainCopyInc = this.jobConfig.compression === 'none' && !useTvbInc;
+    const hasZipPwInc = this.jobConfig.zipPasswordEnabled === true && !!this.jobConfig.zipPassword;
+    const useLayeredInc = useTvbInc && hasZipPwInc;
+    const plainCopyInc = this.jobConfig.compression === 'none' && !useTvbInc && !hasZipPwInc;
     const copyDirInc = path.join(backupSubDir, `${backupName}_incremental_${stampInc}`);
     const artifactPathInc = plainCopyInc ? copyDirInc : (useTvbInc ? tvbPathInc : zipPath);
     if (plainCopyInc) fs.mkdirSync(copyDirInc, { recursive: true });
@@ -1111,10 +1207,26 @@ class BackupEngine {
         }
       };
       let tvbWriterInc = null;
+      let layeredAddInc = null; // promise for the single archive.zip entry (layered only)
       if (useTvbInc) {
-        // See the full backup: encrypted runs write a .tvb.
-        tvbWriterInc = new tvb.TvbWriter(tvbPathInc, this.jobConfig.encryptionPassword, this.jobConfig.compression);
-        this._activeTvb = tvbWriterInc;
+        if (useLayeredInc) {
+          // Both passwords: the ZIP streams into the .tvb as ONE
+          // entry (see the full backup — same shape, same reason).
+          archive = this.jobConfig.createArchive();
+          archive.on('progress', prog => {
+            this.log('debug', `Processed: ${prog.entries.processed}/${prog.entries.total}`);
+          });
+          archive.on('error', onStreamError);
+          tvbWriterInc = new tvb.TvbWriter(tvbPathInc, this.jobConfig.encryptionPassword, 'none', { layered: true });
+          this._activeTvb = tvbWriterInc;
+          this._activeArchive = archive;
+          layeredAddInc = tvbWriterInc.addFile(tvb.TVB_LAYERED_ENTRY, archive, null, () => {});
+          layeredAddInc.catch(() => {});
+        } else {
+          // See the full backup: encrypted runs write a .tvb.
+          tvbWriterInc = new tvb.TvbWriter(tvbPathInc, this.jobConfig.encryptionPassword, this.jobConfig.compression);
+          this._activeTvb = tvbWriterInc;
+        }
       } else if (!plainCopyInc) {
         const output = fs.createWriteStream(zipPath);
         outputStream = output;
@@ -1249,10 +1361,12 @@ class BackupEngine {
               filesNeedingBackup++;
               this.log('info', `Incremental update: ${relativePath}`);
               filesSeen++;
-            } else if (useTvbInc) {
+            } else if (useTvbInc && !useLayeredInc) {
               // See the full-backup loop: one streamed, encrypted
               // entry; a source error fails one file, an output
-              // error fails the whole run.
+              // error fails the whole run. A layered backup does
+              // NOT take this branch — its files go into the ZIP
+              // (the else below), which streams into the .tvb.
               const added = await tvbWriterInc.addFile(relativePath, file, stats, (n) => {
                 bytesDone += n;
                 fileCounted += n;
@@ -1345,7 +1459,23 @@ class BackupEngine {
         }
       }
 
-      if (useTvbInc) {
+      if (useLayeredInc) {
+        // Both passwords: finish the ZIP, wait for its bytes to
+        // land in the .tvb, then finish the .tvb (see the full
+        // backup — same shape, same reason).
+        const layeredDone = (async () => { await archive.finalize(); await layeredAddInc; })();
+        layeredDone.catch(() => {});
+        await Promise.race([layeredDone, archiveFailed, this._cancelWait]);
+        if (this._cancelRequested) throw new BackupCancelled();
+        if (streamError) {
+          try { tvbWriterInc.destroy(); } catch (e) {}
+          throw streamError;
+        }
+        await tvbWriterInc.finish();
+        this._activeTvb = null;
+        this._activeArchive = null;
+        if (this._cancelRequested) throw new BackupCancelled();
+      } else if (useTvbInc) {
         // See the full backup: index + trailer, then the cancel check.
         await tvbWriterInc.finish();
         this._activeTvb = null;
@@ -1601,5 +1731,6 @@ module.exports = {
   JobConfig,
   BackupEngine,
   BackupResult,
-  BackupState
+  BackupState,
+  zipEncryptedAvailable: () => zipEncryptedAvailable
 };

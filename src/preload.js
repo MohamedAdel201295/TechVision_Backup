@@ -57,6 +57,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     vaultChangePassword: (oldPassword, newPassword) => ipcRenderer.invoke('vault-change-password', oldPassword, newPassword),
     vaultHasJobPassword: (jobId) => ipcRenderer.invoke('vault-has-job-password', jobId),
     vaultStoreJobPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-password', jobId, jobPassword),
+    vaultHasJobZipPassword: (jobId) => ipcRenderer.invoke('vault-has-job-zip-password', jobId),
+    vaultStoreJobZipPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-zip-password', jobId, jobPassword),
 
   // Job detail actions
   openEditJob: (jobId) => ipcRenderer.invoke('job-open-edit', jobId),

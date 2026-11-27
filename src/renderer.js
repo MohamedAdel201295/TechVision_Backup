@@ -625,6 +625,11 @@
     var crb2 = $('cloudTopRefreshBtn'); if (crb2) crb2.style.display = name === 'cloud' ? '' : 'none';
     var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
     var wrb = $('wgTopRefreshBtn'); if (wrb) wrb.style.display = name === 'wireguard' ? '' : 'none';
+    /* The Back buttons live in the header, next to the TOP page
+       title — one per view, shown only on its own view. Every
+       other view (Dashboard included) has no Back. */
+    var wb = $('wizardBackBtn'); if (wb) wb.style.display = name === 'wizard' ? '' : 'none';
+    var rb = $('restoreBackBtn'); if (rb) rb.style.display = name === 'restore' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
     /* Inside Cloud the active item is the open panel, not Overview:
@@ -648,9 +653,10 @@
        origin view (the same destination as Back), so their back bar
        is redundant too — hiding it buys the wizard card the same
        ~30px, which is what finally lets the tallest steps fit with
-       no scroll at all (round 2 #5). Batch 2 #6 adds a Back button
-       INLINE beside the wizard/restore title instead — the top back
-       bar stays hidden on both views. */
+       no scroll at all (round 2 #5). Batch 2 #6 put a Back button
+       beside the wizard/restore card title; it has since moved to
+       the header, next to the top page title — the top back bar
+       stays hidden on both views. */
     var bb = $('backBar'); if (bb) bb.style.display = (name === 'dashboard' || name === 'wizard' || name === 'restore') ? 'none' : '';
     /* The top-bar subtitle is redundant — every view carries its own
        heading and description in the page — so it stays hidden and
@@ -2738,12 +2744,16 @@
   }
   /* ---------- backup / restore actions ---------- */
   // Ask for a job password in a modal. Resolves to the password, or
-  // null when the user cancels.
-  function askJobPassword(jobName) {
+  // null when the user cancels. `kind` is 'backup' (the encryption
+  // password) or 'zip' (the ZIP password) — the two are independent,
+  // so the modal must say which one it is asking for.
+  function askJobPassword(jobName, kind) {
     return new Promise(function (resolve) {
       var modal = $('jobPwModal'); var back = $('jobPwBackdrop');
       var input = $('jobPwInput');
-      $('jobPwText').textContent = 'Job "' + jobName + '" is encrypted and its password is not saved in the vault. Enter the backup password to run it.';
+      $('jobPwText').textContent = kind === 'zip'
+        ? 'Job "' + jobName + '" has a ZIP password that is not saved in the vault. Enter the ZIP password to run it.'
+        : 'Job "' + jobName + '" is encrypted and its password is not saved in the vault. Enter the backup password to run it.';
       input.value = '';
       modal.style.display = 'block'; back.classList.add('show');
       setTimeout(function () { input.focus(); }, 50);
@@ -2778,6 +2788,21 @@
         var pw = await askJobPassword(job.name || cfg.name || 'backup job');
         if (!pw) return; // cancelled
         cfg = Object.assign({}, cfg, { encryptionPassword: pw });
+      }
+    }
+    // ZIP-password job whose ZIP password is not in the vault: ask
+    // now, and pass it for this run only (main.js stores it if the
+    // vault is open). Independent of the encryption password above
+    // — a job can need either, both, or neither.
+    if (cfg.zipPasswordEnabled === true) {
+      var hasZipPw = false;
+      if (api && typeof api.vaultHasJobZipPassword === 'function') {
+        try { var zhr = await api.vaultHasJobZipPassword(cfg.id); hasZipPw = !!(zhr && zhr.has); } catch (e) {}
+      }
+      if (!hasZipPw) {
+        var zpw = await askJobPassword(job.name || cfg.name || 'backup job', 'zip');
+        if (!zpw) return; // cancelled
+        cfg = Object.assign({}, cfg, { zipPassword: zpw });
       }
     }
     closeDrawer();
@@ -2816,6 +2841,11 @@
             // pointed at Settings, where no Unlock button exists.
             var shown = await offerVaultUnlockThen(function () { runBackup(job, incremental); }, 'The vault is locked. Enter your master password to run this encrypted backup.');
             if (!shown) toast('Password required', 'This job is encrypted and no password is saved. Run it again and enter the password when asked.', 'error');
+          } else if (result.error === 'ZIP_PASSWORD_REQUIRED') {
+            // Same flow for the ZIP password: unlock the vault and
+            // run again (the saved ZIP password is then found).
+            var zshown = await offerVaultUnlockThen(function () { runBackup(job, incremental); }, 'The vault is locked. Enter your master password to run this backup (it has a ZIP password).');
+            if (!zshown) toast('Password required', 'This job has a ZIP password and none is saved. Run it again and enter the ZIP password when asked.', 'error');
           } else {
             toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
           }
@@ -4906,8 +4936,8 @@
   });
     var tbb = $('topBackBtn');
     if (tbb) tbb.addEventListener('click', goBack);
-    /* Batch 2 #6: Back buttons inline beside the wizard / restore
-       titles — same destination as Cancel (goBack). */
+    /* Batch 2 #6: Back buttons in the header, next to the top page
+       title — same destination as Cancel (goBack). */
     var wbb = $('wizardBackBtn');
     if (wbb) wbb.addEventListener('click', goBack);
     var rbb = $('restoreBackBtn');

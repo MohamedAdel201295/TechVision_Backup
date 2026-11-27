@@ -676,6 +676,21 @@ function resolveBackupPassword(jobConfig) {
   return null;
 }
 
+// Resolve the ZIP password for a job, in the same order as the
+// backup password above. The ZIP password lives in the vault's
+// generic secrets namespace under 'job-zip-password:<jobId>' — a
+// separate secret from the backup password, never the same value
+// unless the user typed the same string twice.
+function resolveZipPassword(jobConfig) {
+  if (jobConfig && typeof jobConfig.zipPassword === 'string' && jobConfig.zipPassword) {
+    return jobConfig.zipPassword;
+  }
+  if (jobConfig && jobConfig.zipPasswordEnabled && vaultKey && jobConfig.id) {
+    try { return vault.getSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobConfig.id); } catch (e) { return null; }
+  }
+  return null;
+}
+
 // Central app log: one file for everything the scheduler, the drive
 // watcher and the backup runs do, so the Logs view has a full story
 // instead of only per-backup files in the destination folder.
@@ -1156,7 +1171,8 @@ async function executeScheduledBackup(job, resolved) {
     compress: job.compress, compression: job.compression,
     allowIncremental: job.allowIncremental, schedule: job.schedule,
     includePatterns: job.includePatterns, excludePatterns: job.excludePatterns,
-    encryptionEnabled: job.encryptionEnabled === true, id: job.id
+    encryptionEnabled: job.encryptionEnabled === true,
+    zipPasswordEnabled: job.zipPasswordEnabled === true, id: job.id
   };
   // Encrypted job, vault locked (or no password saved): the schedule
   // cannot run without the password, so skip this run. The skip used
@@ -1182,6 +1198,29 @@ async function executeScheduledBackup(job, resolved) {
       return;
     }
     jobConfig.encryptionPassword = pw;
+  }
+  // ZIP-password job, vault locked (or no ZIP password saved): the
+  // schedule cannot run without it — same skip rule as the
+  // encryption password above, naming which password is missing.
+  if (jobConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(jobConfig);
+    if (!zpw) {
+      const msg = `Skipped job "${job.name}": the ZIP password is not saved (the vault is locked or no ZIP password is stored). Open the app and unlock the vault with your master password to let scheduled backups of this job run.`;
+      console.log(`[Scheduler] ${msg}`);
+      appendAppLog('warn', msg);
+      recordRun(job.name, {
+        id: `${job.name}-scheduled-skipped-${Date.now()}`, jobId: job.id || null, name: job.name,
+        type: 'full', success: false, status: 'skipped',
+        source: jobPathValue(job.source), destination: jobPathValue(job.destination),
+        timestamp: new Date().toISOString(), files: 0, size: 0, duration: 0,
+        error: msg, result: null
+      });
+      job.lastScheduledRun = new Date().toISOString();
+      saveJobHistory();
+      notifyJobsUpdated();
+      return;
+    }
+    jobConfig.zipPassword = zpw;
   }
   const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
   const jobId = `${job.name}-scheduled-${Date.now()}`;
@@ -1411,6 +1450,14 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'full' };
     jobConfig.encryptionPassword = pw;
   }
+  // A ZIP-password job with no ZIP password anywhere: refuse up
+  // front, like the encryption password above. The renderer asks
+  // for it (askJobPassword) and retries.
+  if (jobConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(jobConfig);
+    if (!zpw) return { success: false, error: 'ZIP_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'full' };
+    jobConfig.zipPassword = zpw;
+  }
   // Never run the same job twice at once (manual + scheduled, or a
   // double-click): two engines would write the same backup folder
   // and the same state file.
@@ -1484,6 +1531,12 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
     try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
   }
+  // After a successful manual run, store a typed ZIP password in
+  // the vault (same rule as the backup password above) so scheduled
+  // runs of this job work too.
+  if (jobRecord.success && jobConfig.zipPasswordEnabled && vaultKey && jobConfig.id && jobConfig.zipPassword) {
+    try { vault.storeSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobConfig.id, jobConfig.zipPassword); } catch (e) { appendAppLog('error', `Could not store the ZIP password for job "${jobName}" in the vault: ${e.message}. Scheduled backups of this job will be skipped until the ZIP password is stored.`); }
+  }
   // A stopped run sends no finished/failed email — the user asked
   // for the stop, it is not a failure.
   if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
@@ -1511,6 +1564,13 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     const pw = resolveBackupPassword(jobConfig);
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
     jobConfig.encryptionPassword = pw;
+  }
+  // A ZIP-password job with no ZIP password anywhere: refuse up
+  // front, like the encryption password above.
+  if (jobConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(jobConfig);
+    if (!zpw) return { success: false, error: 'ZIP_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
+    jobConfig.zipPassword = zpw;
   }
   // Never run the same job twice at once (see the full backup).
   for (const [, a] of activeJobs) {
@@ -1568,6 +1628,12 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
 
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
     try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
+  }
+  // After a successful manual run, store a typed ZIP password in
+  // the vault (same rule as the backup password above) so scheduled
+  // runs of this job work too.
+  if (jobRecord.success && jobConfig.zipPasswordEnabled && vaultKey && jobConfig.id && jobConfig.zipPassword) {
+    try { vault.storeSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobConfig.id, jobConfig.zipPassword); } catch (e) { appendAppLog('error', `Could not store the ZIP password for job "${jobName}" in the vault: ${e.message}. Scheduled backups of this job will be skipped until the ZIP password is stored.`); }
   }
   // A stopped run sends no finished/failed email — the user asked
   // for the stop, it is not a failure.
@@ -1749,7 +1815,7 @@ ipcMain.handle('zip-get-info', async (event, zipPath) => {
   const engine = new RestoreEngine();
   try {
     const entries = await engine.getZipInfo(zipPath);
-    return { success: true, entries };
+    return { success: true, entries, layered: !!(entries && entries.layered) };
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -1841,6 +1907,7 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
   if (jobConfig) {
     delete jobConfig.encryptionPassword;
     if (jobConfig.encryption && typeof jobConfig.encryption === 'object') delete jobConfig.encryption.password;
+    delete jobConfig.zipPassword;
     delete jobConfig.password;
     // templateFile is derived state (which file the job was loaded
     // from), not config — it is re-set from the written filename
@@ -3739,6 +3806,20 @@ ipcMain.handle('vault-store-job-password', async (event, jobId, jobPassword) => 
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
+// ZIP password: the same vault flow, but a separate secret
+// ('job-zip-password:<jobId>') — never the backup password.
+ipcMain.handle('vault-has-job-zip-password', async (event, jobId) => {
+  if (!vaultKey || !jobId) return { has: false };
+  try { return { has: vault.hasSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobId) }; }
+  catch (e) { return { has: false }; }
+});
+ipcMain.handle('vault-store-job-zip-password', async (event, jobId, jobPassword) => {
+  if (!vaultKey) return { success: false, error: 'Vault is locked.' };
+  try {
+    vault.storeSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobId, jobPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
 
 // Settings is a full page in the main window now (view-settings) —
 // the old separate settings window is gone.
@@ -3794,6 +3875,7 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     compression: job.compression,
     compress: job.compress,
     encryptionEnabled: job.encryptionEnabled === true,
+    zipPasswordEnabled: job.zipPasswordEnabled === true,
     allowIncremental: job.allowIncremental,
     includePatterns: job.includePatterns,
     excludePatterns: job.excludePatterns,
@@ -3804,6 +3886,11 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     const pw = resolveBackupPassword(backupConfig);
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED' };
     backupConfig.encryptionPassword = pw;
+  }
+  if (backupConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(backupConfig);
+    if (!zpw) return { success: false, error: 'ZIP_PASSWORD_REQUIRED' };
+    backupConfig.zipPassword = zpw;
   }
 
   const useIncremental = backupConfig.allowIncremental === true && (job.runCount > 0 || (job.runs && job.runs.length > 0));
@@ -3909,8 +3996,17 @@ ipcMain.handle('job-restore', async (event, jobId) => {
     restorePassword = resolveBackupPassword({ id: job.id, encryptionEnabled: true });
     if (!restorePassword) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', message: 'This backup is encrypted. Unlock the vault (or enter the backup password) and try again.' };
   }
+  // A job with a ZIP password needs that password too (a layered
+  // backup's inner ZIP, or a plain password-protected ZIP). Resolve
+  // it the same way; when it is missing the restore reports
+  // ZIP_PASSWORD_REQUIRED and the Restore page asks for it.
+  let restoreZipPassword = null;
+  if (job.zipPasswordEnabled === true) {
+    restoreZipPassword = resolveZipPassword({ id: job.id, zipPasswordEnabled: true });
+    if (!restoreZipPassword) return { success: false, error: 'ZIP_PASSWORD_REQUIRED', message: 'This backup is also password-protected (ZIP). Unlock the vault (or enter the ZIP password on the Restore page) and try again.' };
+  }
   const restoreEngine = new RestoreEngine();
-  const result = await restoreEngine.restore_all(job.result.backup_path, restoreDir, restorePassword);
+  const result = await restoreEngine.restore_all(job.result.backup_path, restoreDir, restorePassword, { zipPassword: restoreZipPassword });
 
   return { success: result.success, files_restored: result.files_restored || 0, errors: result.errors || [] };
 });
