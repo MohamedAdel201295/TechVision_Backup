@@ -61,7 +61,7 @@ function isCidr(s) {
 }
 
 /* First non-internal IPv4 interface -> its network as CIDR, e.g. 192.168.1.0/24. */
-const VIRTUAL_IFACE_RE = /docker|veth|vmware|virtual|vbox|tailscale|wintun|wsl|hyper-v|tap|tun|br-/i;
+const VIRTUAL_IFACE_RE = /docker|veth|vmware|virtual|vbox|tailscale|wintun|wsl|hyper-v|tap|tun|br-|wireguard|amnezia|awg/i;
 function isPrivateIpv4(ip) {
   const p = String(ip || '').split('.').map(Number);
   if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
@@ -79,13 +79,31 @@ function cidrOf(a) {
   const cidr = net.join('.') + '/' + prefix;
   return isCidr(cidr) ? cidr : null;
 }
+function cidrContainsIp(cidr, ip) {
+  const m = String(cidr || '').match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+  const p = String(ip || '').split('.').map(Number);
+  if (!m || p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
+  const prefix = parseInt(m[5], 10);
+  if (prefix < 0 || prefix > 32) return false;
+  const mask = prefix === 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) >>> 0;
+  const net = ((+m[1] << 24) | (+m[2] << 16) | (+m[3] << 8) | +m[4]) >>> 0;
+  const addr = ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+  return (addr & mask) >>> 0 === (net & mask) >>> 0;
+}
 // Pick the LAN subnet from an os.networkInterfaces() table. Pure, so
 // it is unit-testable. Passes: (1) a real private LAN on a real
 // adapter, (2) anything on a real adapter, (3) anything at all.
-// Virtual adapters (Docker, VMware, WSL, Tailscale itself) and
-// link-local addresses (169.254.x) never win while a real LAN exists —
-// advertising a virtual subnet would send the tailnet nowhere.
-function pickLanSubnet(ifs) {
+// Virtual adapters (Docker, VMware, WSL, Tailscale itself, and the
+// WireGuard/AmneziaWG tunnel) and link-local addresses (169.254.x)
+// never win while a real LAN exists — advertising a virtual subnet
+// would send the tailnet nowhere.
+// excludeIps (optional): addresses whose subnet must never be picked
+// — the WireGuard tunnel address: its /24 is a tunnel, not the home
+// LAN, and advertising it would point the tailnet at the tunnel
+// instead of at the printers and cameras (2026-11-27: the router
+// advertised 10.0.0.0/24 for exactly this reason).
+function pickLanSubnet(ifs, excludeIps) {
+  const excluded = Array.isArray(excludeIps) ? excludeIps.filter(Boolean) : [];
   const passes = [
     (name, a) => !VIRTUAL_IFACE_RE.test(name) && isPrivateIpv4(a.address),
     (name, a) => !VIRTUAL_IFACE_RE.test(name),
@@ -98,14 +116,23 @@ function pickLanSubnet(ifs) {
         if (String(a.address || '').startsWith('169.254.')) continue;
         if (!ok(name, a)) continue;
         const cidr = cidrOf(a);
-        if (cidr) return cidr;
+        if (!cidr) continue;
+        if (excluded.some((ip) => cidrContainsIp(cidr, ip))) continue;
+        return cidr;
       }
     }
   }
   return null;
 }
+// The WireGuard/AmneziaWG tunnel address (default 10.0.0.1): its
+// subnet is a tunnel, never the home LAN. main pushes the configured
+// address in (getWgConfig().server.address) before every status read.
+let tunnelAddress = '10.0.0.1';
+function setTunnelAddress(ip) {
+  if (typeof ip === 'string' && ip.trim()) tunnelAddress = ip.trim().split('/')[0];
+}
 function lanSubnet() {
-  try { return pickLanSubnet(os.networkInterfaces()); }
+  try { return pickLanSubnet(os.networkInterfaces(), tunnelAddress ? [tunnelAddress] : []); }
   catch (e) { return null; }
 }
 
@@ -293,6 +320,35 @@ async function setSubnetRouter(on, auth) {
   return { success: true, subnet, approved: false };
 }
 
+/* A stale advertisement, fixed on sight. pickLanSubnet used to return
+   the WireGuard tunnel subnet (10.0.0.0/24) when the tunnel adapter
+   was enumerated before the real LAN, so a machine could sit there
+   advertising the tunnel instead of its home LAN. When the router is
+   ON and the advertised set no longer matches the freshly detected
+   LAN, re-advertise the right subnet (`tailscale up` sets the exact
+   set, so the stale advertisement is replaced) and retry the API
+   approval. Never runs while disconnected — `tailscale up` then
+   would try to sign in. `status` is an already-fetched getStatus()
+   result (the caller usually has one); without it, it reads its own.
+   Returns { success, reconciled, subnet?, approved?, reason? }. */
+async function reconcileSubnetRouter(auth, status) {
+  let st = status || null;
+  if (!st) {
+    try { st = await getStatus(); }
+    catch (e) { return { success: false, reconciled: false, error: 'Could not read Tailscale status.' }; }
+  }
+  if (!st || !st.installed) return { success: false, reconciled: false, error: 'Tailscale is not installed on this computer.' };
+  if (!st.connected) return { success: true, reconciled: false, reason: 'not-connected' };
+  const advertised = Array.isArray(st.advertiseRoutes) ? st.advertiseRoutes : [];
+  if (!advertised.length) return { success: true, reconciled: false, reason: 'router-off' };
+  const lan = st.lanSubnet || null;
+  if (!lan) return { success: true, reconciled: false, reason: 'no-lan' };
+  if (advertised.indexOf(lan) >= 0 && advertised.length === 1) return { success: true, reconciled: false, reason: 'already-correct' };
+  const r = await setSubnetRouter(true, auth);
+  if (!r || !r.success) return { success: false, reconciled: false, error: (r && r.error) || 'Could not re-advertise the home network.' };
+  return { success: true, reconciled: true, subnet: r.subnet, approved: !!r.approved, previous: advertised };
+}
+
 /* ---------- Tailscale API: key expiry (the real integration) ----------
  * `tailscale set --key-expiry=off` is NOT a real CLI flag — the official
  * CLI has no way to turn off key expiry (the only nearby command is the
@@ -336,7 +392,7 @@ async function exchangeOAuthToken(clientId, clientSecret) {
     oauthTokenCache = { clientId, accessToken: j.access_token, expiresAt: now + ((j.expires_in || 3600) * 1000) };
     return { token: j.access_token };
   } catch (e) {
-    return { error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+    return { error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message && e.message !== 'fetch failed' ? e.message : 'Could not reach the Tailscale API.') };
   } finally { clearTimeout(timer); }
 }
 
@@ -372,7 +428,11 @@ async function apiFetch(apiPath, authHeader, opts) {
     try { body = await res.json(); } catch (e) { /* empty body on success */ }
     return { ok: res.ok, status: res.status, body };
   } catch (e) {
-    return { ok: false, status: 0, body: null, error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+    // Node's fetch reports a refused/DNS failure as a bare "fetch
+    // failed" — the credentials line must say what that means in
+    // plain words instead of showing the engine jargon. Any other
+    // specific message (e.g. a certificate problem) is kept as-is.
+    return { ok: false, status: 0, body: null, error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message && e.message !== 'fetch failed' ? e.message : 'Could not reach the Tailscale API.') };
   } finally { clearTimeout(timer); }
 }
 
@@ -532,7 +592,7 @@ async function disableKeyExpiry(auth) {
 }
 
 module.exports = {
-  getStatus, setConnected, setSubnetRouter, lanSubnet, isCidr,
+  getStatus, setConnected, setSubnetRouter, reconcileSubnetRouter, setTunnelAddress, lanSubnet, isCidr, cidrContainsIp,
   installAndConnect, downloadFile, verifySignature, parseSignatureResult, extractLoginUrl, MSI_URL,
   disableKeyExpiry, enableKeyExpiry, getKeyExpiryState, verifyApiAuth, disableKeyExpiryViaApi, exchangeOAuthToken, getDeviceRoutes, approveRoutes, pickLanSubnet, tailnetFromDns, buildInstallScript,
   parseTasklistOutput, guiRunning, ensureGuiRunning, backendState,

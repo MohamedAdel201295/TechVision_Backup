@@ -9,6 +9,12 @@
  *     to, smtpHost, smtpPort, smtpSecure, smtpUser, smtpPass }
  * smtpPass is a Gmail *App Password* (Google Account -> Security ->
  * 2-Step Verification -> App passwords), never the account password.
+ * Round 3: smtpPass no longer lives in settings.json — it is a vault
+ * secret ('smtp'). main.js resolves it (resolveEmailSettings) and
+ * passes the resolved settings into sendMail/notify; this module
+ * never touches the vault itself. A caller that passes no resolved
+ * settings still reads the file, so a legacy plaintext smtpPass
+ * keeps working until migration moves it.
  */
 const fs = require('fs');
 const path = require('path');
@@ -118,9 +124,12 @@ function eventText(kind, job, extra) {
   return String(extra || '');
 }
 
-async function notify(userDataDir, kind, job, extra) {
+async function notify(userDataDir, kind, job, extra, emailSettings) {
   try {
-    const email = readEmailSettings(userDataDir);
+    // emailSettings (vault-resolved, from main) wins when given; the
+    // file read is the legacy fallback for a plaintext smtpPass that
+    // migration has not moved yet.
+    const email = emailSettings || readEmailSettings(userDataDir);
     if (!wants(email, kind)) return { sent: false, reason: 'off' };
     const subjects = {
       started: 'Backup started: ' + ((job && job.name) || ''),

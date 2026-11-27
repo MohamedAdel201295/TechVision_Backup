@@ -7,6 +7,15 @@
  * built-in crypto — no extra binary, no 7-Zip dependency, works the
  * same in the packaged app.
  *
+ * Role: the ZIP-PASSWORD layer. A job with a ZIP password writes a
+ * WinZip AES ZIP (archiver-zip-encrypted, the writer); this module
+ * reads it back. The format is the standard one, so 7-Zip / WinRAR
+ * open the same file with the same password — that is deliberate,
+ * unlike the .tvb layer (src/tvb.js), which no outside program can
+ * open. A .tvb whose single entry is a password-protected ZIP (the
+ * layered case, both passwords) is decrypted by the TVB reader
+ * first, then restored through this module.
+ *
  * Format (WinZip AES, standard, readable by 7-Zip / WinRAR):
  *   extra field 0x9901: AE version (1 or 2), vendor "AE",
  *   strength (1=128, 2=192, 3=256), real compression method.
@@ -582,12 +591,22 @@ function decryptEntry(zipPath, entry, password, zipBuf) {
 }
 
 /** Restore every file from an encrypted ZIP into destDir. */
-async function extractEncrypted(zipPath, destDir, password, onFile) {
+async function extractEncrypted(zipPath, destDir, password, onFile, options) {
+  // Overwrite OFF (default): an existing destination file is skipped,
+  // never replaced. The entry is still decrypted and hash-verified
+  // first, so a wrong password or corrupt entry is reported instead
+  // of silently skipping — only the final rename is withheld.
+  const overwrite = !!(options && options.overwrite);
+  // Chain restores share one written-set (see restore.js): a later
+  // artifact must overwrite files this chain wrote, while files that
+  // existed before the restore are still skipped.
+  const chainWritten = (options && options.chainWritten) || null;
   const entries = readEntries(zipPath);
   const base = path.resolve(destDir);
   if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
   const realBase = fs.realpathSync(base);
   let files = 0; let bytes = 0; const errors = [];
+  let skipped = 0; const skipped_files = [];
   for (const entry of entries) {
     if (entry.isDir) continue;
     // Zip-slip guard: entry names must stay inside destDir. (The
@@ -625,7 +644,23 @@ async function extractEncrypted(zipPath, destDir, password, onFile) {
         errors.push(entry.name + ': written file failed verification');
         continue;
       }
+      // Only an existing regular FILE is skipped — a directory at the
+      // destination path (zip holding both `a` and `a/b.txt`) must
+      // fail on the rename and be reported, not vanish as "skipped".
+      // A file this chain restore wrote itself is NOT skipped: the
+      // newer artifact's version must replace it.
+      let destIsFile = false;
+      try { destIsFile = fs.statSync(realDest).isFile(); } catch (e) { destIsFile = false; }
+      if (!overwrite && destIsFile && !(chainWritten && chainWritten.has(path.resolve(realDest)))) {
+        // Verified but the destination already exists: leave the
+        // good file alone, drop the temp copy, count the skip.
+        try { fs.unlinkSync(tmpDest); } catch (e) {}
+        skipped++;
+        skipped_files.push(entry.name);
+        continue;
+      }
       fs.renameSync(tmpDest, realDest);
+      if (chainWritten) chainWritten.add(path.resolve(realDest));
       files++; bytes += out.bytes;
       if (typeof onFile === 'function') onFile(entry.name, out.bytes);
     } catch (e) {
@@ -633,7 +668,7 @@ async function extractEncrypted(zipPath, destDir, password, onFile) {
       if (e.message.indexOf('Wrong password') === 0) throw e; // one wrong password fails the whole restore
     }
   }
-  return { files: files, bytes: bytes, errors: errors };
+  return { files: files, bytes: bytes, errors: errors, skipped: skipped, skipped_files: skipped_files };
 }
 
 module.exports = { inspectZip, decryptEntry, decryptEntryToFile, extractEncrypted, parseCentralDirectory, crc32 };

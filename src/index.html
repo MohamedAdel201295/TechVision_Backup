@@ -54,7 +54,11 @@
     </div>
     <header class="topbar" id="appHeader">
       <div>
-        <h1 id="appTitle">TechVision Backup</h1>
+        <div class="title-row">
+          <button class="back-btn title-back-btn" type="button" id="wizardBackBtn" style="display:none;">‹ Back</button>
+          <button class="back-btn title-back-btn" type="button" id="restoreBackBtn" style="display:none;">‹ Back</button>
+          <h1 id="appTitle">TechVision Backup</h1>
+        </div>
         <p id="appSubtitle">Your data, protected — full and incremental backups, fast streaming restore.</p>
       </div>
       <div class="topbar-actions">
@@ -112,6 +116,7 @@
         <span id="progressSize">0 B</span>
         <span class="file" id="progressFile"></span>
       </div>
+      <div class="progress-actions"><button class="btn btn-sm" type="button" id="progressStopBtn">■ Stop backup</button></div>
     </section>
     <div class="dash-row">
       <section class="card dash-status">
@@ -134,7 +139,7 @@
             <circle cx="75" cy="75" r="54" fill="none" stroke="var(--surface-3)" stroke-width="16"></circle>
             <circle id="dashDonutArc" cx="75" cy="75" r="54" fill="none" stroke="var(--accent)" stroke-width="16" stroke-linecap="round" stroke-dasharray="0 339.292" transform="rotate(-90 75 75)"></circle>
           </svg>
-          <div class="dash-donut-center"><b id="dashStoragePct">—</b><span>Used</span></div>
+          <div class="dash-donut-center"><b id="dashStoragePct">—</b></div>
         </div>
         <ul class="dash-legend">
           <li><span><span class="dot dot-used"></span>Used Space</span><b id="dashUsed">—</b></li>
@@ -144,9 +149,10 @@
         <div class="dash-storage-sub" id="dashStorageDrive"></div>
       </section>
     </div>
-    <div class="dash-row">
+    <div class="dash-row dash-jobs-row">
       <section class="card dash-recent">
         <div class="dash-card-head"><h2 class="section-title" style="margin:0;">Recent Backup Jobs</h2><button class="link-btn" type="button" id="dashViewAllJobs">View All Jobs →</button></div>
+        <div class="dash-recent-content">
         <table class="dash-table">
           <thead><tr><th>Job Name</th><th>Type</th><th>Status</th><th>Size</th><th>Duration</th><th>Completed At</th></tr></thead>
           <tbody id="dashRecentBody"></tbody>
@@ -156,6 +162,7 @@
           <h3>No backups yet</h3>
           <p>Create your first backup job and protect your files.</p>
           <button class="btn btn-primary" type="button" id="dashEmptyNewJobBtn">＋ Create your first backup</button>
+        </div>
         </div>
       </section>
       <section class="card dash-actions">
@@ -192,7 +199,7 @@
       <button class="btn btn-sm" type="button" id="jobsEditBtn">✎ Edit</button>
       <button class="btn btn-danger btn-sm" type="button" id="jobsDeleteBtn">🗑 Delete</button>
       <button class="btn btn-ghost btn-sm" type="button" id="jobsRefreshBtn">⟳ Refresh</button>
-      <button class="btn btn-ghost btn-sm" type="button" id="jobsClearHistoryBtn">🗑 Clear History</button>
+      <button class="btn btn-ghost btn-sm" type="button" id="jobsClearHistoryBtn">🗑 Delete All Jobs</button>
       <span class="jobs-toolbar-spacer"></span>
       <select class="filter" id="jobsStatusFilter" aria-label="Filter by status">
         <option value="all">All Jobs</option>
@@ -231,8 +238,14 @@
         <div id="jobsDetailsWaiting"></div>
         <div class="jobs-details-actions">
           <button class="btn btn-primary btn-sm" type="button" id="jobsDetailsRun">▶ Run Now</button>
+          <button class="btn btn-sm" type="button" id="jobsDetailsStop" style="display:none;">■ Stop</button>
           <button class="btn btn-sm" type="button" id="jobsDetailsRestore">↺ Restore...</button>
           <button class="btn btn-sm" type="button" id="jobsDetailsEdit">✎ Edit Job</button>
+        </div>
+        <div class="jobs-details-progress" id="jobsDetailsProgress" style="display:none;">
+          <div class="jobs-progress-head"><span>Backup progress</span><b id="jobsDetailsProgressPct">—</b></div>
+          <div class="progress-track"><div class="progress-fill" id="jobsDetailsProgressFill" style="width:0%"></div></div>
+          <div class="jobs-progress-sub" id="jobsDetailsProgressSub">Running…</div>
         </div>
       </aside>
     </div>
@@ -243,7 +256,6 @@
         <h2 class="section-title" style="margin:0;">Logs</h2>
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Today's tasks, what finished, what failed or is still waiting for its drive — and the full log.</p>
       </div>
-      <button class="btn btn-ghost" type="button" id="logsRefreshBtn"><span class="refresh-glyph">⟳</span> Refresh</button>
     </div>
     <div class="log-tabs" id="logsTabs" role="tablist">
       <button class="log-tab active" type="button" data-logtab="today">Today</button>
@@ -305,17 +317,19 @@
     </div>
     <div id="settingsSecuritySection" class="card cloud-section" style="display:none;">
       <h3 style="margin:0 0 4px;font-size:14px;">Master password</h3>
-      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where job passwords for encrypted backups are stored. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
+      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where passwords are stored — for encrypted backups, saved Cloud servers, email notifications and the Tailscale API. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
+      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">The program asks for it every time it starts. If you forget it, the only way is to create a new one — and that deletes every saved password (backup passwords, Cloud servers, email and Tailscale). Changing it here, with the current password, is different: it re-encrypts the vault and keeps all saved passwords.</p>
       <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
       <div id="vaultSetupBox">
         <div class="field">
           <label for="vaultNewPass">New master password</label>
-          <input type="password" id="vaultNewPass" placeholder="At least 8 characters" autocomplete="new-password">
+          <input type="password" id="vaultNewPass" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
         </div>
         <div class="field">
           <label for="vaultNewPassConfirm">Confirm master password</label>
           <input type="password" id="vaultNewPassConfirm" placeholder="Repeat the master password" autocomplete="new-password">
         </div>
+        <p id="vaultResetWarning" style="display:none; color:#e07b7b; margin:0 0 8px; font-size:12px;">You are creating a NEW master password because the old one is lost. Every password saved with the old one — encrypted backups, Cloud servers, email and Tailscale — will stop working and cannot be recovered. Only do this if you are sure.</p>
         <button class="btn" type="button" id="vaultSetupBtn" style="margin-top:4px;">Set master password</button>
       </div>
       <div id="vaultChangeBox" style="display:none;">
@@ -325,14 +339,13 @@
         </div>
         <div class="field">
           <label for="vaultChangeNew">New master password</label>
-          <input type="password" id="vaultChangeNew" placeholder="At least 8 characters" autocomplete="new-password">
+          <input type="password" id="vaultChangeNew" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
         </div>
         <div class="field">
           <label for="vaultChangeConfirm">Confirm new master password</label>
           <input type="password" id="vaultChangeConfirm" placeholder="Repeat the new master password" autocomplete="new-password">
         </div>
         <button class="btn" type="button" id="vaultChangeBtn" style="margin-top:4px;">Change master password</button>
-        <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
       </div>
     </div>
         <div id="settingsEmailSection" class="card cloud-section" style="display:none;">
@@ -667,7 +680,7 @@
     <div class="card vpn-hero" id="vpnHero">
       <div class="vpn-status-row">
         <div>
-          <div class="t-label">Tailscale status</div>
+          <div class="t-label">Tailscale connection</div>
           <div class="vpn-status"><span id="vpnStatusDot" class="vpn-dot"></span><span id="vpnStatusText">Checking…</span></div>
           <div class="t-sub" id="vpnStatusSub"></div>
         </div>
@@ -873,7 +886,9 @@
     <div class="modal-head">
       <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
       <div>
-        <h1 id="wizardTitle">New Backup Job</h1>
+        <div class="title-row">
+          <h1 id="wizardTitle">New Backup Job</h1>
+        </div>
         <p>Five quick steps — the wizard stays open while you pick folders.</p>
       </div>
     </div>
@@ -947,32 +962,52 @@
 
       <!-- Step 3: Options & Schedule -->
       <section class="step-panel" data-panel="3">
-        <h3 style="margin:0 0 6px;">Backup Options</h3>
+        <h3 style="margin:0 0 2px;">Backup Options</h3>
         <div class="toggle-row">
           <div><div class="t-label">Allow incremental backups</div><div class="t-sub">Back up only files that changed since the last backup.</div></div>
           <label class="switch"><input type="checkbox" id="optIncremental" checked><span class="slider"></span></label>
         </div>
         <div class="toggle-row">
-          <div><div class="t-label">Compress with ZIP</div><div class="t-sub">Store the backup as a compressed .zip file.</div></div>
+          <div><div class="t-label">Compress backup</div><div class="t-sub">Compress the files before storing them. Off means the backup stores the files as-is.</div></div>
           <label class="switch"><input type="checkbox" id="optCompress" checked><span class="slider"></span></label>
         </div>
-        <div id="compressLevelField" style="margin:2px 0 0;">
+        <div id="compressLevelField" style="margin:0;">
           <div class="radio-row">
             <label><input type="radio" name="compressLevel" value="standard" checked> Standard <span style="color:var(--muted-2);font-size:12px;">— Deflate level 6, faster</span></label>
             <label><input type="radio" name="compressLevel" value="advanced"> Advanced <span style="color:var(--muted-2);font-size:12px;">— Deflate level 9, smaller</span></label>
           </div>
-          <div class="hint">The level the ZIP will actually use — Standard compresses faster, Advanced squeezes smaller.</div>
+          <div class="radio-row">
+            <label><input type="radio" name="compressLevel" value="standard-pw"> Standard with password <span style="color:var(--muted-2);font-size:12px;">— level 6, ZIP password</span></label>
+            <label><input type="radio" name="compressLevel" value="advanced-pw"> Advanced with password <span style="color:var(--muted-2);font-size:12px;">— level 9, ZIP password</span></label>
+          </div>
+          <div class="hint">"With password" sets a ZIP password (WinZip AES) — not encryption; that's the next step.</div>
+          <div id="zipPwFields" style="display:none; margin-top:2px;">
+            <div class="input-row">
+              <div class="field">
+                <label for="zipPassword">ZIP password</label>
+                <input type="password" id="zipPassword" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
+                <div class="field-error" id="zipPasswordError">Password must be at least 12 characters with uppercase, lowercase, numbers and symbols.</div>
+              </div>
+              <div class="field">
+                <label for="zipPasswordConfirm">Repeat ZIP password</label>
+                <input type="password" id="zipPasswordConfirm" placeholder="Repeat the ZIP password" autocomplete="new-password">
+                <div class="field-error" id="zipPasswordConfirmError">Passwords do not match.</div>
+              </div>
+            </div>
+            <div class="note" id="zipVaultNote" style="display:none;"><strong>Password saved:</strong> this job already has a ZIP password in the vault — leave the fields blank to keep it.</div>
+            <div class="hint">Never written into the job file — encrypted in the vault when unlocked.</div>
+          </div>
         </div>
         <div class="toggle-row">
           <div><div class="t-label">Verify files after backup</div><div class="t-sub">Hash-check files after the backup finishes.</div></div>
           <label class="switch"><input type="checkbox" id="optVerify" checked><span class="slider"></span></label>
         </div>
-        <h3 style="margin:10px 0 6px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
+        <h3 style="margin:2px 0 2px;">Schedule <span class="optional" style="color:var(--muted-2); font-size:13px;">(Optional)</span></h3>
         <div class="toggle-row">
           <div><div class="t-label">Run on schedule</div><div class="t-sub">Run this job automatically.</div></div>
           <label class="switch"><input type="checkbox" id="optSchedule"><span class="slider"></span></label>
         </div>
-        <div id="scheduleFields" style="display:none; margin-top:12px;">
+        <div id="scheduleFields" style="display:none; margin-top:6px;">
           <div class="field">
             <label>Frequency</label>
             <div class="radio-row">
@@ -994,7 +1029,6 @@
                 <label><input type="checkbox" name="customDay" value="4"> Thu</label>
                 <label><input type="checkbox" name="customDay" value="5"> Fri</label>
               </div>
-              <div class="hint">Pick the days this job runs, at the time below.</div>
             </div>
             <div class="field" style="flex:0 0 150px;">
               <label for="scheduleTime">Time</label>
@@ -1008,14 +1042,14 @@
       <section class="step-panel" data-panel="4">
         <h3 style="margin:0 0 6px;">Encryption</h3>
         <div class="toggle-row">
-          <div><div class="t-label">Encrypt backup (AES-256)</div><div class="t-sub">Protect the backup with a password. Standard WinZip AES — 7-Zip and WinRAR can open it too.</div></div>
+          <div><div class="t-label">Encrypt backup (TechVision-only)</div><div class="t-sub">Protect the backup with a password. Only this program can open it — no other program can decrypt it.</div></div>
           <label class="switch"><input type="checkbox" id="optEncrypt"><span class="slider"></span></label>
         </div>
         <div id="encFields" style="display:none; margin-top:12px;">
           <div class="field">
             <label for="encPassword">Backup password</label>
-            <input type="password" id="encPassword" placeholder="At least 8 characters" autocomplete="new-password">
-            <div class="field-error" id="encPasswordError">Please enter a password of at least 8 characters.</div>
+            <input type="password" id="encPassword" placeholder="At least 12 characters — upper, lower, number, symbol" autocomplete="new-password">
+            <div class="field-error" id="encPasswordError">Password must be at least 12 characters with uppercase, lowercase, numbers and symbols.</div>
           </div>
           <div class="field">
             <label for="encPasswordConfirm">Confirm password</label>
@@ -1032,7 +1066,7 @@
       <section class="step-panel" data-panel="5">
         <h3 style="margin:0 0 6px;">Review your job</h3>
         <div class="review" id="reviewBox"></div>
-        <div class="note info" style="margin-top:8px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
+        <div class="note info" id="reviewNote" style="margin-top:8px;"><strong>Ready?</strong> Click <strong>Create Job</strong> to save this job. You can run it right away from the Dashboard.</div>
       </section>
     </div>
     <div class="modal-foot">
@@ -1051,7 +1085,9 @@
     <div class="modal-head">
       <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
       <div>
-        <h1>Restore Backup</h1>
+        <div class="title-row">
+          <h1>Restore Backup</h1>
+        </div>
         <p>Pick a .zip backup file and a folder to restore it into.</p>
       </div>
     </div>
@@ -1094,20 +1130,22 @@
             <div class="field-error" id="restoreDestError">Please choose a destination folder.</div>
           </div>
           <div class="field" id="restorePasswordField" style="display:none;">
-            <label for="restorePassword">Backup password</label>
+            <label for="restorePassword" id="restorePasswordLabel">Backup password</label>
             <input type="password" id="restorePassword" placeholder="Password for this encrypted backup" autocomplete="off">
-            <div class="hint">This backup is encrypted (AES-256). Enter its backup password — the same one used when it was created. Without it, the files cannot be restored.</div>
+            <div class="hint" id="restorePasswordHint">This backup is encrypted (TechVision-only). Enter its backup password to restore it.</div>
             <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
           </div>
-          <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>
-          <div id="restoreAdvanced" style="display:none; margin-top:10px;">
-            <label class="check"><input type="checkbox" id="optOverwrite"> Overwrite existing files</label>
-            <label class="check"><input type="checkbox" id="restoreOptVerify" checked> Verify restored files</label>
+          <div class="field" id="restoreZipPasswordField" style="display:none;">
+            <label for="restoreZipPassword">ZIP password (WinZip AES)</label>
+            <input type="password" id="restoreZipPassword" placeholder="ZIP password for the backup inside this file" autocomplete="off">
+            <div class="field-error" id="restoreZipPasswordError">Please enter the ZIP password.</div>
           </div>
-          <div class="note" style="margin-top:14px;">
-            <strong>Phase 2</strong><br>
-            Streaming restore with yauzl is implemented.<br>
-            VSS (Volume Shadow Copy) is NOT implemented. Locked files will be skipped during backup.
+          <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>
+          <div id="restoreAdvanced" style="display:none; margin-top:2px;">
+            <label class="check"><input type="checkbox" id="optOverwrite"> Overwrite existing files</label>
+          </div>
+          <div class="note" style="margin-top:4px;">
+            <strong>Phase 2</strong> — Streaming restore with yauzl is implemented. VSS (Volume Shadow Copy) is NOT implemented. Locked files will be skipped during backup.
           </div>
         </section>
       </div>
@@ -1211,7 +1249,18 @@
     <button class="btn btn-primary" type="button" id="vaultUnlockBtn">Unlock</button>
     <button class="btn btn-ghost" type="button" id="vaultUnlockSkip">Skip for now</button>
   </div>
+  <button class="btn btn-ghost" type="button" id="vaultResetBtn" style="display:none; margin-top:10px;">I forgot it — create a new master password instead</button>
   <p style="font-size:12px; color:var(--muted); margin:10px 0 0;">Skipping leaves the vault locked: scheduled encrypted backups will not run, and manual runs will ask for the job password instead.</p>
+</div>
+<div class="backdrop" id="masterKeyBackdrop"></div>
+<div class="confirm-modal" id="masterKeyModal" role="alertdialog" aria-labelledby="masterKeyTitle" style="display:none;">
+  <h3 id="masterKeyTitle">🔑 Create a master key</h3>
+  <p id="masterKeyText">This password can only be saved if you create a master key first. One master password protects every saved password in the app — encrypted backups, Cloud servers, email and Tailscale.</p>
+  <div class="confirm-actions">
+    <button class="btn btn-primary" type="button" id="masterKeyGoBtn">Create a master key</button>
+    <button class="btn btn-ghost" type="button" id="masterKeySkipBtn">Continue without saving it</button>
+  </div>
+  <p style="font-size:12px; color:var(--muted); margin:10px 0 0;">Continuing without a master key still works — the password just will not be remembered, and you will be asked for it each time.</p>
 </div>
 <div class="backdrop" id="jobPwBackdrop"></div>
 <div class="confirm-modal" id="jobPwModal" role="alertdialog" aria-labelledby="jobPwTitle" style="display:none;">

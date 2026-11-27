@@ -14,8 +14,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   runIncrementalBackup: (jobConfig) => ipcRenderer.invoke('backup-run-incremental', jobConfig),
 
   // Restore operations
-  restoreAll: (zipPath, restoreDir, password) => ipcRenderer.invoke('restore-all', zipPath, restoreDir, password),
-  restoreSingle: (zipPath, entryName, destPath, password) => ipcRenderer.invoke('restore-single', zipPath, entryName, destPath, password),
+  restoreAll: (zipPath, restoreDir, password, options) => ipcRenderer.invoke('restore-all', zipPath, restoreDir, password, options),
+  restoreSingle: (zipPath, entryName, destPath, password, options) => ipcRenderer.invoke('restore-single', zipPath, entryName, destPath, password, options),
 
   // File system operations
     readDir: (dirPath) => ipcRenderer.invoke('fs-readdir', dirPath),
@@ -51,15 +51,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Master-password vault (job passwords for encrypted backups)
     vaultStatus: () => ipcRenderer.invoke('vault-status'),
     vaultSetup: (masterPassword) => ipcRenderer.invoke('vault-setup', masterPassword),
+    vaultReset: (masterPassword) => ipcRenderer.invoke('vault-reset', masterPassword),
     vaultUnlock: (masterPassword) => ipcRenderer.invoke('vault-unlock', masterPassword),
     vaultLock: () => ipcRenderer.invoke('vault-lock'),
     vaultChangePassword: (oldPassword, newPassword) => ipcRenderer.invoke('vault-change-password', oldPassword, newPassword),
     vaultHasJobPassword: (jobId) => ipcRenderer.invoke('vault-has-job-password', jobId),
     vaultStoreJobPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-password', jobId, jobPassword),
+    vaultHasJobZipPassword: (jobId) => ipcRenderer.invoke('vault-has-job-zip-password', jobId),
+    vaultStoreJobZipPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-zip-password', jobId, jobPassword),
 
   // Job detail actions
   openEditJob: (jobId) => ipcRenderer.invoke('job-open-edit', jobId),
   runBackupForJob: (jobId) => ipcRenderer.invoke('job-run-backup', jobId),
+  stopBackup: (jobId) => ipcRenderer.invoke('job-stop-backup', jobId),
   restoreJob: (jobId) => ipcRenderer.invoke('job-restore', jobId),
   deleteJob: (jobId) => ipcRenderer.invoke('job-delete', jobId),
 
@@ -141,6 +145,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
   vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
   vpnSetRoutes: (on, auth) => ipcRenderer.invoke('vpn-set-routes', on, auth),
+  vpnReconcileSubnet: (auth, status) => ipcRenderer.invoke('vpn-reconcile-subnet', auth, status || null),
   vpnInstallConnect: (adminCreds) => ipcRenderer.invoke('vpn-install-connect', adminCreds || null),
   vpnDisableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-disable-key-expiry', auth),
   vpnEnableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-enable-key-expiry', auth),

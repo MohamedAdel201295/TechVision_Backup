@@ -225,6 +225,12 @@ function mapErrorText(r) {
   if (/system error 67/.test(text)) return 'The server could not be reached at that address, or Windows does not trust its certificate yet.';
   if (/system error 53/.test(text)) return 'The network path was not found — check the server address and port.';
   if (/system error 1326/.test(text)) return 'Wrong user name or password for this Cloud server.';
+  // 1244 = Windows refused to send the login at all: the TLS
+  // handshake failed, so no credentials ever went over the wire.
+  // That is a certificate problem (not trusted for this address, or
+  // the certificate does not cover this address), not a wrong
+  // password — saying so plainly instead of quoting the raw error.
+  if (/system error 1244/.test(text)) return 'Windows refused to send your login (System error 1244): it does not trust the server certificate for this address. If the address was added after the server started, restart the Cloud server on the server machine so it issues a new certificate covering it, then connect again and map.';
   const raw = (r.stderr || r.stdout || '').trim().replace(/\s+/g, ' ');
   return raw ? 'Mapping failed: ' + raw.slice(0, 300) : 'Mapping failed (net use error ' + (r.code || '?') + ').';
 }
@@ -369,6 +375,7 @@ module.exports = {
   installCert,
   ensureWebClient,
   mapDrive,
+  mapErrorText,
   unmapDrive,
   getDriveStatus,
   listFreeLetters,

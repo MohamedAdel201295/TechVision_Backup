@@ -86,7 +86,9 @@ function certSans(certPem) {
 // when it has no usable SANs at all (every cert made before this fix
 // — CN only, or the selfsigned default URI SAN that matches no host,
 // which is exactly why `net use` failed with error 1244), or when
-// the DDNS hostname was added/changed and is not in the cert yet.
+// the DDNS hostname was added/changed and is not in the cert yet, or
+// when the DDNS hostname recorded on the cert at issuance no longer
+// matches the configured one (changed or removed since).
 // Nothing else regenerates it: LAN addresses come and go (a VPN
 // going up/down adds/removes interfaces), and churning the
 // fingerprint on every such change would force every client to
@@ -95,9 +97,37 @@ function certNeedsRegen(cfg) {
   if (!cfg.cert || !cfg.cert.cert) return true;
   const sans = certSans(cfg.cert.cert);
   if (!sans.hasSans) return true;
-  const ddns = String((cfg.ddnsHostname) || '').trim();
-  if (ddns && sans.dns.indexOf(ddns) < 0) return true;
+  const ddns = String((cfg.ddnsHostname) || '').trim().toLowerCase();
+  // The DDNS hostname recorded when the cert was issued: a mismatch
+  // means the config changed (or the DDNS was removed) since, so the
+  // cert no longer matches and must be regenerated once.
+  if (typeof cfg.cert.ddnsHostname === 'string' && cfg.cert.ddnsHostname !== ddns) return true;
+  if (ddns) {
+    const dns = sans.dns.map(function (n) { return String(n).toLowerCase(); });
+    if (dns.indexOf(ddns) < 0) return true;
+  }
   return false;
+}
+
+// Does this certificate cover `host` for Windows hostname validation
+// (`net use` / WebClient)? An IPv4 host needs an IP SAN, a hostname
+// needs a DNS SAN. Returns true / false, or null when the host form
+// cannot be judged here (IPv6) — the caller then proceeds as before
+// instead of blocking a mapping it cannot evaluate.
+// This is the 1244 hole (2026-11-27): the SANs are frozen at issuance
+// — an address that appears later (Tailscale coming up after the
+// server first started) is never in the cert, certNeedsRegen never
+// fires for it, and `net use` fails with System error 1244 while the
+// in-app Client still connects fine (fingerprint pinning does no
+// hostname validation). The map flow must check coverage and fail
+// with the actual cause instead of the cryptic 1244.
+function certCoversHost(certPem, host) {
+  const h = String(host || '').trim().toLowerCase().replace(/\.$/, '');
+  if (!h) return false;
+  if (h.indexOf(':') >= 0) return null; // IPv6 (incl. bracketed): not judged here
+  const sans = certSans(certPem);
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return sans.ips.indexOf(h) >= 0;
+  return sans.dns.map(function (n) { return String(n).toLowerCase(); }).indexOf(h) >= 0;
 }
 
 function certExtensions(cfg, publicIp) {
@@ -135,6 +165,7 @@ async function ensureCert(cfg) {
     cert: pems.cert,
     key: pems.private,
     fingerprint: fingerprintOfCertPem(pems.cert),
+    ddnsHostname: String(cfg.ddnsHostname || '').trim().toLowerCase(),
   };
   return cfg.cert;
 }
@@ -850,7 +881,8 @@ class CloudServer {
 
     if (req.method === 'GET') {
       if (!fs.existsSync(target) || !fs.statSync(target).isFile()) { this._sendJson(res, 404, { error: 'File not found.' }); return; }
-      const size = fs.statSync(target).size;
+      const stat = fs.statSync(target);
+      const size = stat.size;
       const range = String(req.headers.range || '');
       const rm = /^bytes=(\d*)-(\d*)$/.exec(range);
       let start = 0, end = size - 1, partial = false;
@@ -858,7 +890,7 @@ class CloudServer {
         if (rm[1] === '' && rm[2] !== '') { start = Math.max(0, size - parseInt(rm[2], 10)); }
         else {
           start = parseInt(rm[1] || '0', 10);
-          end = rm[2] !== '' ? parseInt(rm[2], 10) : size - 1;
+          if (rm[2] !== '') end = Math.min(parseInt(rm[2], 10), size - 1);
         }
         if (isNaN(start) || isNaN(end) || start < 0 || end < start || start >= size) {
           res.writeHead(416, { 'Content-Range': 'bytes */' + size });
@@ -871,9 +903,10 @@ class CloudServer {
         'Content-Type': this._davMime(path.basename(target)),
         'Content-Length': end - start + 1,
         'Accept-Ranges': 'bytes',
-        'Last-Modified': new Date(fs.statSync(target).mtimeMs).toUTCString(),
+        'Last-Modified': new Date(stat.mtimeMs).toUTCString(),
         ...(partial ? { 'Content-Range': 'bytes ' + start + '-' + end + '/' + size } : {}),
       });
+      if (!size) { res.end(); return; }
       const rs = fs.createReadStream(target, { start, end });
       rs.on('error', () => { try { if (!res.headersSent) res.writeHead(410, { 'Content-Type': 'application/json' }); res.end(); } catch (_) {} });
       rs.pipe(res);
@@ -1047,4 +1080,4 @@ class CloudServer {
   }
 }
 
-module.exports = { CloudServer, defaultServerConfig, ensureCert, certSans, certNeedsRegen, fingerprintOfCertPem, hashPassword, verifyPassword, lanIPs, detectPublicIP, MAX_UPLOAD_BYTES };
+module.exports = { CloudServer, defaultServerConfig, ensureCert, certSans, certCoversHost, certNeedsRegen, fingerprintOfCertPem, hashPassword, verifyPassword, lanIPs, detectPublicIP, MAX_UPLOAD_BYTES };

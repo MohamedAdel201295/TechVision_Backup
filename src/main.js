@@ -28,6 +28,134 @@ const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
 // password is ever written to disk in the clear.
 let vaultKey = null;
 
+// Round 3 — vault overhaul: the vault now also holds the Cloud
+// client, SMTP and Tailscale secrets (generic secrets), and legacy
+// plaintext passwords are migrated into the vault on first unlock.
+// Machine keys (Cloud TLS private key, WireGuard private keys) stay
+// plaintext by design — auto-start — and are NOT vault secrets.
+//
+// Master-password model (changed 2026-11-27, replaces the round-3
+// "remember-me" agreement): the program asks for the master
+// password at EVERY startup — there is NO silent auto-unlock and no
+// remember-me blob is written. Typing the existing key unlocks the
+// vault and all saved passwords work again. Creating a NEW key at
+// startup (without the old one) REPLACES the vault: every saved
+// password is lost, so the UI warns first and requires a
+// confirmation. Changing the key in Settings (old key known) is the
+// opposite: it re-encrypts the vault and saved passwords are KEPT.
+
+// After any successful unlock: migrate any plaintext passwords still
+// sitting in cloud.json / settings.json into the vault. Never
+// throws — a failure here must never block the app.
+function afterVaultUnlocked() {
+  try {
+    if (vaultKey) {
+      const moved = vault.migrateLegacySecrets(app.getPath('userData'), vaultKey);
+      if (moved.cloud || moved.smtp || moved.apiToken || moved.oauthSecret) {
+        console.log('[Vault] Migrated plaintext passwords into the vault: ' + JSON.stringify(moved));
+        appendAppLog('info', 'Moved saved passwords (Cloud, email, Tailscale) into the encrypted vault — they no longer sit in plain text in the settings files.');
+        // The in-memory cloud config may still hold a legacy password
+        // field that migration just deleted from disk: drop it so the
+        // record reads from the vault from now on.
+        try { const cfg = getCloudConfig(); for (const c of (cfg.clients || [])) { if (c.passwordInVault) delete c.password; } } catch (e) {}
+      }
+    }
+  } catch (e) { console.log('[Vault] Migration failed: ' + (e && e.message ? e.message : e)); }
+}
+
+// Saved password for a Cloud server record: the vault secret when the
+// record was migrated (passwordInVault), else the legacy plaintext
+// field until migration runs. Never throws.
+function getClientPassword(rec) {
+  if (!rec) return null;
+  try {
+    if (rec.passwordInVault && vaultKey) {
+      const pw = vault.getSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + rec.id);
+      if (pw) return pw;
+    }
+  } catch (e) {}
+  return rec.password || null;
+}
+
+function readSettingsFile() {
+  try {
+    const p = path.join(app.getPath('userData'), '.techvision', 'settings.json');
+    if (fs.existsSync(p)) { const s = JSON.parse(fs.readFileSync(p, 'utf-8')); return (s && typeof s === 'object') ? s : {}; }
+  } catch (e) {}
+  return {};
+}
+
+// Tailscale credentials for the vpn.* API calls: the renderer only
+// ever sends the non-secret client id (secrets no longer reach it).
+// Fill the secrets in here, from the vault when unlocked, else from
+// the legacy plaintext fields until migration runs. The renderer
+// value wins when it actually carries a secret (it never should).
+function resolveVpnAuth(auth) {
+  const a = (auth && typeof auth === 'object') ? Object.assign({}, auth) : {};
+  const settings = readSettingsFile();
+  const legacy = (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {};
+  try {
+    if (vaultKey) {
+      if (!a.apiToken) a.apiToken = vault.getSecret(app.getPath('userData'), vaultKey, 'tailscale-api-token') || a.apiToken;
+      if (!a.clientSecret) a.clientSecret = vault.getSecret(app.getPath('userData'), vaultKey, 'tailscale-oauth-secret') || a.clientSecret;
+    }
+  } catch (e) {}
+  if (!a.apiToken && legacy.apiToken) a.apiToken = legacy.apiToken;
+  if (!a.clientSecret && legacy.oauthClientSecret) a.clientSecret = legacy.oauthClientSecret;
+  if (!a.clientId && legacy.oauthClientId) a.clientId = legacy.oauthClientId;
+  return a;
+}
+
+// Email settings with the SMTP password resolved: vault secret when
+// unlocked, else the legacy plaintext field until migration runs.
+// mailer.js itself only ever reads the file — it never touches the
+// vault — so callers that send mail go through here.
+function resolveEmailSettings() {
+  const settings = readSettingsFile();
+  const email = (settings.email && typeof settings.email === 'object') ? Object.assign({}, settings.email) : {};
+  try {
+    if (vaultKey) {
+      const pw = vault.getSecret(app.getPath('userData'), vaultKey, 'smtp');
+      if (pw) email.smtpPass = pw;
+    }
+  } catch (e) {}
+  return email;
+}
+
+// Strip plaintext secrets out of a settings object before it leaves
+// main (settings-get): the renderer never receives a password or
+// token. Instead it gets *InVault flags so the fields can show
+// "saved — leave blank to keep it". A legacy plaintext field still
+// on disk also counts as saved until migration moves it.
+function stripSecretsFromSettings(settings) {
+  const s = (settings && typeof settings === 'object') ? JSON.parse(JSON.stringify(settings)) : {};
+  if (!s.email || typeof s.email !== 'object') s.email = {};
+  if (!s.vpn || typeof s.vpn !== 'object') s.vpn = {};
+  let smtpSaved = false, tokenSaved = false, oauthSaved = false;
+  try {
+    if (vaultKey) {
+      smtpSaved = vault.hasSecret(app.getPath('userData'), vaultKey, 'smtp');
+      tokenSaved = vault.hasSecret(app.getPath('userData'), vaultKey, 'tailscale-api-token');
+      oauthSaved = vault.hasSecret(app.getPath('userData'), vaultKey, 'tailscale-oauth-secret');
+    }
+  } catch (e) {}
+  if (s.email.smtpPass) smtpSaved = true;
+  if (s.vpn.apiToken) tokenSaved = true;
+  if (s.vpn.oauthClientSecret) oauthSaved = true;
+  // A flag already on disk stays true even while the vault is locked
+  // (the secret is in the vault, just unreadable right now).
+  if (s.email.smtpPassInVault) smtpSaved = true;
+  if (s.vpn.apiTokenInVault) tokenSaved = true;
+  if (s.vpn.oauthClientSecretInVault) oauthSaved = true;
+  delete s.email.smtpPass;
+  delete s.vpn.apiToken;
+  delete s.vpn.oauthClientSecret;
+  s.email.smtpPassInVault = smtpSaved;
+  s.vpn.apiTokenInVault = tokenSaved;
+  s.vpn.oauthClientSecretInVault = oauthSaved;
+  return s;
+}
+
 // ---------- TechVision Cloud ----------
 // Config file: <userData>/.techvision/cloud.json — { server, clients }.
 // The server instance holds a reference to this object, so user edits
@@ -258,28 +386,45 @@ try {
 }
 
 // Bring over settings/jobs saved under the old per-mode folders
-// (techvision-backup or TechVision Backup) into the pinned folder,
-// copying only files that are missing there.
+// (techvision-backup or TechVision Backup) into the pinned folder.
+// MOVE, don't copy: the old code copied only files missing in the
+// pinned folder and left the source behind forever — so a job the
+// user deleted from the pinned folder was copied BACK on the next
+// startup (it was "missing" there again), loaded as a template, and
+// its missed schedule fired it the moment the app started. A deleted
+// job came back RUNNING after a full Exit and reopen. Moving closes
+// that hole: once adopted, nothing is left behind to resurrect
+// anything. A file whose destination already exists is a stale
+// duplicate of the live copy — it is removed too (the pinned folder
+// is authoritative; nothing writes to the legacy folders anymore, so
+// nothing live can be lost). A file that cannot be removed is logged
+// loudly and left for the next startup to retry.
 function migrateLegacyUserData() {
   try {
     const newBase = path.join(USER_DATA_DIR, '.techvision');
     for (const name of ['techvision-backup', 'TechVision Backup']) {
       const oldBase = path.join(app.getPath('appData'), name, '.techvision');
       if (oldBase === newBase || !fs.existsSync(oldBase)) continue;
-      const copyMissing = (srcDir, destDir) => {
+      const moveMissing = (srcDir, destDir) => {
         if (!fs.existsSync(srcDir)) return;
         if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
         for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
           const src = path.join(srcDir, entry.name);
           const dest = path.join(destDir, entry.name);
-          if (entry.isDirectory()) copyMissing(src, dest);
-          else if (!fs.existsSync(dest)) {
-            fs.copyFileSync(src, dest);
-            console.log(`[Main] Migrated user data file: ${dest}`);
+          if (entry.isDirectory()) {
+            moveMissing(src, dest);
+            try { fs.rmdirSync(src); } catch (e) {} // best effort: drop emptied legacy dirs
+          } else {
+            if (!fs.existsSync(dest)) {
+              fs.copyFileSync(src, dest);
+              console.log(`[Main] Migrated user data file: ${dest}`);
+            }
+            try { fs.unlinkSync(src); }
+            catch (e) { console.error(`[Main] Could not remove migrated legacy file ${src} — it may resurrect deleted jobs on the next start: ${e.message}`); }
           }
         }
       };
-      copyMissing(oldBase, newBase);
+      moveMissing(oldBase, newBase);
     }
   } catch (e) {
     console.error('[Main] User data migration failed:', e.message);
@@ -303,8 +448,42 @@ let mainWindow;
 let pendingWizardJob = null;
 let pendingRestoreJob = null;
 
+// Single instance: a second launch must NOT open a second copy of
+// the app — two processes would write the same jobs/history/vault
+// files, both schedulers could fire the same backup at once, and the
+// Cloud server port would clash. The lock is keyed by the userData
+// folder, which was pinned to %APPDATA%\TechVision Backup above, so
+// it covers both source and packaged runs. Requested here — early,
+// before app.whenReady() creates any state — so a second process
+// quits before it can touch anything. A second launch just brings
+// the running window forward.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    // The window may be minimized, hidden to the tray (X hides it),
+    // or gone — bring it back in front in every case. Never open a
+    // second window.
+    console.log('[Main] Second instance launch — bringing the running window forward');
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    } else {
+      createMainWindow();
+    }
+  });
+}
+
 // Active jobs tracking (Map for tracking in-progress operations)
 const activeJobs = new Map();
+// Live engine per active run, keyed the same way as activeJobs, so
+// job-stop-backup can cancel the exact run that is going. Entries
+// are removed together with the activeJobs entry (finally in the
+// scheduled path, after the record in the manual paths) so a
+// finished run never stays registered.
+const activeEngines = new Map();
 let jobHistory = [];
 
 // Get jobs history file path
@@ -363,7 +542,14 @@ function normalizeJobObject(job, defaultType = 'full') {
     lastScheduledRun: job.lastScheduledRun || null,
     runs: Array.isArray(job.runs) ? job.runs : [],
     runCount: job.runCount ?? (Array.isArray(job.runs) ? job.runs.length : 0),
-    loaded: job.loaded || false
+    loaded: job.loaded || false,
+    // Name of the template file this job was loaded from, when it
+    // was loaded from one (set by loadStoredJobs / job-save-config).
+    // Delete uses it to remove the job's own file BY NAME instead of
+    // relying only on the content scan — a file the scan skips
+    // (unreadable under an odd filename, content that matches
+    // nothing) used to survive while delete still reported success.
+    templateFile: job.templateFile || null
   };
   // A job with runs is a real job, not a template: showing
   // "TEMPLATE / COMPLETED" is contradictory. Only a job that never
@@ -470,6 +656,7 @@ function mergeJobEntries(entries) {
       if (entry.encryptionEnabled !== undefined) job.encryptionEnabled = entry.encryptionEnabled === true;
       if (entry.options) job.options = entry.options;
       if (entry.lastScheduledRun) job.lastScheduledRun = entry.lastScheduledRun;
+      if (entry.templateFile) job.templateFile = entry.templateFile;
       if (!job.runs.length) {
         job.status = entry.status || 'pending';
         job.type = 'template';
@@ -494,7 +681,9 @@ function notifyJobsUpdated() {
 // break or delay a backup. Logs the outcome, nothing else.
 function notifyEmail(kind, job, extra) {
   try {
-    mailer.notify(app.getPath('userData'), kind, job, extra).then(function (r) {
+    // Pass the vault-resolved SMTP settings so notifications keep
+    // working after the password moved out of settings.json.
+    mailer.notify(app.getPath('userData'), kind, job, extra, resolveEmailSettings()).then(function (r) {
       if (r && !r.sent && r.reason !== 'off') console.log('[Mail] Notification not sent (' + kind + '): ' + r.reason);
       else if (r && r.sent) console.log('[Mail] Notification sent (' + kind + ')');
     }).catch(function (e) { console.log('[Mail] Notification error:', e.message); });
@@ -511,6 +700,21 @@ function resolveBackupPassword(jobConfig) {
   }
   if (jobConfig && jobConfig.encryptionEnabled && vaultKey && jobConfig.id) {
     try { return vault.getJobPassword(app.getPath('userData'), vaultKey, jobConfig.id); } catch (e) { return null; }
+  }
+  return null;
+}
+
+// Resolve the ZIP password for a job, in the same order as the
+// backup password above. The ZIP password lives in the vault's
+// generic secrets namespace under 'job-zip-password:<jobId>' — a
+// separate secret from the backup password, never the same value
+// unless the user typed the same string twice.
+function resolveZipPassword(jobConfig) {
+  if (jobConfig && typeof jobConfig.zipPassword === 'string' && jobConfig.zipPassword) {
+    return jobConfig.zipPassword;
+  }
+  if (jobConfig && jobConfig.zipPasswordEnabled && vaultKey && jobConfig.id) {
+    try { return vault.getSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobConfig.id); } catch (e) { return null; }
   }
   return null;
 }
@@ -565,6 +769,14 @@ function runErrorLine(result) {
   const msgs = result.error_messages;
   if (Array.isArray(msgs) && msgs.length) return String(msgs[msgs.length - 1]);
   return 'Backup failed — see the log for details.';
+}
+
+// A stopped run is recorded as 'cancelled' — not 'failed' (it is not
+// an error) and not 'completed'. The Logs failed tab and the failure
+// email both key off this status, so a stop stays out of both.
+function runStatusOf(result) {
+  if (result && result.cancelled) return 'cancelled';
+  return result && result.success ? 'completed' : 'failed';
 }
 
 function recordRun(jobName, jobRecord) {
@@ -633,7 +845,7 @@ async function loadStoredJobs() {
   try {
     if (!fs.existsSync(jobsDir)) return;
     const files = fs.readdirSync(jobsDir);
-    const jsonFiles = files.filter(f => f.endsWith('.json') && f !== 'history.json');
+    const jsonFiles = files.filter(f => f.endsWith('.json') && f !== 'history.json' && f !== 'waiting.json');
     for (const file of jsonFiles) {
       try {
         const content = fs.readFileSync(path.join(jobsDir, file), 'utf-8');
@@ -641,6 +853,9 @@ async function loadStoredJobs() {
         const normalized = normalizeJobObject(rawJob, 'template');
         if (normalized) {
           normalized.loaded = true;
+          // Remember which file this template came from, so delete
+          // can remove it by name (see deleteTemplateFiles).
+          normalized.templateFile = file;
           jobHistory.push(normalized);
           console.log(`[Main] Loaded stored job template: ${normalized.name}`);
         } else {
@@ -694,8 +909,10 @@ function saveJobHistory() {
     fs.writeFileSync(tmpPath, JSON.stringify(recordsToSave, null, 2));
     fs.renameSync(tmpPath, historyPath);
     console.log(`[Main] Saved ${recordsToSave.length} job history records`);
+    return true;
   } catch (e) {
     console.error('[Main] Failed to save job history:', e.message);
+    return false;
   }
 }
 
@@ -849,6 +1066,11 @@ function createMainWindow() {
 // App lifecycle
 app.whenReady().then(() => {
   migrateLegacyUserData(); // Bring old settings/jobs into the pinned folder
+  // Master-password model (2026-11-27): NO auto-unlock at startup.
+  // The renderer asks for the master password on every launch. Any
+  // remember-me blob left over from the old build is deleted here
+  // so it can never silently unlock the vault — and is never read.
+  try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
   loadStoredJobs(); // Load stored jobs on startup
   checkMissedSchedules(); // Email if the app was closed and a schedule was missed
   startScheduler(); // Run scheduled jobs while the app is open
@@ -960,6 +1182,7 @@ function nextScheduledRun(schedule, fromDate, lastRun) {
 
 async function executeScheduledBackup(job, resolved) {
   if (!job || !job.source || !job.destination) return;
+  if (!jobHistory.includes(job)) return; // deleted/replaced while resolving drives
   // Resolved paths from the drive watcher: the source may have moved
   // to another letter (same volume label), or the destination too.
   const sourcePath = (resolved && resolved.source && resolved.source.path) || job.source;
@@ -976,7 +1199,8 @@ async function executeScheduledBackup(job, resolved) {
     compress: job.compress, compression: job.compression,
     allowIncremental: job.allowIncremental, schedule: job.schedule,
     includePatterns: job.includePatterns, excludePatterns: job.excludePatterns,
-    encryptionEnabled: job.encryptionEnabled === true, id: job.id
+    encryptionEnabled: job.encryptionEnabled === true,
+    zipPasswordEnabled: job.zipPasswordEnabled === true, id: job.id
   };
   // Encrypted job, vault locked (or no password saved): the schedule
   // cannot run without the password, so skip this run. The skip used
@@ -986,7 +1210,7 @@ async function executeScheduledBackup(job, resolved) {
   if (jobConfig.encryptionEnabled) {
     const pw = resolveBackupPassword(jobConfig);
     if (!pw) {
-      const msg = `Skipped encrypted job "${job.name}": the vault is locked or no password is saved. Unlock the vault in Settings to let scheduled encrypted backups run.`;
+      const msg = `Skipped encrypted job "${job.name}": the vault is locked or no password is saved. Open the app and unlock the vault with your master password to let scheduled encrypted backups run.`;
       console.log(`[Scheduler] ${msg}`);
       appendAppLog('warn', msg);
       recordRun(job.name, {
@@ -1003,17 +1227,44 @@ async function executeScheduledBackup(job, resolved) {
     }
     jobConfig.encryptionPassword = pw;
   }
+  // ZIP-password job, vault locked (or no ZIP password saved): the
+  // schedule cannot run without it — same skip rule as the
+  // encryption password above, naming which password is missing.
+  if (jobConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(jobConfig);
+    if (!zpw) {
+      const msg = `Skipped job "${job.name}": the ZIP password is not saved (the vault is locked or no ZIP password is stored). Open the app and unlock the vault with your master password to let scheduled backups of this job run.`;
+      console.log(`[Scheduler] ${msg}`);
+      appendAppLog('warn', msg);
+      recordRun(job.name, {
+        id: `${job.name}-scheduled-skipped-${Date.now()}`, jobId: job.id || null, name: job.name,
+        type: 'full', success: false, status: 'skipped',
+        source: jobPathValue(job.source), destination: jobPathValue(job.destination),
+        timestamp: new Date().toISOString(), files: 0, size: 0, duration: 0,
+        error: msg, result: null
+      });
+      job.lastScheduledRun = new Date().toISOString();
+      saveJobHistory();
+      notifyJobsUpdated();
+      return;
+    }
+    jobConfig.zipPassword = zpw;
+  }
   const useIncremental = job.allowIncremental && (job.runCount || 0) > 0;
   const jobId = `${job.name}-scheduled-${Date.now()}`;
-  activeJobs.set(jobId, { name: job.name, status: 'running' });
+  activeJobs.set(jobId, { name: job.name, jobId: job.id, status: 'running' });
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
   notifyEmail('started', { name: job.name, type: useIncremental ? 'incremental' : 'full', source: job.source, destination: job.destination });
   try {
     const engine = new BackupEngine(jobConfig);
+    activeEngines.set(jobId, engine);
     engine.logger = true;
     const result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
     const jobRecord = {
       id: jobId, name: job.name, type: useIncremental ? 'incremental' : 'full',
-      success: result.success, status: result.success ? 'completed' : 'failed',
+      success: result.success, status: runStatusOf(result),
       source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination),
       timestamp: new Date().toISOString(), files: result.files_backed_up,
       size: result.total_bytes, duration: result.duration_seconds, result,
@@ -1022,7 +1273,9 @@ async function executeScheduledBackup(job, resolved) {
     recordRun(job.name, jobRecord);
     job.lastScheduledRun = new Date().toISOString();
     saveJobHistory();
-    notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+    // A stopped run sends no finished/failed email — the user asked
+    // for the stop, it is not a failure.
+    if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
     console.log(`[Scheduler] Scheduled backup ${useIncremental ? 'incremental' : 'full'} for ${job.name}: ${jobRecord.status}`);
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } catch (e) {
@@ -1042,6 +1295,7 @@ async function executeScheduledBackup(job, resolved) {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('jobs-updated');
   } finally {
     activeJobs.delete(jobId);
+    activeEngines.delete(jobId);
   }
 }
 
@@ -1069,6 +1323,7 @@ async function checkSchedules() {
     // drive — the engine creates it — so the job waits only when the
     // source is missing or the destination's drive is provably absent.
     const resolved = await resolveJobPaths(job);
+    if (!jobHistory.includes(job)) continue;
     if (resolved.source.found && (resolved.destination.found || resolved.destination.drivePresent !== false)) {
       if (job.waitingForDrive) { delete job.waitingForDrive; saveWaitingState(); notifyJobsUpdated(); }
       executeScheduledBackup(job, resolved);
@@ -1223,6 +1478,14 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'full' };
     jobConfig.encryptionPassword = pw;
   }
+  // A ZIP-password job with no ZIP password anywhere: refuse up
+  // front, like the encryption password above. The renderer asks
+  // for it (askJobPassword) and retries.
+  if (jobConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(jobConfig);
+    if (!zpw) return { success: false, error: 'ZIP_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'full' };
+    jobConfig.zipPassword = zpw;
+  }
   // Never run the same job twice at once (manual + scheduled, or a
   // double-click): two engines would write the same backup folder
   // and the same state file.
@@ -1235,13 +1498,19 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 
   // Real progress for the window that started the run: the renderer
   // used to fake the bar (raced to 92% and froze). The engine now
-  // reports real bytes; forward them as they arrive.
+  // reports real bytes; forward them as they arrive. The payload
+  // carries the job id/name so the Jobs details progress bar can
+  // match the event to the running job (dictation #2).
   engine.onProgress = (p) => {
-    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', p); } catch (e) {}
+    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', Object.assign({}, p, { jobId: jobConfig.id || null, jobName })); } catch (e) {}
   };
 
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, jobId: jobConfig.id || null, status: 'running' });
+  activeEngines.set(jobId, engine);
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
 
   notifyEmail('started', { name: jobName, type: 'full', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
 
@@ -1265,7 +1534,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
     name: jobName,
     type: 'full',
     success: result.success,
-    status: result.success ? 'completed' : 'failed',
+    status: runStatusOf(result),
     source: jobPathValue(jobConfig.source),
     destination: jobPathValue(jobConfig.destination),
     timestamp: new Date().toISOString(),
@@ -1280,6 +1549,7 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   saveJobHistory();
   notifyJobsUpdated();
   activeJobs.delete(jobId);
+  activeEngines.delete(jobId);
 
   // The run used a password the user typed: if the vault is unlocked,
   // save it there (encrypted) so scheduled runs of this job work too.
@@ -1289,7 +1559,15 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
     try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
   }
-  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+  // After a successful manual run, store a typed ZIP password in
+  // the vault (same rule as the backup password above) so scheduled
+  // runs of this job work too.
+  if (jobRecord.success && jobConfig.zipPasswordEnabled && vaultKey && jobConfig.id && jobConfig.zipPassword) {
+    try { vault.storeSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobConfig.id, jobConfig.zipPassword); } catch (e) { appendAppLog('error', `Could not store the ZIP password for job "${jobName}" in the vault: ${e.message}. Scheduled backups of this job will be skipped until the ZIP password is stored.`); }
+  }
+  // A stopped run sends no finished/failed email — the user asked
+  // for the stop, it is not a failure.
+  if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Backup completed: ${jobName}, saved to history`);
   return jobRecord;
 });
@@ -1315,6 +1593,13 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
     jobConfig.encryptionPassword = pw;
   }
+  // A ZIP-password job with no ZIP password anywhere: refuse up
+  // front, like the encryption password above.
+  if (jobConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(jobConfig);
+    if (!zpw) return { success: false, error: 'ZIP_PASSWORD_REQUIRED', name: jobName, status: 'failed', type: 'incremental' };
+    jobConfig.zipPassword = zpw;
+  }
   // Never run the same job twice at once (see the full backup).
   for (const [, a] of activeJobs) {
     if (a.name === jobName || (jobConfig.id && a.jobId === jobConfig.id)) {
@@ -1325,11 +1610,15 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
 
   // Real progress for the window that started the run (see full backup).
   engine.onProgress = (p) => {
-    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', p); } catch (e) {}
+    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', Object.assign({}, p, { jobId: jobConfig.id || null, jobName })); } catch (e) {}
   };
 
   const jobId = `${jobName}-${Date.now()}`;
   activeJobs.set(jobId, { name: jobName, jobId: jobConfig.id || null, status: 'running' });
+  activeEngines.set(jobId, engine);
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
   notifyEmail('started', { name: jobName, type: 'incremental', source: jobPathValue(jobConfig.source), destination: jobPathValue(jobConfig.destination) });
 
   engine.logger = true;
@@ -1348,7 +1637,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
     name: jobName,
     type: 'incremental',
     success: result.success,
-    status: result.success ? 'completed' : 'failed',
+    status: runStatusOf(result),
     source: jobPathValue(jobConfig.source),
     destination: jobPathValue(jobConfig.destination),
     timestamp: new Date().toISOString(),
@@ -1363,38 +1652,49 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
   saveJobHistory();
   notifyJobsUpdated();
   activeJobs.delete(jobId);
+  activeEngines.delete(jobId);
 
   if (jobRecord.success && jobConfig.encryptionEnabled && vaultKey && jobConfig.id && jobConfig.encryptionPassword) {
     try { vault.storeJobPassword(app.getPath('userData'), vaultKey, jobConfig.id, jobConfig.encryptionPassword); } catch (e) { appendAppLog('error', `Could not store the password for job "${jobName}" in the vault: ${e.message}. Scheduled encrypted backups of this job will be skipped until the password is stored.`); }
   }
-  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+  // After a successful manual run, store a typed ZIP password in
+  // the vault (same rule as the backup password above) so scheduled
+  // runs of this job work too.
+  if (jobRecord.success && jobConfig.zipPasswordEnabled && vaultKey && jobConfig.id && jobConfig.zipPassword) {
+    try { vault.storeSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobConfig.id, jobConfig.zipPassword); } catch (e) { appendAppLog('error', `Could not store the ZIP password for job "${jobName}" in the vault: ${e.message}. Scheduled backups of this job will be skipped until the ZIP password is stored.`); }
+  }
+  // A stopped run sends no finished/failed email — the user asked
+  // for the stop, it is not a failure.
+  if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   console.log(`[Main] Incremental backup completed: ${jobName}`);
   return jobRecord;
 });
 
 // Restore operations
-ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password) => {
+// options is optional: { overwrite: true } replaces existing files;
+// default (no option) leaves them alone and reports files_skipped.
+ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password, options) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null);
+    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null, options || {});
     // restore_all reports failures in its result object instead of
     // throwing (wrong password, hash mismatch) — honour it, or a
     // failed restore would be reported as success. Its counters are
     // files_restored/total_bytes, not files/size.
     if (result && result.success === false) {
-      return { success: false, error: (result.errors && result.errors[0]) || 'Restore failed.' };
+      return { success: false, error: (result.errors && result.errors[0]) || 'Restore failed.', files_skipped: (result && result.files_skipped) || 0 };
     }
-    return { success: true, files: (result && result.files_restored) || 0, size: (result && result.total_bytes) || 0 };
+    return { success: true, files: (result && result.files_restored) || 0, size: (result && result.total_bytes) || 0, files_skipped: (result && result.files_skipped) || 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
   }
 });
 
-ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, password) => {
+ipcMain.handle('restore-single', async (event, zipPath, entryName, destPath, password, options) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath, password || null);
-    return { success: true, files: result && result.files ? result.files : 0 };
+    const result = await restoreEngine.restoreFile(zipPath, entryName, destPath, password || null, options || {});
+    return { success: true, files: result && result.files ? result.files : 0, skipped: result && result.skipped ? result.skipped : 0 };
   } catch (err) {
     return { success: false, error: err && err.message ? err.message : String(err) };
   }
@@ -1511,7 +1811,15 @@ ipcMain.handle('fs-exists', async (event, filePath) => {
 ipcMain.handle('fs-drive-usage', async (event, targetPath) => {
   try {
     if (typeof targetPath !== 'string' || !targetPath) return { success: false, error: 'No path' };
-    var st = fs.statfsSync(targetPath);
+    // Async on purpose (round 3): the sync statfs ran on the main
+    // process, so a dead network share / removed USB / sleeping drive
+    // blocked everything and the window went "Not Responding". The
+    // async call still waits for a slow drive, but the UI stays alive
+    // — and it gives up after 8s instead of hanging the hover forever.
+    var st = await Promise.race([
+      fs.promises.statfs(targetPath),
+      new Promise(function (_, reject) { setTimeout(function () { reject(new Error('Drive read timed out')); }, 8000); })
+    ]);
     var total = st.blocks * st.bsize;
     var free = st.bfree * st.bsize;
     if (!Number.isFinite(total) || total <= 0) return { success: false, error: 'Unknown drive' };
@@ -1535,7 +1843,7 @@ ipcMain.handle('zip-get-info', async (event, zipPath) => {
   const engine = new RestoreEngine();
   try {
     const entries = await engine.getZipInfo(zipPath);
-    return { success: true, entries };
+    return { success: true, entries, layered: !!(entries && entries.layered) };
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -1551,12 +1859,39 @@ ipcMain.handle('job-get-active', async () => {
 });
 
 ipcMain.handle('job-clear-history', async () => {
-  jobHistory.length = 0;
-  // Persist the clear: before this, the in-memory list was emptied but
-  // history.json was never rewritten, so all the history came back
-  // after a restart. Job definition files (<id>.json) are untouched,
-  // so the jobs themselves survive — only their run history is gone.
-  saveJobHistory();
+  // Delete means delete: clearing history used to empty the run
+  // records while leaving every job template (and its schedule) on
+  // disk, so the jobs came back on the next start and their missed
+  // schedules fired them. A clear now removes EVERYTHING: template
+  // files, run history and drive-wait state. A running backup blocks
+  // the clear — its completion would re-create history for a job the
+  // user just deleted. A template file that cannot be removed fails
+  // the clear loudly instead of claiming success.
+  if ([...activeJobs.values()].some(a => a.status === 'running')) {
+    return { success: false, error: 'A backup is running. Wait for it to finish before clearing history.' };
+  }
+  const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
+  try {
+    if (fs.existsSync(jobsDir)) {
+      for (const file of fs.readdirSync(jobsDir)) {
+        if (!file.endsWith('.json') || file === 'history.json' || file === 'waiting.json') continue;
+        const p = path.join(jobsDir, file);
+        try { fs.unlinkSync(p); console.log(`[Main] Deleted job template file: ${p}`); }
+        catch (e) { return { success: false, error: `Cannot delete job template ${file}: ${e.message}` }; }
+      }
+    }
+  } catch (e) { return { success: false, error: e.message }; }
+  const previous = jobHistory;
+  jobHistory = [];
+  // saveWaitingState() derives waiting.json from jobHistory, so an
+  // empty jobHistory writes an empty waiting file — the drive-wait
+  // state for every job is gone too.
+  saveWaitingState();
+  if (!saveJobHistory()) {
+    jobHistory = previous;
+    saveWaitingState();
+    return { success: false, error: 'Could not save cleared history. Deletion is incomplete; please retry.' };
+  }
   notifyJobsUpdated();
   return { success: true };
 });
@@ -1600,7 +1935,12 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
   if (jobConfig) {
     delete jobConfig.encryptionPassword;
     if (jobConfig.encryption && typeof jobConfig.encryption === 'object') delete jobConfig.encryption.password;
+    delete jobConfig.zipPassword;
     delete jobConfig.password;
+    // templateFile is derived state (which file the job was loaded
+    // from), not config — it is re-set from the written filename
+    // below and must not be persisted into the file itself.
+    delete jobConfig.templateFile;
   }
   // Removable drives: remember HOW to find the source/destination
   // drive again — by name, by letter, or by serial number. The wizard
@@ -1630,20 +1970,40 @@ ipcMain.handle('job-save-config', async (event, jobConfig) => {
     fs.renameSync(tmpPath, jobPath);
     // Migration: old configs were saved by name (<name>.json). If one
     // exists for this job, remove it so it is not loaded as a second job.
+    // Same-name guard: <name>.json may be ANOTHER live job's legacy
+    // template (same name, different id) — only remove it when its
+    // stored id is this job's, or it carries no id and no other live
+    // job shares the name. An unreadable file is left alone.
     const oldNamePath = path.join(jobsDir, `${jobConfig.name}.json`);
     if (oldNamePath !== jobPath && fs.existsSync(oldNamePath)) {
-      try { fs.unlinkSync(oldNamePath); } catch (e) {}
+      let ownLegacy = true;
+      try {
+        const old = JSON.parse(fs.readFileSync(oldNamePath, 'utf-8'));
+        const oldId = old && old.id;
+        if (oldId && oldId !== fileId) ownLegacy = false;
+        else if (!oldId && jobHistory.some(j => j.loaded && j.name === jobConfig.name && j.id !== fileId)) ownLegacy = false;
+      } catch (e) { ownLegacy = false; console.error(`[Main] Skipping unreadable legacy job file during save: ${oldNamePath} (${e.message})`); }
+      if (ownLegacy) { try { fs.unlinkSync(oldNamePath); } catch (e) {} }
     }
     console.log(`[Main] Job saved to: ${jobPath}`);
     // The template only entered the list on the next startup before:
     // add it to the in-memory history now so Create Job shows it at once.
     const tpl = normalizeJobObject(Object.assign({}, jobConfig, {
       id: jobConfig.id || ('job-' + jobConfig.name),
-      type: 'TEMPLATE', status: 'PENDING', loaded: true
+      type: 'TEMPLATE', status: 'PENDING', loaded: true,
+      templateFile: `${fileId}.json`
     }));
     if (tpl) {
       let existing = jobHistory.findIndex(j => j.id === tpl.id);
-      if (existing < 0) existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
+      // Same-name jobs are separate tasks: a save carrying a real id
+      // must never fall through to the name match, or saving job B
+      // (name X, id B) would replace job A (name X, id A) in the
+      // list. The name fallback is only for a legacy template that
+      // genuinely has no id: its id IS the fallback form 'job-<name>'
+      // (fileId above), so a save carrying that id may still adopt
+      // the loaded template — e.g. one whose in-memory id came from
+      // a run record instead — and keep its run history.
+      if (existing < 0 && tpl.id === ('job-' + tpl.name)) existing = jobHistory.findIndex(j => j.loaded && j.name === tpl.name);
       if (existing >= 0) {
         // Keep the job's run history: a re-save must not wipe its runs.
         tpl.runs = jobHistory[existing].runs || [];
@@ -1673,7 +2033,7 @@ ipcMain.handle('job-list-stored', async () => {
   try {
     if (!fs.existsSync(jobsDir)) return [];
     const files = fs.readdirSync(jobsDir);
-    return files.filter(f => f.endsWith('.json') && f !== 'history.json').map(f => {
+    return files.filter(f => f.endsWith('.json') && f !== 'history.json' && f !== 'waiting.json').map(f => {
       const content = fs.readFileSync(path.join(jobsDir, f), 'utf-8');
       return JSON.parse(content);
     });
@@ -1727,7 +2087,9 @@ ipcMain.handle('settings-get', async () => {
   const settingsPath = path.join(app.getPath('userData'), '.techvision', 'settings.json');
   try {
     if (fs.existsSync(settingsPath)) {
-      return JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      // Secrets never leave main: the renderer gets *InVault flags
+      // instead of the passwords/tokens themselves.
+      return stripSecretsFromSettings(JSON.parse(fs.readFileSync(settingsPath, 'utf-8')));
     }
   } catch (e) {}
   return {
@@ -1743,18 +2105,66 @@ ipcMain.handle('settings-save', async (event, settings) => {
     fs.mkdirSync(settingsDir, { recursive: true });
   }
   const settingsPath = path.join(settingsDir, 'settings.json');
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  // Round 3: a typed password/token must never land in settings.json
+  // in plain text. When the vault is unlocked it goes straight into
+  // the vault; when there is NO master password yet the rest of the
+  // settings still save, the secret is dropped, and the renderer is
+  // told (needsMasterKey) so it can offer "Create a master key" and
+  // retry. A blank field means "keep whatever is already saved" —
+  // the renderer never sends a stored secret back, so blank cannot
+  // mean "delete" here.
+  const notSaved = [];
+  let needsMasterKey = false;
+  let needsUnlock = false;
+  const next = (settings && typeof settings === 'object') ? JSON.parse(JSON.stringify(settings)) : {};
+  if (!next.email || typeof next.email !== 'object') next.email = {};
+  if (!next.vpn || typeof next.vpn !== 'object') next.vpn = {};
+  // Carry the saved-secret flags from disk: a save while the vault
+  // is locked sends blank password fields ("keep what is saved"),
+  // and the flags must not be lost just because nothing was typed.
+  const prevSettings = readSettingsFile();
+  if (prevSettings.email && prevSettings.email.smtpPassInVault) next.email.smtpPassInVault = true;
+  if (prevSettings.vpn) {
+    if (prevSettings.vpn.apiTokenInVault) next.vpn.apiTokenInVault = true;
+    if (prevSettings.vpn.oauthClientSecretInVault) next.vpn.oauthClientSecretInVault = true;
+  }
+  const vaultExists = vault.vaultExists(app.getPath('userData'));
+  function takeSecret(obj, field, secretName, label) {
+    const value = obj[field];
+    delete obj[field];
+    if (typeof value === 'string' && value) {
+      if (vaultKey) {
+        try {
+          vault.storeSecret(app.getPath('userData'), vaultKey, secretName, value);
+          obj[field + 'InVault'] = true;
+        } catch (e) { notSaved.push(label); needsUnlock = true; }
+      } else {
+        notSaved.push(label);
+        if (!vaultExists) needsMasterKey = true; else needsUnlock = true;
+      }
+    } else if (vaultKey) {
+      // Blank field, secret already in the vault: keep the flag so
+      // the renderer still shows it as saved.
+      try { if (vault.hasSecret(app.getPath('userData'), vaultKey, secretName)) obj[field + 'InVault'] = true; } catch (e) {}
+    }
+  }
+  takeSecret(next.email, 'smtpPass', 'smtp', 'smtp');
+  takeSecret(next.vpn, 'apiToken', 'tailscale-api-token', 'apiToken');
+  takeSecret(next.vpn, 'oauthClientSecret', 'tailscale-oauth-secret', 'oauthSecret');
+  fs.writeFileSync(settingsPath, JSON.stringify(next, null, 2));
   // Apply Start-with-Windows right away: saving the setting must
   // register/unregister the app at login without needing a restart.
   applyAutoStart();
-  return { success: true };
+  return { success: true, secretsNotSaved: notSaved, needsMasterKey, needsUnlock };
 });
 
-// Send a test notification with the saved email settings.
+// Send a test notification with the saved email settings — the SMTP
+// password is resolved from the vault (or the legacy field) here, so
+// mailer never sees a settings object without it.
 ipcMain.handle('email-test', async () => {
   const r = await mailer.sendMail(app.getPath('userData'),
     'Test email from TechVision Backup',
-    'This is a test notification from TechVision Backup.\n\nIf you got this, email notifications are set up correctly.\nTime: ' + new Date().toLocaleString());
+    'This is a test notification from TechVision Backup.\n\nIf you got this, email notifications are set up correctly.\nTime: ' + new Date().toLocaleString(), resolveEmailSettings());
   return { success: r.sent, error: r.sent ? undefined : r.reason };
 });
 
@@ -1765,18 +2175,62 @@ ipcMain.handle('vault-status', async () => {
 ipcMain.handle('vault-setup', async (event, masterPassword) => {
   try {
     vaultKey = vault.setupVault(app.getPath('userData'), masterPassword);
+    afterVaultUnlocked();
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
+
+/* Replace the vault with a fresh one (the startup "I forgot my
+   master password" path). Everything the old vault encrypted is
+   LOST — the renderer warns and confirms before calling this. The
+   "saved in the vault" flags in settings.json / cloud.json are
+   cleared with it, so the app stops claiming passwords are saved
+   when they no longer are. Legacy PLAINTEXT passwords are NOT
+   touched: they are not in the vault, and migration moves them into
+   the new vault on unlock. */
+ipcMain.handle('vault-reset', async (event, masterPassword) => {
+  try {
+    const hadVault = vault.vaultExists(app.getPath('userData'));
+    vaultKey = vault.resetVault(app.getPath('userData'), masterPassword);
+    if (hadVault) clearVaultSecretFlags();
+    afterVaultUnlocked();
+    return { success: true, replaced: hadVault };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Drop every "password is saved in the vault" flag after a vault
+   reset — the passwords they point at no longer exist. On disk AND
+   in main's in-memory cloud config (getCloudConfig caches it). Never
+   throws. */
+function clearVaultSecretFlags() {
+  try {
+    const sp = path.join(app.getPath('userData'), '.techvision', 'settings.json');
+    if (fs.existsSync(sp)) {
+      const s = JSON.parse(fs.readFileSync(sp, 'utf-8'));
+      if (s.email) delete s.email.smtpPassInVault;
+      if (s.vpn) { delete s.vpn.apiTokenInVault; delete s.vpn.oauthClientSecretInVault; }
+      fs.writeFileSync(sp, JSON.stringify(s, null, 2));
+    }
+  } catch (e) { console.log('[Vault] Could not clear settings vault flags: ' + (e && e.message ? e.message : e)); }
+  try {
+    const cfg = getCloudConfig();
+    for (const c of (cfg.clients || [])) delete c.passwordInVault;
+    saveCloudConfig();
+  } catch (e) { console.log('[Vault] Could not clear cloud vault flags: ' + (e && e.message ? e.message : e)); }
+}
 ipcMain.handle('vault-unlock', async (event, masterPassword) => {
   try {
     vaultKey = vault.unlockVault(app.getPath('userData'), masterPassword);
+    afterVaultUnlocked();
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
 ipcMain.handle('vault-lock', async () => {
   if (vaultKey) vault.lockVault(vaultKey);
   vaultKey = null;
+  // Also drop any leftover remember-me blob from the old build, so
+  // the next launch asks for the master password again.
+  try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
   return { success: true };
 });
 
@@ -1809,7 +2263,7 @@ ipcMain.handle('cloud-get-config', async () => {
       accessMode: cloudAccessMode(cfg.server.accessMode),
       ddnsHostname: cfg.server.ddnsHostname || '',
     },
-    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password, accessMode: cloudAccessMode(c.accessMode) })),
+    clients: (cfg.clients || []).map((c) => ({ id: c.id, name: c.name, host: c.host, port: c.port, user: c.user, fingerprint: c.fingerprint || null, hasPassword: !!c.password || !!c.passwordInVault, accessMode: cloudAccessMode(c.accessMode) })),
   };
 });
 
@@ -1828,16 +2282,20 @@ ipcMain.handle('cloud-server-save', async (event, opts) => {
   const wasRunning = getCloudServer().isRunning();
   const portChanged = cfg.server.port !== port;
   const accessMode = cloudAccessMode(opts && opts.accessMode);
-  cfg.server.enabled = !!(opts && opts.enabled);
-  cfg.server.port = port;
-  cfg.server.accessMode = accessMode;
   // DDNS hostname (round 2 #9): recorded for clients — the server
   // itself listens on 0.0.0.0 and never consumes it. Also feeds the
   // certificate SANs (round 2 #12).
-  cfg.server.ddnsHostname = String((opts && opts.ddnsHostname) || '').trim().slice(0, 253);
+  const ddnsHostname = String((opts && opts.ddnsHostname) || '').trim().slice(0, 253);
+  // A DDNS change feeds the cert SANs, so a running server must
+  // restart for the new cert to take effect — same as a port change.
+  const ddnsChanged = ddnsHostname.toLowerCase() !== String(cfg.server.ddnsHostname || '').trim().toLowerCase();
+  cfg.server.enabled = !!(opts && opts.enabled);
+  cfg.server.port = port;
+  cfg.server.accessMode = accessMode;
+  cfg.server.ddnsHostname = ddnsHostname;
   saveCloudConfig();
   try {
-    if (wasRunning && portChanged) {
+    if (wasRunning && (portChanged || ddnsChanged)) {
       await getCloudServer().stop();
       if (cfg.server.enabled) await getCloudServer().start();
     } else if (cfg.server.enabled && !wasRunning) {
@@ -1906,14 +2364,19 @@ ipcMain.handle('cloud-user-set-password', async (event, name, password) => {
   }
 });
 
-// Saved servers (client side). The password for a server IS stored on
-// this device, in cloud.json next to the server record — the user asked
-// for one-click reconnect instead of typing it every time (same choice
-// as the SMTP password in settings.json). It never leaves main: the
+// Saved servers (client side). The password for a server is stored
+// in the master-password vault (secret 'cloud-client:<id>') when the
+// vault is unlocked — never in plain text in cloud.json. The record
+// keeps passwordInVault:true so the connect flow reads the vault.
+// A legacy plaintext `password` still in the file is honoured until
+// migration moves it (first unlock). It never leaves main: the
 // renderer only sees hasPassword, and connect uses the stored password
 // when none is typed. Remove it any time with "Forget saved password"
 // on the server card; changing the password on the server just means
-// the next connect asks for the new one.
+// the next connect asks for the new one. When there is NO master
+// password yet, the server still saves — just without the password —
+// and the renderer is told (needsMasterKey) so it can offer to
+// create one and retry; the app is never blocked on this.
 ipcMain.handle('cloud-client-save', async (event, s) => {
   try {
     const cfg = getCloudConfig();
@@ -1932,8 +2395,34 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     // not silently become Normal on re-save.
     const accessMode = s.accessMode ? cloudAccessMode(s.accessMode)
       : (existing ? cloudAccessMode(existing.accessMode) : 'normal');
-    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode, password: (s.password && String(s.password)) || (existing && existing.password) || null };
-    if (i >= 0) { rec.id = cfg.clients[i].id; if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
+    const rec = { id, name: String(s.name || host), host, port, user: String(s.user || ''), fingerprint: s.fingerprint || null, certPem: s.certPem || null, accessMode };
+    // Update-in-place keeps the pre-existing id — resolve it BEFORE
+    // storing any secret, or the vault key would name a fresh id the
+    // record is never stored under.
+    if (i >= 0) rec.id = cfg.clients[i].id;
+    // Keep a previously migrated/vault password marker, and a legacy
+    // plaintext password, when no new password was sent.
+    if (existing && existing.passwordInVault) rec.passwordInVault = true;
+    if (existing && existing.password) rec.password = existing.password;
+    let passwordNotSaved = false;
+    let needsMasterKey = false;
+    let needsUnlock = false;
+    const newPassword = (s.password && String(s.password)) || '';
+    if (newPassword) {
+      if (vaultKey) {
+        try {
+          vault.storeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + rec.id, newPassword);
+          rec.passwordInVault = true;
+          delete rec.password;
+        } catch (e) { passwordNotSaved = true; needsUnlock = true; }
+      } else {
+        // No vault to store it in: save the server without the
+        // password and let the renderer offer to create a master key.
+        passwordNotSaved = true;
+        if (!vault.vaultExists(app.getPath('userData'))) needsMasterKey = true; else needsUnlock = true;
+      }
+    }
+    if (i >= 0) { if (!rec.fingerprint) rec.fingerprint = cfg.clients[i].fingerprint; if (!rec.certPem) rec.certPem = cfg.clients[i].certPem; cfg.clients[i] = rec; }
     else cfg.clients.push(rec);
     saveCloudConfig();
     // Return the id the record is actually stored under: on an
@@ -1941,7 +2430,7 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     // 'srv-…' id generated above — callers (connect, join) look the
     // record up by the returned id, and a wrong one made reconnects
     // fail with "Password needed" on every re-save.
-    return { success: true, id: rec.id };
+    return { success: true, id: rec.id, passwordNotSaved, needsMasterKey, needsUnlock };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -1952,6 +2441,8 @@ ipcMain.handle('cloud-client-forget-password', async (event, id) => {
   const rec = (cfg.clients || []).find((c) => c.id === id);
   if (!rec) return { success: false, error: 'Server not found.' };
   rec.password = null;
+  rec.passwordInVault = false;
+  try { if (vaultKey) vault.removeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + id); } catch (e) {}
   saveCloudConfig();
   return { success: true };
 });
@@ -2013,7 +2504,7 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     // successful login with it remembers it for next time.
     const cfg = getCloudConfig();
     const rec = (cfg.clients || []).find((c) => c.id === opts.serverId);
-    const password = (opts.password && String(opts.password)) || (rec && rec.password) || '';
+    const password = (opts.password && String(opts.password)) || getClientPassword(rec) || '';
     if (!password) return { success: false, error: 'Password needed — enter the password for user ' + (opts.user || '') + '.' };
     /* WireGuard mode: the tunnel has to be up first — a down tunnel
        fails fast here with a clear message instead of waiting out
@@ -2030,8 +2521,26 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     // one — e.g. after "Forget password" while still connected — and
     // Office/media opens need a password to seed or they prompt.
     cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite, password }));
-    if (rec && opts.password && String(opts.password)) { rec.password = String(opts.password); saveCloudConfig(); }
-    return { success: true, info };
+    // A typed password that just authenticated is remembered for next
+    // time — in the vault when it is unlocked. When there is no
+    // master password yet it is NOT written to cloud.json in plain
+    // text; the renderer is told so it can offer to create one.
+    let passwordNotSaved = false;
+    let needsMasterKey = false;
+    if (rec && opts.password && String(opts.password)) {
+      if (vaultKey) {
+        try {
+          vault.storeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + rec.id, String(opts.password));
+          rec.passwordInVault = true;
+          delete rec.password;
+          saveCloudConfig();
+        } catch (e) { passwordNotSaved = true; }
+      } else {
+        passwordNotSaved = true;
+        if (!vault.vaultExists(app.getPath('userData'))) needsMasterKey = true;
+      }
+    }
+    return { success: true, info, passwordNotSaved, needsMasterKey };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -2225,7 +2734,7 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
       let error = null;
       let remote = null;
       if (!rec) { status = 'error'; error = 'This server was removed from the Client tab.'; }
-      else if (!rec.password) { status = 'password-needed'; }
+      else if (!getClientPassword(rec)) { status = 'password-needed'; }
       else {
         const st = await cloudMapDrive.getDriveStatus(m.letter);
         if (st.success && st.mapped) {
@@ -2236,7 +2745,7 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
       out.push({
         serverId: m.serverId, letter: m.letter, host: m.host, port: m.port, user: m.user,
         reconnect: !!m.reconnect, status, error, remote,
-        name: rec ? rec.name : m.serverId, hasPassword: !!(rec && rec.password),
+        name: rec ? rec.name : m.serverId, hasPassword: !!(rec && getClientPassword(rec)),
       });
     }
     return { success: true, mappings: out, freeLetters: free.success ? free.letters : [] };
@@ -2250,7 +2759,17 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
     const cfg = getCloudConfig();
     const rec = cfg.clients.find((c) => c.id === serverId);
     if (!rec) return { success: false, error: 'Server not found.' };
-    if (!rec.password) return { success: false, error: 'password-needed' };
+    // Client-connection guard (the user asked for this, 2026-11-27):
+    // never attempt a mapping when the Client is not connected to
+    // THIS server. A live session proves the server answers, the
+    // password is right and the certificate is the pinned one —
+    // without it, `net use` fails with a cryptic error (e.g. 1244)
+    // for a problem the Client tab would have shown plainly. The
+    // renderer answers 'not-connected' with a message and a jump to
+    // the Client tab. (Startup auto-reconnect is separate and keeps
+    // working without a session — see reconnectMapDrives.)
+    if (!cloudSessions.get(serverId)) return { success: false, error: 'not-connected' };
+    if (!getClientPassword(rec)) return { success: false, error: 'password-needed' };
     const l = String(letter || '').toUpperCase();
     if (!/^[A-Z]$/.test(l)) return { success: false, error: 'Pick a drive letter (A–Z).' };
     const state = getMapdriveState();
@@ -2278,8 +2797,31 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
         const inst = await cloudMapDrive.installCert(rec.certPem);
         if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
       }
+    } else {
+      // No trusted certificate saved for this server at all: the
+      // install step used to be skipped silently here and `net use`
+      // then failed with System error 1244. Say so plainly instead
+      // — connecting once in the Client tab trusts the certificate
+      // and saves it. (Unreachable from the Map button itself now
+      // that the connection guard above requires a live session,
+      // which implies a trusted certificate — kept as a loud guard
+      // for direct IPC callers.)
+      return { success: false, error: 'This server has no trusted certificate saved yet — connect once in the Client tab first (it trusts the certificate), then map the drive.' };
     }
-    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+    // Windows hostname validation: `net use` only sends the login
+    // when the certificate covers the mapped host (IP SAN for an IP,
+    // DNS SAN for a name). A certificate issued before this address
+    // existed on the server (e.g. Tailscale came up after the server
+    // first started) never gains the SAN — certNeedsRegen
+    // deliberately does not churn on interface changes — so check
+    // here and fail with the actual cause instead of letting
+    // `net use` answer with System error 1244. (null = host form
+    // this check cannot judge, e.g. IPv6: proceed as before.)
+    const covers = cloudServerMod.certCoversHost(rec.certPem, rec.host);
+    if (covers === false) {
+      return { success: false, error: 'The server certificate does not cover this address (' + rec.host + '). It was issued before this address existed on the server — restart the Cloud server on the server machine so it issues a new certificate covering it, then connect again in the Client tab (Trust & connect) and map the drive.' };
+    }
+    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
     if (!mapped.success) return { success: false, error: mapped.error };
     state.mappings = state.mappings.filter((m) => m.serverId !== serverId && m.letter !== l);
     state.mappings.push({ serverId, letter: l, host: rec.host, port: rec.port, user: rec.user, reconnect: !!reconnect });
@@ -2375,7 +2917,7 @@ async function seedCloudCredentialsForOpen(serverId, rec) {
   try {
     const conn = cloudSessions.get(serverId);
     const user = (conn && conn.user) || rec.user;
-    const password = (conn && conn.password) || rec.password;
+    const password = (conn && conn.password) || getClientPassword(rec);
     if (!user || !password) {
       console.log(`[Cloud] No saved password for ${rec.host} — Office/media will prompt for the Cloud login once.`);
       appendAppLog('warn', `[Cloud] Opening a file on ${rec.host} without a saved password — Windows will ask for the Cloud login.`);
@@ -2482,7 +3024,7 @@ async function reconnectMapDrives() {
     for (const m of state.mappings) {
       if (!m.reconnect) continue;
       const rec = cfg.clients.find((c) => c.id === m.serverId);
-      if (!rec || !rec.password) continue;
+      if (!rec || !getClientPassword(rec)) continue;
       const st = await cloudMapDrive.getDriveStatus(m.letter);
       if (st.success && st.mapped) continue;
       let probeOk = true;
@@ -2493,7 +3035,7 @@ async function reconnectMapDrives() {
         const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
         if (trusted.success && !trusted.trusted) { appendAppLog('info', '[Cloud] Map drive ' + m.letter + ': certificate is not trusted yet, skipping reconnect.'); continue; }
       }
-      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: rec.password });
+      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
       appendAppLog(r.success ? 'info' : 'error', '[Cloud] Map drive ' + m.letter + ': reconnect ' + (r.success ? 'ok' : ('failed — ' + (r.error || ''))));
     }
   } catch (e) {}
@@ -2503,7 +3045,7 @@ async function reconnectMapDrives() {
 // The module only shells out to the Tailscale CLI that is already
 // installed on the machine; it implements no VPN of its own.
 ipcMain.handle('vpn-get-status', async () => {
-  try { return await vpn.getStatus(); }
+  try { vpn.setTunnelAddress(getWgConfig().server.address); return await vpn.getStatus(); }
   catch (e) { return { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
 });
 ipcMain.handle('vpn-set-connected', async (event, on) => {
@@ -2525,32 +3067,53 @@ ipcMain.handle('vpn-set-connected', async (event, on) => {
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the VPN connection.' }; }
 });
 ipcMain.handle('vpn-set-routes', async (event, on, auth) => {
-  try { return await vpn.setSubnetRouter(!!on, auth); }
+  // Secrets come from the vault here, not the renderer: the renderer
+  // only ever sends the OAuth client id.
+  try { vpn.setTunnelAddress(getWgConfig().server.address); return await vpn.setSubnetRouter(!!on, resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
 });
+// Re-advertise the home LAN when the advertised route went stale
+// (2026-11-27: the router advertised the 10.0.0.0/24 tunnel subnet).
+// `status` is the renderer's already-fetched status, so no second
+// status read is needed; without it the module reads its own.
+ipcMain.handle('vpn-reconcile-subnet', async (event, auth, status) => {
+  try { vpn.setTunnelAddress(getWgConfig().server.address); return await vpn.reconcileSubnetRouter(resolveVpnAuth(auth), status || null); }
+  catch (e) { return { success: false, reconciled: false, error: e && e.message ? e.message : 'Could not check the subnet router.' }; }
+});
 ipcMain.handle('vpn-get-routes', async (event, auth) => {
-  try { return await vpn.getDeviceRoutes(auth); }
+  try { return await vpn.getDeviceRoutes(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read routes.' }; }
 });
 ipcMain.handle('vpn-approve-routes', async (event, auth, routes) => {
-  try { return await vpn.approveRoutes(auth, routes); }
+  try { return await vpn.approveRoutes(resolveVpnAuth(auth), routes); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not approve routes.' }; }
 });
 ipcMain.handle('vpn-disable-key-expiry', async (event, auth) => {
-  try { return await vpn.disableKeyExpiry(auth); }
+  try { return await vpn.disableKeyExpiry(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not disable key expiry.' }; }
 });
 ipcMain.handle('vpn-enable-key-expiry', async (event, auth) => {
-  try { return await vpn.enableKeyExpiry(auth); }
+  try { return await vpn.enableKeyExpiry(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not enable key expiry.' }; }
 });
 ipcMain.handle('vpn-key-expiry-state', async (event, auth) => {
-  try { return await vpn.getKeyExpiryState(auth); }
+  try { return await vpn.getKeyExpiryState(resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read key expiry state.' }; }
 });
 ipcMain.handle('vpn-verify-api', async (event, auth) => {
-  try { return await vpn.verifyApiAuth(auth); }
-  catch (e) { return { valid: false, error: e && e.message ? e.message : 'Could not check the credentials.' }; }
+  try {
+    // A credential IS saved but the vault is locked: say so plainly
+    // instead of "No API credential saved" — the token exists, the
+    // app just cannot read it until the vault is unlocked. (A legacy
+    // plaintext credential still verifies fine, so it is not blocked.)
+    if (!vaultKey && vault.vaultExists(app.getPath('userData'))) {
+      const s = readSettingsFile();
+      if (s.vpn && (s.vpn.apiTokenInVault || s.vpn.oauthClientSecretInVault) && !s.vpn.apiToken && !s.vpn.oauthClientSecret) {
+        return { valid: false, error: 'The vault is locked — unlock it with your master password to use the saved credential.' };
+      }
+    }
+    return await vpn.verifyApiAuth(resolveVpnAuth(auth));
+  } catch (e) { return { valid: false, error: e && e.message ? e.message : 'Could not check the credentials.' }; }
 });
 ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
   try {
@@ -3250,6 +3813,12 @@ ipcMain.handle('wg-install-amneziawg', async (event) => {
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {
     vaultKey = vault.changeMasterPassword(app.getPath('userData'), oldPassword, newPassword);
+    // Change re-encrypts the vault with the new key: saved passwords
+    // are KEPT (unlike the startup reset, which replaces the vault).
+    // afterVaultUnlocked only migrates leftover plaintext now — there
+    // is no remember-me blob any more, and the next launch still
+    // asks for the master password.
+    afterVaultUnlocked();
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
@@ -3262,6 +3831,20 @@ ipcMain.handle('vault-store-job-password', async (event, jobId, jobPassword) => 
   if (!vaultKey) return { success: false, error: 'Vault is locked.' };
   try {
     vault.storeJobPassword(app.getPath('userData'), vaultKey, jobId, jobPassword);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+// ZIP password: the same vault flow, but a separate secret
+// ('job-zip-password:<jobId>') — never the backup password.
+ipcMain.handle('vault-has-job-zip-password', async (event, jobId) => {
+  if (!vaultKey || !jobId) return { has: false };
+  try { return { has: vault.hasSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobId) }; }
+  catch (e) { return { has: false }; }
+});
+ipcMain.handle('vault-store-job-zip-password', async (event, jobId, jobPassword) => {
+  if (!vaultKey) return { success: false, error: 'Vault is locked.' };
+  try {
+    vault.storeSecret(app.getPath('userData'), vaultKey, 'job-zip-password:' + jobId, jobPassword);
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
@@ -3297,6 +3880,7 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
   // the engine with a confusing error).
   const src = await driveResolver.resolvePathAsync(jobPathValue(job.source), job.sourceDriveMatch || job.sourceVolumeLabel || null);
   const dst = await driveResolver.resolvePathAsync(jobPathValue(job.destination), job.destinationDriveMatch || job.destinationVolumeLabel || null);
+  if (!jobHistory.includes(job)) return { success: false, error: 'Job was deleted or changed before the backup started.' };
   // A missing SOURCE always blocks the run. A missing DESTINATION
   // blocks it only when its drive is provably absent: a destination
   // folder that does not exist yet is created by the engine, so
@@ -3319,6 +3903,7 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     compression: job.compression,
     compress: job.compress,
     encryptionEnabled: job.encryptionEnabled === true,
+    zipPasswordEnabled: job.zipPasswordEnabled === true,
     allowIncremental: job.allowIncremental,
     includePatterns: job.includePatterns,
     excludePatterns: job.excludePatterns,
@@ -3330,16 +3915,33 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     if (!pw) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED' };
     backupConfig.encryptionPassword = pw;
   }
+  if (backupConfig.zipPasswordEnabled) {
+    const zpw = resolveZipPassword(backupConfig);
+    if (!zpw) return { success: false, error: 'ZIP_PASSWORD_REQUIRED' };
+    backupConfig.zipPassword = zpw;
+  }
 
   const useIncremental = backupConfig.allowIncremental === true && (job.runCount > 0 || (job.runs && job.runs.length > 0));
   const runType = useIncremental ? 'incremental' : 'full';
   const runJobId = `${jobName}-${Date.now()}`;
   activeJobs.set(runJobId, { name: jobName, jobId: job.id, status: 'running' });
+  // The UI shows the job as RUNNING (with its Stop button) while the
+  // run goes — it used to learn about the run only when it ended.
+  notifyJobsUpdated();
   notifyEmail('started', { name: jobName, type: runType, source: jobPathValue(backupConfig.source), destination: jobPathValue(backupConfig.destination) });
 
   let result;
   try {
     const engine = new BackupEngine(backupConfig);
+    activeEngines.set(runJobId, engine);
+    // Scheduled runs never reported progress to the window, so a
+    // running job showed no % anywhere. Broadcast the engine's
+    // progress with the job id (dictation #2) — the Jobs details
+    // progress bar matches it to the selected job. Same payload
+    // shape as the manual runs, plus the identity.
+    engine.onProgress = (p) => {
+      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('backup-progress', Object.assign({}, p, { jobId: job.id || null, jobName })); } catch (e) {}
+    };
     engine.logger = true;
     result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
   } catch (e) {
@@ -3353,7 +3955,7 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
     name: jobName,
     type: runType,
     success: result.success,
-    status: result.success ? 'completed' : 'failed',
+    status: runStatusOf(result),
     source: jobPathValue(backupConfig.source),
     destination: jobPathValue(backupConfig.destination),
     timestamp: new Date().toISOString(),
@@ -3367,8 +3969,35 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
   saveJobHistory();
   notifyJobsUpdated();
   activeJobs.delete(runJobId);
-  notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
+  activeEngines.delete(runJobId);
+  // A stopped run sends no finished/failed email — the user asked
+  // for the stop, it is not a failure.
+  if (!result.cancelled) notifyEmail(jobRecord.success ? 'finished' : 'failed', jobRecord);
   return { success: result.success, job: job, result: result };
+});
+
+// Stop a running backup. jobId is the job's id (job.id); the name is
+// used as a fallback so runs started without a stored id (ad-hoc
+// runs) stop too. Returns promptly — the run's own await unwinds
+// through the engine's cancel flag, deletes the partial artifact
+// and records the run as 'cancelled'. Stopping a job that is not
+// running is NOT_RUNNING, not an error.
+ipcMain.handle('job-stop-backup', async (event, jobId) => {
+  let name = null;
+  if (jobId) {
+    const job = jobHistory.find((j) => j.id === jobId);
+    if (job) name = job.name;
+  }
+  let stopped = 0;
+  for (const [key, engine] of activeEngines) {
+    const a = activeJobs.get(key);
+    if (!a) continue;
+    if ((jobId && a.jobId === jobId) || (name && a.name === name)) {
+      try { engine.requestCancel(); stopped++; } catch (e) {}
+    }
+  }
+  if (!stopped) return { success: false, error: 'NOT_RUNNING' };
+  return { success: true, stopped: stopped };
 });
 
 ipcMain.handle('job-restore', async (event, jobId) => {
@@ -3395,8 +4024,17 @@ ipcMain.handle('job-restore', async (event, jobId) => {
     restorePassword = resolveBackupPassword({ id: job.id, encryptionEnabled: true });
     if (!restorePassword) return { success: false, error: 'ENCRYPTION_PASSWORD_REQUIRED', message: 'This backup is encrypted. Unlock the vault (or enter the backup password) and try again.' };
   }
+  // A job with a ZIP password needs that password too (a layered
+  // backup's inner ZIP, or a plain password-protected ZIP). Resolve
+  // it the same way; when it is missing the restore reports
+  // ZIP_PASSWORD_REQUIRED and the Restore page asks for it.
+  let restoreZipPassword = null;
+  if (job.zipPasswordEnabled === true) {
+    restoreZipPassword = resolveZipPassword({ id: job.id, zipPasswordEnabled: true });
+    if (!restoreZipPassword) return { success: false, error: 'ZIP_PASSWORD_REQUIRED', message: 'This backup is also password-protected (ZIP). Unlock the vault (or enter the ZIP password on the Restore page) and try again.' };
+  }
   const restoreEngine = new RestoreEngine();
-  const result = await restoreEngine.restore_all(job.result.backup_path, restoreDir, restorePassword);
+  const result = await restoreEngine.restore_all(job.result.backup_path, restoreDir, restorePassword, { zipPassword: restoreZipPassword });
 
   return { success: result.success, files_restored: result.files_restored || 0, errors: result.errors || [] };
 });
@@ -3413,51 +4051,101 @@ ipcMain.handle('job-delete', async (event, jobId) => {
   // job by id or by name — except one that belongs to a different
   // job still listed (same-name jobs stay separate tasks).
   const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
-  function deleteTemplateFiles(id, name, source, destination) {
+  function deleteTemplateFiles(id, name, source, destination, knownFiles) {
     const removed = [];
     try {
       if (!fs.existsSync(jobsDir)) return removed;
+      // A loaded template's own file is known by name from load time
+      // (job.templateFile) — delete it directly instead of relying
+      // only on the content scan below. This closes the silent-
+      // success hole: a file the scan skips (unreadable under an odd
+      // filename, content that matches nothing) used to survive
+      // while delete still reported success, so the row vanished and
+      // the template came back on the next start. Unlink needs no
+      // read, so even a corrupt or read-locked file is removed; a
+      // file that cannot be unlinked fails the delete loudly instead
+      // of lying about it. A known file already gone from disk is
+      // simply skipped — the job is already gone for good.
+      for (const known of new Set(knownFiles || [])) {
+        if (!known) continue;
+        const kp = path.join(jobsDir, known);
+        if (!fs.existsSync(kp)) continue;
+        try { fs.unlinkSync(kp); removed.push(known); console.log(`[Main] Deleted job template file: ${kp}`); }
+        catch (e) { throw new Error(`Cannot delete job template ${known}: ${e.message}`); }
+      }
       // Ids of jobs other than the one being deleted: a template
       // whose content id is one of these belongs to that other job
       // and must survive even if the name matches.
       const otherIds = new Set(jobHistory.filter(j => j.id !== id).map(j => j.id).filter(Boolean));
       for (const file of fs.readdirSync(jobsDir)) {
-        if (!file.endsWith('.json') || file === 'history.json') continue;
+        if (!file.endsWith('.json') || file === 'history.json' || file === 'waiting.json') continue;
         const p = path.join(jobsDir, file);
-        let match = (file === `${id}.json` || file === `${name}.json`);
-        if (!match) {
-          try {
-            const content = JSON.parse(fs.readFileSync(p, 'utf-8'));
-            const cid = content && content.id;
-            const cname = content && content.name;
-            if (cid && cid === id) match = true;
-            else if (cname && cname === name) {
-              // Same name, but the file may belong to a different job
-              // that happens to share the name — keep it, unless it
-              // is the same job by paths (a stale second template
-              // file for this job: an old <name>.json plus the
-              // current <id>.json both survive a delete otherwise).
-              const samePaths = source && destination && content.source && content.destination
-                && jobPathValue(content.source) === jobPathValue(source)
-                && jobPathValue(content.destination) === jobPathValue(destination);
-              if (!(cid && otherIds.has(cid)) || samePaths) match = true;
-            }
-          } catch (e) { /* unparseable file: only the filename guesses above apply */ }
+        // Read the template FIRST: the filename alone cannot tell
+        // whose job it is — a legacy <name>.json may belong to a
+        // different live job that happens to share the name, and a
+        // file named <id>.json may carry another job's content.
+        // An unreadable file that could be this job's own template
+        // (<id>.json / <name>.json) makes deletion inconclusive:
+        // report failure instead of claiming success with a live
+        // template. Any other unreadable file is skipped (logged) —
+        // it belongs to another job or is junk, and must not block
+        // every delete forever.
+        let content;
+        try {
+          content = JSON.parse(fs.readFileSync(p, 'utf-8'));
+        } catch (e) {
+          console.error(`[Main] Skipping unreadable job template file during delete: ${p} (${e.message})`);
+          if (file === id + '.json' || file === name + '.json') {
+            throw new Error(`Cannot verify job template ${file}: ${e.message}`);
+          }
+          continue;
+        }
+        const cid = content && content.id;
+        const cname = content && content.name;
+        let match = false;
+        if (cid && cid === id) match = true;
+        else if (cname && cname === name) {
+          // Same name, but the file may belong to a different job
+          // that happens to share the name — keep it, unless it
+          // is the same job by paths (a stale second template
+          // file for this job: an old <name>.json plus the
+          // current <id>.json both survive a delete otherwise).
+          const samePaths = source && destination && content.source && content.destination
+            && jobPathValue(content.source) === jobPathValue(source)
+            && jobPathValue(content.destination) === jobPathValue(destination);
+          if (!(cid && otherIds.has(cid)) || samePaths) match = true;
         }
         if (match) {
-          try { fs.unlinkSync(p); removed.push(file); console.log(`[Main] Deleted job template file: ${p}`); } catch (e) { console.error('[Main] Failed to delete job template file:', e.message); }
+          try { fs.unlinkSync(p); removed.push(file); console.log(`[Main] Deleted job template file: ${p}`); }
+          catch (e) { throw new Error(`Cannot delete job template ${file}: ${e.message}`); }
         }
       }
-    } catch (e) { console.error('[Main] Failed to scan jobs dir for templates:', e.message); }
+    } catch (e) { console.error('[Main] Failed to scan jobs dir for templates:', e.message); throw e; }
     return removed;
   }
   let idx = jobHistory.findIndex(j => j.id === jobId);
   if (idx < 0) idx = jobHistory.findIndex(j => j.name === jobId);
   if (idx >= 0) {
     const job = jobHistory[idx];
-    deleteTemplateFiles(job.id, job.name, job.source, job.destination);
-    jobHistory.splice(idx, 1);
-    saveJobHistory();
+    // Old name/id files can represent the same task. Remove their
+    // in-memory entries too, or a remaining schedule recreates history.
+    const sameTask = j => j.id === job.id || (j.name === job.name
+      && job.source && job.destination
+      && jobPathValue(j.source) === jobPathValue(job.source)
+      && jobPathValue(j.destination) === jobPathValue(job.destination));
+    const deleting = jobHistory.filter(sameTask);
+    if ([...activeJobs.values()].some(a => deleting.some(j => a.jobId ? a.jobId === j.id : a.name === j.name))) {
+      return { success: false, error: 'This backup is running. Wait for it to finish before deleting the job.' };
+    }
+    try { deleteTemplateFiles(job.id, job.name, job.source, job.destination, deleting.filter(j => j.loaded).map(j => j.templateFile)); }
+    catch (e) { return { success: false, error: e.message }; }
+    const previous = jobHistory;
+    jobHistory = jobHistory.filter(j => !sameTask(j));
+    if (!saveJobHistory()) {
+      jobHistory = previous;
+      return { success: false, error: 'Could not save deleted job history. Deletion is incomplete; please retry.' };
+    }
+    saveWaitingState();
     notifyJobsUpdated();
     return { success: true };
   }
@@ -3465,12 +4153,16 @@ ipcMain.handle('job-delete', async (event, jobId) => {
   // exist on disk. Delete it (by content match) and persist the
   // history — before this the handler returned success without ever
   // saving, so any run records on disk came back on the next start.
-  const orphanPath = path.join(jobsDir, `${jobId}.json`);
-  const removed = deleteTemplateFiles(jobId, jobId);
-  try {
-    if (jobId && fs.existsSync(orphanPath) && !removed.includes(`${jobId}.json`)) { fs.unlinkSync(orphanPath); removed.push(`${jobId}.json`); }
-  } catch (e) { /* fall through to not found */ }
-  if (removed.length) { saveJobHistory(); notifyJobsUpdated(); return { success: true }; }
+  let removed;
+  try { removed = deleteTemplateFiles(jobId, jobId); }
+  catch (e) { return { success: false, error: e.message }; }
+  // No blind fallback unlink of <jobId>.json here: if the content
+  // scan skipped that file it either belongs to a different live job
+  // or is unreadable, and both must survive the delete.
+  if (removed.length) {
+    if (!saveJobHistory()) return { success: false, error: 'Could not save deleted job history.' };
+    saveWaitingState(); notifyJobsUpdated(); return { success: true };
+  }
   return { success: false, error: 'Job not found' };
 });
 

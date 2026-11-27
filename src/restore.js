@@ -1,6 +1,6 @@
 /**
  * TechVision Restore Engine
- * Restore from ZIP with hash verification
+ * Restore from ZIP / .tvb with hash verification
  * Uses yauzl for streaming extraction (memory efficient)
  */
 
@@ -10,9 +10,35 @@ const crypto = require('crypto');
 const yauzl = require('yauzl');
 const EventEmitter = require('events');
 const { Transform } = require('stream');
-// WinZip AES-256 reader (pure JS, Node crypto). yauzl cannot decrypt,
-// so encrypted backups go through this module instead.
+// TechVision-only encrypted backups (.tvb): yauzl cannot decrypt,
+// so encrypted backups go through this module instead. A .tvb is
+// NOT a ZIP — no outside program can open it.
+const tvb = require('./tvb.js');
+// ZIP-password layer (WinZip AES): yauzl cannot decrypt, so a
+// password-protected ZIP goes through this module instead. The
+// format is standard, so 7-Zip opens the same file with the same
+// password — deliberately unlike the .tvb layer above.
 const zipAes = require('./zip-aes.js');
+
+// --- CRC32 (for the plain-ZIP restore paths below, which verify each
+// entry against its central-directory CRC) ---
+const CRC_TABLE = (function () {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c;
+  }
+  return table;
+})();
+function crc32(buf, prev) {
+  // Chainable: crc32(chunk2, crc32(chunk1)) === crc32(Buffer.concat([chunk1, chunk2])).
+  // `prev` is a previously returned value; with no prev it behaves
+  // exactly as before (single-shot CRC of the whole buffer).
+  let c = (prev === undefined ? 0xFFFFFFFF : (prev ^ 0xFFFFFFFF)) >>> 0;
+  for (let i = 0; i < buf.length; i++) c = (CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
 
 /**
  * Restore Result Class
@@ -24,6 +50,11 @@ class RestoreResult extends EventEmitter {
     this.files_restored = 0;
     this.files_verified = 0;
     this.files_mismatched = 0;
+    // Destination files left untouched because they already exist
+    // and overwrite was OFF (the default) — never replaced, counted
+    // here and listed in skipped_files (entry paths, '/'-separated).
+    this.files_skipped = 0;
+    this.skipped_files = [];
     this.total_bytes = 0;
     this.duration_seconds = 0;
     this.errors = [];
@@ -41,6 +72,41 @@ class RestoreResult extends EventEmitter {
 // plain-folder backups (see techvision-core.js). It is metadata, not
 // user data: never restored as a file, never listed in getZipInfo.
 const MANIFEST_NAME = '.techvision-manifest.json';
+
+// Overwrite option (restore): default OFF — an existing destination
+// file is SKIPPED, never replaced, unless the caller passes
+// { overwrite: true }. The option is optional everywhere so older
+// callers keep the safe default.
+function restoreOptions(options) {
+  // chainWritten (a Set of resolved destination paths written by
+  // earlier artifacts of THIS chain restore) passes through: a
+  // later artifact must overwrite files the chain itself wrote,
+  // while files that existed before the restore are still skipped.
+  // zipPassword is the ZIP-layer password (a layered .tvb's inner
+  // ZIP, or a plain password-protected ZIP) — a non-string or empty
+  // value is treated as "no ZIP password given".
+  return {
+    overwrite: !!(options && options.overwrite),
+    chainWritten: (options && options.chainWritten) || null,
+    zipPassword: (options && typeof options.zipPassword === 'string' && options.zipPassword) ? options.zipPassword : null
+  };
+}
+
+// The error a layered restore returns (as the first error string)
+// when the inner ZIP is password-protected and no ZIP password was
+// given. The restore page watches for this prefix and shows the
+// second (ZIP) password field; the backup password stays the one
+// that opened the .tvb.
+const ZIP_PASSWORD_REQUIRED = 'ZIP_PASSWORD_REQUIRED';
+
+// Skip decision for overwrite OFF: only an existing regular FILE is
+// skipped. A directory at the destination path must NOT count as a
+// skip — e.g. a zip holding both `a` and `a/b.txt`: the `a/b.txt`
+// entry creates dir `a`, and the `a` entry must fail on the rename
+// (reported as an error), not vanish silently as "skipped".
+function destIsFile(dest) {
+  try { return fs.statSync(dest).isFile(); } catch (e) { return false; }
+}
 
 // Write-then-commit: stream to a temp file in the SAME directory as the
 // final path (so the rename stays on one filesystem), then rename over
@@ -124,7 +190,7 @@ function copyFileHashed(src, dest) {
 // new Date().toISOString().replace(/[:.]/g, '-') (see
 // techvision-core.js). The job name is greedy: a job literally
 // named `my_full_job` still parses as job `my_full_job`.
-const ARTIFACT_RE = /^(.*)_(full|incremental)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.zip)?$/;
+const ARTIFACT_RE = /^(.*)_(full|incremental)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.(zip|tvb))?$/;
 
 function parseArtifactName(fileName) {
   const m = ARTIFACT_RE.exec(fileName);
@@ -200,30 +266,46 @@ class RestoreEngine {
    * above): the base Full plus every incremental up to it, oldest
    * first. A Full on its own restores exactly as before.
    */
-  async restore_all(zipPath, restoreDir, password) {
+  async restore_all(zipPath, restoreDir, password, options) {
+    const opts = restoreOptions(options);
     const chain = findBackupChain(zipPath);
     if (!chain || (chain.chain.length === 1 && !chain.baseMissing)) {
-      return this._restoreSingle(zipPath, restoreDir, password);
+      return this._restoreSingle(zipPath, restoreDir, password, opts);
     }
     const result = new RestoreResult();
     const startTime = Date.now();
     result.chain = chain.chain.map((p) => path.basename(p));
+    const skippedNames = new Set();
+    // Files this chain restore writes itself: a later artifact must
+    // overwrite them (newest version wins), while files that existed
+    // before the restore started are still skipped when overwrite is
+    // OFF. Without this set the incremental's changed files were
+    // skipped as "already exist" and the restore came back stale.
+    const chainWritten = new Set();
+    const chainOpts = Object.assign({}, opts, { chainWritten: chainWritten });
     for (const artifact of chain.chain) {
-      const one = await this._restoreSingle(artifact, restoreDir, password);
+      const one = await this._restoreSingle(artifact, restoreDir, password, chainOpts);
       result.files_restored += one.files_restored;
       result.files_verified += one.files_verified;
       result.files_mismatched += one.files_mismatched;
       result.total_bytes += one.total_bytes;
       result.errors.push(...one.errors);
       result.warnings.push(...one.warnings);
+      // A file skipped in two chain artifacts is one skipped file,
+      // not two — dedupe by entry name.
+      for (const name of (one.skipped_files || [])) skippedNames.add(name);
     }
+    result.skipped_files = [...skippedNames];
+    result.files_skipped = result.skipped_files.length;
     if (chain.baseMissing) {
       result.errors.push('Base full backup not found — this incremental backup is only a delta; files that did not change are missing from this restore.');
     } else {
       result.warnings.push('Restored a backup chain, oldest first: ' + result.chain.join(' + ') + '.');
     }
     result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
-    result.success = result.files_restored > 0 && result.errors.length === 0 && result.files_mismatched === 0;
+    // A restore that only skipped (every file already exists) still
+    // succeeded — nothing was lost and nothing failed.
+    result.success = (result.files_restored > 0 || result.files_skipped > 0) && result.errors.length === 0 && result.files_mismatched === 0;
     return result;
   }
 
@@ -232,36 +314,95 @@ class RestoreEngine {
    * folder). This is the old restore_all body, unchanged — the chain
    * wrapper above calls it once per artifact.
    */
-  async _restoreSingle(zipPath, restoreDir, password) {
+  async _restoreSingle(zipPath, restoreDir, password, options) {
+    const opts = restoreOptions(options);
     const result = new RestoreResult();
     const startTime = Date.now();
-    // Encrypted backup (WinZip AES-256): yauzl cannot decrypt, so the
-    // AES reader handles the whole restore. Wrong password fails fast.
-    // Only the INSPECT may fall through to the yauzl path below (a
-    // Zip64 or otherwise unreadable central directory is still a ZIP
-    // yauzl can open); a failure inside the AES extraction itself is
-    // a real failure and is reported, not retried through yauzl.
-    let encryptedInfo = null;
-    try {
-      if (zipPath && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
-        encryptedInfo = zipAes.inspectZip(zipPath);
-      }
-    } catch (e) {
-      encryptedInfo = null; // fall through to the yauzl path below
+    // Overwrite OFF (default): an existing destination file is
+    // skipped, never replaced. Callers check this AFTER the entry
+    // verified (CRC / manifest hash) — a corrupt backup file still
+    // errors instead of silently skipping. Returns true when the
+    // entry was counted as skipped (temp file already removed).
+    function skipIfExists(tmp, dest, rel) {
+      if (opts.overwrite || !destIsFile(dest)) return false;
+      // Written by an earlier artifact of this same chain restore:
+      // the newer version must replace it, not be skipped.
+      if (opts.chainWritten && opts.chainWritten.has(path.resolve(dest))) return false;
+      try { fs.unlinkSync(tmp); } catch (e) {}
+      result.files_skipped++;
+      result.skipped_files.push(rel);
+      return true;
     }
-    if (encryptedInfo && encryptedInfo.encrypted) {
+    // TechVision-only encrypted backup (.tvb): yauzl cannot decrypt,
+    // so the TVB reader handles the whole restore. A wrong password
+    // fails fast on the first entry; a truncated file fails at
+    // inspect time with "corrupt or truncated", never as a wrong
+    // password. This branch runs only for .tvb files — a plain ZIP
+    // goes to the yauzl path below.
+    if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
       try {
         if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
         if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
-        const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, function (name, size) {
-          result.files_restored++;
-          result.total_bytes += size;
+        // Layered backup (both passwords): the .tvb holds ONE entry
+        // — a whole password-protected ZIP — not files. Decrypt it
+        // to a temp file inside the restore folder, then restore
+        // THAT as a ZIP (the encrypted-ZIP branch below, or the
+        // plain yauzl path). The temp file is always removed
+        // afterwards. The encryption password opens the .tvb; the
+        // ZIP password (opts.zipPassword) opens the ZIP inside.
+        // A layered .tvb is recognised by the header flag, not by
+        // the entry name alone — a per-file .tvb that happens to
+        // hold one file called 'archive.zip' is not layered.
+        const layeredInfo = tvb.inspectTvb(zipPath, password);
+        if (layeredInfo.layered) {
+          if (layeredInfo.entries.length !== 1 || layeredInfo.entries[0].name !== tvb.TVB_LAYERED_ENTRY) {
+            throw new Error('This backup is damaged: a layered backup must hold exactly one archive entry.');
+          }
+          const innerZip = path.join(restoreDir, '.' + path.basename(zipPath, path.extname(zipPath)) + '-inner.zip');
+          try {
+            await tvb.decryptEntryToFile(zipPath, layeredInfo.entries[0], password, innerZip);
+            // The inner ZIP is a whole artifact: restore it through
+            // the same single-artifact path. The recursion cannot
+            // loop — innerZip is a .zip, never a .tvb.
+            const inner = await this._restoreSingle(innerZip, restoreDir, opts.zipPassword, opts);
+            result.files_restored = inner.files_restored;
+            result.files_verified = inner.files_verified;
+            result.files_mismatched = inner.files_mismatched;
+            result.files_skipped = inner.files_skipped;
+            result.skipped_files = inner.skipped_files;
+            result.total_bytes = inner.total_bytes;
+            result.errors = inner.errors;
+            result.success = inner.success;
+            result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+            return result;
+          } finally {
+            try { fs.unlinkSync(innerZip); } catch (e) {}
+          }
+        }
+        const extracted = await tvb.extractTvb(zipPath, restoreDir, password, {
+          onFile: function (name, size) {
+            result.files_restored++;
+            result.total_bytes += size;
+          },
+          commit: function (rel, tmp, dest) {
+            // Verified already (GCM tag + SHA-256 inside the reader):
+            // rename over the destination — unless it already exists
+            // and overwrite is OFF, in which case the good file
+            // there is left alone.
+            if (skipIfExists(tmp, dest, rel)) return false;
+            fs.renameSync(tmp, dest);
+            if (opts.chainWritten) opts.chainWritten.add(path.resolve(dest));
+            return true;
+          }
         });
         result.errors = extracted.errors;
-        // Every file was authenticated by HMAC at decrypt time and
-        // verified after writing, so restored == verified here.
+        // Every file was authenticated by its GCM tag at decrypt
+        // time and SHA-256-verified after writing, so restored ==
+        // verified here. An empty .tvb (a 0-file incremental) restores
+        // as success with 0 files — deliberately different from the
+        // yauzl path, which errors on an empty ZIP.
         result.files_verified = result.files_restored;
-        result.success = result.files_mismatched === 0 && result.errors.length === 0 && result.files_restored > 0;
+        result.success = result.files_mismatched === 0 && result.errors.length === 0;
         result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
         return result;
       } catch (e) {
@@ -314,12 +455,21 @@ class RestoreEngine {
                     result.errors.push(`Hash mismatch (corrupt backup file): ${rel}`);
                     result.files_mismatched++;
                   } else {
-                    fs.renameSync(tmp, dest);
-                    result.files_restored++; result.files_verified++; result.total_bytes += copied.size;
+                    // Verified: rename over the destination — unless
+                    // it already exists and overwrite is OFF, in
+                    // which case the good file there is left alone.
+                    if (!skipIfExists(tmp, dest, rel.replace(/\\/g, '/'))) {
+                      fs.renameSync(tmp, dest);
+                      if (opts.chainWritten) opts.chainWritten.add(path.resolve(dest));
+                      result.files_restored++; result.files_verified++; result.total_bytes += copied.size;
+                    }
                   }
                 } else {
-                  fs.renameSync(tmp, dest);
-                  result.files_restored++; result.total_bytes += copied.size;
+                  if (!skipIfExists(tmp, dest, rel.replace(/\\/g, '/'))) {
+                    fs.renameSync(tmp, dest);
+                    if (opts.chainWritten) opts.chainWritten.add(path.resolve(dest));
+                    result.files_restored++; result.total_bytes += copied.size;
+                  }
                 }
               }
             } catch (e) {
@@ -332,8 +482,8 @@ class RestoreEngine {
         if (!manifest) {
           result.warnings.push('This backup has no integrity manifest (created before verification was added) — files were copied without hash verification.');
         }
-        result.success = result.files_restored > 0 && result.errors.length === 0;
-        if (result.files_restored === 0 && result.errors.length === 0) {
+        result.success = (result.files_restored > 0 || result.files_skipped > 0) && result.errors.length === 0;
+        if (result.files_restored === 0 && result.files_skipped === 0 && result.errors.length === 0) {
           result.errors.push('Nothing to restore: the backup folder is empty.');
         }
         result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
@@ -344,6 +494,46 @@ class RestoreEngine {
       result.errors.push(e.message);
       result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
       return result;
+    }
+    // Password-protected ZIP (WinZip AES): yauzl cannot decrypt, so
+    // the ZIP-AES reader handles the whole restore. This is the
+    // ZIP-password layer — a plain .zip whose entries are AES
+    // encrypted (7-Zip opens the same file with the same password),
+    // or the inner ZIP of a layered .tvb (see the .tvb branch
+    // above). A ZIP whose central directory cannot be read at all
+    // falls through to the yauzl path below (it may be a plain ZIP
+    // the reader could not parse); a wrong password fails the whole
+    // restore, and no partial file is left behind — the reader
+    // checks the password verification value BEFORE it streams any
+    // plaintext, and every entry is hash-verified before the rename.
+    let encryptedInfo = null;
+    try { encryptedInfo = zipAes.inspectZip(zipPath); } catch (e) { encryptedInfo = null; }
+    if (encryptedInfo && encryptedInfo.encrypted) {
+      try {
+        if (!password) {
+          throw new Error(ZIP_PASSWORD_REQUIRED + ': This backup is password-protected. Enter its ZIP password and try again.');
+        }
+        if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
+        const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, (rel, size) => {
+          result.files_restored++;
+          result.total_bytes += size;
+        }, {
+          overwrite: opts.overwrite,
+          chainWritten: opts.chainWritten
+        });
+        result.files_skipped = extracted.skipped;
+        result.skipped_files = extracted.skipped_files;
+        result.errors = extracted.errors;
+        result.files_verified = result.files_restored;
+        result.success = result.files_mismatched === 0 && result.errors.length === 0;
+        result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+        return result;
+      } catch (e) {
+        result.success = false;
+        result.errors.push(e.message);
+        result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+        return result;
+      }
     }
     return new Promise((resolve, reject) => {
       let pendingEntries = 0;
@@ -369,11 +559,12 @@ class RestoreEngine {
         result.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
         // A restore that restored nothing, or failed on any entry, is
         // a failure — the old code reported success whenever no hash
-        // mismatched, even with 0 files and a list of errors.
-        if (result.files_restored === 0 && result.errors.length === 0) {
+        // mismatched, even with 0 files and a list of errors. (A
+        // restore that only skipped existing files still succeeded.)
+        if (result.files_restored === 0 && result.files_skipped === 0 && result.errors.length === 0) {
           result.errors.push('Nothing to restore: the backup contains no files.');
         }
-        result.success = result.files_restored > 0 && result.errors.length === 0 && result.files_mismatched === 0;
+        result.success = (result.files_restored > 0 || result.files_skipped > 0) && result.errors.length === 0 && result.files_mismatched === 0;
         resolve(result);
       };
       // A zipfile-level error (bad entry name, corrupt central
@@ -416,7 +607,7 @@ class RestoreEngine {
           // the Unix mode down and compared it with 0x10, so a real
           // `subdir/` was written as an empty FILE named `subdir`
           // and `subdir/a.txt` then failed with ENOTDIR. A trailing
-          // slash is the reliable test (same as zip-aes).
+          // slash is the reliable test (same as the TVB reader).
           if (entry.fileName.endsWith('/') || (entry.externalAttributes & 0x10) !== 0) {
             return;
           }
@@ -511,7 +702,7 @@ class RestoreEngine {
             // (a 'data' listener + pipe would buffer unboundedly).
             const crcStream = new Transform({
               transform(chunk, encoding, callback) {
-                crc = zipAes.crc32(chunk, crc);
+                crc = crc32(chunk, crc);
                 bytes += chunk.length;
                 callback(null, chunk);
               }
@@ -530,6 +721,14 @@ class RestoreEngine {
                 result.errors.push(`Size mismatch (truncated data): ${entry.fileName}`);
                 result.files_mismatched++;
               } else {
+                // CRC and size passed: rename over the destination —
+                // unless it already exists and overwrite is OFF, in
+                // which case the good file there is left alone.
+                if (skipIfExists(tmpPath, writePath, entry.fileName)) {
+                  pendingEntries--;
+                  maybeFinish();
+                  return;
+                }
                 try { fs.renameSync(tmpPath, writePath); } catch (e) {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
                   result.errors.push(`Failed to write ${entry.fileName}: ${e.message}`);
@@ -537,6 +736,7 @@ class RestoreEngine {
                   maybeFinish();
                   return;
                 }
+                if (opts.chainWritten) opts.chainWritten.add(path.resolve(writePath));
                 result.files_restored++;
                 result.files_verified++;
                 result.total_bytes += bytes;
@@ -569,15 +769,27 @@ class RestoreEngine {
       walk(zipPath);
       return entries;
     }
-    // ZIP: the AES inspector lists entries AND flags encrypted ones, so
-    // the restore wizard knows when to ask for a password. If its
-    // parser cannot read the file, fall back to yauzl (no flag).
-    try {
-      const info = zipAes.inspectZip(zipPath);
-      return info.entries.filter(function (e) { return !e.isDir; }).map(function (e) {
-        return { path: e.name.replace(/\//g, path.sep), size: e.size, isDir: false, encrypted: e.encrypted };
+    // .tvb: the TVB inspector lists entries AND flags them encrypted,
+    // so the restore wizard knows when to ask for a password. A
+    // corrupt/truncated .tvb throws here — a clear error, never a
+    // silent fallback to yauzl (which cannot read a .tvb at all).
+    if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
+      const info = tvb.inspectTvb(zipPath);
+      const entries = info.entries.map(function (e) {
+        return { path: e.name.replace(/\//g, path.sep), size: e.size, isDir: false, encrypted: true };
       });
-    } catch (e) { /* fall through to yauzl below */ }
+      // A layered .tvb's single entry is a whole ZIP, not a file —
+      // the info card must not report "1 file" and the ZIP's size.
+      // Carried as a property on the array so the return shape (an
+      // array of entries) does not change for other callers.
+      entries.layered = !!info.layered;
+      return entries;
+    }
+    // Plain ZIP: yauzl lists the entries (no `encrypted` flag on
+    // yauzl, but bit 0 of the general-purpose flag is the encryption
+    // bit — a legacy encrypted ZIP still shows as encrypted so the
+    // wizard asks for a password, even though only .tvb backups are
+    // created anymore).
     return new Promise((resolve, reject) => {
       yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
         if (err) return reject(err);
@@ -620,16 +832,17 @@ class RestoreEngine {
    * an unchanged file lives only in the base Full, not in the
    * incremental that was picked.
    */
-  async restoreFile(zipPath, entryName, destPath, password) {
+  async restoreFile(zipPath, entryName, destPath, password, options) {
+    const opts = restoreOptions(options);
     const chain = findBackupChain(zipPath);
     try {
-      return await this._restoreFileSingle(zipPath, entryName, destPath, password);
+      return await this._restoreFileSingle(zipPath, entryName, destPath, password, opts);
     } catch (e) {
       if (e.code !== 'ENTRY_NOT_FOUND' || !chain || chain.chain.length < 2) throw e;
       const earlier = chain.chain.slice(0, -1).reverse();
       for (const artifact of earlier) {
         try {
-          return await this._restoreFileSingle(artifact, entryName, destPath, password);
+          return await this._restoreFileSingle(artifact, entryName, destPath, password, opts);
         } catch (e2) {
           if (e2.code !== 'ENTRY_NOT_FOUND') throw e2;
           // Not in this one either — keep looking backwards.
@@ -644,7 +857,18 @@ class RestoreEngine {
    * Rejects with code 'ENTRY_NOT_FOUND' when the file is not in
    * this artifact, so the chain wrapper above can keep looking.
    */
-  async _restoreFileSingle(zipPath, entryName, destPath, password) {
+  async _restoreFileSingle(zipPath, entryName, destPath, password, options) {
+    const opts = restoreOptions(options);
+    // Overwrite OFF (default): an existing destination file is
+    // skipped, never replaced — reported as { files: 0, skipped: 1 }.
+    // Checked AFTER the entry verified, like the bulk path.
+    function skippedResult(tmp) {
+      if (!opts.overwrite && destIsFile(destPath)) {
+        try { if (tmp && fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (e2) {}
+        return { files: 0, skipped: 1 };
+      }
+      return null;
+    }
     // Plain-copy backup folder: the entry is a plain file inside
     // it. (Single-file restore never supported folders before —
     // yauzl cannot open a directory — so this branch also fixes
@@ -661,7 +885,31 @@ class RestoreEngine {
       const manifest = readManifest(zipPath);
       const dir = path.dirname(destPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const tmpPath = tempPathFor(destPath);
+      // Containment (same policy as the TVB single-file path and the
+      // bulk restore): the destination is the restore folder + the
+      // entry's path inside the backup, so the root is destPath with
+      // the entry's path segments removed. A pre-existing symlink
+      // (or Windows junction) in between must not redirect the write
+      // outside that root — resolve the REAL parent and write
+      // through it. (When the caller renames the file, the derived
+      // root is wider than the real folder — the check then passes,
+      // and the write still goes through the real parent.)
+      let realDest = destPath;
+      try {
+        const parts = rel.split('/').filter(function (p) { return p && p !== '.'; });
+        let root = destPath;
+        for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+        const realRoot = fs.realpathSync(root);
+        const realParent = fs.realpathSync(dir);
+        if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+          throw new Error('Skipped unsafe path: ' + entryName);
+        }
+        realDest = path.join(realParent, path.basename(destPath));
+      } catch (e) {
+        if (/Skipped unsafe path/.test(e.message)) throw e;
+        throw new Error('Failed to create folder for ' + entryName + ': ' + e.message);
+      }
+      const tmpPath = tempPathFor(realDest);
       const copied = await copyFileHashed(src, tmpPath);
       if (manifest) {
         const want = manifest.files[rel];
@@ -670,48 +918,153 @@ class RestoreEngine {
           throw new Error('Hash mismatch (corrupt backup file): ' + rel);
         }
       }
-      fs.renameSync(tmpPath, destPath);
+      const skipped = skippedResult(tmpPath);
+      if (skipped) return skipped;
+      fs.renameSync(tmpPath, realDest);
       return { files: 1 };
     }
-    // Encrypted entry: decrypt it directly with the AES reader.
-    // Only an unreadable central directory falls through to yauzl
-    // (e.g. Zip64); a decrypt failure (wrong password, tampered
-    // ciphertext, bad CRC) is reported as-is, never retried through
-    // yauzl — which cannot decrypt and would either fail confusingly
-    // or write garbage.
-    let inspected = false;
-    try {
-      if (zipPath && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
-        const info = zipAes.inspectZip(zipPath);
-        inspected = true;
-        const wanted = entryName.replace(/\\/g, '/');
-        const hit = info.entries.find(function (e) { return e.name === wanted; });
-        if (hit && hit.encrypted) {
-          if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
-          // The inspected entry already carries the full fields
-          // (localOffset, compressedSize, crc, ...) — stream-decrypt
-          // it straight into the temp file, never buffering the
-          // entry (see zip-aes.js decryptEntryToFile).
-          const dir = path.dirname(destPath);
-          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          // Write-then-rename (same rule as the plain path): a failed
-          // write must not leave a partial file at the destination.
-          const tmpPath = tempPathFor(destPath);
-          try {
-            await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
-            fs.renameSync(tmpPath, destPath);
-          } catch (e) {
-            try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
-            throw e;
-          }
-          return { files: 1 };
+    // TechVision-only encrypted backup (.tvb): decrypt the entry
+    // directly with the TVB reader. A decrypt failure (wrong
+    // password, tampered ciphertext) is reported as-is, never
+    // retried through yauzl — which cannot decrypt and would either
+    // fail confusingly or write garbage.
+    if (zipPath && /\.tvb$/i.test(zipPath) && fs.existsSync(zipPath) && !fs.statSync(zipPath).isDirectory()) {
+      // The password is passed so the index tag is verified BEFORE
+      // the entry is trusted for a restore (a null password only
+      // happens when the caller did not give one — the explicit
+      // check below then refuses, before anything is written).
+      const info = tvb.inspectTvb(zipPath, password);
+      const wanted = entryName.replace(/\\/g, '/');
+      if (!password) throw new Error('This backup is encrypted — a password is required to restore it.');
+      // Layered backup (both passwords): the .tvb holds ONE entry —
+      // a whole password-protected ZIP. Any entry other than the
+      // ZIP itself lives INSIDE it: decrypt the ZIP to a temp file
+      // and restore the entry from there. (The ZIP itself, asked
+      // for by name, falls through to the direct path below — it
+      // IS an entry of the .tvb.)
+      if (info.layered && wanted !== tvb.TVB_LAYERED_ENTRY) {
+        if (info.entries.length !== 1 || info.entries[0].name !== tvb.TVB_LAYERED_ENTRY) {
+          throw new Error('This backup is damaged: a layered backup must hold exactly one archive entry.');
         }
-        // The entry is plain (or not in this ZIP at all): the yauzl
-        // path below handles both — a missing entry rejects there.
+        const innerDir = path.dirname(destPath);
+        if (!fs.existsSync(innerDir)) fs.mkdirSync(innerDir, { recursive: true });
+        const innerZip = path.join(innerDir, '.' + path.basename(zipPath, path.extname(zipPath)) + '-inner.zip');
+        try {
+          await tvb.decryptEntryToFile(zipPath, info.entries[0], password, innerZip);
+          // The recursion cannot loop — innerZip is a .zip, never a
+          // .tvb — and it routes to the encrypted-ZIP or plain-ZIP
+          // single-file path below.
+          return await this._restoreFileSingle(innerZip, entryName, destPath, opts.zipPassword, opts);
+        } finally {
+          try { fs.unlinkSync(innerZip); } catch (e) {}
+        }
       }
-    } catch (e) {
-      if (inspected) throw e; // the inspector read the file; the failure is real
-      // Inspector could not read the file: fall through to yauzl.
+      const hit = info.entries.find(function (e) { return e.name === wanted; });
+      if (!hit) {
+        const e = new Error('Entry not found in backup: ' + entryName);
+        e.code = 'ENTRY_NOT_FOUND';
+        throw e;
+      }
+      // The inspected entry already carries the full fields
+      // (dataOffset, storedSize, iv, sha256, ...) — stream-decrypt
+      // it straight into the temp file, never buffering the entry
+      // (see tvb.js decryptEntryToFile).
+      const dir = path.dirname(destPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // Containment (same policy as the bulk restore): the
+      // destination is the restore folder + the entry's path inside
+      // the backup, so the root is destPath with the entry's path
+      // segments removed. A pre-existing symlink (or Windows
+      // junction) in between must not redirect the write outside
+      // that root — resolve the REAL parent and write through it.
+      // (When the caller renames the file, the derived root is
+      // wider than the real folder — the check then passes, and
+      // the write still goes through the real parent.)
+      let realDest = destPath;
+      try {
+        const parts = wanted.split('/').filter(function (p) { return p && p !== '.'; });
+        let root = destPath;
+        for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+        const realRoot = fs.realpathSync(root);
+        const realParent = fs.realpathSync(dir);
+        if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+          throw new Error('Skipped unsafe path: ' + entryName);
+        }
+        realDest = path.join(realParent, path.basename(destPath));
+      } catch (e) {
+        if (/Skipped unsafe path/.test(e.message)) throw e;
+        throw new Error('Failed to create folder for ' + entryName + ': ' + e.message);
+      }
+      // Write-then-rename (same rule as the plain path): a failed
+      // write must not leave a partial file at the destination.
+      const tmpPath = tempPathFor(realDest);
+      try {
+        await tvb.decryptEntryToFile(zipPath, hit, password, tmpPath);
+        const skipped = skippedResult(tmpPath);
+        if (skipped) return skipped;
+        fs.renameSync(tmpPath, realDest);
+      } catch (e) {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+        throw e;
+      }
+      return { files: 1 };
+    }
+    // Password-protected ZIP (WinZip AES), single file: yauzl
+    // cannot decrypt, so the ZIP-AES reader decrypts the entry
+    // straight into the temp file. A wrong password fails before
+    // any byte is written (the reader checks the password
+    // verification value first), and the HMAC + CRC are checked
+    // before the rename.
+    let encInfo = null;
+    try { encInfo = zipAes.inspectZip(zipPath); } catch (e) { encInfo = null; }
+    if (encInfo && encInfo.encrypted) {
+      const wanted = entryName.replace(/\\/g, '/');
+      const hit = encInfo.entries.find(function (e) { return e.name === wanted; });
+      if (!hit) {
+        const e = new Error('Entry not found in backup: ' + entryName);
+        e.code = 'ENTRY_NOT_FOUND';
+        throw e;
+      }
+      if (!password) {
+        throw new Error(ZIP_PASSWORD_REQUIRED + ': This backup is password-protected. Enter its ZIP password and try again.');
+      }
+      const dir = path.dirname(destPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // Containment (same policy as the TVB single-file path and the
+      // bulk restore): the destination is the restore folder + the
+      // entry's path inside the backup, so the root is destPath with
+      // the entry's path segments removed. A pre-existing symlink
+      // (or Windows junction) in between must not redirect the write
+      // outside that root — resolve the REAL parent and write
+      // through it. (When the caller renames the file, the derived
+      // root is wider than the real folder — the check then passes,
+      // and the write still goes through the real parent.)
+      let realDest = destPath;
+      try {
+        const parts = wanted.split('/').filter(function (p) { return p && p !== '.'; });
+        let root = destPath;
+        for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+        const realRoot = fs.realpathSync(root);
+        const realParent = fs.realpathSync(dir);
+        if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+          throw new Error('Skipped unsafe path: ' + entryName);
+        }
+        realDest = path.join(realParent, path.basename(destPath));
+      } catch (e) {
+        if (/Skipped unsafe path/.test(e.message)) throw e;
+        throw new Error('Failed to create folder for ' + entryName + ': ' + e.message);
+      }
+      const tmpPath = tempPathFor(realDest);
+      try {
+        await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
+        const skipped = skippedResult(tmpPath);
+        if (skipped) return skipped;
+        fs.renameSync(tmpPath, realDest);
+      } catch (e) {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+        throw e;
+      }
+      return { files: 1 };
     }
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -750,6 +1103,36 @@ class RestoreEngine {
                 if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
               } catch (e) { return done(e); }
 
+              // Containment (same policy as the TVB single-file path
+              // and the bulk restore): the destination is the restore
+              // folder + the entry's path inside the backup, so the
+              // root is destPath with the entry's path segments
+              // removed. A pre-existing symlink (or Windows junction)
+              // in between must not redirect the write outside that
+              // root — resolve the REAL parent and write through it.
+              // (When the caller renames the file, the derived root
+              // is wider than the real folder — the check then
+              // passes, and the write still goes through the real
+              // parent.)
+              const wanted = entry.fileName;
+              let realDest = destPath;
+              try {
+                const parts = wanted.split('/').filter(function (p) { return p && p !== '.'; });
+                let root = destPath;
+                for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+                const realRoot = fs.realpathSync(root);
+                const realParent = fs.realpathSync(dir);
+                if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+                  try { ReadStream.destroy(); } catch (e2) {}
+                  return done(new Error('Skipped unsafe path: ' + entry.fileName));
+                }
+                realDest = path.join(realParent, path.basename(destPath));
+              } catch (e) {
+                try { ReadStream.destroy(); } catch (e2) {}
+                if (/Skipped unsafe path/.test(e.message)) return done(e);
+                return done(new Error('Failed to create folder for ' + entry.fileName + ': ' + e.message));
+              }
+
               // Stream through a CRC check into a temp file and rename
               // over the destination only when the CRC (and size)
               // match: the old code piped straight to the destination
@@ -757,7 +1140,7 @@ class RestoreEngine {
               // all, so a corrupt entry was restored as if it were
               // good — and a good file at the destination was
               // overwritten with corrupt bytes.
-              const tmpPath = tempPathFor(destPath);
+              const tmpPath = tempPathFor(realDest);
               const file = fs.createWriteStream(tmpPath);
               let crc = 0;
               let bytes = 0;
@@ -772,7 +1155,7 @@ class RestoreEngine {
               };
               const crcStream = new Transform({
                 transform(chunk, encoding, callback) {
-                  crc = zipAes.crc32(chunk, crc);
+                  crc = crc32(chunk, crc);
                   bytes += chunk.length;
                   callback(null, chunk);
                 }
@@ -791,7 +1174,13 @@ class RestoreEngine {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                   return done(new Error(`Size mismatch (truncated data): ${entry.fileName}`));
                 }
-                try { fs.renameSync(tmpPath, destPath); } catch (e) {
+                // Verified: rename over the destination — unless it
+                // already exists and overwrite is OFF.
+                if (!opts.overwrite && destIsFile(destPath)) {
+                  try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+                  return done(null, { files: 0, skipped: 1 });
+                }
+                try { fs.renameSync(tmpPath, realDest); } catch (e) {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
                   return done(e);
                 }

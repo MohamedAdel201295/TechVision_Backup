@@ -48,7 +48,7 @@
     var type = safeStr(raw.type, 'FULL').toUpperCase();
     if (type !== 'FULL' && type !== 'INCREMENTAL' && type !== 'TEMPLATE') type = 'FULL';
     var status = safeStr(raw.status, 'PENDING').toUpperCase();
-    if (['COMPLETED', 'RUNNING', 'PENDING', 'FAILED', 'TEMPLATE'].indexOf(status) === -1) status = 'PENDING';
+    if (['COMPLETED', 'RUNNING', 'PENDING', 'FAILED', 'CANCELLED', 'TEMPLATE'].indexOf(status) === -1) status = 'PENDING';
     var job = {
       id: raw.id || raw.jobId || '',
       name: name,
@@ -130,7 +130,13 @@
       if ($('settingEmailMissed')) $('settingEmailMissed').checked = em.notifyOnMissed !== false;
       if ($('settingEmailTo')) $('settingEmailTo').value = em.to || '';
       if ($('settingEmailUser')) $('settingEmailUser').value = em.smtpUser || '';
-      if ($('settingEmailPass')) $('settingEmailPass').value = em.smtpPass || '';
+      // The SMTP password never comes back from main (round 3): the
+      // field stays blank, and the placeholder says it is saved in
+      // the vault when it is. A typed value is a NEW password.
+      if ($('settingEmailPass')) {
+        $('settingEmailPass').value = '';
+        $('settingEmailPass').placeholder = em.smtpPassInVault ? 'Saved in the vault — leave blank to keep it' : 'App Password';
+      }
       if ($('settingEmailHost')) $('settingEmailHost').value = em.smtpHost || 'smtp.gmail.com';
       if ($('settingEmailPort')) $('settingEmailPort').value = String(em.smtpPort || 465);
       if ($('settingVerify')) $('settingVerify').checked = settings.verify !== false;
@@ -159,10 +165,34 @@
       }
     });
     try {
-      await api.saveSettings(next);
+      var res = await api.saveSettings(next);
       settings = next;
+      // A password just stored in the vault must not sit in the field
+      // or in the in-memory settings: the next save reads the fields,
+      // and a blank field means "keep what is saved".
+      var notSaved = (res && res.secretsNotSaved) || [];
+      // Only when a password was actually typed and stored: a blank
+      // field means "keep what is saved", not "a new secret exists".
+      if (notSaved.indexOf('smtp') < 0 && next.email.smtpPass) {
+        if ($('settingEmailPass')) {
+          $('settingEmailPass').value = '';
+          $('settingEmailPass').placeholder = 'Saved in the vault — leave blank to keep it';
+        }
+        if (settings.email) { settings.email.smtpPass = ''; settings.email.smtpPassInVault = true; }
+      } else if (settings.email) settings.email.smtpPass = '';
       refreshEmailMenuStatus();
       toast('Settings saved', 'Your preferences have been saved.', 'success');
+      if (res && res.needsMasterKey && notSaved.length) {
+        askCreateMasterKey('the email / VPN password', function () { saveSettings(); },
+          function () { toast('Password not saved', 'The password was not saved because there is no master key yet. The rest of your settings were saved.', 'warning'); });
+      } else if (res && res.needsUnlock && notSaved.length) {
+        // The vault is locked: show the unlock modal itself and
+        // re-run the save after unlocking (the typed password is
+        // still in the field) — the old toast pointed at Settings,
+        // where no Unlock button ever existed.
+        var unlocked = await offerVaultUnlockThen(function () { saveSettings(); }, 'The vault is locked. Enter your master password to save the email password.');
+        if (!unlocked) toast('Vault is locked', 'The password was not saved because the vault is locked.', 'warning');
+      }
     } catch (e) {
       toast('Settings failed', e && e.message ? e.message : 'Could not save settings.', 'error');
     }
@@ -255,7 +285,12 @@
     set('dashLastBackup', last ? formatTimeOnly(last.timestamp) : '—');
     set('dashLastBackupSub', last ? formatDayWord(last.timestamp) + ' · ' + (last.type === 'INCREMENTAL' ? 'Incremental' : 'Full') : 'No backups yet');
     renderDashboardStatus(list, bad, last);
-    renderDashboardRecent(list);
+    // A template on its very first run has no row yet (the list
+    // above excludes templates) — but it IS the most recent backup
+    // activity, so the Recent list includes it while it runs, with
+    // its Stop button. The counts above keep excluding templates,
+    // as before.
+    renderDashboardRecent(list.concat(jobs.filter(function (j) { return j.type === 'TEMPLATE' && j.running; })));
   }
   function renderDashboardStatus(list, bad, last) {
     var banner = $('dashBanner'); if (!banner) return;
@@ -303,34 +338,129 @@
       tds[3].textContent = formatBytes(job.size);
       tds[4].textContent = formatHMS(job.duration);
       tds[5].textContent = formatDashboardTime(job.timestamp);
+      // A running job gets its Stop button right next to the RUNNING
+      // pill. The row click still opens the drawer — the button
+      // stops the click from reaching it.
+      if (job.running) {
+        var stopBtn = document.createElement('button');
+        stopBtn.type = 'button';
+        stopBtn.className = 'btn btn-sm dash-stop-btn';
+        stopBtn.textContent = '■ Stop';
+        stopBtn.title = 'Stop this backup';
+        stopBtn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          stopJobById(job.id);
+        });
+        tds[2].appendChild(stopBtn);
+      }
       tr.dataset.dest = job.destination || '';
       tr.addEventListener('click', function () { openDrawer(job); });
       body.appendChild(tr);
     });
+    // The list was just re-built: if the mouse is still over a row,
+    // re-apply the hover — a re-render replaces the row element, and
+    // a stationary mouse fires no new mouseover to restore it.
+    if (storageHoverDest !== null) {
+      var hoveredRow = body.querySelector('tr:hover');
+      if (hoveredRow) showStorageHover(hoveredRow.dataset.dest || '');
+      else clearStorageHover();
+    }
   }
-  /* Storage donut: usage of the drive holding the latest backup's
-     destination. Re-reads only when the destination changes, or when
-     Check Storage is pressed (force). A failed read shows "—", never
-     a fake number. A request token keeps a slow hover read from
-     overwriting a newer revert (round 2 #6). */
+  /* Storage donut: EMPTY by default (dictation #1) — it shows a
+     job's storage only while a Recent row is hovered/selected, and
+     clears again on mouse-leave, even after a run finishes. The
+     latest backup's destination is still tracked in storageDest for
+     "Open Location" (it opens the latest backup's folder when
+     nothing is hovered), but it is never displayed on its own. A
+     failed read shows "—", never a fake number. A request token
+     keeps a slow hover read from overwriting a newer revert
+     (round 2 #6). */
   var storageDest = '';
   var storageReq = 0;
+  /* Drive-usage reads, guarded (round 3): a dead share / sleeping
+     drive answers slowly or never, so reads are cached per destination
+     (30s), duplicate in-flight reads for the same destination share
+     one IPC call, and at most 2 run at once. A single call still gives
+     up after 10s so a stalled drive can never wedge the card. Only
+     successful reads are cached; failures stay uncached and retry. */
+  var DRIVE_USAGE_TTL = 30000;
+  var DRIVE_USAGE_MAX_IN_FLIGHT = 2;
+  var DRIVE_USAGE_TIMEOUT = 10000;
+  var driveUsageCache = Object.create(null);    // dest -> { at, result }
+  var driveUsageInflight = Object.create(null); // dest -> Promise
+  var driveUsageQueue = [];                     // { dest, resolve, reject }
+  var driveUsageActive = 0;
+  function driveUsagePump() {
+    while (driveUsageActive < DRIVE_USAGE_MAX_IN_FLIGHT && driveUsageQueue.length) {
+      (function (job) {
+        driveUsageActive++;
+        driveUsageFetchNow(job.dest).then(function (r) {
+          driveUsageActive--; job.resolve(r); driveUsagePump();
+        }, function (e) {
+          driveUsageActive--; job.reject(e); driveUsagePump();
+        });
+      })(driveUsageQueue.shift());
+    }
+  }
+  function driveUsageFetchNow(dest) {
+    return Promise.race([
+      api.getDriveUsage(dest),
+      new Promise(function (resolve) { setTimeout(function () { resolve({ success: false, error: 'Drive read timed out' }); }, DRIVE_USAGE_TIMEOUT); })
+    ]);
+  }
+  function getDriveUsageCached(dest) {
+    var hit = driveUsageCache[dest];
+    if (hit && Date.now() - hit.at < DRIVE_USAGE_TTL) return Promise.resolve(hit.result);
+    if (driveUsageInflight[dest]) return driveUsageInflight[dest];
+    var p = new Promise(function (resolve, reject) {
+      driveUsageQueue.push({ dest: dest, resolve: resolve, reject: reject });
+      driveUsagePump();
+    }).then(function (r) {
+      delete driveUsageInflight[dest];
+      if (r && r.success) driveUsageCache[dest] = { at: Date.now(), result: r };
+      return r;
+    }, function (e) {
+      delete driveUsageInflight[dest];
+      throw e;
+    });
+    driveUsageInflight[dest] = p;
+    return p;
+  }
   async function renderStorageFor(dest, req) {
     var pctEl = $('dashStoragePct'); if (!pctEl) return;
     var arc = $('dashDonutArc');
-    var set = function (id, v) { var el = $(id); if (el) el.textContent = v; };
+    var set = function (id, v) {
+      var el = $(id); if (!el) return;
+      el.textContent = v;
+      // 3-digit "100%" is wider than 2-digit values: shrink it so it
+      // stays inside the donut hole (round 3). 2-digit values keep
+      // the 20px/17px size.
+      if (id === 'dashStoragePct') el.classList.toggle('donut-narrow', String(v).length >= 4);
+    };
     if (!dest) {
       if (req !== storageReq) return;
       set('dashStoragePct', '—');
       set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
-      set('dashStorageDrive', 'No backups yet — run a job to see storage.');
+      // Empty by default (dictation #1): the card shows a job's
+      // storage only while a Recent row is hovered. When jobs exist
+      // the hint says so; with no jobs at all it says there are none.
+      var anyJob = jobs.some(function (j) { return j.type !== 'TEMPLATE'; });
+      set('dashStorageDrive', anyJob ? 'Hover a backup job to see its storage.' : 'No backups yet — run a job to see storage.');
       if (arc) arc.setAttribute('stroke-dasharray', '0 339.292');
       return;
     }
     set('dashStorageDrive', dest);
     if (!api || typeof api.getDriveUsage !== 'function') return;
+    // A hover preview switches the card to another job's drive: show
+    // the neutral placeholder at once instead of the previous job's
+    // numbers while the read is in flight. The default card (no hover)
+    // keeps its old values until the fresh read lands — no flicker.
+    if (storageHoverDest !== null) {
+      set('dashStoragePct', '—');
+      set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
+    }
     try {
-      var r = await api.getDriveUsage(dest);
+      var r = await getDriveUsageCached(dest);
       if (req !== storageReq) return;
       if (!r || !r.success) {
         set('dashStoragePct', '—');
@@ -352,32 +482,47 @@
       set('dashStoragePct', '—');
     }
   }
-  async function refreshStorageCard(force) {
+  async function refreshStorageCard() {
     var pctEl = $('dashStoragePct'); if (!pctEl) return;
+    // Track the latest destination for "Open Location" only — the
+    // card itself stays empty unless a hover is on screen.
     var last = lastCompletedRun(jobs.filter(function (j) { return j.type !== 'TEMPLATE'; }));
-    var dest = last ? (last.destination || '') : '';
-    if (!force && dest === storageDest) return;
-    storageDest = dest;
+    storageDest = last ? (last.destination || '') : '';
+    // A hover preview is on screen: a background refresh must not
+    // clobber it — the revert happens on mouseleave instead.
+    if (storageHoverDest !== null) return;
     var req = ++storageReq;
-    await renderStorageFor(dest, req);
+    await renderStorageFor('', req);
   }
-  /* Hover preview (round 2 #6): hovering a row in Recent Backup Jobs
-     shows THAT job's backup storage in the card at once — its
-     destination, donut %, Used/Free/Total. Leaving the list reverts
-     to the latest backup's destination. The hover never touches
-     storageDest (the default's cache), so the revert is a plain
-     forced refresh. */
+  /* Hover preview (round 2 #6, dictation #1): hovering a row in
+     Recent Backup Jobs shows THAT job's backup storage in the card
+     at once — its destination, donut %, Used/Free/Total. Leaving
+     the list reverts to EMPTY (the card shows nothing by default).
+     The hover never touches storageDest (the "Open Location"
+     cache), so the revert is a plain forced refresh. */
   var storageHoverDest = null;
-  async function showStorageHover(dest) {
+  var storageHoverTimer = null;
+  /* Debounced (round 3): sweeping the mouse across rows used to fire
+     a drive read per row. The read only starts 150ms after the mouse
+     settles on a row, so a quick pass costs nothing. */
+  function showStorageHover(dest) {
+    if (storageHoverTimer) { clearTimeout(storageHoverTimer); storageHoverTimer = null; }
     if (dest === storageHoverDest) return;
-    storageHoverDest = dest;
-    var req = ++storageReq;
-    await renderStorageFor(dest, req);
+    storageHoverTimer = setTimeout(function () {
+      storageHoverTimer = null;
+      if (dest === storageHoverDest) return;
+      storageHoverDest = dest;
+      var req = ++storageReq;
+      renderStorageFor(dest, req);
+    }, 150);
   }
   function clearStorageHover() {
+    // A hover that has not fired yet must not fire after the mouse
+    // left — otherwise it would re-show a preview nobody is on.
+    if (storageHoverTimer) { clearTimeout(storageHoverTimer); storageHoverTimer = null; }
     if (storageHoverDest === null) return;
     storageHoverDest = null;
-    refreshStorageCard(true);
+    refreshStorageCard();
   }
 
   /* ---------- history list ---------- */
@@ -385,6 +530,7 @@
     if (status === 'COMPLETED') return 'pill-completed';
     if (status === 'RUNNING') return 'pill-running';
     if (status === 'FAILED') return 'pill-failed';
+    if (status === 'CANCELLED') return 'pill-cancelled';
     if (status === 'TEMPLATE' || type === 'TEMPLATE') return 'pill-template';
     return 'pill-pending';
   }
@@ -449,6 +595,9 @@
   window.__closeWizardView = function () { showView(wizardReturnView || 'dashboard'); };
 
   function showView(name) {
+    // Leaving Settings abandons a half-started vault reset (the
+    // setup box goes back to the normal create/change boxes).
+    if (name !== 'settings') vaultResetArmed = false;
     currentView = name;
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
@@ -476,6 +625,11 @@
     var crb2 = $('cloudTopRefreshBtn'); if (crb2) crb2.style.display = name === 'cloud' ? '' : 'none';
     var tr = $('vpnTopRefreshBtn'); if (tr) tr.style.display = name === 'vpn' ? '' : 'none';
     var wrb = $('wgTopRefreshBtn'); if (wrb) wrb.style.display = name === 'wireguard' ? '' : 'none';
+    /* The Back buttons live in the header, next to the TOP page
+       title — one per view, shown only on its own view. Every
+       other view (Dashboard included) has no Back. */
+    var wb = $('wizardBackBtn'); if (wb) wb.style.display = name === 'wizard' ? '' : 'none';
+    var rb = $('restoreBackBtn'); if (rb) rb.style.display = name === 'restore' ? '' : 'none';
     document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
     var btn = document.querySelector('[data-nav="' + name + '"]');
     /* Inside Cloud the active item is the open panel, not Overview:
@@ -499,7 +653,10 @@
        origin view (the same destination as Back), so their back bar
        is redundant too — hiding it buys the wizard card the same
        ~30px, which is what finally lets the tallest steps fit with
-       no scroll at all (round 2 #5). */
+       no scroll at all (round 2 #5). Batch 2 #6 put a Back button
+       beside the wizard/restore card title; it has since moved to
+       the header, next to the top page title — the top back bar
+       stays hidden on both views. */
     var bb = $('backBar'); if (bb) bb.style.display = (name === 'dashboard' || name === 'wizard' || name === 'restore') ? 'none' : '';
     /* The top-bar subtitle is redundant — every view carries its own
        heading and description in the page — so it stays hidden and
@@ -545,7 +702,7 @@
       applyModuleUI('vpn');
       setBackTitle('VPN');
       setAppTitle('TechVision Tailscale VPN', 'Your private network — every device, anywhere, as if it were home.');
-      loadVpn();
+      loadVpn(true); // fresh open: credential fields reset (typed-but-unsaved input from last visit is dropped)
     }
     if (name === 'wireguard') {
       lastBackupView = name;
@@ -640,7 +797,9 @@
       items = runs.filter(function (it) { return it.run.success === true || String(it.run.status || '').toUpperCase() === 'COMPLETED'; });
       if (emptyText) emptyText.textContent = 'No completed backups yet.';
     } else if (currentLogTab === 'failed') {
-      items = runs.filter(function (it) { return it.run.success === false || String(it.run.status || '').toUpperCase() === 'FAILED'; });
+      // A run stopped by the user is 'cancelled', not failed: it
+      // stays out of this tab (it still shows under Today).
+      items = runs.filter(function (it) { return (it.run.success === false || String(it.run.status || '').toUpperCase() === 'FAILED') && String(it.run.status || '').toUpperCase() !== 'CANCELLED'; });
       // Jobs still waiting for their drive belong here too — they have
       // not run, and the user asked to see what did not happen.
       jobs.forEach(function (job) {
@@ -722,6 +881,33 @@
   }
   /* ---------- Jobs page 02: table + details panel ---------- */
   var jobsSelectedId = null; // id of the job shown in the details panel
+  /* Live % for the Jobs details progress bar (dictation #2). The map
+     keeps the last known % per running job (by id, falling back to
+     the lowercase name) so a re-render mid-run keeps the bar instead
+     of resetting it. A pct of null means "running, no % reported
+     yet" — never a fake number. */
+  var jobProgressByKey = {};
+  function jobProgressKey(job) {
+    if (!job) return null;
+    if (job.id) return 'id:' + job.id;
+    if (job.name) return 'name:' + String(job.name).toLowerCase();
+    return null;
+  }
+  function updateJobsProgressBar(pct, sub) {
+    var pctEl = $('jobsDetailsProgressPct');
+    var fill = $('jobsDetailsProgressFill');
+    var subEl = $('jobsDetailsProgressSub');
+    if (pct === null || pct === undefined) {
+      if (pctEl) pctEl.textContent = '—';
+      if (fill) fill.style.width = '0%';
+      if (subEl) subEl.textContent = 'Running…';
+      return;
+    }
+    var p = Math.max(0, Math.min(100, Number(pct) || 0));
+    if (pctEl) pctEl.textContent = Math.round(p) + '%';
+    if (fill) fill.style.width = p + '%';
+    if (subEl) subEl.textContent = sub || 'Running…';
+  }
   function selectedJob() {
     if (!jobsSelectedId) return null;
     var found = jobs.filter(function (j) { return j.id === jobsSelectedId; });
@@ -754,7 +940,9 @@
     });
     var sel = selectedJob();
     if (sel && visible.indexOf(sel) === -1) sel = null;
-    if (!sel && visible.length) sel = visible[0];
+    // No auto-select (dictation #2): the details panel stays hidden
+    // until the user clicks a row. jobsSelectedId only changes on a
+    // click (or when the selected job leaves the visible list).
     jobsSelectedId = sel ? sel.id : null;
     body.innerHTML = '';
     var empty = $('jobsEmptyState');
@@ -788,6 +976,11 @@
   }
   function renderJobsDetails(job) {
     var panel = $('jobsDetails'); if (!panel) return;
+    // The panel appears only when a job is clicked (dictation #2):
+    // on page open, with nothing selected, it is hidden entirely
+    // and the table takes the full width.
+    panel.style.display = job ? '' : 'none';
+    var jl = document.querySelector('.jobs-layout'); if (jl) jl.classList.toggle('no-details', !job);
     var name = $('jobsDetailsName'), pill = $('jobsDetailsPill');
     var banner = $('jobsDetailsBanner'), bIco = $('jobsDetailsBannerIco'), bTitle = $('jobsDetailsBannerTitle'), bSub = $('jobsDetailsBannerSub');
     var listEl = $('jobsDetailsList'), waitEl = $('jobsDetailsWaiting');
@@ -800,10 +993,15 @@
       if (bSub) bSub.textContent = 'Create your first backup job to protect your files.';
       if (listEl) listEl.innerHTML = '';
       if (waitEl) waitEl.innerHTML = '';
+      var sb0 = $('jobsDetailsStop'); if (sb0) sb0.style.display = 'none';
       return;
     }
     if (name) name.textContent = job.name;
     if (pill) { pill.className = 'pill ' + pillClass(job.status, job.type); pill.textContent = job.status; }
+    // Stop is visible only while THIS job is actually running; the
+    // jobs-updated refresh at run end hides it again.
+    var stopBtn = $('jobsDetailsStop');
+    if (stopBtn) stopBtn.style.display = job.running ? '' : 'none';
     if (banner) {
       banner.classList.remove('warn', 'bad', 'idle');
       if (job.status === 'COMPLETED') {
@@ -838,7 +1036,7 @@
         ['Schedule', scheduleLabel(sched) || 'Manual only'],
         ['Next run', nextRunText(job)],
         ['Compression', compressionLabel(job)],
-        ['Encryption', enc ? 'Enabled (AES-256)' : 'Off'],
+        ['Encryption', enc ? 'Enabled (TechVision-only AES-256-GCM)' : 'Off'],
         ['Last Run Result', job.runs && job.runs.length ? job.status + ' — ' + formatDate(job.timestamp) : 'Never run'],
         ['Files Backed Up', job.runs && job.runs.length ? String(job.files) : '—'],
         ['Total Size', job.runs && job.runs.length ? formatBytes(job.size) : '—']
@@ -860,15 +1058,54 @@
         waitEl.appendChild(wdiv);
       }
     }
+    // Progress bar under the details (dictation #2): shown only
+    // while THIS job is running. The % comes from the live progress
+    // map; a running job with no % reported yet shows "Running…"
+    // with no fake number.
+    var prog = $('jobsDetailsProgress');
+    if (prog) {
+      if (job && job.running) {
+        prog.style.display = '';
+        var pk = jobProgressKey(job);
+        var last = pk ? jobProgressByKey[pk] : null;
+        updateJobsProgressBar(last ? last.pct : null, last ? last.sub : null);
+      } else {
+        prog.style.display = 'none';
+      }
+    }
   }
   async function deleteSelectedJob() {
     var j = selectedJob();
     if (!j || !api || typeof api.deleteJob !== 'function') return;
+    // Scoped confirmation (round 3): deleting a job removes its
+    // template file and its run history. Cancel leaves everything
+    // untouched — nothing is deleted until the user confirms.
+    askConfirm('Delete "' + j.name + '"? This removes the job template file and its run history. This cannot be undone.', async function () {
+      try {
+        var res = await api.deleteJob(j.id);
+        if (res && res.success) { toast('Job deleted', j.name + ' has been deleted.', 'success'); await refreshJobs(); }
+        else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
+      } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
+    }, { title: 'Delete job?', yesLabel: 'Yes, delete job', noLabel: 'Keep job' });
+  }
+
+  /* ---------- stop a running backup ---------- */
+  // One stop path for every Stop button (Jobs details, Dashboard row,
+  // progress card): main matches the job id against the live runs
+  // (falling back to the job name) and cancels the engine. The run
+  // unwinds on its own; the jobs-updated refresh at the end hides
+  // the button and shows the run as CANCELLED.
+  async function stopJobById(jobId) {
+    if (!jobId || !api || typeof api.stopBackup !== 'function') return;
     try {
-      var res = await api.deleteJob(j.id);
-      if (res && res.success) { toast('Job deleted', j.name + ' has been deleted.', 'success'); await refreshJobs(); }
-      else toast('Delete failed', (res && res.error) || 'Could not delete job.', 'error');
-    } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error'); }
+      var res = await api.stopBackup(jobId);
+      if (res && res.success) toast('Stopping backup', 'The backup is stopping — the partial files are removed.', '');
+      else toast('Nothing to stop', (res && res.error === 'NOT_RUNNING') ? 'That backup is not running any more.' : ((res && res.error) || 'Could not stop the backup.'), 'error');
+    } catch (e) { toast('Stop failed', e && e.message ? e.message : 'Could not stop the backup.', 'error'); }
+  }
+  async function stopSelectedJob() {
+    var j = selectedJob();
+    if (j) stopJobById(j.id);
   }
 
   /* ---------- TechVision Cloud ---------- */
@@ -876,8 +1113,7 @@
   var cloudPanel = 'home';       // 'home' | 'server' | 'client' | 'mapdrive'
   var wgPanel = 'server';        // 'server' | 'nat' — WireGuard tabs
   var cloudSelected = null;      // saved server record being connected to
-  var cloudPendingProbe = null;  // { fingerprint, certPem } awaiting trust
-  var cloudCertChanged = false; // the server's cert changed since it was trusted — re-trust pending
+  var cloudPendingProbe = null;  // { fingerprint, certPem, changed } awaiting trust
   var cloudConn = null;          // { serverId, info } while connected
   var cloudPath = '';            // current remote path, '' = root, '/' separators
   var cloudTransferTimer = null;
@@ -1153,6 +1389,22 @@
     if (prevValue) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevValue) { sel.value = prevValue; break; } }
   }
 
+  // Last detected addresses, kept so the Server panel can re-render
+  // them (with the saved DDNS) without re-detecting every time.
+  var cloudDetectedAddresses = null;
+  function renderCloudServerAddresses() {
+    var addrs = $('cloudServerAddrs'); if (!addrs) return;
+    var lines = [];
+    if (cloudDetectedAddresses) {
+      var r = cloudDetectedAddresses;
+      lines.push(r.publicIP ? 'Public (from outside): ' + r.publicIP : 'Public: unknown (no internet or detection failed)');
+      if (r.lanIPs && r.lanIPs.length) lines.push('LAN (same network): ' + r.lanIPs.join(', '));
+    }
+    var ddns = cloudCfg && cloudCfg.server && cloudCfg.server.ddnsHostname;
+    if (ddns) lines.push('DDNS: ' + ddns);
+    addrs.textContent = lines.join(' — ') || 'Detect your addresses to see them here.';
+  }
+
   function renderCloudServer() {
     if (!cloudCfg) return;
     var s = cloudCfg.server || {};
@@ -1170,6 +1422,7 @@
     var en = $('cloudServerEnabled'); if (en) en.checked = !!s.enabled;
     var port = $('cloudServerPort'); if (port) port.value = String(s.port || 8443);
     var dd = $('cloudServerDdns'); if (dd) dd.value = s.ddnsHostname || '';
+    renderCloudServerAddresses();
     var gp = $('cloudGuidePort'); if (gp) gp.textContent = String(s.port || 8443);
     var fp = $('cloudServerFactPort'); if (fp) fp.textContent = String(s.port || 8443);
     var fu = $('cloudServerFactUsers'); if (fu) fu.textContent = String((s.users || []).length);
@@ -1406,7 +1659,12 @@
     if (recHint) recHint.textContent = hasPassword
       ? 'Maps this drive again every time the app opens.'
       : 'Save the server password in the Client tab to reconnect automatically.';
-    if (srvHint) srvHint.textContent = hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.';
+    // Say the connection state here too, before the user presses Map:
+    // mapping needs a live Client connection to this server (the
+    // guard in cloudMapDriveAction), not just a saved record.
+    var connectedHere = !!(cloudConn && cloudConn.serverId === serverId);
+    if (srvHint) srvHint.textContent = (hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.')
+      + (connectedHere ? '' : ' Not connected — connect in the Client tab before mapping.');
   }
 
   async function cloudMapDriveAction() {
@@ -1425,6 +1683,15 @@
         cloudMapInvalidateCache();
       } else if (r && r.error === 'password-needed') {
         toast('Password needed', 'Save the server password in the Client tab first — connect once with the password, and it is saved on this device.', 'error');
+      } else if (r && r.error === 'not-connected') {
+        // Client-connection guard: never attempt the mapping when
+        // the Client is not connected to this server. Say so, then
+        // jump to the Client tab with this server selected, so
+        // Connect is one click away — then he maps from here.
+        toast('Not connected', 'You are not connected to this server in the Client tab. Connect first, then map the drive.', 'error');
+        var srv = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === serverId; });
+        if (srv) selectCloudServer(srv);
+        showCloudPanel('client');
       } else {
         toast('Mapping failed', (r && r.error) || 'Could not map the drive.', 'error');
       }
@@ -1434,9 +1701,16 @@
     await renderMapdrivePanel();
   }
 
+  // Pick the server a connect is for: close any open connect box and
+  // take a COPY of the record, so later mutations (a newly trusted
+  // fingerprint) do not rewrite the list entry before it is saved.
+  function selectCloudServer(srv) {
+    closeCloudConnect();
+    cloudSelected = Object.assign({}, srv);
+  }
+
   function openCloudConnect(srv, presetPassword) {
-    cloudSelected = srv;
-    cloudPendingProbe = null;
+    selectCloudServer(srv);
     var box = $('cloudConnectBox'); if (box) box.style.display = '';
     var title = $('cloudConnectTitle'); if (title) title.textContent = 'Connect to ' + srv.name + (srv.user ? ' as ' + srv.user : '');
     var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
@@ -1449,14 +1723,16 @@
     var box = $('cloudConnectBox'); if (box) box.style.display = 'none';
     cloudSelected = null;
     cloudPendingProbe = null;
-    cloudCertChanged = false;
+    // Leave nothing typed or stuck behind: a failed probe must not
+    // leave the button disabled or labelled "Checking server…".
+    var pass = $('cloudConnectPass'); if (pass) pass.value = '';
+    var btn = $('cloudConnectBtn'); if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
   }
 
   // One click on a saved server: the password is already on this device
   // (the main process uses the stored one), so go straight in — no box.
   async function cloudConnectSaved(srv) {
-    cloudSelected = srv;
-    cloudPendingProbe = null;
+    selectCloudServer(srv);
     await cloudConnectFlow(true, null);
   }
 
@@ -1490,18 +1766,16 @@
   }
 
   async function cloudConnectFlow(autoTrust, passwordOverride) {
-    if (!cloudSelected) return;
+    // Work on a local copy of the selected record: if the user picks
+    // another server mid-flow, the stale flow must stop, not connect
+    // to the wrong server.
+    var selected = cloudSelected;
+    if (!selected) return;
     if (!api || typeof api.cloudClientProbe !== 'function' || typeof api.cloudClientConnect !== 'function') return cloudMissing();
-    /* WireGuard mode: the tunnel has to be up before probing — a
-       down tunnel fails fast here with a clear message instead of
-       waiting out the 15s probe timeout. Main re-checks the same
-       way in cloud-client-connect for the trusted path. */
-    var wgMode = (cloudSelected.accessMode || cloudClientAccess) === 'wireguard';
-    if (wgMode) {
-      var wgCheck = await wgTunnelUpFor(cloudSelected.host);
-      if (!wgCheck.ok) { toast('WireGuard tunnel is down', wgCheck.error, 'error'); return; }
-    }
     var btn = $('cloudConnectBtn');
+    // A double-click must not start the flow twice.
+    if (btn && btn.disabled) return;
+    if (btn) btn.disabled = true;
     var pass = $('cloudConnectPass');
     var password = passwordOverride !== undefined ? (passwordOverride || '') : (pass ? pass.value : '');
     var justTrusted = null; // fingerprint trusted in this very click
@@ -1510,41 +1784,57 @@
     // trust the new fingerprint — the same manual box as first trust,
     // with the new fingerprint to compare. Never silently accept a
     // different certificate.
-    function offerCertRetrust(probe) {
-      cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
-      cloudCertChanged = true;
-      var title2 = $('cloudConnectTitle'); if (title2) title2.textContent = 'Connect to ' + cloudSelected.name + (cloudSelected.user ? ' as ' + cloudSelected.user : '');
-      var ft2 = $('cloudFingerprintText'); if (ft2) ft2.textContent = probe.fingerprint;
-      var fb2 = $('cloudFingerprintBox'); if (fb2) fb2.style.display = '';
-      var box2 = $('cloudConnectBox'); if (box2) box2.style.display = '';
-      var btn2 = $('cloudConnectBtn'); if (btn2) btn2.textContent = 'Trust & connect';
-      toast('Server certificate changed', 'Compare the new fingerprint with the fingerprint shown on the server, then press Trust & connect.', '');
+    function offerTrust(probe, changed) {
+      cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem, changed: changed };
+      var title = $('cloudConnectTitle');
+      if (title) title.textContent = 'Connect to ' + selected.name + (selected.user ? ' as ' + selected.user : '');
+      var ft = $('cloudFingerprintText'); if (ft) ft.textContent = probe.fingerprint;
+      var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = '';
+      var box = $('cloudConnectBox'); if (box) box.style.display = '';
+      if (pass && password) pass.value = password;
+      if (btn) btn.textContent = 'Trust & connect';
+      toast(changed ? 'Server certificate changed' : 'Check the fingerprint',
+        'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
     }
-    // No trusted certificate yet (or the trusted one changed — see
-    // below): probe the server first (nothing sensitive is sent to
-    // probe), then trust its fingerprint.
-    if (!cloudSelected.fingerprint || cloudCertChanged) {
-      if (!cloudPendingProbe) {
-        try {
-          if (btn) { btn.disabled = true; btn.textContent = 'Checking server…'; }
-          var probe = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-          if (!probe || !probe.success) { toast('Cannot reach server', (probe && probe.error) || 'Check the address and port.', 'error'); return; }
-          cloudPendingProbe = { fingerprint: probe.fingerprint, certPem: probe.certPem };
-        } catch (e) {
-          toast('Cannot reach server', e && e.message ? e.message : 'Check the address and port.', 'error');
+
+    try {
+      /* WireGuard mode: the tunnel has to be up before probing — a
+         down tunnel fails fast here with a clear message instead of
+         waiting out the 15s probe timeout. Main re-checks the same
+         way in cloud-client-connect for the trusted path. */
+      if ((selected.accessMode || cloudClientAccess) === 'wireguard') {
+        var wgCheck = await wgTunnelUpFor(selected.host);
+        if (selected !== cloudSelected) return;
+        if (!wgCheck.ok) { toast('WireGuard tunnel is down', wgCheck.error, 'error'); return; }
+      }
+
+      // No trusted certificate yet (or the trusted one changed — see
+      // below): probe the server first (nothing sensitive is sent to
+      // probe), then trust its fingerprint.
+      var probe = cloudPendingProbe;
+      var certPem = selected.certPem;
+      // A changed certificate must never be trusted by a one-click
+      // Save & connect — only the manual Trust & connect button
+      // (which calls this with no arguments, so autoTrust is
+      // undefined) may accept it, after the user compared the
+      // fingerprint.
+      if (probe && probe.changed && autoTrust) return;
+      if (!probe && (!selected.fingerprint || !certPem)) {
+        if (btn) btn.textContent = 'Checking server…';
+        probe = await api.cloudClientProbe(selected.host, selected.port);
+        if (selected !== cloudSelected) return;
+        if (!probe || !probe.success) {
+          toast('Cannot reach server', (probe && probe.error) || 'Check the address and port.', 'error');
           return;
-        } finally {
-          // A failed probe must leave the button usable again, with its
-          // normal label — otherwise it stays stuck on "Checking server…".
-          if (btn) { btn.disabled = false; if (btn.textContent === 'Checking server…') btn.textContent = 'Connect'; }
         }
-        if (!autoTrust) {
+        if (selected.fingerprint && probe.fingerprint !== selected.fingerprint) {
+          offerTrust(probe, true);
+          return;
+        }
+        if (!selected.fingerprint && !autoTrust) {
           // Manual path: show the fingerprint and wait for the user to
           // compare it with the server screen and press Trust & connect.
-          var ft = $('cloudFingerprintText'); if (ft) ft.textContent = cloudPendingProbe.fingerprint;
-          var fbox = $('cloudFingerprintBox'); if (fbox) fbox.style.display = '';
-          if (btn) btn.textContent = 'Trust & connect';
-          toast('Check the fingerprint', 'Compare it with the fingerprint shown on the server, then press Trust & connect.', '');
+          offerTrust(probe, false);
           return;
         }
         // Save & connect asked for one click: trust this fingerprint
@@ -1552,51 +1842,35 @@
         // Connected toast and stays pinned afterwards; a changed
         // certificate is still refused on the next connect.
       }
+
       // Trust the probed fingerprint (user pressed Trust & connect, or
       // Save & connect is doing the whole thing in one click).
-      try {
-        if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+      if (probe && probe.fingerprint !== selected.fingerprint) {
+        if (btn) btn.textContent = 'Saving…';
         var saved = await api.cloudClientSave({
-          id: cloudSelected.id, name: cloudSelected.name, host: cloudSelected.host,
-          port: cloudSelected.port, user: cloudSelected.user,
-          fingerprint: cloudPendingProbe.fingerprint, certPem: cloudPendingProbe.certPem,
-          accessMode: cloudClientAccess,
+          id: selected.id, name: selected.name, host: selected.host, port: selected.port,
+          user: selected.user, fingerprint: probe.fingerprint, certPem: probe.certPem,
+          accessMode: selected.accessMode,
         });
+        if (selected !== cloudSelected) return;
         if (!saved || !saved.success) { toast('Save failed', (saved && saved.error) || 'Could not save server.', 'error'); return; }
-        cloudSelected.fingerprint = cloudPendingProbe.fingerprint;
-        cloudSelected.certPem = cloudPendingProbe.certPem;
-        justTrusted = cloudPendingProbe.fingerprint;
-        cloudCertChanged = false;
+        selected.fingerprint = probe.fingerprint;
+        selected.certPem = probe.certPem;
+        justTrusted = probe.fingerprint;
+        cloudPendingProbe = null;
         var fp = $('cloudFingerprintBox'); if (fp) fp.style.display = 'none';
-        await loadCloud();
-      } catch (e) {
-        toast('Save error', e && e.message ? e.message : 'Could not save server.', 'error');
-        return;
-      } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Connect'; }
       }
-    }
-    // Trusted certificate: connect with the password — typed in the box,
-    // or the one saved on this device when this is a one-click reconnect.
-    if (!password && !cloudSelected.hasPassword) { toast('Password needed', 'Enter the password for user ' + (cloudSelected.user || '') + '.', 'error'); return; }
-    try {
-      if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
-      var certPem = cloudSelected.certPem;
-      if (!certPem) {
-        // Fingerprint known but the PEM was saved before this build, or
-        // the record came from the list (cloud-get-config does not send
-        // the PEM): re-probe once to get it. A different fingerprint
-        // means the server's certificate changed — offer to trust the
-        // new one instead of dead-ending with "remove and add again".
-        var p2 = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-        if (!p2 || !p2.success) { toast('Cannot reach server', (p2 && p2.error) || 'Check the address and port.', 'error'); return; }
-        if (p2.fingerprint !== cloudSelected.fingerprint) { offerCertRetrust(p2); return; }
-        certPem = p2.certPem;
-      }
+      if (probe) certPem = probe.certPem;
+
+      // Trusted certificate: connect with the password — typed in the box,
+      // or the one saved on this device when this is a one-click reconnect.
+      if (!password && !selected.hasPassword) { toast('Password needed', 'Enter the password for user ' + (selected.user || '') + '.', 'error'); return; }
+      if (btn) btn.textContent = 'Connecting…';
       var r = await api.cloudClientConnect({
-        serverId: cloudSelected.id, host: cloudSelected.host, port: cloudSelected.port,
-        certPem: certPem, user: cloudSelected.user, password: password || null,
+        serverId: selected.id, host: selected.host, port: selected.port,
+        certPem: certPem, user: selected.user, password: password || null,
       });
+      if (selected !== cloudSelected) return;
       if (!r || !r.success) {
         var connErr = (r && r.error) || 'Wrong user name or password.';
         // The server's certificate changed since this record was
@@ -1606,42 +1880,53 @@
         // offer to trust it — the same manual box as first trust, with
         // the new fingerprint to compare. Never silently accept a
         // different certificate.
-        if (/certificat/i.test(connErr) && cloudSelected.fingerprint) {
-          try {
-            var pr = await api.cloudClientProbe(cloudSelected.host, cloudSelected.port);
-            if (pr && pr.success && pr.fingerprint && pr.fingerprint !== cloudSelected.fingerprint) {
-              offerCertRetrust(pr);
-              return;
-            }
-          } catch (e) {}
+        if (/certificat/i.test(connErr) && selected.fingerprint) {
+          var replacement = null;
+          try { replacement = await api.cloudClientProbe(selected.host, selected.port); } catch (e) {}
+          if (selected !== cloudSelected) return;
+          if (replacement && replacement.success && replacement.fingerprint && replacement.fingerprint !== selected.fingerprint) {
+            offerTrust(replacement, true);
+            return;
+          }
         }
         toast('Connection failed', connErr, 'error'); return;
       }
-      // Keep the server name: closeCloudConnect() clears cloudSelected.
-      cloudConn = { serverId: cloudSelected.id, info: r.info, name: cloudSelected.name };
+      // `selected` is a local copy, so closeCloudConnect() clearing
+      // cloudSelected below cannot lose the server name.
+      cloudConn = { serverId: selected.id, info: r.info, name: selected.name };
       cloudMapInvalidateCache();
-      if (pass) pass.value = '';
       closeCloudConnect();
       cloudPath = '';
       var browser = $('cloudBrowser'); if (browser) browser.style.display = '';
-      toast('Connected', 'Signed in as ' + (r.info.user || cloudSelected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).') + (justTrusted ? ' Server fingerprint ' + justTrusted.slice(0, 16) + '… trusted.' : ''));
+      toast('Connected', 'Signed in as ' + (r.info.user || selected.user) + (r.info.canWrite ? ' (read + write).' : ' (read-only).') + (justTrusted ? ' Server fingerprint ' + justTrusted.slice(0, 16) + '… trusted.' : ''));
       renderCloudHome();
       // Re-read the config: a typed password was just saved on this
       // device, so the server card must now show Connect + Forget
       // without waiting for the user to navigate away and back.
       await loadCloud();
       await cloudBrowse('');
+      // The typed password just authenticated but could not be stored
+      // (no master key yet): offer to create one — the retry saves
+      // it into the vault so the next connect is one click.
+      if (r && r.passwordNotSaved && r.needsMasterKey && password) {
+        askCreateMasterKey('the Cloud server password', async function () {
+          var r2 = await api.cloudClientSave({
+            id: selected.id, name: selected.name, host: selected.host, port: selected.port,
+            user: selected.user, accessMode: selected.accessMode, password: password,
+          });
+          if (r2 && r2.success && !r2.passwordNotSaved) { toast('Password saved', 'The Cloud password is now saved in the vault.', 'success'); await loadCloud(); }
+        }, function () { toast('Password not saved', 'Connected, but the password was not saved — you will be asked for it on every connect until a master key is created.', 'warning'); });
+      }
       cloudStartPoller();
     } catch (e) {
-      toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
+      if (selected === cloudSelected) toast('Connection failed', e && e.message ? e.message : 'Could not connect.', 'error');
     } finally {
-      if (btn) {
+      if (btn && selected === cloudSelected) {
         btn.disabled = false;
         // A re-trust offer just set the label to "Trust & connect" —
-        // do not overwrite it on the way out (the fingerprint box
-        // being visible is the sign that the offer is on screen).
-        var fbox = $('cloudFingerprintBox');
-        if (!fbox || fbox.style.display === 'none') btn.textContent = 'Connect';
+        // do not overwrite it on the way out (a pending probe is the
+        // sign that the offer is on screen).
+        btn.textContent = cloudPendingProbe ? 'Trust & connect' : 'Connect';
       }
     }
   }
@@ -2363,7 +2648,7 @@
     $('drawerDest').textContent = job.destination || '—';
     $('drawerType').textContent = job.type;
     var enc = job.encryptionEnabled === true || (job.raw && job.raw.encryptionEnabled === true);
-    if ($('drawerEncryption')) $('drawerEncryption').textContent = enc ? 'AES-256 🔒' : 'Off';
+    if ($('drawerEncryption')) $('drawerEncryption').textContent = enc ? 'TechVision-only 🔒' : 'Off';
     $('drawerStatus').textContent = job.status;
     $('drawerFiles').textContent = String(job.files);
     $('drawerSize').textContent = formatBytes(job.size);
@@ -2400,6 +2685,9 @@
     /* Settings is a full page now: the four tabs switch sections. The
        old drawer view names still work: 'home' = General, 'email' = Email. */
     var tab = view === 'email' ? 'email' : view === 'backup' ? 'backup' : view === 'security' ? 'security' : 'general';
+    // Switching away from the Security tab abandons a half-started
+    // vault reset (see showView for the same on leaving Settings).
+    if (tab !== 'security') vaultResetArmed = false;
     var sections = { general: 'settingsGeneralSection', backup: 'settingsBackupSection', security: 'settingsSecuritySection', email: 'settingsEmailSection' };
     Object.keys(sections).forEach(function (k) { var s = $(sections[k]); if (s) s.style.display = k === tab ? '' : 'none'; });
     document.querySelectorAll('[data-settings-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-settings-tab') === tab); });
@@ -2429,6 +2717,9 @@
     $('progressSize').textContent = '';
     $('progressFile').textContent = '';
     $('progressCard').classList.add('show');
+    // A fresh run gets a fresh Stop button (re-armed after the
+    // previous run disabled it with "Stopping…").
+    var psb = $('progressStopBtn'); if (psb) { psb.disabled = false; psb.textContent = '■ Stop backup'; }
     setProgressButtons(true);
   }
   function setProgress(pct, files, size, fileName) {
@@ -2453,12 +2744,16 @@
   }
   /* ---------- backup / restore actions ---------- */
   // Ask for a job password in a modal. Resolves to the password, or
-  // null when the user cancels.
-  function askJobPassword(jobName) {
+  // null when the user cancels. `kind` is 'backup' (the encryption
+  // password) or 'zip' (the ZIP password) — the two are independent,
+  // so the modal must say which one it is asking for.
+  function askJobPassword(jobName, kind) {
     return new Promise(function (resolve) {
       var modal = $('jobPwModal'); var back = $('jobPwBackdrop');
       var input = $('jobPwInput');
-      $('jobPwText').textContent = 'Job "' + jobName + '" is encrypted and its password is not saved in the vault. Enter the backup password to run it.';
+      $('jobPwText').textContent = kind === 'zip'
+        ? 'Job "' + jobName + '" has a ZIP password that is not saved in the vault. Enter the ZIP password to run it.'
+        : 'Job "' + jobName + '" is encrypted and its password is not saved in the vault. Enter the backup password to run it.';
       input.value = '';
       modal.style.display = 'block'; back.classList.add('show');
       setTimeout(function () { input.focus(); }, 50);
@@ -2472,10 +2767,16 @@
       input.onkeydown = function (ev) { if (ev.key === 'Enter') done(input.value || null); };
     });
   }
+  /* The job id of the manual run currently showing in the progress
+     card — the card's Stop button stops THIS run. */
+  var currentRunJobId = null;
   async function runBackup(job, incremental) {
     if (!job) return;
     if (!api || typeof api.runFullBackup !== 'function') { toast('Backup unavailable', 'Backup API is not available.', 'error'); return; }
     var cfg = job.raw || job;
+    // The normalized job id — main matches it against the live runs
+    // (by id, falling back to the job name).
+    currentRunJobId = job.id || cfg.id || null;
     // Encrypted job whose password is not in the vault: ask now, and
     // pass it for this run only (main.js stores it if the vault is open).
     if (cfg.encryptionEnabled === true) {
@@ -2487,6 +2788,21 @@
         var pw = await askJobPassword(job.name || cfg.name || 'backup job');
         if (!pw) return; // cancelled
         cfg = Object.assign({}, cfg, { encryptionPassword: pw });
+      }
+    }
+    // ZIP-password job whose ZIP password is not in the vault: ask
+    // now, and pass it for this run only (main.js stores it if the
+    // vault is open). Independent of the encryption password above
+    // — a job can need either, both, or neither.
+    if (cfg.zipPasswordEnabled === true) {
+      var hasZipPw = false;
+      if (api && typeof api.vaultHasJobZipPassword === 'function') {
+        try { var zhr = await api.vaultHasJobZipPassword(cfg.id); hasZipPw = !!(zhr && zhr.has); } catch (e) {}
+      }
+      if (!hasZipPw) {
+        var zpw = await askJobPassword(job.name || cfg.name || 'backup job', 'zip');
+        if (!zpw) return; // cancelled
+        cfg = Object.assign({}, cfg, { zipPassword: zpw });
       }
     }
     closeDrawer();
@@ -2507,21 +2823,40 @@
         ? await api.runIncrementalBackup(cfg)
         : await api.runFullBackup(cfg);
       if (stopProgress) stopProgress();
-      setProgress(100, result && result.files, result && result.size);
-      var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
-      setTimeout(function () { hideProgress(); }, 900);
-      if (result && (result.success === false || result.status === 'failed')) {
-        if (result.error === 'ENCRYPTION_PASSWORD_REQUIRED') {
-          toast('Password required', 'This job is encrypted and no password is saved. Unlock the vault in Settings, or run it and enter the password when asked.', 'error');
-        } else {
-          toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
-        }
+      currentRunJobId = null;
+      if (result && result.status === 'cancelled') {
+        // Stopped by the user: the bar never reaches 100% (the run
+        // did not finish), and it is neither a success nor a failure.
+        setTimeout(function () { hideProgress(); }, 900);
+        toast('Backup stopped', job.name + ' — the backup was stopped and the partial files were removed.', '');
       } else {
-        toast('Backup completed', job.name + ' — ' + files + ' file' + (files === 1 ? '' : 's') + ' backed up.', 'success');
+        setProgress(100, result && result.files, result && result.size);
+        var files = result ? safeNum(result.files ?? result.fileCount, 0) : 0;
+        setTimeout(function () { hideProgress(); }, 900);
+        if (result && (result.success === false || result.status === 'failed')) {
+          if (result.error === 'ENCRYPTION_PASSWORD_REQUIRED') {
+            // The vault is locked: show the unlock modal itself and
+            // run again after unlocking (the saved password is then
+            // found). Otherwise say so plainly — the old toast
+            // pointed at Settings, where no Unlock button exists.
+            var shown = await offerVaultUnlockThen(function () { runBackup(job, incremental); }, 'The vault is locked. Enter your master password to run this encrypted backup.');
+            if (!shown) toast('Password required', 'This job is encrypted and no password is saved. Run it again and enter the password when asked.', 'error');
+          } else if (result.error === 'ZIP_PASSWORD_REQUIRED') {
+            // Same flow for the ZIP password: unlock the vault and
+            // run again (the saved ZIP password is then found).
+            var zshown = await offerVaultUnlockThen(function () { runBackup(job, incremental); }, 'The vault is locked. Enter your master password to run this backup (it has a ZIP password).');
+            if (!zshown) toast('Password required', 'This job has a ZIP password and none is saved. Run it again and enter the ZIP password when asked.', 'error');
+          } else {
+            toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
+          }
+        } else {
+          toast('Backup completed', job.name + ' — ' + files + ' file' + (files === 1 ? '' : 's') + ' backed up.', 'success');
+        }
       }
       await loadJobs();
     } catch (e) {
       if (stopProgress) stopProgress();
+      currentRunJobId = null;
       hideProgress();
       toast('Backup failed', e && e.message ? e.message : 'The backup did not complete.', 'error');
     }
@@ -2565,6 +2900,27 @@
       var data = await api.getJobHistory();
       var arr = Array.isArray(data) ? data : (data && Array.isArray(data.jobs) ? data.jobs : (data && Array.isArray(data.history) ? data.history : []));
       jobs = arr.map(normJob);
+      // Which jobs are running RIGHT NOW: main tracks live runs in
+      // activeJobs (job-get-active). A running job shows RUNNING +
+      // its Stop button; the jobs-updated event at run start/end
+      // re-runs this, so the button appears and disappears with the
+      // run. Name matching is the fallback for runs started without
+      // a stored id — two same-name jobs can never run at once, so
+      // the name cannot point at the wrong run.
+      var active = [];
+      if (api && typeof api.getActiveJobs === 'function') {
+        try { active = await api.getActiveJobs() || []; } catch (e) { active = []; }
+      }
+      var runningById = {}, runningByName = {};
+      active.forEach(function (a) {
+        if (!a || a.status !== 'running') return;
+        if (a.jobId) runningById[a.jobId] = true;
+        if (a.name) runningByName[String(a.name).toLowerCase()] = true;
+      });
+      jobs.forEach(function (j) {
+        j.running = !!(runningById[j.id] || runningByName[String(j.name).toLowerCase()]);
+        if (j.running) j.status = 'RUNNING';
+      });
     } catch (e) {
       toast('Could not load history', e && e.message ? e.message : 'History could not be loaded.', 'error');
       jobs = [];
@@ -2585,6 +2941,19 @@
     el.classList.add('spinning');
     el.addEventListener('animationend', function h() { el.classList.remove('spinning'); el.removeEventListener('animationend', h); });
   }
+  /* Manual refresh page animation (dictation #3): the page content
+     briefly "goes and comes back" when the user presses a refresh
+     button himself. Only the click handlers below call this —
+     background refreshes (jobs-updated, pollers, loadJobs) never do,
+     so an automatic refresh never animates. */
+  function playManualRefreshAnim() {
+    var m = document.querySelector('.main');
+    if (!m) return;
+    m.classList.remove('manual-refresh-anim');
+    void m.offsetWidth;
+    m.classList.add('manual-refresh-anim');
+    m.addEventListener('animationend', function h() { m.classList.remove('manual-refresh-anim'); m.removeEventListener('animationend', h); });
+  }
   async function refreshJobs() {
     spinOnce($('backupTopRefreshBtn'));
     if (api && typeof api.refreshJobs === 'function') {
@@ -2594,26 +2963,58 @@
   }
 
   /* ---------- master-password vault ---------- */
+  // Startup "create a new master password" (old key lost): while
+  // this is set, Settings → Security shows the setup box with the
+  // loss warning instead of the change box, and the Set button
+  // replaces the vault instead of creating one. Cleared on a
+  // successful setup or as soon as the user leaves the Security tab
+  // / Settings.
+  var vaultResetArmed = false;
   async function refreshVaultStatus() {
     var txt = $('vaultStatusText'); if (!txt) return;
     if (!api || typeof api.vaultStatus !== 'function') { txt.textContent = 'Vault API is not available.'; return; }
     try {
       var st = await api.vaultStatus();
-      txt.textContent = !st.exists
-        ? 'No master password set up yet.'
-        : (st.locked ? 'Vault is set up and locked.' : 'Vault is unlocked for this session.');
-      if ($('vaultSetupBox')) $('vaultSetupBox').style.display = st.exists ? 'none' : 'block';
-      if ($('vaultChangeBox')) $('vaultChangeBox').style.display = st.exists ? 'block' : 'none';
+      // Settings only says whether a master password is set — the
+      // locked/unlocked state lives in the unlock modal, and there
+      // is no Lock button here any more.
+      txt.textContent = !st.exists ? 'No master password set up yet.' : 'Master password is set.';
+      var showSetup = !st.exists || vaultResetArmed;
+      if ($('vaultSetupBox')) $('vaultSetupBox').style.display = showSetup ? 'block' : 'none';
+      if ($('vaultChangeBox')) $('vaultChangeBox').style.display = showSetup ? 'none' : 'block';
+      if ($('vaultResetWarning')) $('vaultResetWarning').style.display = vaultResetArmed ? '' : 'none';
     } catch (e) { txt.textContent = 'Could not read the vault status.'; }
   }
+  // The unlock modal's own wording — on-demand calls replace it with
+  // a reason ("...to save the email password"), so the startup path
+  // restores the default every time it shows the modal.
+  var vaultUnlockDefaultText = '';
+  try { var _vmt = $('vaultModalText'); if (_vmt) vaultUnlockDefaultText = _vmt.textContent; } catch (e) {}
+  var startupKeyPromptShown = false; // once per launch: "Not now" asks again next launch, never twice in one launch
   async function checkVaultOnStartup() {
     if (!api || typeof api.vaultStatus !== 'function') return;
     try {
       var st = await api.vaultStatus();
       if (st.exists && st.locked) {
+        var _t = $('vaultModalText'); if (_t && vaultUnlockDefaultText) _t.textContent = vaultUnlockDefaultText;
+        // Startup only: offer the "I forgot it" path. On-demand
+        // unlocks (mid-session) never show it — the key is not lost,
+        // just locked.
+        var _rb = $('vaultResetBtn'); if (_rb) _rb.style.display = '';
         $('vaultModal').style.display = 'block';
         $('vaultBackdrop').classList.add('show');
         setTimeout(function () { var i = $('vaultUnlockPass'); if (i) i.focus(); }, 50);
+      } else if (!st.exists && !startupKeyPromptShown) {
+        // No master password yet: ask to create one right away. The
+        // app used to open silently with no key at all, and the only
+        // way to create one was digging into Settings → Security.
+        // "Not now" never blocks the app; the prompt comes back on
+        // the next launch until a key is created.
+        startupKeyPromptShown = true;
+        askCreateMasterKey(null, null, null, {
+          text: 'No master password yet. Create one master password to protect every saved password in the app — encrypted backups, Cloud servers, email and Tailscale. The program will ask for it every time it starts. You can skip for now — the prompt comes back on the next launch until a key is created.',
+          skipLabel: 'Not now'
+        });
       }
     } catch (e) { /* vault stays locked; encrypted runs will ask instead */ }
   }
@@ -2622,6 +3023,110 @@
     $('vaultBackdrop').classList.remove('show');
     var e = $('vaultUnlockError'); if (e) e.classList.remove('show');
   }
+
+  // Startup "I forgot it" path: warn (the loss is permanent) and
+  // confirm first; only then arm the reset and open Settings →
+  // Security, where the setup box shows with the loss warning and
+  // the Set button replaces the vault. The unlock modal itself is
+  // hidden — the reset happens in Settings, the one place a master
+  // password is created.
+  function startVaultReset() {
+    askConfirm('Creating a new master password REPLACES the vault. Every password saved with the old master password — encrypted backups, Cloud servers, email and Tailscale — will stop working and cannot be recovered. Are you sure you want to create a new one?', function () {
+      hideVaultModal();
+      openSettings();
+      showSettingsView('security');
+      // Arm AFTER the view switches: openSettings() opens the
+      // General tab, and switching tabs clears the flag.
+      vaultResetArmed = true;
+      refreshVaultStatus();
+      setTimeout(function () { var i = $('vaultNewPass'); if (i) i.focus(); }, 50);
+    }, { title: 'Create a new master password?', yesLabel: 'Yes, replace the vault', noLabel: 'No, keep the old one' });
+  }
+
+  // Unlock on demand: when the vault is locked and an action needs a
+  // secret, the unlock modal itself appears — the old toasts pointed
+  // at "Settings → Security", where no Unlock button ever existed.
+  // The retry runs once, after a successful unlock; Skip clears it
+  // so a later unrelated unlock never re-runs a stale action.
+  var vaultUnlockPending = null;
+  function showVaultUnlockModal(retry, text) {
+    var modal = $('vaultModal'), back = $('vaultBackdrop');
+    if (!modal) return false;
+    if (text) { var t = $('vaultModalText'); if (t) t.textContent = text; }
+    // On-demand only: the "create a new one" path is a startup
+    // thing (the key is lost). Mid-session the key is just locked,
+    // so the reset button stays hidden here.
+    var _rb = $('vaultResetBtn'); if (_rb) _rb.style.display = 'none';
+    if (retry) {
+      if (vaultUnlockPending) {
+        var prev = vaultUnlockPending;
+        vaultUnlockPending = function () { try { prev(); } catch (e) {} try { retry(); } catch (e) {} };
+      } else vaultUnlockPending = retry;
+    }
+    modal.style.display = 'block';
+    if (back) back.classList.add('show');
+    setTimeout(function () { var i = $('vaultUnlockPass'); if (i) i.focus(); }, 50);
+    return true;
+  }
+  async function offerVaultUnlockThen(retry, text) {
+    if (!api || typeof api.vaultStatus !== 'function') return false;
+    try {
+      var st = await api.vaultStatus();
+      if (st.exists && st.locked) return showVaultUnlockModal(retry, text);
+    } catch (e) {}
+    return false;
+  }
+  // The job wizard runs in its own script, so it reaches the unlock
+  // modal through window, like the create-key prompt.
+  window.__showVaultUnlockModal = showVaultUnlockModal;
+  window.__offerVaultUnlockThen = offerVaultUnlockThen;
+
+  /* ---------- "Create a master key" prompt (round 3) ----------
+     Any password-related action taken before a master password
+     exists offers this instead of silently dropping the password:
+     "Create a master key" jumps straight to Settings → Security →
+     Master Password, and once the key is created the original action
+     runs again on its own. "Continue without saving it" runs the
+     action without storing the password — the app is never blocked. */
+  var masterKeyPending = null; // { retry, skip } for the action that asked
+  function askCreateMasterKey(actionLabel, retry, skip, opts) {
+    var modal = $('masterKeyModal'), back = $('masterKeyBackdrop');
+    if (!modal) { if (skip) skip(); return; }
+    // opts.text replaces the whole line (the startup prompt has its
+    // own wording); opts.skipLabel replaces the Skip button ("Not
+    // now" at startup). Both are reset on every call so a later
+    // prompt never inherits the startup wording.
+    if (opts && opts.text) $('masterKeyText').textContent = opts.text;
+    else if (actionLabel) $('masterKeyText').textContent = 'This password (' + actionLabel + ') can only be saved if you create a master key first. One master password protects every saved password in the app — encrypted backups, Cloud servers, email and Tailscale.';
+    var skb = $('masterKeySkipBtn');
+    if (skb) skb.textContent = (opts && opts.skipLabel) || 'Continue without saving it';
+    if (masterKeyPending) {
+      // A prompt is already showing (e.g. Save & connect just asked
+      // and the connect flow asks again for the same password): chain
+      // the new action onto the pending one instead of stacking a
+      // second modal — one key creation runs both retries.
+      var prev = masterKeyPending;
+      masterKeyPending = {
+        retry: function () { try { if (prev.retry) prev.retry(); } catch (e) {} try { if (retry) retry(); } catch (e) {} },
+        skip: function () { try { if (prev.skip) prev.skip(); } catch (e) {} try { if (skip) skip(); } catch (e) {} },
+      };
+      return;
+    }
+    masterKeyPending = { retry: retry || null, skip: skip || null };
+    modal.style.display = 'block';
+    if (back) back.classList.add('show');
+  }
+  function hideMasterKeyModal() {
+    var modal = $('masterKeyModal'), back = $('masterKeyBackdrop');
+    if (modal) modal.style.display = 'none';
+    if (back) back.classList.remove('show');
+  }
+  // The job wizard runs in the same window but in its own script, so
+  // it reaches this prompt through window.
+  window.__askCreateMasterKey = askCreateMasterKey;
+  window.__vaultExists = async function () {
+    try { var st = await api.vaultStatus(); return !!(st && st.exists); } catch (e) { return false; }
+  };
 
   /* ---------- TechVision Tailscale VPN (Tailscale client manager) ----------
      One panel per machine: status, connect/disconnect, peers, subnet
@@ -2635,7 +3140,26 @@
 
   function vpnMissing() { toast('VPN', 'The VPN bridge is not available in this build.', 'error'); }
 
-  async function loadVpn() {
+  // API credential fields: what is typed stays typed while the VPN
+  // page is open. A view refresh or a status poll used to blank the
+  // token/secret fields and overwrite the client ID with the saved
+  // value, wiping a credential mid-typing (2026-11-27). While the
+  // page is open, a field is only ever filled on a fresh open
+  // (reset=true: token/secret blank, client ID from settings) —
+  // a poll or a refresh never overwrites a value, though the
+  // placeholder still updates. Leaving the VPN page without Save
+  // still drops what was typed: showView('vpn') resets on open,
+  // and Save stays the only thing that persists anything.
+  function fillVpnCredFields(reset) {
+    var tok = $('vpnApiToken');
+    if (tok) { if (reset) tok.value = ''; tok.placeholder = (settings.vpn && settings.vpn.apiTokenInVault) ? 'Saved in the vault — leave blank to keep it' : 'tskey-api-…'; }
+    var ocid = $('vpnOauthClientId');
+    if (ocid && reset) ocid.value = (settings.vpn && settings.vpn.oauthClientId) || '';
+    var osec = $('vpnOauthClientSecret');
+    if (osec) { if (reset) osec.value = ''; osec.placeholder = (settings.vpn && settings.vpn.oauthClientSecretInVault) ? 'Saved in the vault — leave blank to keep it' : 'OAuth client secret'; }
+  }
+
+  async function loadVpn(resetCreds) {
     if (!api || typeof api.vpnGetStatus !== 'function') return vpnMissing();
     var st;
     try { st = await api.vpnGetStatus(); } catch (e) { st = { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
@@ -2702,7 +3226,7 @@
       // Connect looks dead until the app is opened. Connect opens it.
       if (sub) sub.textContent = st.guiRunning === false
         ? 'The Tailscale app is not running — press Connect and the app will open it for you.'
-        : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.');
+        : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected — press Connect to start it.');
       if (btn) btn.textContent = 'Connect';
       if (lb) lb.style.display = 'none';
       // The settings live in this card (API credentials, key expiry,
@@ -2715,14 +3239,31 @@
       // applies while advertising).
       if (dc) dc.style.display = '';
       var ket0 = $('vpnKeyExpiryToggle'); if (ket0) ket0.checked = vpnKeyExpiryWanted();
-      var tok0 = $('vpnApiToken'); if (tok0) tok0.value = (settings.vpn && settings.vpn.apiToken) || '';
-      var ocid0 = $('vpnOauthClientId'); if (ocid0) ocid0.value = (settings.vpn && settings.vpn.oauthClientId) || '';
-      var osec0 = $('vpnOauthClientSecret'); if (osec0) osec0.value = (settings.vpn && settings.vpn.oauthClientSecret) || '';
+      fillVpnCredFields(!!resetCreds);
       refreshVpnRoutesState();
       refreshVpnKeyExpiryState();
       refreshVpnApiCredsStatus(false);
       renderVpnPeers([]);
       return;
+    }
+    // Stale advertisement, fixed on sight (2026-11-27): the router
+    // was advertising the 10.0.0.0/24 tunnel subnet instead of the
+    // home LAN. When it is ON and the advertised set no longer
+    // matches the freshly detected LAN, re-advertise the right
+    // subnet and reload the status. At most one attempt every 5
+    // minutes, so a failing daemon does not make every 15-second
+    // poll run `tailscale up`.
+    if (st.connected && (st.advertiseRoutes || []).length && st.lanSubnet && (st.advertiseRoutes || []).indexOf(st.lanSubnet) < 0
+      && api && typeof api.vpnReconcileSubnet === 'function' && Date.now() - vpnLastSubnetReconcile > 5 * 60 * 1000) {
+      vpnLastSubnetReconcile = Date.now();
+      try {
+        var rc = await api.vpnReconcileSubnet(vpnAuth(), st);
+        if (rc && rc.reconciled) {
+          st = await api.vpnGetStatus();
+          vpnStatusCache = st || {};
+          toast('VPN', 'Sharing your home network — the advertised route was corrected to ' + (rc.subnet || st.lanSubnet) + ' (it was ' + ((rc.previous || []).join(', ') || 'a stale route') + ').', 'success');
+        }
+      } catch (e) { /* next view load retries (throttled above) */ }
     }
     if (txt) txt.textContent = 'Connected';
     if (sub) sub.textContent = 'You are on your private network' + (st.tailnet ? (' — ' + st.tailnet) : '') + '.';
@@ -2741,9 +3282,7 @@
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
       : 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
     var ket = $('vpnKeyExpiryToggle'); if (ket) ket.checked = vpnKeyExpiryWanted();
-    var tok = $('vpnApiToken'); if (tok) tok.value = (settings.vpn && settings.vpn.apiToken) || '';
-    var ocid = $('vpnOauthClientId'); if (ocid) ocid.value = (settings.vpn && settings.vpn.oauthClientId) || '';
-    var osec = $('vpnOauthClientSecret'); if (osec) osec.value = (settings.vpn && settings.vpn.oauthClientSecret) || '';
+    fillVpnCredFields(!!resetCreds);
     renderVpnPeers(st.peers || []);
     // First sign-in (or first view while connected): turn off the 180-day
     // key expiry automatically, so the device never asks to sign in again.
@@ -2771,19 +3310,52 @@
   }
   // The API credential for key expiry: OAuth client first (never
   // expires), API token second. null = nothing saved yet.
+  // Round 3: the secrets themselves never reach the renderer — main
+  // resolves them from the vault. Only the non-secret client id is
+  // sent, and the *InVault flags say whether anything is saved.
   function vpnAuth() {
     var v = (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {};
-    if (v.oauthClientId && v.oauthClientSecret) return { clientId: v.oauthClientId, clientSecret: v.oauthClientSecret };
-    if (v.apiToken && String(v.apiToken).trim()) return { apiToken: v.apiToken };
-    return null;
+    if (!v.oauthClientId && !v.apiTokenInVault && !v.oauthClientSecretInVault) return null;
+    return v.oauthClientId ? { clientId: v.oauthClientId } : {};
+  }
+  // After a credential is saved, say at once whether it actually
+  // WORKS ("saved" alone says nothing) — the verify runs right now
+  // and the toast carries the real outcome.
+  async function confirmVpnCredentialSaved(kind) {
+    var vr = await refreshVpnApiCredsStatus(true);
+    if (vr && vr.valid) toast('VPN', kind + ' saved and verified — it works with the Tailscale API.', 'success');
+    else if (vr) toast('VPN', kind + ' saved, but it does not work: ' + (vr.error || 'could not verify it.'), 'error');
+    else toast('VPN', kind + ' saved.', 'success');
   }
   async function saveVpnSettings(patch) {
     var v = Object.assign({}, (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {}, patch);
     try {
       var next = Object.assign({}, settings, { vpn: v });
-      await api.saveSettings(next);
+      var res = await api.saveSettings(next);
       settings = next;
-    } catch (e) { /* keep the in-memory value; the toggle still works this session */ }
+      // A secret just stored in the vault leaves the field: the next
+      // save reads the fields, and a blank field means "keep it".
+      var notSaved = (res && res.secretsNotSaved) || [];
+      if (patch.apiToken !== undefined && notSaved.indexOf('apiToken') < 0) {
+        var t = $('vpnApiToken'); if (t) { t.value = ''; if (patch.apiToken) t.placeholder = 'Saved in the vault — leave blank to keep it'; }
+        if (settings.vpn) { settings.vpn.apiToken = ''; if (patch.apiToken) settings.vpn.apiTokenInVault = true; }
+      }
+      if (patch.oauthClientSecret !== undefined && notSaved.indexOf('oauthSecret') < 0) {
+        var s = $('vpnOauthClientSecret'); if (s) { s.value = ''; if (patch.oauthClientSecret) s.placeholder = 'Saved in the vault — leave blank to keep it'; }
+        if (settings.vpn) { settings.vpn.oauthClientSecret = ''; if (patch.oauthClientSecret) settings.vpn.oauthClientSecretInVault = true; }
+      }
+      if (res && res.needsMasterKey && notSaved.length) {
+        askCreateMasterKey('the Tailscale credential', function () { saveVpnSettings(patch).then(function (r2) { if (r2 && !((r2.secretsNotSaved || []).length)) confirmVpnCredentialSaved(patch.apiToken !== undefined ? 'API token' : 'OAuth client'); }).catch(function () {}); },
+          function () { toast('Credential not saved', 'The Tailscale credential was not saved because there is no master key yet.', 'warning'); });
+      } else if (res && res.needsUnlock && notSaved.length) {
+        // The vault is locked: show the unlock modal itself and
+        // re-run the save after unlocking — the old toast pointed
+        // at Settings, where no Unlock button ever existed.
+        var shown = await offerVaultUnlockThen(function () { saveVpnSettings(patch).then(function (r2) { if (r2 && !((r2.secretsNotSaved || []).length)) confirmVpnCredentialSaved(patch.apiToken !== undefined ? 'API token' : 'OAuth client'); }).catch(function () {}); }, 'The vault is locked. Enter your master password to save the Tailscale credential.');
+        if (!shown) toast('Vault is locked', 'The Tailscale credential was not saved because the vault is locked.', 'warning');
+      }
+      return res;
+    } catch (e) { /* keep the in-memory value; the toggle still works this session */ return null; }
   }
   async function disableVpnKeyExpiry(quiet) {
     if (!api || typeof api.vpnDisableKeyExpiry !== 'function') return false;
@@ -2840,17 +3412,34 @@
   // once a minute) and right after every save.
   var vpnApiCredsLastVerify = 0;
   var vpnApiCredsVerifying = false;
+  // The word sits in the collapsed summary, so it must say WHY on
+  // its own — the full reason lives on the line inside the box.
+  function vpnCredsShortReason(error) {
+    var e = String(error || '');
+    if (/refused the token/.test(e)) return 'token refused';
+    if (/refused the OAuth client/.test(e)) return 'OAuth client refused';
+    if (/Could not reach the Tailscale API|did not answer in time/.test(e)) return 'could not reach the Tailscale API';
+    if (/vault is locked/i.test(e)) return 'vault is locked';
+    if (/No API credential/.test(e)) return 'no credentials saved';
+    if (/Connect to Tailscale first/.test(e)) return 'connect to Tailscale first';
+    if (/not installed/.test(e)) return 'Tailscale is not installed';
+    return e.length > 80 ? e.slice(0, 80) + '…' : (e || 'did not work');
+  }
   async function refreshVpnApiCredsStatus(force) {
     var word = $('vpnApiCredsStatusWord');
     var line = $('vpnApiCredsStatus');
-    if (!word && !line) return;
+    if (!word && !line) return null;
     var setWord = function (text, cls) { if (word) { word.textContent = text; word.className = 't-sub ' + (cls || ''); } };
     var setLine = function (text, cls) { if (line) { line.textContent = text; line.className = 't-sub ' + (cls || ''); } };
     var auth = vpnAuth();
-    if (!auth) { setWord('· Not saved', ''); setLine('No credentials saved yet — save an OAuth client or a token below, and this line will say whether it works.'); return; }
-    if (!force && Date.now() - vpnApiCredsLastVerify < 60000) return;
-    if (vpnApiCredsVerifying) return;
-    if (!api || typeof api.vpnVerifyApi !== 'function') return;
+    // Two statuses, two labels — the connection word lives in the
+    // hero above ("Tailscale connection"), this one is always the
+    // API sign-in, so a lone "Disconnected" can never be read as
+    // the VPN itself being down.
+    if (!auth) { setWord('· Not saved', ''); setLine('No credentials saved yet — save an OAuth client or a token below, and this line will say whether it works.'); return { valid: false, error: 'No credentials saved.' }; }
+    if (!force && Date.now() - vpnApiCredsLastVerify < 60000) return null;
+    if (vpnApiCredsVerifying) return null;
+    if (!api || typeof api.vpnVerifyApi !== 'function') return null;
     vpnApiCredsVerifying = true;
     setWord('· Verifying…', '');
     setLine('Verifying the credentials with the Tailscale API…');
@@ -2861,13 +3450,18 @@
         var via = r.via === 'oauth' ? 'OAuth client' : (r.via === 'token' ? 'API token' : 'credentials');
         setWord('· Connected', 'vpn-creds-ok');
         setLine('Connected — the ' + via + ' works with the Tailscale API.');
+        return { valid: true, via: r.via };
       } else {
-        setWord('· Disconnected', 'vpn-creds-bad');
-        setLine('Disconnected — ' + ((r && r.error) || 'the credentials did not work.'));
+        var err = (r && r.error) || 'the credentials did not work.';
+        setWord('· API: Disconnected — ' + vpnCredsShortReason(err), 'vpn-creds-bad');
+        setLine('Disconnected — ' + err);
+        return { valid: false, error: err };
       }
     } catch (e) {
-      setWord('· Disconnected', 'vpn-creds-bad');
-      setLine('Disconnected — ' + (e && e.message ? e.message : 'could not check the credentials.'));
+      var err2 = e && e.message ? e.message : 'could not check the credentials.';
+      setWord('· API: Disconnected — ' + vpnCredsShortReason(err2), 'vpn-creds-bad');
+      setLine('Disconnected — ' + err2);
+      return { valid: false, error: err2 };
     } finally { vpnApiCredsVerifying = false; }
   }
   // Turn key expiry back ON through the API (the toggle flipped off).
@@ -2899,6 +3493,7 @@
   // The console button only shows when the approval is missing and
   // the API cannot do it, and the note then carries the real reason.
   var vpnRoutesLastApproveTry = 0;
+  var vpnLastSubnetReconcile = 0; // throttle for the stale-route fix above
   var vpnRoutesApprovedHint = null; // {subnet, at} — a successful approve
   // call is trusted for a minute, so the note says "approved" at once
   // instead of waiting for the control plane to show it on a re-read.
@@ -3353,15 +3948,26 @@
     var jnb = $('jobsNewJobBtn'); if (jnb) jnb.addEventListener('click', function () { openJobWizard(null); });
     var jenb = $('jobsEmptyNewJobBtn'); if (jenb) jenb.addEventListener('click', function () { openJobWizard(null); });
     /* Jobs page 02 toolbar + details panel: everything acts on the
-       selected row (first row when nothing is picked yet). */
+       selected row (nothing is selected until the user clicks a row
+       — dictation #2). */
     var jrb = $('jobsRunBtn'); if (jrb) jrb.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
+    var jsb = $('jobsDetailsStop'); if (jsb) jsb.addEventListener('click', stopSelectedJob);
+    var psb = $('progressStopBtn'); if (psb) psb.addEventListener('click', function () {
+      if (!currentRunJobId) return;
+      psb.disabled = true; psb.textContent = 'Stopping…';
+      stopJobById(currentRunJobId);
+    });
     var jeb = $('jobsEditBtn'); if (jeb) jeb.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
     var jdb = $('jobsDeleteBtn'); if (jdb) jdb.addEventListener('click', deleteSelectedJob);
-    var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', refreshJobs);
+    var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', function () { playManualRefreshAnim(); refreshJobs(); });
     var jch = $('jobsClearHistoryBtn'); if (jch) jch.addEventListener('click', function () {
       if (!api || typeof api.clearJobHistory !== 'function') return;
-      askConfirm('Do you want to delete ALL backup history? This cannot be undone.', async function () {
-        try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
+      askConfirm('Delete ALL jobs? This removes every job template, its run history, its waiting state and its schedule. This cannot be undone.', async function () {
+        try {
+          var res = await api.clearJobHistory();
+          if (res && res.success) { await loadJobs(); toast('All jobs deleted', 'Every job, its history and its schedule have been deleted.', 'success'); }
+          else toast('Clear failed', (res && res.error) || 'History could not be cleared.', 'error');
+        }
         catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
       });
     });
@@ -3371,6 +3977,28 @@
     var jdr = $('jobsDetailsRun'); if (jdr) jdr.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
     var jdrs = $('jobsDetailsRestore'); if (jdrs) jdrs.addEventListener('click', function () { var j = selectedJob(); if (j) openRestore(j); });
     var jde = $('jobsDetailsEdit'); if (jde) jde.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
+    /* Live % for the Jobs details progress bar (dictation #2): one
+       persistent backup-progress subscription, separate from the
+       progress card's per-run one. Manual runs carry the job id in
+       the event (main forwards it); scheduled runs are broadcast
+       with a jobId by main; the currentRunJobId fallback covers a
+       run started from this window. The % is stored per job and the
+       bar is updated in place when the running job is the selected
+       one — no full re-render, so the bar never flickers. */
+    if (api && typeof api.onBackupProgress === 'function') {
+      api.onBackupProgress(function (p) {
+        if (!p) return;
+        var key = null;
+        if (p.jobId) key = 'id:' + p.jobId;
+        else if (p.jobName) key = 'name:' + String(p.jobName).toLowerCase();
+        else if (currentRunJobId) key = 'id:' + currentRunJobId;
+        if (!key) return;
+        var sub = (p.filesDone !== undefined && p.filesDone !== null) ? (p.filesDone + ' files') : null;
+        jobProgressByKey[key] = { pct: p.pct, sub: sub };
+        var sel = selectedJob();
+        if (sel && jobProgressKey(sel) === key && sel.running) updateJobsProgressBar(p.pct, sub);
+      });
+    }
     /* Dashboard 01 quick actions. */
     var dnj = $('dashNewJob'); if (dnj) dnj.addEventListener('click', function () { openJobWizard(null); });
     var denj = $('dashEmptyNewJobBtn'); if (denj) denj.addEventListener('click', function () { openJobWizard(null); });
@@ -3393,12 +4021,17 @@
       drb.addEventListener('mouseleave', clearStorageHover);
     }
     var dopen = $('dashOpenLocation'); if (dopen) dopen.addEventListener('click', function () {
-      if (storageDest && api && typeof api.openPath === 'function') api.openPath(storageDest).catch(function () {});
+      var dest = storageHoverDest === null ? storageDest : storageHoverDest;
+      if (dest && api && typeof api.openPath === 'function') api.openPath(dest).catch(function () {});
     });
 
     $('navRestore').addEventListener('click', function () { openRestore(null); });
     var brb = $('backupTopRefreshBtn');
-    if (brb) brb.addEventListener('click', refreshJobs);
+    /* Batch 2 #4: the labeled Logs Refresh button is gone — the topbar
+       icon is the only Logs refresh now, so it must re-render the Logs
+       list too when the Logs view is showing (refreshJobs only reloads
+       the job data). */
+    if (brb) brb.addEventListener('click', function () { playManualRefreshAnim(); refreshJobs().then(function () { if (currentView === 'logs') renderLogs(currentLogTab); }); });
     $('themeToggle').addEventListener('click', async function () {
       var next = document.body.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
       applyTheme(next);
@@ -3407,14 +4040,55 @@
       }
     });
     $('settingsBtn').addEventListener('click', function () { openSettings(); refreshVaultStatus(); });
+    // Same strength rule as vault.js validateStrongPassword (the
+    // renderer runs without require(), so the small check is
+    // duplicated here — keep the copies in sync). Used for the
+    // master password create/change below; the backup password
+    // check lives in job-wizard.js.
+    function strongPasswordError(pw) {
+      if (!pw || typeof pw !== 'string') return 'Enter a password of at least 12 characters with uppercase, lowercase, numbers and symbols.';
+      if (pw.length < 12) return 'Password must be at least 12 characters long.';
+      if (!/[A-Z]/.test(pw)) return 'Password must contain at least one uppercase letter.';
+      if (!/[a-z]/.test(pw)) return 'Password must contain at least one lowercase letter.';
+      if (!/[0-9]/.test(pw)) return 'Password must contain at least one number.';
+      if (!/[^A-Za-z0-9]/.test(pw)) return 'Password must contain at least one symbol.';
+      return null;
+    }
     var vsb = $('vaultSetupBtn');
     if (vsb) vsb.addEventListener('click', async function () {
       var p1 = $('vaultNewPass').value, p2 = $('vaultNewPassConfirm').value;
-      if (p1.length < 8) { toast('Password too short', 'The master password must be at least 8 characters.', 'warning'); return; }
+      // Batch 3: at least 12 characters with uppercase, lowercase,
+      // a number and a symbol. (The master password already has
+      // two fields — Password + Confirm — with a match check below;
+      // only the strength rule changes here.)
+      var weak = strongPasswordError(p1);
+      if (weak) { toast('Password too weak', weak, 'warning'); return; }
       if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same master password.', 'warning'); return; }
       try {
-        var r = await api.vaultSetup(p1);
-        if (r && r.success) { $('vaultNewPass').value = ''; $('vaultNewPassConfirm').value = ''; toast('Vault set up', 'Master password saved. The vault is unlocked for this session.', 'success'); }
+        // Reset mode (started from the startup unlock modal): the Set
+        // button REPLACES the vault — old saved passwords are gone.
+        // Normal mode: first-time setup.
+        var r = vaultResetArmed ? await api.vaultReset(p1) : await api.vaultSetup(p1);
+        if (r && r.success) {
+          $('vaultNewPass').value = ''; $('vaultNewPassConfirm').value = '';
+          if (vaultResetArmed) {
+            vaultResetArmed = false;
+            toast('New master password set', 'The old vault was replaced. Saved passwords from the old master password are gone — save them again where needed.', 'success');
+            // The reset cleared the "saved in the vault" flags on
+            // disk: reload so the UI stops claiming passwords are
+            // saved (SMTP placeholder, Tailscale credentials line,
+            // Cloud client records).
+            try { await loadSettings(); } catch (e) {}
+            try { await loadCloud(); } catch (e) {}
+            masterKeyPending = null;
+          } else {
+            toast('Vault set up', 'Master password saved. The vault is unlocked for this session.', 'success');
+            // A "Create a master key" prompt was waiting on this: run
+            // the original action again now that the vault exists.
+            if (masterKeyPending && masterKeyPending.retry) { var retry = masterKeyPending.retry; masterKeyPending = null; try { retry(); } catch (e) {} }
+            else masterKeyPending = null;
+          }
+        }
         else toast('Setup failed', (r && r.error) || 'Could not set up the vault.', 'error');
       } catch (e) { toast('Setup failed', e && e.message ? e.message : 'Could not set up the vault.', 'error'); }
       refreshVaultStatus();
@@ -3422,7 +4096,8 @@
     var vcb = $('vaultChangeBtn');
     if (vcb) vcb.addEventListener('click', async function () {
       var oldP = $('vaultOldPass').value, p1 = $('vaultChangeNew').value, p2 = $('vaultChangeConfirm').value;
-      if (p1.length < 8) { toast('Password too short', 'The new master password must be at least 8 characters.', 'warning'); return; }
+      var weak = strongPasswordError(p1);
+      if (weak) { toast('Password too weak', weak, 'warning'); return; }
       if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same new master password.', 'warning'); return; }
       try {
         var r = await api.vaultChangePassword(oldP, p1);
@@ -3431,22 +4106,42 @@
       } catch (e) { toast('Change failed', e && e.message ? e.message : 'Could not change the master password.', 'error'); }
       refreshVaultStatus();
     });
-    var vlb = $('vaultLockBtn');
-    if (vlb) vlb.addEventListener('click', async function () {
-      try { await api.vaultLock(); toast('Vault locked', 'Job passwords are locked until you unlock the vault again.', ''); } catch (e) {}
-      refreshVaultStatus();
-    });
+    // No Lock button any more (Settings → Security keeps only
+    // create / change): the vault locks itself when the app closes,
+    // and the next launch asks for the master password again.
+    // (The vault-lock IPC stays for tests; no UI calls it.)
     var vub = $('vaultUnlockBtn');
     if (vub) vub.addEventListener('click', async function () {
       var pw = $('vaultUnlockPass').value;
       try {
         var r = await api.vaultUnlock(pw);
-        if (r && r.success) { $('vaultUnlockPass').value = ''; hideVaultModal(); toast('Vault unlocked', 'Scheduled encrypted backups can run again.', 'success'); }
+        if (r && r.success) {
+          $('vaultUnlockPass').value = '';
+          var pend = vaultUnlockPending; vaultUnlockPending = null;
+          hideVaultModal(); toast('Vault unlocked', 'Scheduled encrypted backups can run again.', 'success');
+          if (pend) { try { pend(); } catch (e) {} }
+        }
         else { $('vaultUnlockError').classList.add('show'); }
       } catch (e) { $('vaultUnlockError').classList.add('show'); }
     });
     var vus = $('vaultUnlockSkip');
-    if (vus) vus.addEventListener('click', hideVaultModal);
+    if (vus) vus.addEventListener('click', function () { vaultUnlockPending = null; hideVaultModal(); });
+    var vrb = $('vaultResetBtn');
+    if (vrb) vrb.addEventListener('click', function () { startVaultReset(); });
+    var mkg = $('masterKeyGoBtn');
+    if (mkg) mkg.addEventListener('click', function () {
+      hideMasterKeyModal();
+      openSettings();
+      showSettingsView('security');
+      refreshVaultStatus();
+      setTimeout(function () { var i = $('vaultNewPass'); if (i) i.focus(); }, 50);
+    });
+    var mks = $('masterKeySkipBtn');
+    if (mks) mks.addEventListener('click', function () {
+      hideMasterKeyModal();
+      if (masterKeyPending && masterKeyPending.skip) { var skip = masterKeyPending.skip; masterKeyPending = null; try { skip(); } catch (e) {} }
+      else masterKeyPending = null;
+    });
     var vup = $('vaultUnlockPass');
     if (vup) vup.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); $('vaultUnlockBtn').click(); } });
     document.querySelectorAll('[data-settings-tab]').forEach(function (tab) {
@@ -3499,7 +4194,6 @@
         var nav = btn.getAttribute('data-nav');
         document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
         btn.classList.add('active');
-        if (nav === 'logs') toast('Logs', 'Open the Log Viewer from the Logs window.', '');
         if (nav === 'jobs') showView('jobs');
         if (nav === 'dashboard') showView('dashboard');
         if (nav === 'logs') showView('logs');
@@ -3617,7 +4311,7 @@
       var vcb3 = $('vpnConnectBtn'); if (vcb3) { vcb3.disabled = false; vcb3.textContent = 'Install & connect'; }
     });
     var vrb = $('vpnTopRefreshBtn');
-    if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
+    if (vrb) vrb.addEventListener('click', function () { playManualRefreshAnim(); loadVpn(); });
     // Peers appear on their own: while the VPN view is open, or the Cloud
     // client panel is open in Tailscale mode, re-read Tailscale status
     // every 15s so a device that joins shows up without re-opening the
@@ -3666,10 +4360,23 @@
     if (vts) vts.addEventListener('click', async function () {
       var inp = $('vpnApiToken');
       var token = inp ? inp.value.trim() : '';
-      await saveVpnSettings({ apiToken: token });
-      toast('VPN', token ? 'API token saved.' : 'API token removed.', 'success');
+      var res = await saveVpnSettings({ apiToken: token });
+      // A blank field keeps the saved token (it is in the vault now,
+      // so the field never holds it) — it no longer deletes it.
+      // The credentials box opens at once, before the verify: the
+      // verify can take a few seconds when the API is slow.
       var d0 = $('vpnApiCreds'); if (d0) d0.open = true;
-      refreshVpnApiCredsStatus(true);
+      if (res && res.secretsNotSaved && res.secretsNotSaved.indexOf('apiToken') >= 0) {
+        if (!res.needsMasterKey && !res.needsUnlock) toast('VPN', 'API token could not be saved.', 'error');
+        // needsMasterKey / needsUnlock: the prompt or the unlock
+        // modal is already showing; its retry saves and verifies.
+        refreshVpnApiCredsStatus(true);
+      } else if (token) {
+        confirmVpnCredentialSaved('API token');
+      } else {
+        toast('VPN', 'No token entered — the saved one (if any) is kept.', 'success');
+        refreshVpnApiCredsStatus(true);
+      }
       refreshVpnKeyExpiryState();
       refreshVpnRoutesState();
     });
@@ -3679,10 +4386,17 @@
       var secInp = $('vpnOauthClientSecret');
       var id = idInp ? idInp.value.trim() : '';
       var sec = secInp ? secInp.value.trim() : '';
-      await saveVpnSettings({ oauthClientId: id, oauthClientSecret: sec });
-      toast('VPN', (id && sec) ? 'OAuth client saved.' : 'OAuth client removed.', 'success');
+      var res2 = await saveVpnSettings({ oauthClientId: id, oauthClientSecret: sec });
       var d1 = $('vpnApiCreds'); if (d1) d1.open = true;
-      refreshVpnApiCredsStatus(true);
+      if (res2 && res2.secretsNotSaved && res2.secretsNotSaved.indexOf('oauthSecret') >= 0) {
+        if (!res2.needsMasterKey && !res2.needsUnlock) toast('VPN', 'OAuth client could not be saved.', 'error');
+        refreshVpnApiCredsStatus(true);
+      } else if (id && sec) {
+        confirmVpnCredentialSaved('OAuth client');
+      } else {
+        toast('VPN', 'Nothing entered — the saved client (if any) is kept.', 'success');
+        refreshVpnApiCredsStatus(true);
+      }
       refreshVpnKeyExpiryState();
       refreshVpnRoutesState();
     });
@@ -3744,28 +4458,32 @@
     $('drawerRun').addEventListener('click', function () { if (currentJob) runBackup(currentJob, false); });
     $('drawerRestore').addEventListener('click', function () { if (currentJob) openRestore(currentJob); });
     $('drawerEdit').addEventListener('click', function () { var j = currentJob; if (j) { closeDrawer(); openJobWizard(j); } });
-    $('drawerDelete').addEventListener('click', async function () {
+    $('drawerDelete').addEventListener('click', function () {
       if (!currentJob) return;
-      try {
-        const result = await api.deleteJob(currentJob.id);
-        if (result.success) {
-          toast('Job deleted', currentJob.name + ' has been deleted.', 'success');
-          closeDrawer();
-          await refreshJobs();
-        } else {
-          toast('Delete failed', result.error || 'Could not delete job.', 'error');
+      // Same scoped confirmation as deleteSelectedJob (round 3): the
+      // job is named, and the message states what goes away (template
+      // file + run history). Cancel deletes nothing.
+      var j = currentJob;
+      askConfirm('Delete "' + j.name + '"? This removes the job template file and its run history. This cannot be undone.', async function () {
+        try {
+          const result = await api.deleteJob(j.id);
+          if (result.success) {
+            toast('Job deleted', j.name + ' has been deleted.', 'success');
+            closeDrawer();
+            await refreshJobs();
+          } else {
+            toast('Delete failed', result.error || 'Could not delete job.', 'error');
+          }
+        } catch (e) {
+          toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error');
         }
-      } catch (e) {
-        toast('Delete error', e && e.message ? e.message : 'Could not delete job.', 'error');
-      }
+      }, { title: 'Delete job?', yesLabel: 'Yes, delete job', noLabel: 'Keep job' });
     });
     document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') { closeDrawer(); closeSettings(); cloudHideContextMenu(); } });
 
     document.querySelectorAll('#logsTabs .log-tab').forEach(function (btn) {
       btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
     });
-    var lrb = $('logsRefreshBtn');
-    if (lrb) lrb.addEventListener('click', function () { spinOnce(lrb.querySelector('.refresh-glyph')); loadJobs().then(function () { renderLogs(currentLogTab); }); });
     var llf = $('logsLevelFilter');
     if (llf) llf.addEventListener('change', renderFullLog);
     var ls = $('logsSearch');
@@ -3773,7 +4491,7 @@
 
     /* ---------- TechVision Cloud wiring ---------- */
     var crb = $('cloudTopRefreshBtn');
-    if (crb) crb.addEventListener('click', function () { loadCloud(); });
+    if (crb) crb.addEventListener('click', function () { playManualRefreshAnim(); loadCloud(); });
     var cms = $('cloudModeServer');
     if (cms) cms.addEventListener('click', function () { showCloudPanel('server'); });
     var cmc = $('cloudModeClient');
@@ -3816,17 +4534,8 @@
       if (!api || typeof api.cloudDetectIP !== 'function') return cloudMissing();
       try {
         cdi.disabled = true; cdi.textContent = 'Detecting…';
-        var r = await api.cloudDetectIP();
-        var addrs = $('cloudServerAddrs');
-        if (addrs) {
-          var lines = [];
-          if (r.publicIP) lines.push('Public (from outside): ' + r.publicIP);
-          else lines.push('Public: unknown (no internet or detection failed)');
-          if (r.lanIPs && r.lanIPs.length) lines.push('LAN (same network): ' + r.lanIPs.join(', '));
-          var ddns = ($('cloudServerDdns') || {}).value || '';
-          if (ddns) lines.push('DDNS: ' + ddns);
-          addrs.textContent = lines.join(' — ');
-        }
+        cloudDetectedAddresses = await api.cloudDetectIP();
+        renderCloudServerAddresses();
       } catch (e) { toast('Detect error', e && e.message ? e.message : 'Could not detect addresses.', 'error'); }
       finally { cdi.disabled = false; cdi.textContent = 'Detect my addresses'; }
     });
@@ -3843,35 +4552,78 @@
     var cua = $('cloudUserAddBtn');
     if (cua) cua.addEventListener('click', async function () {
       if (!api || typeof api.cloudUserAdd !== 'function') return cloudMissing();
+      var doAdd = async function () {
+        try {
+          var r = await api.cloudUserAdd({
+            name: ($('cloudUserName') || {}).value || '',
+            password: ($('cloudUserPass') || {}).value || '',
+            root: ($('cloudUserRoot') || {}).value || '',
+            canWrite: $('cloudUserCanWrite') ? $('cloudUserCanWrite').checked : false,
+          });
+          if (r && r.success) {
+            toast('User added', r.user.name + ' can now connect.', 'success');
+            var n = $('cloudUserName'); if (n) n.value = '';
+            var p = $('cloudUserPass'); if (p) p.value = '';
+            var rt = $('cloudUserRoot'); if (rt) rt.value = '';
+            await loadCloud();
+            return true;
+          } else toast('Add user failed', (r && r.error) || 'Could not add user.', 'error');
+        } catch (e) { toast('Add user error', e && e.message ? e.message : 'Could not add user.', 'error'); }
+        return false;
+      };
+      // A server user has a password, so adding one is a
+      // password-related action: with no master key yet, offer to
+      // create one first (same gate as the Cloud Client save) and
+      // add the user right after. Skipping still adds the user.
+      // (The user password itself stays scrypt-hashed in
+      // cloud.json, not in the vault — the prompt is the gate.)
       try {
-        var r = await api.cloudUserAdd({
-          name: ($('cloudUserName') || {}).value || '',
-          password: ($('cloudUserPass') || {}).value || '',
-          root: ($('cloudUserRoot') || {}).value || '',
-          canWrite: $('cloudUserCanWrite') ? $('cloudUserCanWrite').checked : false,
-        });
-        if (r && r.success) {
-          toast('User added', r.user.name + ' can now connect.', 'success');
-          var n = $('cloudUserName'); if (n) n.value = '';
-          var p = $('cloudUserPass'); if (p) p.value = '';
-          var rt = $('cloudUserRoot'); if (rt) rt.value = '';
-          await loadCloud();
-        } else toast('Add user failed', (r && r.error) || 'Could not add user.', 'error');
-      } catch (e) { toast('Add user error', e && e.message ? e.message : 'Could not add user.', 'error'); }
+        var hasKey = true;
+        try { hasKey = await window.__vaultExists(); } catch (e) {}
+        if (!hasKey) {
+          askCreateMasterKey('the Cloud user password', function () { doAdd(); }, async function () { var ok = await doAdd(); if (ok) toast('User added without a master key', 'The user was added, but no master key was created — the app will ask you again when it starts.', 'warning'); });
+          return;
+        }
+      } catch (e) {}
+      doAdd();
     });
     var cca = $('cloudClientAddBtn');
     if (cca) cca.addEventListener('click', async function () {
       if (!api || typeof api.cloudClientSave !== 'function') return cloudMissing();
       try {
         var password = ($('cloudClientPass') || {}).value || '';
+        // Captured now: the form is cleared after a successful save,
+        // but a "Create a master key" retry below still needs them.
+        var srvName = ($('cloudClientName') || {}).value || '';
+        var srvHost = ($('cloudClientHost') || {}).value || '';
+        var srvPort = parseInt(($('cloudClientPort') || {}).value, 10);
+        var srvUser = ($('cloudClientUser') || {}).value || '';
         var r = await api.cloudClientSave({
-          name: ($('cloudClientName') || {}).value || '',
-          host: ($('cloudClientHost') || {}).value || '',
-          port: parseInt(($('cloudClientPort') || {}).value, 10),
-          user: ($('cloudClientUser') || {}).value || '',
+          name: srvName,
+          host: srvHost,
+          port: srvPort,
+          user: srvUser,
           accessMode: cloudClientAccess,
+          password: password || undefined,
         });
         if (r && r.success) {
+          // The server saved but the password could not be stored
+          // (no master key yet): offer to create one — the retry
+          // saves the same password into the vault afterwards.
+          if (r.passwordNotSaved && r.needsMasterKey && password) {
+            askCreateMasterKey('the Cloud server password', async function () {
+              var r2 = await api.cloudClientSave({
+                id: r.id,
+                name: srvName,
+                host: srvHost,
+                port: srvPort,
+                user: srvUser,
+                accessMode: cloudClientAccess,
+                password: password,
+              });
+              if (r2 && r2.success && !r2.passwordNotSaved) { toast('Password saved', 'The Cloud password is now saved in the vault.', 'success'); await loadCloud(); }
+            }, function () { toast('Server saved without its password', 'The server was saved, but its password was not — you will be asked for it on every connect until a master key is created.', 'warning'); });
+          }
           toast('Server saved', 'Server added to the list.', 'success');
           var n2 = $('cloudClientName'); if (n2) n2.value = '';
           var h2 = $('cloudClientHost'); if (h2) h2.value = '';
@@ -3886,9 +4638,8 @@
           var rec = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === r.id; });
           if (rec) {
             if (password) {
-              cloudSelected = rec;
-              cloudPendingProbe = null;
-              cloudConnectFlow(true, password);
+              selectCloudServer(rec);
+              await cloudConnectFlow(true, password);
             } else {
               openCloudConnect(rec);
             }
@@ -3934,7 +4685,7 @@
     var cmb = $('cloudMkdirBtn');
     if (cmb) cmb.addEventListener('click', function () { cloudNewFolder(cloudPath); });
     var cbr = $('cloudBrowserRefreshBtn');
-    if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
+    if (cbr) cbr.addEventListener('click', function () { playManualRefreshAnim(); cloudBrowse(cloudPath); });
     // Open mode (spec v2): which way a double-click opens a file.
     // The choice persists in cloud.json; no mode ever creates a
     // drive letter.
@@ -4015,7 +4766,7 @@
 
   // WireGuard view wiring — all buttons of #view-wireguard.
   var wgRb = $('wgTopRefreshBtn');
-  if (wgRb) wgRb.addEventListener('click', function () { loadWireGuard(); });
+  if (wgRb) wgRb.addEventListener('click', function () { playManualRefreshAnim(); loadWireGuard(); });
   var wgDb = $('wgDownloadBtn');
   if (wgDb) wgDb.addEventListener('click', async function () {
     if (!api || typeof api.wgOpenDownload !== 'function') return wgMissing();
@@ -4185,6 +4936,12 @@
   });
     var tbb = $('topBackBtn');
     if (tbb) tbb.addEventListener('click', goBack);
+    /* Batch 2 #6: Back buttons in the header, next to the top page
+       title — same destination as Cancel (goBack). */
+    var wbb = $('wizardBackBtn');
+    if (wbb) wbb.addEventListener('click', goBack);
+    var rbb = $('restoreBackBtn');
+    if (rbb) rbb.addEventListener('click', goBack);
 
     loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
     showView('dashboard');

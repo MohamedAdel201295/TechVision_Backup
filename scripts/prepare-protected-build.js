@@ -8,7 +8,7 @@
  *   build.files). `npm start` / `electron .` never run this script,
  *   so day-to-day development is unchanged.
  * - Main-process files (main.js, engine, vault, mailer, restore,
- *   zip-aes, drive-resolver, cloud-server, cloud-client) are compiled to V8 bytecode (.jsc) with
+ *   tvb, drive-resolver, cloud-server, cloud-client) are compiled to V8 bytecode (.jsc) with
  *   bytenode, so the shipped app contains no readable JavaScript for
  *   the engine. main.js becomes a tiny loader that requires('bytenode')
  *   and loads main.jsc.
@@ -46,7 +46,7 @@ const stagingDir = path.join(root, 'build-protected');
 const stagingSrc = path.join(stagingDir, 'src');
 
 const MAIN_FILES = [
-  'main.js', 'techvision-core.js', 'restore.js', 'zip-aes.js',
+  'main.js', 'techvision-core.js', 'restore.js', 'tvb.js',
   'mailer.js', 'vault.js', 'drive-resolver.js',
   'cloud-server.js', 'cloud-client.js', 'vpn.js',
 ];

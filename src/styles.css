@@ -190,6 +190,13 @@ input:-webkit-autofill {
    so removing the class afterwards cannot snap the button back. */
 .icon-btn.spinning { animation: spin .7s linear; }
 .refresh-glyph.spinning { display: inline-block; animation: spin .7s linear; }
+/* Manual refresh page animation (dictation #3): when the user presses
+   a refresh button himself, the page content briefly "goes and comes
+   back" — a small fade out and in. Single iteration, subtle on
+   purpose; background refreshes never add this class, so they stay
+   completely silent (standing no-flicker rule). */
+@keyframes manualRefresh { 0% { opacity: 1; transform: translateY(0); } 35% { opacity: .25; transform: translateY(3px); } 100% { opacity: 1; transform: translateY(0); } }
+.main.manual-refresh-anim { animation: manualRefresh .45s ease; }
 
 /* ---------- Buttons ---------- */
 .btn {
@@ -246,10 +253,16 @@ select.filter {
 .pill-pending { background: var(--warning-bg); color: var(--warning); }
 .pill-running { background: var(--info-bg); color: var(--info); }
 .pill-running::before { animation: pulseDot 1s infinite; }
+.pill-cancelled { background: var(--surface-3); color: var(--muted); border: 1px dashed var(--border); }
 .pill-failed { background: var(--danger-bg); color: var(--danger); }
 .pill-template { background: var(--surface-3); color: var(--muted); }
 .pill-full { background: var(--info-bg); color: var(--info); }
 .pill-incremental { background: rgba(168, 85, 247, .14); color: #a855f7; }
+/* Stop button inside a Dashboard Recent row (next to the RUNNING
+   pill) and in the backup progress card. Small, same window, no
+   layout change: the button only exists while a run is active. */
+.dash-stop-btn { padding: 2px 8px; font-size: 12px; margin-left: 6px; vertical-align: middle; }
+.progress-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 
 .empty-state {
   text-align: center; padding: 48px 20px; border: 1px dashed var(--border);
@@ -323,6 +336,9 @@ select.filter {
    tier below re-measures the same budget (card starts ~64px down
    there). */
 #view-wizard .modal-wrap, #view-restore .modal-wrap { padding: 4px 8px 8px; }
+/* Batch 2 #7: the wizard card is the same size as the Restore card
+   (920px wide — heights already shared) — the wizard inner area grows. */
+#view-wizard .modal-wrap { max-width: 920px; }
 #view-wizard .modal-wrap .wizard-card, #view-restore .modal-wrap .wizard-card { max-height: calc(100vh - 96px); }
 #view-wizard .modal-wrap .wizard-card .modal-body, #view-restore .modal-wrap .wizard-card .modal-body { max-height: calc(100vh - 209px); }
 .modal-card, .wizard-card {
@@ -331,6 +347,11 @@ select.filter {
 }
 .modal-head { padding: 8px 22px 0; display: flex; align-items: flex-start; gap: 12px; }
 .modal-head h1, .modal-head h2 { font-size: 20px; margin: 0; }
+/* Batch 2 #6: Back button inline beside the wizard/restore title —
+   same row as the h1, compact so the header height does not grow. */
+.title-row { display: flex; align-items: center; gap: 10px; }
+.title-row h1 { margin: 0; }
+.title-back-btn { flex-shrink: 0; padding: 3px 10px; font-size: 13px; }
 .modal-head p { color: var(--muted); margin: 4px 0 0; font-size: 13px; }
 .modal-body { padding: 10px 22px 16px; }
 .field { margin-bottom: 11px; }
@@ -494,6 +515,15 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .jobs-toolbar-spacer { flex: 1; }
 .jobs-search { min-width: 160px; }
 .jobs-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; align-items: start; }
+/* No job selected: the details panel is hidden (dictation #2) and
+   the table takes the whole width instead of leaving an empty
+   300px column behind. */
+.jobs-layout.no-details { grid-template-columns: minmax(0, 1fr); }
+.jobs-details-progress { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.jobs-progress-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 12.5px; }
+.jobs-progress-head b { color: var(--accent); font-size: 15px; }
+.jobs-details-progress .progress-track { margin: 8px 0 6px; }
+.jobs-progress-sub { color: var(--muted); font-size: 12px; }
 .jobs-table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 6px 14px; overflow-x: auto; }
 .jobs-table th, .jobs-table td { padding: 6px 8px; }
 .jobs-table tbody tr.selected { background: var(--accent-bg); }
@@ -516,6 +546,15 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 }
 
 .confirm-modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 60; width: min(420px, calc(100vw - 32px)); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); padding: 20px; }
+/* The Yes/No dialog is always the topmost question when shown: it
+   must paint above every other modal, including #vaultModal, which
+   shares .confirm-modal (z-index 60) but sits LATER in the DOM —
+   a confirm opened over the startup unlock modal (the "I forgot
+   it" reset) used to be invisible and unclickable behind it. The
+   backdrop goes above the other modals too, so the vault modal is
+   dimmed while the question is up. Toasts (100) stay on top. */
+#confirmModal { z-index: 70; }
+#confirmBackdrop.show { z-index: 65; }
 .confirm-modal h3 { margin: 0 0 8px; font-size: 18px; }
 .confirm-modal p { margin: 0; color: var(--muted); font-size: 14px; }
 .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
@@ -697,7 +736,8 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .dash-stat-value-sm { font-size: 17px; padding-top: 4px; }
 .dash-stat-label, .dash-stat-value, .dash-stat-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dash-stat-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.dash-row { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; margin-bottom: 10px; }
+.dash-row { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 12px; margin-bottom: 10px; }
+.dash-row > .card { min-width: 0; }
 .dash-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
 .link-btn { background: none; border: none; color: var(--accent); font-weight: 600; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 6px; font-family: inherit; }
 .link-btn:hover { background: var(--accent-bg); }
@@ -718,11 +758,13 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .dash-donut-wrap { position: relative; width: 96px; height: 96px; margin: 2px auto 0; }
 .dash-donut { display: block; }
 .dash-donut-center { position: absolute; inset: 0; }
-/* The % sits EXACTLY on the donut's centre (not the centre of the
-   %-plus-"Used" group, which left it ~9px high). "Used" hangs just
-   below it, still inside the hole. */
+/* The % sits EXACTLY on the donut's centre. (Round 3 #1: the "Used"
+   label that used to hang below it was removed.) */
 .dash-donut-center b { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 20px; font-weight: 600; line-height: 1; }
-.dash-donut-center span { position: absolute; left: 50%; top: 50%; transform: translate(-50%, 0); margin-top: 13px; font-size: 12px; color: var(--muted); }
+/* "100%" is 4 characters: at 20px it fills ~91% of the hole. The
+   narrow size keeps a 3-digit value at most ~72% of the hole
+   (round 3). 2-digit values keep the 20px size. */
+.dash-donut-center b.donut-narrow { font-size: 15px; }
 .dash-legend { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px; }
 .dash-legend li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 2px 0; }
 .dash-legend li span { display: flex; align-items: center; color: var(--muted); }
@@ -730,7 +772,22 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; margin-right: 8px; }
 .dot-used { background: var(--accent); }
 .dot-free { background: var(--surface-3); }
-.dash-storage-sub { margin-top: 6px; font-size: 12px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dash-storage-sub { margin-top: 6px; min-height: 18px; font-size: 12px; color: var(--muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Keep the lower Dashboard cards stable as recent jobs appear/disappear.
+   A long list scrolls inside its card rather than resizing Quick Actions.
+   The height fills the viewport minus the fixed upper content (banner +
+   stats/storage row + gaps + padding): 475px above the short-height
+   tier, 446px inside it (see the clamp below). At 1200x800 that is
+   325px, so the page fits exactly; taller viewports cap at 330px. */
+.dash-jobs-row { --dash-jobs-height: clamp(230px, calc(100vh - 475px), 330px); }
+.dash-jobs-row > .card { height: var(--dash-jobs-height); min-width: 0; margin-bottom: 0; }
+.dash-recent { display: flex; flex-direction: column; }
+.dash-recent > .dash-card-head { flex: 0 0 auto; }
+.dash-recent-content { flex: 1; min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.dash-recent-content .dash-table { min-width: 510px; }
+.dash-recent-content .empty-state { padding: 16px 12px; }
+.dash-recent-content .empty-state .big { font-size: 32px; line-height: 1; }
+.dash-recent-content .empty-state p { margin-bottom: 10px; font-size: 13px; }
 .dash-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .dash-table th { text-align: left; color: var(--muted); font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
 .dash-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
@@ -751,31 +808,80 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 /* ---------- Restore 04 ---------- */
 .restore-wrap { max-width: 920px; }
 .restore-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
-.restore-step { margin-bottom: 20px; }
-.restore-step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+/* Restore 04 chrome trim (round 3): the body scrolled 24px at the
+   real 1200x800 window (scrollHeight 601 vs clientHeight 577,
+   innerHeight ~772). ~48px trimmed from inside the restore view
+   only — step gaps, step-head gaps, mode-card padding, side gap and
+   the Phase-2 note — so it fits with margin. Shared wizard chrome
+   (modal-head / modal-body / modal-foot) is untouched. */
+.restore-step { margin-bottom: 4px; }
+#restoreAdvanced .check { padding: 2px 0; }
+.restore-step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 3px; }
 .restore-step-num {
-  width: 26px; height: 26px; flex: 0 0 26px; border-radius: 50%;
+  width: 24px; height: 24px; flex: 0 0 24px; border-radius: 50%;
   background: var(--accent); color: var(--on-accent);
-  font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center;
 }
-.restore-step-head h3 { margin: 0; font-size: 15px; }
-.restore-valid { font-size: 13px; font-weight: 600; color: var(--success); margin-top: 6px; }
+.restore-step-head h3 { margin: 0; font-size: 14px; }
+.restore-valid { font-size: 13px; font-weight: 600; color: var(--success); margin-top: 3px; }
 .restore-valid.bad { color: var(--danger); }
 .restore-mode-card {
   border: 1px solid var(--accent); background: var(--accent-bg);
-  border-radius: var(--radius-lg); padding: 12px 14px;
+  border-radius: var(--radius-lg); padding: 6px 14px;
 }
 .restore-mode-title { font-weight: 700; }
 .restore-mode-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
-.restore-side { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 0; }
+.restore-side { display: flex; flex-direction: column; gap: 8px; position: sticky; top: 0; }
 .restore-side .card { margin-bottom: 0; }
 .restore-side h3 { margin: 0 0 10px; font-size: 14px; }
 .restore-empty { font-size: 13px; color: var(--muted); }
 .restore-info-list { margin: 0; }
-.restore-info-list > div { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-top: 1px solid var(--border); font-size: 13px; }
+.restore-info-list > div { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-top: 1px solid var(--border); font-size: 13px; }
 .restore-info-list > div:first-child { border-top: none; }
 .restore-info-list dt { color: var(--muted); }
 .restore-info-list dd { margin: 0; font-weight: 600; text-align: right; word-break: break-all; }
+/* Restore scroll fix (2026-11-27): with a backup loaded the body ran
+   77px past the viewport at the real 1200x800 window (654 vs 577) —
+   the password field + the info list. The LEFT column is the taller
+   one in every loaded state (628 vs 436 side), so the room has to
+   come from the main column, not the info list: tighter step/field
+   spacing, the password hint on one line, and the Phase-2 note
+   flowing on two lines instead of four. No information or control is
+   removed — the note keeps all its facts, the hint keeps its message.
+   Every rule here is scoped to #view-restore, so no other page
+   changes. */
+#view-restore .modal-body { padding: 8px 22px 10px; }
+#view-restore .field { margin-bottom: 4px; }
+#view-restore .field label { margin-bottom: 4px; }
+#view-restore .field input[type="text"], #view-restore .field input[type="password"] { padding: 6px 10px; }
+#restorePasswordField .hint { line-height: 1.35; }
+#view-restore .note { padding: 8px 15px; margin: 4px 0 8px; font-size: 12.5px; }
+/* The result box (a .note) also shows the "ZIP password needed"
+   message in the layered flow — it shares the page with the second
+   password field, so it is a touch tighter than the other notes. */
+#view-restore #resultBox { padding: 4px 12px; margin: 2px 0 4px; }
+#restoreAdvancedBtn { padding-top: 6px; padding-bottom: 6px; }
+/* Wizard step 3, ZIP password fields (item 6): the two fields + hint
+   add ~183px to the Options step, which pushed it 38px past the
+   no-scroll limit at the real 1200x800 window (615 vs 577). The
+   hint is one line now and the field spacing is tightened — scoped
+   to #zipPwFields only, so no other step changes. */
+#zipPwFields .field { margin-bottom: 4px; }
+#zipPwFields .field label { margin-bottom: 4px; }
+#zipPwFields .field input[type="password"] { padding: 6px 12px; }
+/* The two ZIP fields sit side by side (one row instead of two
+   stacked) so the Options step stays compact when they are shown. */
+#zipPwFields .input-row .field { flex: 1; min-width: 0; margin-bottom: 0; }
+/* Wizard body padding (same as the restore page): the Options step
+   with the ZIP fields shown needs a few more pixels at the real
+   1200x800 window — this also gives step 5 (the tightest step)
+   a little more room. */
+#view-wizard .modal-body { padding: 8px 22px 12px; }
+/* The wizard's toggle rows are two lines of text (label + sub).
+   A slightly tighter line-height keeps the tallest step (Options +
+   Schedule, both sections expanded) inside the no-scroll budget. */
+#view-wizard .toggle-row .t-label { line-height: 1.25; }
+#view-wizard .toggle-row .t-sub { line-height: 1.25; }
 @media (max-width: 860px) {
   .restore-layout { grid-template-columns: 1fr; }
   .restore-side { position: static; }
@@ -990,6 +1096,7 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   .dash-stat { padding: 10px 12px; }
   .dash-ico { width: 36px; height: 36px; flex: 0 0 36px; font-size: 17px; }
   .dash-row { gap: 8px; margin-bottom: 8px; }
+  .dash-jobs-row { --dash-jobs-height: clamp(230px, calc(100vh - 446px), 330px); }
   .dash-card-head { margin-bottom: 4px; }
   .dash-banner { padding: 8px 12px; }
   .dash-facts { gap: 8px; margin-top: 8px; }
@@ -999,7 +1106,9 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
   /* Smaller donut, smaller % (hole is only ~49px here — 20px text
      would fill it edge to edge, the same complaint as round 2 #1). */
   .dash-donut-center b { font-size: 17px; }
-  .dash-donut-center span { margin-top: 11px; }
+  /* Narrow 3-digit value at the compact donut too (hole is only
+     ~49px here — "100%" at 17px measures ~44px, ~91% of it). */
+  .dash-donut-center b.donut-narrow { font-size: 13px; }
   .dash-table th { padding: 5px 8px; }
   .dash-table td { padding: 6px 8px; }
   /* Quick Actions go two-across so the six buttons take three
