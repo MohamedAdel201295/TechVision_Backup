@@ -386,28 +386,45 @@ try {
 }
 
 // Bring over settings/jobs saved under the old per-mode folders
-// (techvision-backup or TechVision Backup) into the pinned folder,
-// copying only files that are missing there.
+// (techvision-backup or TechVision Backup) into the pinned folder.
+// MOVE, don't copy: the old code copied only files missing in the
+// pinned folder and left the source behind forever — so a job the
+// user deleted from the pinned folder was copied BACK on the next
+// startup (it was "missing" there again), loaded as a template, and
+// its missed schedule fired it the moment the app started. A deleted
+// job came back RUNNING after a full Exit and reopen. Moving closes
+// that hole: once adopted, nothing is left behind to resurrect
+// anything. A file whose destination already exists is a stale
+// duplicate of the live copy — it is removed too (the pinned folder
+// is authoritative; nothing writes to the legacy folders anymore, so
+// nothing live can be lost). A file that cannot be removed is logged
+// loudly and left for the next startup to retry.
 function migrateLegacyUserData() {
   try {
     const newBase = path.join(USER_DATA_DIR, '.techvision');
     for (const name of ['techvision-backup', 'TechVision Backup']) {
       const oldBase = path.join(app.getPath('appData'), name, '.techvision');
       if (oldBase === newBase || !fs.existsSync(oldBase)) continue;
-      const copyMissing = (srcDir, destDir) => {
+      const moveMissing = (srcDir, destDir) => {
         if (!fs.existsSync(srcDir)) return;
         if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
         for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
           const src = path.join(srcDir, entry.name);
           const dest = path.join(destDir, entry.name);
-          if (entry.isDirectory()) copyMissing(src, dest);
-          else if (!fs.existsSync(dest)) {
-            fs.copyFileSync(src, dest);
-            console.log(`[Main] Migrated user data file: ${dest}`);
+          if (entry.isDirectory()) {
+            moveMissing(src, dest);
+            try { fs.rmdirSync(src); } catch (e) {} // best effort: drop emptied legacy dirs
+          } else {
+            if (!fs.existsSync(dest)) {
+              fs.copyFileSync(src, dest);
+              console.log(`[Main] Migrated user data file: ${dest}`);
+            }
+            try { fs.unlinkSync(src); }
+            catch (e) { console.error(`[Main] Could not remove migrated legacy file ${src} — it may resurrect deleted jobs on the next start: ${e.message}`); }
           }
         }
       };
-      copyMissing(oldBase, newBase);
+      moveMissing(oldBase, newBase);
     }
   } catch (e) {
     console.error('[Main] User data migration failed:', e.message);
@@ -1746,12 +1763,39 @@ ipcMain.handle('job-get-active', async () => {
 });
 
 ipcMain.handle('job-clear-history', async () => {
-  jobHistory.length = 0;
-  // Persist the clear: before this, the in-memory list was emptied but
-  // history.json was never rewritten, so all the history came back
-  // after a restart. Job definition files (<id>.json) are untouched,
-  // so the jobs themselves survive — only their run history is gone.
-  saveJobHistory();
+  // Delete means delete: clearing history used to empty the run
+  // records while leaving every job template (and its schedule) on
+  // disk, so the jobs came back on the next start and their missed
+  // schedules fired them. A clear now removes EVERYTHING: template
+  // files, run history and drive-wait state. A running backup blocks
+  // the clear — its completion would re-create history for a job the
+  // user just deleted. A template file that cannot be removed fails
+  // the clear loudly instead of claiming success.
+  if ([...activeJobs.values()].some(a => a.status === 'running')) {
+    return { success: false, error: 'A backup is running. Wait for it to finish before clearing history.' };
+  }
+  const jobsDir = path.join(app.getPath('userData'), '.techvision', 'jobs');
+  try {
+    if (fs.existsSync(jobsDir)) {
+      for (const file of fs.readdirSync(jobsDir)) {
+        if (!file.endsWith('.json') || file === 'history.json' || file === 'waiting.json') continue;
+        const p = path.join(jobsDir, file);
+        try { fs.unlinkSync(p); console.log(`[Main] Deleted job template file: ${p}`); }
+        catch (e) { return { success: false, error: `Cannot delete job template ${file}: ${e.message}` }; }
+      }
+    }
+  } catch (e) { return { success: false, error: e.message }; }
+  const previous = jobHistory;
+  jobHistory = [];
+  // saveWaitingState() derives waiting.json from jobHistory, so an
+  // empty jobHistory writes an empty waiting file — the drive-wait
+  // state for every job is gone too.
+  saveWaitingState();
+  if (!saveJobHistory()) {
+    jobHistory = previous;
+    saveWaitingState();
+    return { success: false, error: 'Could not save cleared history. Deletion is incomplete; please retry.' };
+  }
   notifyJobsUpdated();
   return { success: true };
 });

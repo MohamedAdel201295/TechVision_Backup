@@ -7,10 +7,26 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start))); }
-function fixture(t, jobs, fault) {
+function fixture(t, jobs, fault, opts) {
+  opts = opts || {};
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-job-delete-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const dir = path.join(root, '.techvision', 'jobs'); fs.mkdirSync(dir, { recursive: true });
+  // Pinned mode mirrors the real app: userData is
+  // <root>/TechVision Backup and the legacy folder is
+  // <root>/techvision-backup. Classic mode (the old tests) keeps the
+  // single flat layout.
+  const dir = opts.pinned
+    ? path.join(root, 'TechVision Backup', '.techvision', 'jobs')
+    : path.join(root, '.techvision', 'jobs');
+  fs.mkdirSync(dir, { recursive: true });
+  const legacyDir = opts.pinned ? path.join(root, 'techvision-backup', '.techvision', 'jobs') : null;
+  if (legacyDir && opts.legacy) {
+    fs.mkdirSync(legacyDir, { recursive: true });
+    for (const j of opts.legacy) {
+      const { _file, ...content } = j;
+      fs.writeFileSync(path.join(legacyDir, _file || (j.id + '.json')), JSON.stringify(content));
+    }
+  }
   for (const j of jobs) {
     // A job may carry _file to override the on-disk filename (legacy
     // templates are often <name>.json with no id field at all). _file
@@ -26,14 +42,28 @@ function fixture(t, jobs, fault) {
   const failReads = new Set();
   io.readFileSync = (p, enc) => { if (failReads.has(path.basename(String(p)))) throw new Error('EACCES: test unreadable template'); return fs.readFileSync(p, enc); };
   const context = vm.createContext({ fs: io, path, process, console: { log(){}, error(){}, warn(){} },
-    app: { getPath: () => root }, jobHistory: JSON.parse(JSON.stringify(jobs)), activeJobs: new Map(),
-    getHistoryPath: () => path.join(dir, 'history.json'), loadWaitingState(){}, saveWaitingState(){},
+    app: { getPath: (name) => opts.pinned ? (name === 'appData' ? root : path.join(root, 'TechVision Backup')) : root, setPath(){} },
+    jobHistory: JSON.parse(JSON.stringify(jobs)), activeJobs: new Map(),
+    getHistoryPath: () => path.join(dir, 'history.json'),
     notifyJobsUpdated(){}, jobPathValue: v => typeof v === 'string' ? v : v?.path || '',
     ipcMain: { handle: (name, fn) => { handlers[name] = fn; } } });
   vm.runInContext(section('function normalizeJobObject(', '// Tell the main window'), context);
   vm.runInContext(section('async function loadStoredJobs()', '// Persist the drive-wait state'), context);
+  vm.runInContext(section('// Persist the drive-wait state', 'function getAutoStartSetting'), context);
+  vm.runInContext(section('// ONE userData folder for every way of running the app.', 'function migrateLegacyUserData()'), context);
+  vm.runInContext(section('function migrateLegacyUserData()', '// Assets path for icons'), context);
   vm.runInContext(section("ipcMain.handle('job-delete'", 'function promptRestoreDir()'), context);
-  return { context, dir, failReads, remove: id => handlers['job-delete'](null, id), restart: () => vm.runInContext('loadStoredJobs()', context) };
+  vm.runInContext(section("ipcMain.handle('job-clear-history'", "ipcMain.handle('job-get-config'"), context);
+  const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch (e) { return null; } };
+  return { context, dir, legacyDir, failReads,
+    remove: id => handlers['job-delete'](null, id),
+    clear: () => handlers['job-clear-history'](),
+    restart: () => vm.runInContext('loadStoredJobs()', context),
+    migrate: () => vm.runInContext('migrateLegacyUserData()', context),
+    history: () => readJson(path.join(dir, 'history.json')),
+    waiting: () => readJson(path.join(dir, 'waiting.json')),
+    files: () => fs.readdirSync(dir).filter(f => f.endsWith('.json')),
+    legacyFiles: () => legacyDir ? fs.readdirSync(legacyDir).filter(f => f.endsWith('.json')) : [] };
 }
 const base = { id: 'qa-my-backup', name: 'my backup', source: '/qa/source', destination: '/qa/dest', schedule: {enabled:true,time:'00:00',frequency:'Daily'}, runs:[] };
 test('deleted scheduled job stays absent after disk reload', async t => {
@@ -140,4 +170,108 @@ test('delete succeeds when the recorded template file is already gone', async t 
   assert.equal((await f.remove(base.id)).success, true);
   await f.restart();
   assert.equal(f.context.jobHistory.length, 0);
+});
+
+// Delete-absolute (2026-11-27): the user's "My Backup" came back
+// RUNNING after a full Exit + reopen even though the Jobs Delete
+// reported success and history.json was empty on load. Root cause:
+// migrateLegacyUserData COPIED the template back from the legacy
+// folder (%APPDATA%\techvision-backup) on every startup — the copy
+// never deleted its source, so a file deleted from the pinned folder
+// was "missing" there again and got copied back, loaded as a
+// template, and its missed Daily 02:00 schedule fired it. The
+// migration must MOVE, not copy. These tests pin the exact shape:
+// a legacy template, an empty post-delete history, delete, migrate
+// again (next startup), restart — the job must stay gone.
+const legacyMyBackup = { _file: 'My Backup.json', name: 'My Backup', source: 'C:\\Users\\Mohamed Adel\\Desktop\\M3yar', destination: 'C:\\Users\\Mohamed Adel\\Desktop\\M3yar-backup', schedule: { enabled: true, time: '02:00', frequency: 'Daily' }, type: 'template', runs: [] };
+test('legacy migration moves the template; a later delete stays deleted after restart', async t => {
+  const f = fixture(t, [], null, { pinned: true, legacy: [legacyMyBackup] });
+  f.migrate();
+  assert.equal(fs.existsSync(path.join(f.legacyDir, 'My Backup.json')), false, 'legacy source must be gone after the move');
+  assert.equal(fs.existsSync(path.join(f.dir, 'My Backup.json')), true, 'template must be adopted into the pinned folder');
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 1);
+  assert.equal(f.context.jobHistory[0].name, 'My Backup');
+  assert.equal((await f.remove(f.context.jobHistory[0].id)).success, true);
+  assert.equal(fs.existsSync(path.join(f.dir, 'My Backup.json')), false);
+  f.migrate(); // the next startup: nothing left behind to copy back
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 0);
+  assert.deepEqual(f.history(), [], 'history.json must stay empty after the migration');
+});
+test('legacy migration removes a stale duplicate when the destination already has the file', async t => {
+  const f = fixture(t, [legacyMyBackup], null, { pinned: true, legacy: [legacyMyBackup] });
+  assert.equal(fs.existsSync(path.join(f.legacyDir, 'My Backup.json')), true);
+  f.migrate();
+  assert.equal(fs.existsSync(path.join(f.legacyDir, 'My Backup.json')), false, 'stale duplicate must not survive to resurrect a later delete');
+  assert.equal(fs.existsSync(path.join(f.dir, 'My Backup.json')), true, 'the live copy is kept');
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 1);
+});
+test('legacy migration keeps a file the destination is missing, and the scheduler still cannot start a deleted job', async t => {
+  const f = fixture(t, [], null, { pinned: true, legacy: [legacyMyBackup] });
+  f.migrate();
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 1);
+  // Delete, migrate again, restart — then prove the scheduler has
+  // nothing to start: checkSchedules with a due slot and a counting
+  // executeScheduledBackup must fire zero runs.
+  assert.equal((await f.remove(f.context.jobHistory[0].id)).success, true);
+  f.migrate();
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 0);
+  f.context.nextScheduledRun = () => new Date(0);
+  f.context.started = 0;
+  f.context.executeScheduledBackup = () => { f.context.started++; };
+  f.context.resolveJobPaths = () => Promise.resolve({ source: { found: true }, destination: { found: true } });
+  vm.runInContext(section('async function checkSchedules()', '// Fill in a job'), f.context);
+  await vm.runInContext('checkSchedules()', f.context);
+  assert.equal(f.context.started, 0);
+});
+
+// Clear history (2026-11-27): the Jobs-page "Clear History" button
+// used to empty the run records while leaving every template (and
+// its schedule) on disk — the jobs came back on the next start and
+// their missed schedules fired them. Delete means delete: a clear
+// now removes template files, run history and drive-wait state, and
+// refuses while a backup is running.
+test('clear history removes templates, history and waiting state, and nothing returns after restart', async t => {
+  const other = { ...base, id: 'qa-other', name: 'other job', source: '/qa/other', destination: '/qa/other-dest', schedule: { enabled: false }, runs: [] };
+  const f = fixture(t, [base, other]);
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 2);
+  // A run record for the scheduled job + a waiting entry for it.
+  fs.writeFileSync(path.join(f.dir, 'history.json'), JSON.stringify([
+    { id: 'run-1', jobId: base.id, name: base.name, type: 'full', status: 'completed', success: true, source: base.source, destination: base.destination, timestamp: new Date().toISOString(), files: 3, size: 100, duration: 1, error: null, result: null }
+  ]));
+  fs.writeFileSync(path.join(f.dir, 'waiting.json'), JSON.stringify([
+    { jobId: base.id, name: base.name, since: new Date().toISOString(), due: new Date().toISOString(), which: 'source', path: base.source, label: null }
+  ]));
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 2);
+  assert.equal((await f.clear()).success, true);
+  assert.equal(f.context.jobHistory.length, 0);
+  assert.deepEqual(f.files(), ['history.json', 'waiting.json']);
+  assert.deepEqual(f.history(), []);
+  assert.deepEqual(f.waiting(), []);
+  await f.restart();
+  assert.equal(f.context.jobHistory.length, 0);
+});
+test('clear history refuses while a backup is running, and nothing is deleted', async t => {
+  const f = fixture(t, [base]);
+  await f.restart();
+  f.context.activeJobs.set('run', { name: base.name, jobId: base.id, status: 'running' });
+  const r = await f.clear();
+  assert.equal(r.success, false);
+  assert.match(r.error, /running/i);
+  assert.equal(f.context.jobHistory.length, 1);
+  assert.equal(fs.existsSync(path.join(f.dir, base.id + '.json')), true);
+});
+test('clear history fails loudly when a template file cannot be deleted', async t => {
+  const f = fixture(t, [base], 'unlink');
+  await f.restart();
+  const r = await f.clear();
+  assert.equal(r.success, false);
+  assert.match(r.error, /template|delete/i);
+  assert.equal(f.context.jobHistory.length, 1);
 });

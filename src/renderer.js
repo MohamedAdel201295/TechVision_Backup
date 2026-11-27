@@ -3824,8 +3824,12 @@
     var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', refreshJobs);
     var jch = $('jobsClearHistoryBtn'); if (jch) jch.addEventListener('click', function () {
       if (!api || typeof api.clearJobHistory !== 'function') return;
-      askConfirm('Do you want to delete ALL backup history? This cannot be undone.', async function () {
-        try { await api.clearJobHistory(); await loadJobs(); toast('History cleared', 'Backup history has been cleared.', 'success'); }
+      askConfirm('Delete ALL jobs? This removes every job template, its run history, its waiting state and its schedule. This cannot be undone.', async function () {
+        try {
+          var res = await api.clearJobHistory();
+          if (res && res.success) { await loadJobs(); toast('All jobs deleted', 'Every job, its history and its schedule have been deleted.', 'success'); }
+          else toast('Clear failed', (res && res.error) || 'History could not be cleared.', 'error');
+        }
         catch (e) { toast('Clear failed', e && e.message ? e.message : 'History could not be cleared.', 'error'); }
       });
     });
