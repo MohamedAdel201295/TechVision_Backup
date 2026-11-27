@@ -190,6 +190,13 @@ input:-webkit-autofill {
    so removing the class afterwards cannot snap the button back. */
 .icon-btn.spinning { animation: spin .7s linear; }
 .refresh-glyph.spinning { display: inline-block; animation: spin .7s linear; }
+/* Manual refresh page animation (dictation #3): when the user presses
+   a refresh button himself, the page content briefly "goes and comes
+   back" — a small fade out and in. Single iteration, subtle on
+   purpose; background refreshes never add this class, so they stay
+   completely silent (standing no-flicker rule). */
+@keyframes manualRefresh { 0% { opacity: 1; transform: translateY(0); } 35% { opacity: .25; transform: translateY(3px); } 100% { opacity: 1; transform: translateY(0); } }
+.main.manual-refresh-anim { animation: manualRefresh .45s ease; }
 
 /* ---------- Buttons ---------- */
 .btn {
@@ -500,6 +507,15 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .jobs-toolbar-spacer { flex: 1; }
 .jobs-search { min-width: 160px; }
 .jobs-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; align-items: start; }
+/* No job selected: the details panel is hidden (dictation #2) and
+   the table takes the whole width instead of leaving an empty
+   300px column behind. */
+.jobs-layout.no-details { grid-template-columns: minmax(0, 1fr); }
+.jobs-details-progress { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.jobs-progress-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; font-size: 12.5px; }
+.jobs-progress-head b { color: var(--accent); font-size: 15px; }
+.jobs-details-progress .progress-track { margin: 8px 0 6px; }
+.jobs-progress-sub { color: var(--muted); font-size: 12px; }
 .jobs-table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 6px 14px; overflow-x: auto; }
 .jobs-table th, .jobs-table td { padding: 6px 8px; }
 .jobs-table tbody tr.selected { background: var(--accent-bg); }

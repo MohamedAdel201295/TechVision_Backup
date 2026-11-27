@@ -1423,9 +1423,11 @@ ipcMain.handle('backup-run-full', async (event, jobConfig) => {
 
   // Real progress for the window that started the run: the renderer
   // used to fake the bar (raced to 92% and froze). The engine now
-  // reports real bytes; forward them as they arrive.
+  // reports real bytes; forward them as they arrive. The payload
+  // carries the job id/name so the Jobs details progress bar can
+  // match the event to the running job (dictation #2).
   engine.onProgress = (p) => {
-    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', p); } catch (e) {}
+    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', Object.assign({}, p, { jobId: jobConfig.id || null, jobName })); } catch (e) {}
   };
 
   const jobId = `${jobName}-${Date.now()}`;
@@ -1520,7 +1522,7 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
 
   // Real progress for the window that started the run (see full backup).
   engine.onProgress = (p) => {
-    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', p); } catch (e) {}
+    try { if (event.sender && !event.sender.isDestroyed()) event.sender.send('backup-progress', Object.assign({}, p, { jobId: jobConfig.id || null, jobName })); } catch (e) {}
   };
 
   const jobId = `${jobName}-${Date.now()}`;
@@ -3817,6 +3819,14 @@ ipcMain.handle('job-run-backup', async (event, jobId) => {
   try {
     const engine = new BackupEngine(backupConfig);
     activeEngines.set(runJobId, engine);
+    // Scheduled runs never reported progress to the window, so a
+    // running job showed no % anywhere. Broadcast the engine's
+    // progress with the job id (dictation #2) — the Jobs details
+    // progress bar matches it to the selected job. Same payload
+    // shape as the manual runs, plus the identity.
+    engine.onProgress = (p) => {
+      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('backup-progress', Object.assign({}, p, { jobId: job.id || null, jobName })); } catch (e) {}
+    };
     engine.logger = true;
     result = useIncremental ? await engine.run_incremental_backup() : await engine.run_full_backup();
   } catch (e) {

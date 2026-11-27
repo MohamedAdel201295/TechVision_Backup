@@ -366,11 +366,15 @@
       else clearStorageHover();
     }
   }
-  /* Storage donut: usage of the drive holding the latest backup's
-     destination. Re-reads only when the destination changes, or when
-     Check Storage is pressed (force). A failed read shows "—", never
-     a fake number. A request token keeps a slow hover read from
-     overwriting a newer revert (round 2 #6). */
+  /* Storage donut: EMPTY by default (dictation #1) — it shows a
+     job's storage only while a Recent row is hovered/selected, and
+     clears again on mouse-leave, even after a run finishes. The
+     latest backup's destination is still tracked in storageDest for
+     "Open Location" (it opens the latest backup's folder when
+     nothing is hovered), but it is never displayed on its own. A
+     failed read shows "—", never a fake number. A request token
+     keeps a slow hover read from overwriting a newer revert
+     (round 2 #6). */
   var storageDest = '';
   var storageReq = 0;
   /* Drive-usage reads, guarded (round 3): a dead share / sleeping
@@ -437,7 +441,11 @@
       if (req !== storageReq) return;
       set('dashStoragePct', '—');
       set('dashUsed', '—'); set('dashFree', '—'); set('dashTotal', '—');
-      set('dashStorageDrive', 'No backups yet — run a job to see storage.');
+      // Empty by default (dictation #1): the card shows a job's
+      // storage only while a Recent row is hovered. When jobs exist
+      // the hint says so; with no jobs at all it says there are none.
+      var anyJob = jobs.some(function (j) { return j.type !== 'TEMPLATE'; });
+      set('dashStorageDrive', anyJob ? 'Hover a backup job to see its storage.' : 'No backups yet — run a job to see storage.');
       if (arc) arc.setAttribute('stroke-dasharray', '0 339.292');
       return;
     }
@@ -474,24 +482,24 @@
       set('dashStoragePct', '—');
     }
   }
-  async function refreshStorageCard(force) {
+  async function refreshStorageCard() {
     var pctEl = $('dashStoragePct'); if (!pctEl) return;
+    // Track the latest destination for "Open Location" only — the
+    // card itself stays empty unless a hover is on screen.
     var last = lastCompletedRun(jobs.filter(function (j) { return j.type !== 'TEMPLATE'; }));
-    var dest = last ? (last.destination || '') : '';
-    if (!force && dest === storageDest) return;
-    storageDest = dest;
+    storageDest = last ? (last.destination || '') : '';
     // A hover preview is on screen: a background refresh must not
     // clobber it — the revert happens on mouseleave instead.
     if (storageHoverDest !== null) return;
     var req = ++storageReq;
-    await renderStorageFor(dest, req);
+    await renderStorageFor('', req);
   }
-  /* Hover preview (round 2 #6): hovering a row in Recent Backup Jobs
-     shows THAT job's backup storage in the card at once — its
-     destination, donut %, Used/Free/Total. Leaving the list reverts
-     to the latest backup's destination. The hover never touches
-     storageDest (the default's cache), so the revert is a plain
-     forced refresh. */
+  /* Hover preview (round 2 #6, dictation #1): hovering a row in
+     Recent Backup Jobs shows THAT job's backup storage in the card
+     at once — its destination, donut %, Used/Free/Total. Leaving
+     the list reverts to EMPTY (the card shows nothing by default).
+     The hover never touches storageDest (the "Open Location"
+     cache), so the revert is a plain forced refresh. */
   var storageHoverDest = null;
   var storageHoverTimer = null;
   /* Debounced (round 3): sweeping the mouse across rows used to fire
@@ -514,7 +522,7 @@
     if (storageHoverTimer) { clearTimeout(storageHoverTimer); storageHoverTimer = null; }
     if (storageHoverDest === null) return;
     storageHoverDest = null;
-    refreshStorageCard(true);
+    refreshStorageCard();
   }
 
   /* ---------- history list ---------- */
@@ -865,6 +873,33 @@
   }
   /* ---------- Jobs page 02: table + details panel ---------- */
   var jobsSelectedId = null; // id of the job shown in the details panel
+  /* Live % for the Jobs details progress bar (dictation #2). The map
+     keeps the last known % per running job (by id, falling back to
+     the lowercase name) so a re-render mid-run keeps the bar instead
+     of resetting it. A pct of null means "running, no % reported
+     yet" — never a fake number. */
+  var jobProgressByKey = {};
+  function jobProgressKey(job) {
+    if (!job) return null;
+    if (job.id) return 'id:' + job.id;
+    if (job.name) return 'name:' + String(job.name).toLowerCase();
+    return null;
+  }
+  function updateJobsProgressBar(pct, sub) {
+    var pctEl = $('jobsDetailsProgressPct');
+    var fill = $('jobsDetailsProgressFill');
+    var subEl = $('jobsDetailsProgressSub');
+    if (pct === null || pct === undefined) {
+      if (pctEl) pctEl.textContent = '—';
+      if (fill) fill.style.width = '0%';
+      if (subEl) subEl.textContent = 'Running…';
+      return;
+    }
+    var p = Math.max(0, Math.min(100, Number(pct) || 0));
+    if (pctEl) pctEl.textContent = Math.round(p) + '%';
+    if (fill) fill.style.width = p + '%';
+    if (subEl) subEl.textContent = sub || 'Running…';
+  }
   function selectedJob() {
     if (!jobsSelectedId) return null;
     var found = jobs.filter(function (j) { return j.id === jobsSelectedId; });
@@ -897,7 +932,9 @@
     });
     var sel = selectedJob();
     if (sel && visible.indexOf(sel) === -1) sel = null;
-    if (!sel && visible.length) sel = visible[0];
+    // No auto-select (dictation #2): the details panel stays hidden
+    // until the user clicks a row. jobsSelectedId only changes on a
+    // click (or when the selected job leaves the visible list).
     jobsSelectedId = sel ? sel.id : null;
     body.innerHTML = '';
     var empty = $('jobsEmptyState');
@@ -931,6 +968,11 @@
   }
   function renderJobsDetails(job) {
     var panel = $('jobsDetails'); if (!panel) return;
+    // The panel appears only when a job is clicked (dictation #2):
+    // on page open, with nothing selected, it is hidden entirely
+    // and the table takes the full width.
+    panel.style.display = job ? '' : 'none';
+    var jl = document.querySelector('.jobs-layout'); if (jl) jl.classList.toggle('no-details', !job);
     var name = $('jobsDetailsName'), pill = $('jobsDetailsPill');
     var banner = $('jobsDetailsBanner'), bIco = $('jobsDetailsBannerIco'), bTitle = $('jobsDetailsBannerTitle'), bSub = $('jobsDetailsBannerSub');
     var listEl = $('jobsDetailsList'), waitEl = $('jobsDetailsWaiting');
@@ -1006,6 +1048,21 @@
         wdiv.className = 'job-waiting';
         wdiv.textContent = '⏳ Waiting for the ' + (w.which || 'source') + ' drive since ' + formatDate(w.since) + ' — ' + (w.path || '') + (w.label ? ' (volume "' + w.label + '")' : '');
         waitEl.appendChild(wdiv);
+      }
+    }
+    // Progress bar under the details (dictation #2): shown only
+    // while THIS job is running. The % comes from the live progress
+    // map; a running job with no % reported yet shows "Running…"
+    // with no fake number.
+    var prog = $('jobsDetailsProgress');
+    if (prog) {
+      if (job && job.running) {
+        prog.style.display = '';
+        var pk = jobProgressKey(job);
+        var last = pk ? jobProgressByKey[pk] : null;
+        updateJobsProgressBar(last ? last.pct : null, last ? last.sub : null);
+      } else {
+        prog.style.display = 'none';
       }
     }
   }
@@ -2852,6 +2909,19 @@
     el.classList.add('spinning');
     el.addEventListener('animationend', function h() { el.classList.remove('spinning'); el.removeEventListener('animationend', h); });
   }
+  /* Manual refresh page animation (dictation #3): the page content
+     briefly "goes and comes back" when the user presses a refresh
+     button himself. Only the click handlers below call this —
+     background refreshes (jobs-updated, pollers, loadJobs) never do,
+     so an automatic refresh never animates. */
+  function playManualRefreshAnim() {
+    var m = document.querySelector('.main');
+    if (!m) return;
+    m.classList.remove('manual-refresh-anim');
+    void m.offsetWidth;
+    m.classList.add('manual-refresh-anim');
+    m.addEventListener('animationend', function h() { m.classList.remove('manual-refresh-anim'); m.removeEventListener('animationend', h); });
+  }
   async function refreshJobs() {
     spinOnce($('backupTopRefreshBtn'));
     if (api && typeof api.refreshJobs === 'function') {
@@ -3846,7 +3916,8 @@
     var jnb = $('jobsNewJobBtn'); if (jnb) jnb.addEventListener('click', function () { openJobWizard(null); });
     var jenb = $('jobsEmptyNewJobBtn'); if (jenb) jenb.addEventListener('click', function () { openJobWizard(null); });
     /* Jobs page 02 toolbar + details panel: everything acts on the
-       selected row (first row when nothing is picked yet). */
+       selected row (nothing is selected until the user clicks a row
+       — dictation #2). */
     var jrb = $('jobsRunBtn'); if (jrb) jrb.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
     var jsb = $('jobsDetailsStop'); if (jsb) jsb.addEventListener('click', stopSelectedJob);
     var psb = $('progressStopBtn'); if (psb) psb.addEventListener('click', function () {
@@ -3856,7 +3927,7 @@
     });
     var jeb = $('jobsEditBtn'); if (jeb) jeb.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
     var jdb = $('jobsDeleteBtn'); if (jdb) jdb.addEventListener('click', deleteSelectedJob);
-    var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', refreshJobs);
+    var jrf = $('jobsRefreshBtn'); if (jrf) jrf.addEventListener('click', function () { playManualRefreshAnim(); refreshJobs(); });
     var jch = $('jobsClearHistoryBtn'); if (jch) jch.addEventListener('click', function () {
       if (!api || typeof api.clearJobHistory !== 'function') return;
       askConfirm('Delete ALL jobs? This removes every job template, its run history, its waiting state and its schedule. This cannot be undone.', async function () {
@@ -3874,6 +3945,28 @@
     var jdr = $('jobsDetailsRun'); if (jdr) jdr.addEventListener('click', function () { var j = selectedJob(); if (j) runBackup(j, false); });
     var jdrs = $('jobsDetailsRestore'); if (jdrs) jdrs.addEventListener('click', function () { var j = selectedJob(); if (j) openRestore(j); });
     var jde = $('jobsDetailsEdit'); if (jde) jde.addEventListener('click', function () { var j = selectedJob(); if (j) openJobWizard(j); });
+    /* Live % for the Jobs details progress bar (dictation #2): one
+       persistent backup-progress subscription, separate from the
+       progress card's per-run one. Manual runs carry the job id in
+       the event (main forwards it); scheduled runs are broadcast
+       with a jobId by main; the currentRunJobId fallback covers a
+       run started from this window. The % is stored per job and the
+       bar is updated in place when the running job is the selected
+       one — no full re-render, so the bar never flickers. */
+    if (api && typeof api.onBackupProgress === 'function') {
+      api.onBackupProgress(function (p) {
+        if (!p) return;
+        var key = null;
+        if (p.jobId) key = 'id:' + p.jobId;
+        else if (p.jobName) key = 'name:' + String(p.jobName).toLowerCase();
+        else if (currentRunJobId) key = 'id:' + currentRunJobId;
+        if (!key) return;
+        var sub = (p.filesDone !== undefined && p.filesDone !== null) ? (p.filesDone + ' files') : null;
+        jobProgressByKey[key] = { pct: p.pct, sub: sub };
+        var sel = selectedJob();
+        if (sel && jobProgressKey(sel) === key && sel.running) updateJobsProgressBar(p.pct, sub);
+      });
+    }
     /* Dashboard 01 quick actions. */
     var dnj = $('dashNewJob'); if (dnj) dnj.addEventListener('click', function () { openJobWizard(null); });
     var denj = $('dashEmptyNewJobBtn'); if (denj) denj.addEventListener('click', function () { openJobWizard(null); });
@@ -3902,7 +3995,7 @@
 
     $('navRestore').addEventListener('click', function () { openRestore(null); });
     var brb = $('backupTopRefreshBtn');
-    if (brb) brb.addEventListener('click', refreshJobs);
+    if (brb) brb.addEventListener('click', function () { playManualRefreshAnim(); refreshJobs(); });
     $('themeToggle').addEventListener('click', async function () {
       var next = document.body.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
       applyTheme(next);
@@ -4163,7 +4256,7 @@
       var vcb3 = $('vpnConnectBtn'); if (vcb3) { vcb3.disabled = false; vcb3.textContent = 'Install & connect'; }
     });
     var vrb = $('vpnTopRefreshBtn');
-    if (vrb) vrb.addEventListener('click', function () { loadVpn(); });
+    if (vrb) vrb.addEventListener('click', function () { playManualRefreshAnim(); loadVpn(); });
     // Peers appear on their own: while the VPN view is open, or the Cloud
     // client panel is open in Tailscale mode, re-read Tailscale status
     // every 15s so a device that joins shows up without re-opening the
@@ -4337,7 +4430,7 @@
       btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
     });
     var lrb = $('logsRefreshBtn');
-    if (lrb) lrb.addEventListener('click', function () { spinOnce(lrb.querySelector('.refresh-glyph')); loadJobs().then(function () { renderLogs(currentLogTab); }); });
+    if (lrb) lrb.addEventListener('click', function () { playManualRefreshAnim(); spinOnce(lrb.querySelector('.refresh-glyph')); loadJobs().then(function () { renderLogs(currentLogTab); }); });
     var llf = $('logsLevelFilter');
     if (llf) llf.addEventListener('change', renderFullLog);
     var ls = $('logsSearch');
@@ -4345,7 +4438,7 @@
 
     /* ---------- TechVision Cloud wiring ---------- */
     var crb = $('cloudTopRefreshBtn');
-    if (crb) crb.addEventListener('click', function () { loadCloud(); });
+    if (crb) crb.addEventListener('click', function () { playManualRefreshAnim(); loadCloud(); });
     var cms = $('cloudModeServer');
     if (cms) cms.addEventListener('click', function () { showCloudPanel('server'); });
     var cmc = $('cloudModeClient');
@@ -4539,7 +4632,7 @@
     var cmb = $('cloudMkdirBtn');
     if (cmb) cmb.addEventListener('click', function () { cloudNewFolder(cloudPath); });
     var cbr = $('cloudBrowserRefreshBtn');
-    if (cbr) cbr.addEventListener('click', function () { cloudBrowse(cloudPath); });
+    if (cbr) cbr.addEventListener('click', function () { playManualRefreshAnim(); cloudBrowse(cloudPath); });
     // Open mode (spec v2): which way a double-click opens a file.
     // The choice persists in cloud.json; no mode ever creates a
     // drive letter.
@@ -4620,7 +4713,7 @@
 
   // WireGuard view wiring — all buttons of #view-wireguard.
   var wgRb = $('wgTopRefreshBtn');
-  if (wgRb) wgRb.addEventListener('click', function () { loadWireGuard(); });
+  if (wgRb) wgRb.addEventListener('click', function () { playManualRefreshAnim(); loadWireGuard(); });
   var wgDb = $('wgDownloadBtn');
   if (wgDb) wgDb.addEventListener('click', async function () {
     if (!api || typeof api.wgOpenDownload !== 'function') return wgMissing();
