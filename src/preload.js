@@ -51,6 +51,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Master-password vault (job passwords for encrypted backups)
     vaultStatus: () => ipcRenderer.invoke('vault-status'),
     vaultSetup: (masterPassword) => ipcRenderer.invoke('vault-setup', masterPassword),
+    vaultReset: (masterPassword) => ipcRenderer.invoke('vault-reset', masterPassword),
     vaultUnlock: (masterPassword) => ipcRenderer.invoke('vault-unlock', masterPassword),
     vaultLock: () => ipcRenderer.invoke('vault-lock'),
     vaultChangePassword: (oldPassword, newPassword) => ipcRenderer.invoke('vault-change-password', oldPassword, newPassword),

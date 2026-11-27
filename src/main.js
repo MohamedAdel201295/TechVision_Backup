@@ -3,7 +3,7 @@
  * Electron main process for backup application
  */
 
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
@@ -29,24 +29,25 @@ const DRIVE_WAIT_MS = 2 * 60 * 60 * 1000;
 let vaultKey = null;
 
 // Round 3 — vault overhaul: the vault now also holds the Cloud
-// client, SMTP and Tailscale secrets (generic secrets), the master
-// password is remembered per-device via safeStorage (DPAPI on
-// Windows), and legacy plaintext passwords are migrated into the
-// vault on first unlock. Machine keys (Cloud TLS private key,
-// WireGuard private keys) stay plaintext by design — auto-start —
-// and are NOT vault secrets.
+// client, SMTP and Tailscale secrets (generic secrets), and legacy
+// plaintext passwords are migrated into the vault on first unlock.
+// Machine keys (Cloud TLS private key, WireGuard private keys) stay
+// plaintext by design — auto-start — and are NOT vault secrets.
+//
+// Master-password model (changed 2026-11-27, replaces the round-3
+// "remember-me" agreement): the program asks for the master
+// password at EVERY startup — there is NO silent auto-unlock and no
+// remember-me blob is written. Typing the existing key unlocks the
+// vault and all saved passwords work again. Creating a NEW key at
+// startup (without the old one) REPLACES the vault: every saved
+// password is lost, so the UI warns first and requires a
+// confirmation. Changing the key in Settings (old key known) is the
+// opposite: it re-encrypts the vault and saved passwords are KEPT.
 
-// After any successful unlock: remember this device (best-effort,
-// safeStorage may be unavailable) and migrate any plaintext
-// passwords still sitting in cloud.json / settings.json into the
-// vault. Never throws — a failure here must never block the app.
+// After any successful unlock: migrate any plaintext passwords still
+// sitting in cloud.json / settings.json into the vault. Never
+// throws — a failure here must never block the app.
 function afterVaultUnlocked() {
-  try {
-    if (vaultKey) {
-      const saved = vault.saveUnlockBlob(app.getPath('userData'), safeStorage, vaultKey);
-      if (!saved.saved) console.log('[Vault] Remember-me not saved: ' + (saved.reason || 'unknown'));
-    }
-  } catch (e) { console.log('[Vault] Remember-me failed: ' + (e && e.message ? e.message : e)); }
   try {
     if (vaultKey) {
       const moved = vault.migrateLegacySecrets(app.getPath('userData'), vaultKey);
@@ -60,21 +61,6 @@ function afterVaultUnlocked() {
       }
     }
   } catch (e) { console.log('[Vault] Migration failed: ' + (e && e.message ? e.message : e)); }
-}
-
-// Try the saved safeStorage unlock blob at startup. Returns true when
-// the vault is now unlocked. Never throws — a missing/stale blob just
-// means the master password is asked for, as before.
-function tryRememberedUnlock() {
-  try {
-    if (vaultKey || !vault.vaultExists(app.getPath('userData'))) return false;
-    const key = vault.tryAutoUnlock(app.getPath('userData'), safeStorage);
-    if (!key) return false;
-    vaultKey = key;
-    afterVaultUnlocked();
-    console.log('[Vault] Auto-unlocked from the remembered device unlock.');
-    return true;
-  } catch (e) { return false; }
 }
 
 // Saved password for a Cloud server record: the vault secret when the
@@ -1020,12 +1006,11 @@ function createMainWindow() {
 // App lifecycle
 app.whenReady().then(() => {
   migrateLegacyUserData(); // Bring old settings/jobs into the pinned folder
-  // Remember-me: if this device saved a safeStorage unlock blob, the
-  // vault opens here — before schedules/missed-mail run — so the
-  // master password is never asked again while the app is installed.
-  // Best-effort: without a blob (or without safeStorage) the vault
-  // simply stays locked and the renderer asks, as before.
-  tryRememberedUnlock();
+  // Master-password model (2026-11-27): NO auto-unlock at startup.
+  // The renderer asks for the master password on every launch. Any
+  // remember-me blob left over from the old build is deleted here
+  // so it can never silently unlock the vault — and is never read.
+  try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
   loadStoredJobs(); // Load stored jobs on startup
   checkMissedSchedules(); // Email if the app was closed and a schedule was missed
   startScheduler(); // Run scheduled jobs while the app is open
@@ -1164,7 +1149,7 @@ async function executeScheduledBackup(job, resolved) {
   if (jobConfig.encryptionEnabled) {
     const pw = resolveBackupPassword(jobConfig);
     if (!pw) {
-      const msg = `Skipped encrypted job "${job.name}": the vault is locked or no password is saved. Unlock the vault in Settings to let scheduled encrypted backups run.`;
+      const msg = `Skipped encrypted job "${job.name}": the vault is locked or no password is saved. Open the app and unlock the vault with your master password to let scheduled encrypted backups run.`;
       console.log(`[Scheduler] ${msg}`);
       appendAppLog('warn', msg);
       recordRun(job.name, {
@@ -2053,6 +2038,45 @@ ipcMain.handle('vault-setup', async (event, masterPassword) => {
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
+
+/* Replace the vault with a fresh one (the startup "I forgot my
+   master password" path). Everything the old vault encrypted is
+   LOST — the renderer warns and confirms before calling this. The
+   "saved in the vault" flags in settings.json / cloud.json are
+   cleared with it, so the app stops claiming passwords are saved
+   when they no longer are. Legacy PLAINTEXT passwords are NOT
+   touched: they are not in the vault, and migration moves them into
+   the new vault on unlock. */
+ipcMain.handle('vault-reset', async (event, masterPassword) => {
+  try {
+    const hadVault = vault.vaultExists(app.getPath('userData'));
+    vaultKey = vault.resetVault(app.getPath('userData'), masterPassword);
+    if (hadVault) clearVaultSecretFlags();
+    afterVaultUnlocked();
+    return { success: true, replaced: hadVault };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+/* Drop every "password is saved in the vault" flag after a vault
+   reset — the passwords they point at no longer exist. On disk AND
+   in main's in-memory cloud config (getCloudConfig caches it). Never
+   throws. */
+function clearVaultSecretFlags() {
+  try {
+    const sp = path.join(app.getPath('userData'), '.techvision', 'settings.json');
+    if (fs.existsSync(sp)) {
+      const s = JSON.parse(fs.readFileSync(sp, 'utf-8'));
+      if (s.email) delete s.email.smtpPassInVault;
+      if (s.vpn) { delete s.vpn.apiTokenInVault; delete s.vpn.oauthClientSecretInVault; }
+      fs.writeFileSync(sp, JSON.stringify(s, null, 2));
+    }
+  } catch (e) { console.log('[Vault] Could not clear settings vault flags: ' + (e && e.message ? e.message : e)); }
+  try {
+    const cfg = getCloudConfig();
+    for (const c of (cfg.clients || [])) delete c.passwordInVault;
+    saveCloudConfig();
+  } catch (e) { console.log('[Vault] Could not clear cloud vault flags: ' + (e && e.message ? e.message : e)); }
+}
 ipcMain.handle('vault-unlock', async (event, masterPassword) => {
   try {
     vaultKey = vault.unlockVault(app.getPath('userData'), masterPassword);
@@ -2063,9 +2087,8 @@ ipcMain.handle('vault-unlock', async (event, masterPassword) => {
 ipcMain.handle('vault-lock', async () => {
   if (vaultKey) vault.lockVault(vaultKey);
   vaultKey = null;
-  // An explicit lock also forgets the remembered device unlock, so
-  // the next launch asks for the master password again. (Uninstall
-  // removes the blob as well, via the app-data folder.)
+  // Also drop any leftover remember-me blob from the old build, so
+  // the next launch asks for the master password again.
   try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
   return { success: true };
 });
@@ -2929,8 +2952,19 @@ ipcMain.handle('vpn-key-expiry-state', async (event, auth) => {
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not read key expiry state.' }; }
 });
 ipcMain.handle('vpn-verify-api', async (event, auth) => {
-  try { return await vpn.verifyApiAuth(resolveVpnAuth(auth)); }
-  catch (e) { return { valid: false, error: e && e.message ? e.message : 'Could not check the credentials.' }; }
+  try {
+    // A credential IS saved but the vault is locked: say so plainly
+    // instead of "No API credential saved" — the token exists, the
+    // app just cannot read it until the vault is unlocked. (A legacy
+    // plaintext credential still verifies fine, so it is not blocked.)
+    if (!vaultKey && vault.vaultExists(app.getPath('userData'))) {
+      const s = readSettingsFile();
+      if (s.vpn && (s.vpn.apiTokenInVault || s.vpn.oauthClientSecretInVault) && !s.vpn.apiToken && !s.vpn.oauthClientSecret) {
+        return { valid: false, error: 'The vault is locked — unlock it with your master password to use the saved credential.' };
+      }
+    }
+    return await vpn.verifyApiAuth(resolveVpnAuth(auth));
+  } catch (e) { return { valid: false, error: e && e.message ? e.message : 'Could not check the credentials.' }; }
 });
 ipcMain.handle('vpn-install-connect', async (event, adminCreds) => {
   try {
@@ -3630,9 +3664,11 @@ ipcMain.handle('wg-install-amneziawg', async (event) => {
 ipcMain.handle('vault-change-password', async (event, oldPassword, newPassword) => {
   try {
     vaultKey = vault.changeMasterPassword(app.getPath('userData'), oldPassword, newPassword);
-    // The remembered unlock blob holds the OLD key: re-save it under
-    // the new key (and migrate anything still plaintext) so the next
-    // launch still auto-unlocks.
+    // Change re-encrypts the vault with the new key: saved passwords
+    // are KEPT (unlike the startup reset, which replaces the vault).
+    // afterVaultUnlocked only migrates leftover plaintext now — there
+    // is no remember-me blob any more, and the next launch still
+    // asks for the master password.
     afterVaultUnlocked();
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }

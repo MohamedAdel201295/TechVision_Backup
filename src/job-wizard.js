@@ -299,18 +299,35 @@
                   try {
                     var retry = await api.vaultStoreJobPassword(job.id, pw);
                     if (retry && retry.success) toast('Password saved', 'The backup password is now saved in the vault.', 'success');
-                    else toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+                    else toast('Password not saved', 'Job saved, but the password was not stored' + ((retry && retry.error) ? ': ' + retry.error : '.') + ' Manual runs will ask for the password.', 'warning');
                   } catch (e) {}
                 }, function () {
-                  toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+                  toast('Password not saved', 'Job saved, but the password was not stored. Manual runs will ask for the password; create a master password later to save it for scheduled runs.', 'warning');
                 });
               } else {
-                toast('Vault is locked', 'Job saved, but the password was not stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+                // The vault exists but is locked (or the store failed
+                // for another reason): offer the unlock modal on
+                // demand — the old toast pointed at Settings →
+                // Security, where no Unlock button ever existed.
+                // Skipping keeps the job usable for manual runs.
+                var offered = false;
+                try {
+                  if (typeof window.__offerVaultUnlockThen === 'function') {
+                    offered = await window.__offerVaultUnlockThen(async function () {
+                      try {
+                        var retry2 = await api.vaultStoreJobPassword(job.id, pw);
+                        if (retry2 && retry2.success) toast('Password saved', 'The backup password is now saved in the vault.', 'success');
+                        else toast('Password not saved', 'Job saved, but the password was not stored. Manual runs will ask for the password.', 'warning');
+                      } catch (e) {}
+                    }, 'Unlock the vault to save the backup password for this job.');
+                  }
+                } catch (e) {}
+                if (!offered) toast('Password not saved', 'Job saved, but the password was not stored. Manual runs will ask for the password.', 'warning');
               }
             }
           } catch (e) {}
         } else if (!pw && !hasSavedPassword) {
-          toast('No password saved', 'Job saved, but no password was stored: unlock or set up the master password in Settings so scheduled encrypted backups can run.', 'warning');
+          toast('No password saved', 'Job saved, but no backup password was stored. Manual runs will ask for the password each time; scheduled runs need a saved password.', 'warning');
         }
       }
       if (typeof api.refreshJobs === 'function') { try { await api.refreshJobs(); } catch (e) {} }

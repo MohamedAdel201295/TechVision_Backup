@@ -186,7 +186,12 @@
         askCreateMasterKey('the email / VPN password', function () { saveSettings(); },
           function () { toast('Password not saved', 'The password was not saved because there is no master key yet. The rest of your settings were saved.', 'warning'); });
       } else if (res && res.needsUnlock && notSaved.length) {
-        toast('Vault is locked', 'The password was not saved: unlock the vault in Settings → Security and save again.', 'warning');
+        // The vault is locked: show the unlock modal itself and
+        // re-run the save after unlocking (the typed password is
+        // still in the field) — the old toast pointed at Settings,
+        // where no Unlock button ever existed.
+        var unlocked = await offerVaultUnlockThen(function () { saveSettings(); }, 'The vault is locked. Enter your master password to save the email password.');
+        if (!unlocked) toast('Vault is locked', 'The password was not saved because the vault is locked.', 'warning');
       }
     } catch (e) {
       toast('Settings failed', e && e.message ? e.message : 'Could not save settings.', 'error');
@@ -582,6 +587,9 @@
   window.__closeWizardView = function () { showView(wizardReturnView || 'dashboard'); };
 
   function showView(name) {
+    // Leaving Settings abandons a half-started vault reset (the
+    // setup box goes back to the normal create/change boxes).
+    if (name !== 'settings') vaultResetArmed = false;
     currentView = name;
     var dash = $('view-dashboard'); var jobsView = $('view-jobs'); var logsView = $('view-logs'); var cloudView = $('view-cloud');
     var vpnView = $('view-vpn');
@@ -2612,6 +2620,9 @@
     /* Settings is a full page now: the four tabs switch sections. The
        old drawer view names still work: 'home' = General, 'email' = Email. */
     var tab = view === 'email' ? 'email' : view === 'backup' ? 'backup' : view === 'security' ? 'security' : 'general';
+    // Switching away from the Security tab abandons a half-started
+    // vault reset (see showView for the same on leaving Settings).
+    if (tab !== 'security') vaultResetArmed = false;
     var sections = { general: 'settingsGeneralSection', backup: 'settingsBackupSection', security: 'settingsSecuritySection', email: 'settingsEmailSection' };
     Object.keys(sections).forEach(function (k) { var s = $(sections[k]); if (s) s.style.display = k === tab ? '' : 'none'; });
     document.querySelectorAll('[data-settings-tab]').forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-settings-tab') === tab); });
@@ -2740,7 +2751,12 @@
         setTimeout(function () { hideProgress(); }, 900);
         if (result && (result.success === false || result.status === 'failed')) {
           if (result.error === 'ENCRYPTION_PASSWORD_REQUIRED') {
-            toast('Password required', 'This job is encrypted and no password is saved. Unlock the vault in Settings, or run it and enter the password when asked.', 'error');
+            // The vault is locked: show the unlock modal itself and
+            // run again after unlocking (the saved password is then
+            // found). Otherwise say so plainly — the old toast
+            // pointed at Settings, where no Unlock button exists.
+            var shown = await offerVaultUnlockThen(function () { runBackup(job, incremental); }, 'The vault is locked. Enter your master password to run this encrypted backup.');
+            if (!shown) toast('Password required', 'This job is encrypted and no password is saved. Run it again and enter the password when asked.', 'error');
           } else {
             toast('Backup failed', result.error || result.message || 'The backup did not complete.', 'error');
           }
@@ -2845,26 +2861,58 @@
   }
 
   /* ---------- master-password vault ---------- */
+  // Startup "create a new master password" (old key lost): while
+  // this is set, Settings → Security shows the setup box with the
+  // loss warning instead of the change box, and the Set button
+  // replaces the vault instead of creating one. Cleared on a
+  // successful setup or as soon as the user leaves the Security tab
+  // / Settings.
+  var vaultResetArmed = false;
   async function refreshVaultStatus() {
     var txt = $('vaultStatusText'); if (!txt) return;
     if (!api || typeof api.vaultStatus !== 'function') { txt.textContent = 'Vault API is not available.'; return; }
     try {
       var st = await api.vaultStatus();
-      txt.textContent = !st.exists
-        ? 'No master password set up yet.'
-        : (st.locked ? 'Vault is set up and locked.' : 'Vault is unlocked for this session.');
-      if ($('vaultSetupBox')) $('vaultSetupBox').style.display = st.exists ? 'none' : 'block';
-      if ($('vaultChangeBox')) $('vaultChangeBox').style.display = st.exists ? 'block' : 'none';
+      // Settings only says whether a master password is set — the
+      // locked/unlocked state lives in the unlock modal, and there
+      // is no Lock button here any more.
+      txt.textContent = !st.exists ? 'No master password set up yet.' : 'Master password is set.';
+      var showSetup = !st.exists || vaultResetArmed;
+      if ($('vaultSetupBox')) $('vaultSetupBox').style.display = showSetup ? 'block' : 'none';
+      if ($('vaultChangeBox')) $('vaultChangeBox').style.display = showSetup ? 'none' : 'block';
+      if ($('vaultResetWarning')) $('vaultResetWarning').style.display = vaultResetArmed ? '' : 'none';
     } catch (e) { txt.textContent = 'Could not read the vault status.'; }
   }
+  // The unlock modal's own wording — on-demand calls replace it with
+  // a reason ("...to save the email password"), so the startup path
+  // restores the default every time it shows the modal.
+  var vaultUnlockDefaultText = '';
+  try { var _vmt = $('vaultModalText'); if (_vmt) vaultUnlockDefaultText = _vmt.textContent; } catch (e) {}
+  var startupKeyPromptShown = false; // once per launch: "Not now" asks again next launch, never twice in one launch
   async function checkVaultOnStartup() {
     if (!api || typeof api.vaultStatus !== 'function') return;
     try {
       var st = await api.vaultStatus();
       if (st.exists && st.locked) {
+        var _t = $('vaultModalText'); if (_t && vaultUnlockDefaultText) _t.textContent = vaultUnlockDefaultText;
+        // Startup only: offer the "I forgot it" path. On-demand
+        // unlocks (mid-session) never show it — the key is not lost,
+        // just locked.
+        var _rb = $('vaultResetBtn'); if (_rb) _rb.style.display = '';
         $('vaultModal').style.display = 'block';
         $('vaultBackdrop').classList.add('show');
         setTimeout(function () { var i = $('vaultUnlockPass'); if (i) i.focus(); }, 50);
+      } else if (!st.exists && !startupKeyPromptShown) {
+        // No master password yet: ask to create one right away. The
+        // app used to open silently with no key at all, and the only
+        // way to create one was digging into Settings → Security.
+        // "Not now" never blocks the app; the prompt comes back on
+        // the next launch until a key is created.
+        startupKeyPromptShown = true;
+        askCreateMasterKey(null, null, null, {
+          text: 'No master password yet. Create one master password to protect every saved password in the app — encrypted backups, Cloud servers, email and Tailscale. The program will ask for it every time it starts. You can skip for now — the prompt comes back on the next launch until a key is created.',
+          skipLabel: 'Not now'
+        });
       }
     } catch (e) { /* vault stays locked; encrypted runs will ask instead */ }
   }
@@ -2874,6 +2922,63 @@
     var e = $('vaultUnlockError'); if (e) e.classList.remove('show');
   }
 
+  // Startup "I forgot it" path: warn (the loss is permanent) and
+  // confirm first; only then arm the reset and open Settings →
+  // Security, where the setup box shows with the loss warning and
+  // the Set button replaces the vault. The unlock modal itself is
+  // hidden — the reset happens in Settings, the one place a master
+  // password is created.
+  function startVaultReset() {
+    askConfirm('Creating a new master password REPLACES the vault. Every password saved with the old master password — encrypted backups, Cloud servers, email and Tailscale — will stop working and cannot be recovered. Are you sure you want to create a new one?', function () {
+      hideVaultModal();
+      openSettings();
+      showSettingsView('security');
+      // Arm AFTER the view switches: openSettings() opens the
+      // General tab, and switching tabs clears the flag.
+      vaultResetArmed = true;
+      refreshVaultStatus();
+      setTimeout(function () { var i = $('vaultNewPass'); if (i) i.focus(); }, 50);
+    }, { title: 'Create a new master password?', yesLabel: 'Yes, replace the vault', noLabel: 'No, keep the old one' });
+  }
+
+  // Unlock on demand: when the vault is locked and an action needs a
+  // secret, the unlock modal itself appears — the old toasts pointed
+  // at "Settings → Security", where no Unlock button ever existed.
+  // The retry runs once, after a successful unlock; Skip clears it
+  // so a later unrelated unlock never re-runs a stale action.
+  var vaultUnlockPending = null;
+  function showVaultUnlockModal(retry, text) {
+    var modal = $('vaultModal'), back = $('vaultBackdrop');
+    if (!modal) return false;
+    if (text) { var t = $('vaultModalText'); if (t) t.textContent = text; }
+    // On-demand only: the "create a new one" path is a startup
+    // thing (the key is lost). Mid-session the key is just locked,
+    // so the reset button stays hidden here.
+    var _rb = $('vaultResetBtn'); if (_rb) _rb.style.display = 'none';
+    if (retry) {
+      if (vaultUnlockPending) {
+        var prev = vaultUnlockPending;
+        vaultUnlockPending = function () { try { prev(); } catch (e) {} try { retry(); } catch (e) {} };
+      } else vaultUnlockPending = retry;
+    }
+    modal.style.display = 'block';
+    if (back) back.classList.add('show');
+    setTimeout(function () { var i = $('vaultUnlockPass'); if (i) i.focus(); }, 50);
+    return true;
+  }
+  async function offerVaultUnlockThen(retry, text) {
+    if (!api || typeof api.vaultStatus !== 'function') return false;
+    try {
+      var st = await api.vaultStatus();
+      if (st.exists && st.locked) return showVaultUnlockModal(retry, text);
+    } catch (e) {}
+    return false;
+  }
+  // The job wizard runs in its own script, so it reaches the unlock
+  // modal through window, like the create-key prompt.
+  window.__showVaultUnlockModal = showVaultUnlockModal;
+  window.__offerVaultUnlockThen = offerVaultUnlockThen;
+
   /* ---------- "Create a master key" prompt (round 3) ----------
      Any password-related action taken before a master password
      exists offers this instead of silently dropping the password:
@@ -2882,10 +2987,17 @@
      runs again on its own. "Continue without saving it" runs the
      action without storing the password — the app is never blocked. */
   var masterKeyPending = null; // { retry, skip } for the action that asked
-  function askCreateMasterKey(actionLabel, retry, skip) {
+  function askCreateMasterKey(actionLabel, retry, skip, opts) {
     var modal = $('masterKeyModal'), back = $('masterKeyBackdrop');
     if (!modal) { if (skip) skip(); return; }
-    if (actionLabel) $('masterKeyText').textContent = 'This password (' + actionLabel + ') can only be saved if you create a master key first. One master password protects every saved password in the app — encrypted backups, Cloud servers, email and Tailscale.';
+    // opts.text replaces the whole line (the startup prompt has its
+    // own wording); opts.skipLabel replaces the Skip button ("Not
+    // now" at startup). Both are reset on every call so a later
+    // prompt never inherits the startup wording.
+    if (opts && opts.text) $('masterKeyText').textContent = opts.text;
+    else if (actionLabel) $('masterKeyText').textContent = 'This password (' + actionLabel + ') can only be saved if you create a master key first. One master password protects every saved password in the app — encrypted backups, Cloud servers, email and Tailscale.';
+    var skb = $('masterKeySkipBtn');
+    if (skb) skb.textContent = (opts && opts.skipLabel) || 'Continue without saving it';
     if (masterKeyPending) {
       // A prompt is already showing (e.g. Save & connect just asked
       // and the connect flow asks again for the same password): chain
@@ -2993,7 +3105,7 @@
       // Connect looks dead until the app is opened. Connect opens it.
       if (sub) sub.textContent = st.guiRunning === false
         ? 'The Tailscale app is not running — press Connect and the app will open it for you.'
-        : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected.');
+        : (st.backendState === 'Stopped' ? 'You are signed in, but the VPN is off.' : 'Tailscale is not connected — press Connect to start it.');
       if (btn) btn.textContent = 'Connect';
       if (lb) lb.style.display = 'none';
       // The settings live in this card (API credentials, key expiry,
@@ -3070,6 +3182,15 @@
     if (!v.oauthClientId && !v.apiTokenInVault && !v.oauthClientSecretInVault) return null;
     return v.oauthClientId ? { clientId: v.oauthClientId } : {};
   }
+  // After a credential is saved, say at once whether it actually
+  // WORKS ("saved" alone says nothing) — the verify runs right now
+  // and the toast carries the real outcome.
+  async function confirmVpnCredentialSaved(kind) {
+    var vr = await refreshVpnApiCredsStatus(true);
+    if (vr && vr.valid) toast('VPN', kind + ' saved and verified — it works with the Tailscale API.', 'success');
+    else if (vr) toast('VPN', kind + ' saved, but it does not work: ' + (vr.error || 'could not verify it.'), 'error');
+    else toast('VPN', kind + ' saved.', 'success');
+  }
   async function saveVpnSettings(patch) {
     var v = Object.assign({}, (settings.vpn && typeof settings.vpn === 'object') ? settings.vpn : {}, patch);
     try {
@@ -3088,10 +3209,14 @@
         if (settings.vpn) { settings.vpn.oauthClientSecret = ''; if (patch.oauthClientSecret) settings.vpn.oauthClientSecretInVault = true; }
       }
       if (res && res.needsMasterKey && notSaved.length) {
-        askCreateMasterKey('the Tailscale credential', function () { saveVpnSettings(patch); },
+        askCreateMasterKey('the Tailscale credential', function () { saveVpnSettings(patch).then(function (r2) { if (r2 && !((r2.secretsNotSaved || []).length)) confirmVpnCredentialSaved(patch.apiToken !== undefined ? 'API token' : 'OAuth client'); }).catch(function () {}); },
           function () { toast('Credential not saved', 'The Tailscale credential was not saved because there is no master key yet.', 'warning'); });
       } else if (res && res.needsUnlock && notSaved.length) {
-        toast('Vault is locked', 'The Tailscale credential was not saved: unlock the vault in Settings → Security and save again.', 'warning');
+        // The vault is locked: show the unlock modal itself and
+        // re-run the save after unlocking — the old toast pointed
+        // at Settings, where no Unlock button ever existed.
+        var shown = await offerVaultUnlockThen(function () { saveVpnSettings(patch).then(function (r2) { if (r2 && !((r2.secretsNotSaved || []).length)) confirmVpnCredentialSaved(patch.apiToken !== undefined ? 'API token' : 'OAuth client'); }).catch(function () {}); }, 'The vault is locked. Enter your master password to save the Tailscale credential.');
+        if (!shown) toast('Vault is locked', 'The Tailscale credential was not saved because the vault is locked.', 'warning');
       }
       return res;
     } catch (e) { /* keep the in-memory value; the toggle still works this session */ return null; }
@@ -3151,17 +3276,34 @@
   // once a minute) and right after every save.
   var vpnApiCredsLastVerify = 0;
   var vpnApiCredsVerifying = false;
+  // The word sits in the collapsed summary, so it must say WHY on
+  // its own — the full reason lives on the line inside the box.
+  function vpnCredsShortReason(error) {
+    var e = String(error || '');
+    if (/refused the token/.test(e)) return 'token refused';
+    if (/refused the OAuth client/.test(e)) return 'OAuth client refused';
+    if (/Could not reach the Tailscale API|did not answer in time/.test(e)) return 'could not reach the Tailscale API';
+    if (/vault is locked/i.test(e)) return 'vault is locked';
+    if (/No API credential/.test(e)) return 'no credentials saved';
+    if (/Connect to Tailscale first/.test(e)) return 'connect to Tailscale first';
+    if (/not installed/.test(e)) return 'Tailscale is not installed';
+    return e.length > 80 ? e.slice(0, 80) + '…' : (e || 'did not work');
+  }
   async function refreshVpnApiCredsStatus(force) {
     var word = $('vpnApiCredsStatusWord');
     var line = $('vpnApiCredsStatus');
-    if (!word && !line) return;
+    if (!word && !line) return null;
     var setWord = function (text, cls) { if (word) { word.textContent = text; word.className = 't-sub ' + (cls || ''); } };
     var setLine = function (text, cls) { if (line) { line.textContent = text; line.className = 't-sub ' + (cls || ''); } };
     var auth = vpnAuth();
-    if (!auth) { setWord('· Not saved', ''); setLine('No credentials saved yet — save an OAuth client or a token below, and this line will say whether it works.'); return; }
-    if (!force && Date.now() - vpnApiCredsLastVerify < 60000) return;
-    if (vpnApiCredsVerifying) return;
-    if (!api || typeof api.vpnVerifyApi !== 'function') return;
+    // Two statuses, two labels — the connection word lives in the
+    // hero above ("Tailscale connection"), this one is always the
+    // API sign-in, so a lone "Disconnected" can never be read as
+    // the VPN itself being down.
+    if (!auth) { setWord('· Not saved', ''); setLine('No credentials saved yet — save an OAuth client or a token below, and this line will say whether it works.'); return { valid: false, error: 'No credentials saved.' }; }
+    if (!force && Date.now() - vpnApiCredsLastVerify < 60000) return null;
+    if (vpnApiCredsVerifying) return null;
+    if (!api || typeof api.vpnVerifyApi !== 'function') return null;
     vpnApiCredsVerifying = true;
     setWord('· Verifying…', '');
     setLine('Verifying the credentials with the Tailscale API…');
@@ -3172,13 +3314,18 @@
         var via = r.via === 'oauth' ? 'OAuth client' : (r.via === 'token' ? 'API token' : 'credentials');
         setWord('· Connected', 'vpn-creds-ok');
         setLine('Connected — the ' + via + ' works with the Tailscale API.');
+        return { valid: true, via: r.via };
       } else {
-        setWord('· Disconnected', 'vpn-creds-bad');
-        setLine('Disconnected — ' + ((r && r.error) || 'the credentials did not work.'));
+        var err = (r && r.error) || 'the credentials did not work.';
+        setWord('· API: Disconnected — ' + vpnCredsShortReason(err), 'vpn-creds-bad');
+        setLine('Disconnected — ' + err);
+        return { valid: false, error: err };
       }
     } catch (e) {
-      setWord('· Disconnected', 'vpn-creds-bad');
-      setLine('Disconnected — ' + (e && e.message ? e.message : 'could not check the credentials.'));
+      var err2 = e && e.message ? e.message : 'could not check the credentials.';
+      setWord('· API: Disconnected — ' + vpnCredsShortReason(err2), 'vpn-creds-bad');
+      setLine('Disconnected — ' + err2);
+      return { valid: false, error: err2 };
     } finally { vpnApiCredsVerifying = false; }
   }
   // Turn key expiry back ON through the API (the toggle flipped off).
@@ -3731,13 +3878,29 @@
       if (p1.length < 8) { toast('Password too short', 'The master password must be at least 8 characters.', 'warning'); return; }
       if (p1 !== p2) { toast('Passwords do not match', 'Please repeat the same master password.', 'warning'); return; }
       try {
-        var r = await api.vaultSetup(p1);
+        // Reset mode (started from the startup unlock modal): the Set
+        // button REPLACES the vault — old saved passwords are gone.
+        // Normal mode: first-time setup.
+        var r = vaultResetArmed ? await api.vaultReset(p1) : await api.vaultSetup(p1);
         if (r && r.success) {
-          $('vaultNewPass').value = ''; $('vaultNewPassConfirm').value = ''; toast('Vault set up', 'Master password saved. The vault is unlocked for this session.', 'success');
-          // A "Create a master key" prompt was waiting on this: run
-          // the original action again now that the vault exists.
-          if (masterKeyPending && masterKeyPending.retry) { var retry = masterKeyPending.retry; masterKeyPending = null; try { retry(); } catch (e) {} }
-          else masterKeyPending = null;
+          $('vaultNewPass').value = ''; $('vaultNewPassConfirm').value = '';
+          if (vaultResetArmed) {
+            vaultResetArmed = false;
+            toast('New master password set', 'The old vault was replaced. Saved passwords from the old master password are gone — save them again where needed.', 'success');
+            // The reset cleared the "saved in the vault" flags on
+            // disk: reload so the UI stops claiming passwords are
+            // saved (SMTP placeholder, Tailscale credentials line,
+            // Cloud client records).
+            try { await loadSettings(); } catch (e) {}
+            try { await loadCloud(); } catch (e) {}
+            masterKeyPending = null;
+          } else {
+            toast('Vault set up', 'Master password saved. The vault is unlocked for this session.', 'success');
+            // A "Create a master key" prompt was waiting on this: run
+            // the original action again now that the vault exists.
+            if (masterKeyPending && masterKeyPending.retry) { var retry = masterKeyPending.retry; masterKeyPending = null; try { retry(); } catch (e) {} }
+            else masterKeyPending = null;
+          }
         }
         else toast('Setup failed', (r && r.error) || 'Could not set up the vault.', 'error');
       } catch (e) { toast('Setup failed', e && e.message ? e.message : 'Could not set up the vault.', 'error'); }
@@ -3755,22 +3918,28 @@
       } catch (e) { toast('Change failed', e && e.message ? e.message : 'Could not change the master password.', 'error'); }
       refreshVaultStatus();
     });
-    var vlb = $('vaultLockBtn');
-    if (vlb) vlb.addEventListener('click', async function () {
-      try { await api.vaultLock(); toast('Vault locked', 'Job passwords are locked until you unlock the vault again.', ''); } catch (e) {}
-      refreshVaultStatus();
-    });
+    // No Lock button any more (Settings → Security keeps only
+    // create / change): the vault locks itself when the app closes,
+    // and the next launch asks for the master password again.
+    // (The vault-lock IPC stays for tests; no UI calls it.)
     var vub = $('vaultUnlockBtn');
     if (vub) vub.addEventListener('click', async function () {
       var pw = $('vaultUnlockPass').value;
       try {
         var r = await api.vaultUnlock(pw);
-        if (r && r.success) { $('vaultUnlockPass').value = ''; hideVaultModal(); toast('Vault unlocked', 'Scheduled encrypted backups can run again.', 'success'); }
+        if (r && r.success) {
+          $('vaultUnlockPass').value = '';
+          var pend = vaultUnlockPending; vaultUnlockPending = null;
+          hideVaultModal(); toast('Vault unlocked', 'Scheduled encrypted backups can run again.', 'success');
+          if (pend) { try { pend(); } catch (e) {} }
+        }
         else { $('vaultUnlockError').classList.add('show'); }
       } catch (e) { $('vaultUnlockError').classList.add('show'); }
     });
     var vus = $('vaultUnlockSkip');
-    if (vus) vus.addEventListener('click', hideVaultModal);
+    if (vus) vus.addEventListener('click', function () { vaultUnlockPending = null; hideVaultModal(); });
+    var vrb = $('vaultResetBtn');
+    if (vrb) vrb.addEventListener('click', function () { startVaultReset(); });
     var mkg = $('masterKeyGoBtn');
     if (mkg) mkg.addEventListener('click', function () {
       hideMasterKeyModal();
@@ -4007,11 +4176,20 @@
       var res = await saveVpnSettings({ apiToken: token });
       // A blank field keeps the saved token (it is in the vault now,
       // so the field never holds it) — it no longer deletes it.
+      // The credentials box opens at once, before the verify: the
+      // verify can take a few seconds when the API is slow.
+      var d0 = $('vpnApiCreds'); if (d0) d0.open = true;
       if (res && res.secretsNotSaved && res.secretsNotSaved.indexOf('apiToken') >= 0) {
         if (!res.needsMasterKey && !res.needsUnlock) toast('VPN', 'API token could not be saved.', 'error');
-      } else toast('VPN', token ? 'API token saved.' : 'No token entered — the saved one (if any) is kept.', 'success');
-      var d0 = $('vpnApiCreds'); if (d0) d0.open = true;
-      refreshVpnApiCredsStatus(true);
+        // needsMasterKey / needsUnlock: the prompt or the unlock
+        // modal is already showing; its retry saves and verifies.
+        refreshVpnApiCredsStatus(true);
+      } else if (token) {
+        confirmVpnCredentialSaved('API token');
+      } else {
+        toast('VPN', 'No token entered — the saved one (if any) is kept.', 'success');
+        refreshVpnApiCredsStatus(true);
+      }
       refreshVpnKeyExpiryState();
       refreshVpnRoutesState();
     });
@@ -4022,11 +4200,16 @@
       var id = idInp ? idInp.value.trim() : '';
       var sec = secInp ? secInp.value.trim() : '';
       var res2 = await saveVpnSettings({ oauthClientId: id, oauthClientSecret: sec });
+      var d1 = $('vpnApiCreds'); if (d1) d1.open = true;
       if (res2 && res2.secretsNotSaved && res2.secretsNotSaved.indexOf('oauthSecret') >= 0) {
         if (!res2.needsMasterKey && !res2.needsUnlock) toast('VPN', 'OAuth client could not be saved.', 'error');
-      } else toast('VPN', (id && sec) ? 'OAuth client saved.' : 'Nothing entered — the saved client (if any) is kept.', 'success');
-      var d1 = $('vpnApiCreds'); if (d1) d1.open = true;
-      refreshVpnApiCredsStatus(true);
+        refreshVpnApiCredsStatus(true);
+      } else if (id && sec) {
+        confirmVpnCredentialSaved('OAuth client');
+      } else {
+        toast('VPN', 'Nothing entered — the saved client (if any) is kept.', 'success');
+        refreshVpnApiCredsStatus(true);
+      }
       refreshVpnKeyExpiryState();
       refreshVpnRoutesState();
     });
@@ -4184,21 +4367,40 @@
     var cua = $('cloudUserAddBtn');
     if (cua) cua.addEventListener('click', async function () {
       if (!api || typeof api.cloudUserAdd !== 'function') return cloudMissing();
+      var doAdd = async function () {
+        try {
+          var r = await api.cloudUserAdd({
+            name: ($('cloudUserName') || {}).value || '',
+            password: ($('cloudUserPass') || {}).value || '',
+            root: ($('cloudUserRoot') || {}).value || '',
+            canWrite: $('cloudUserCanWrite') ? $('cloudUserCanWrite').checked : false,
+          });
+          if (r && r.success) {
+            toast('User added', r.user.name + ' can now connect.', 'success');
+            var n = $('cloudUserName'); if (n) n.value = '';
+            var p = $('cloudUserPass'); if (p) p.value = '';
+            var rt = $('cloudUserRoot'); if (rt) rt.value = '';
+            await loadCloud();
+            return true;
+          } else toast('Add user failed', (r && r.error) || 'Could not add user.', 'error');
+        } catch (e) { toast('Add user error', e && e.message ? e.message : 'Could not add user.', 'error'); }
+        return false;
+      };
+      // A server user has a password, so adding one is a
+      // password-related action: with no master key yet, offer to
+      // create one first (same gate as the Cloud Client save) and
+      // add the user right after. Skipping still adds the user.
+      // (The user password itself stays scrypt-hashed in
+      // cloud.json, not in the vault — the prompt is the gate.)
       try {
-        var r = await api.cloudUserAdd({
-          name: ($('cloudUserName') || {}).value || '',
-          password: ($('cloudUserPass') || {}).value || '',
-          root: ($('cloudUserRoot') || {}).value || '',
-          canWrite: $('cloudUserCanWrite') ? $('cloudUserCanWrite').checked : false,
-        });
-        if (r && r.success) {
-          toast('User added', r.user.name + ' can now connect.', 'success');
-          var n = $('cloudUserName'); if (n) n.value = '';
-          var p = $('cloudUserPass'); if (p) p.value = '';
-          var rt = $('cloudUserRoot'); if (rt) rt.value = '';
-          await loadCloud();
-        } else toast('Add user failed', (r && r.error) || 'Could not add user.', 'error');
-      } catch (e) { toast('Add user error', e && e.message ? e.message : 'Could not add user.', 'error'); }
+        var hasKey = true;
+        try { hasKey = await window.__vaultExists(); } catch (e) {}
+        if (!hasKey) {
+          askCreateMasterKey('the Cloud user password', function () { doAdd(); }, async function () { var ok = await doAdd(); if (ok) toast('User added without a master key', 'The user was added, but no master key was created — the app will ask you again when it starts.', 'warning'); });
+          return;
+        }
+      } catch (e) {}
+      doAdd();
     });
     var cca = $('cloudClientAddBtn');
     if (cca) cca.addEventListener('click', async function () {

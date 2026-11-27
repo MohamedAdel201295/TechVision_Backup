@@ -310,7 +310,7 @@
     <div id="settingsSecuritySection" class="card cloud-section" style="display:none;">
       <h3 style="margin:0 0 4px;font-size:14px;">Master password</h3>
       <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">One password that unlocks the vault where passwords are stored — for encrypted backups, saved Cloud servers, email notifications and the Tailscale API. The vault file lives in the app's own data folder — never in Windows, never in plain text.</p>
-      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">Once you enter it, this device remembers it — you will not be asked again unless you lock the vault or reinstall the app. There is no way to recover a forgotten master password.</p>
+      <p style="color:var(--muted); margin:0 0 8px; font-size:12px;">The program asks for it every time it starts. If you forget it, the only way is to create a new one — and that deletes every saved password (backup passwords, Cloud servers, email and Tailscale). Changing it here, with the current password, is different: it re-encrypts the vault and keeps all saved passwords.</p>
       <p style="font-size:13px;" id="vaultStatusText">Checking vault…</p>
       <div id="vaultSetupBox">
         <div class="field">
@@ -321,6 +321,7 @@
           <label for="vaultNewPassConfirm">Confirm master password</label>
           <input type="password" id="vaultNewPassConfirm" placeholder="Repeat the master password" autocomplete="new-password">
         </div>
+        <p id="vaultResetWarning" style="display:none; color:#e07b7b; margin:0 0 8px; font-size:12px;">You are creating a NEW master password because the old one is lost. Every password saved with the old one — encrypted backups, Cloud servers, email and Tailscale — will stop working and cannot be recovered. Only do this if you are sure.</p>
         <button class="btn" type="button" id="vaultSetupBtn" style="margin-top:4px;">Set master password</button>
       </div>
       <div id="vaultChangeBox" style="display:none;">
@@ -337,7 +338,6 @@
           <input type="password" id="vaultChangeConfirm" placeholder="Repeat the new master password" autocomplete="new-password">
         </div>
         <button class="btn" type="button" id="vaultChangeBtn" style="margin-top:4px;">Change master password</button>
-        <button class="btn btn-ghost" type="button" id="vaultLockBtn" style="margin-top:4px;">🔒 Lock vault</button>
       </div>
     </div>
         <div id="settingsEmailSection" class="card cloud-section" style="display:none;">
@@ -672,7 +672,7 @@
     <div class="card vpn-hero" id="vpnHero">
       <div class="vpn-status-row">
         <div>
-          <div class="t-label">Tailscale status</div>
+          <div class="t-label">Tailscale connection</div>
           <div class="vpn-status"><span id="vpnStatusDot" class="vpn-dot"></span><span id="vpnStatusText">Checking…</span></div>
           <div class="t-sub" id="vpnStatusSub"></div>
         </div>
@@ -1215,6 +1215,7 @@
     <button class="btn btn-primary" type="button" id="vaultUnlockBtn">Unlock</button>
     <button class="btn btn-ghost" type="button" id="vaultUnlockSkip">Skip for now</button>
   </div>
+  <button class="btn btn-ghost" type="button" id="vaultResetBtn" style="display:none; margin-top:10px;">I forgot it — create a new master password instead</button>
   <p style="font-size:12px; color:var(--muted); margin:10px 0 0;">Skipping leaves the vault locked: scheduled encrypted backups will not run, and manual runs will ask for the job password instead.</p>
 </div>
 <div class="backdrop" id="masterKeyBackdrop"></div>

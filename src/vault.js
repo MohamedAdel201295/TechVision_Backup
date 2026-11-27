@@ -128,6 +128,22 @@ function setupVault(userDataDir, masterPassword) {
   return key;
 }
 
+/* Replace the vault with a fresh one (the "I forgot my master
+   password" path at startup). The old vault file is deleted first,
+   so every secret the old key encrypted is GONE for good — the
+   caller must warn the user and get a confirmation before calling
+   this. The old remember-me blob (if any) is deleted too, since it
+   unlocks the old vault only. setupVault's "already exists" guard is
+   bypassed here on purpose: replacing is the whole point. */
+function resetVault(userDataDir, masterPassword) {
+  if (!masterPassword || masterPassword.length < 8) {
+    throw new Error('Master password must be at least 8 characters.');
+  }
+  try { fs.unlinkSync(getVaultPath(userDataDir)); } catch (e) { /* no old vault */ }
+  try { clearUnlockBlob(userDataDir); } catch (e) { /* no old blob */ }
+  return setupVault(userDataDir, masterPassword);
+}
+
 function unlockVault(userDataDir, masterPassword) {
   const data = readVault(userDataDir);
   if (!data) throw new Error('No vault has been set up yet.');
@@ -357,7 +373,7 @@ function changeMasterPassword(userDataDir, oldPassword, newPassword) {
 }
 
 module.exports = {
-  getVaultPath, vaultExists, setupVault, unlockVault, lockVault,
+  getVaultPath, vaultExists, setupVault, resetVault, unlockVault, lockVault,
   storeJobPassword, getJobPassword, hasJobPassword,
   removeJobPassword, changeMasterPassword,
   storeSecret, getSecret, hasSecret, removeSecret,

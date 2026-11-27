@@ -336,7 +336,7 @@ async function exchangeOAuthToken(clientId, clientSecret) {
     oauthTokenCache = { clientId, accessToken: j.access_token, expiresAt: now + ((j.expires_in || 3600) * 1000) };
     return { token: j.access_token };
   } catch (e) {
-    return { error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+    return { error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message && e.message !== 'fetch failed' ? e.message : 'Could not reach the Tailscale API.') };
   } finally { clearTimeout(timer); }
 }
 
@@ -372,7 +372,11 @@ async function apiFetch(apiPath, authHeader, opts) {
     try { body = await res.json(); } catch (e) { /* empty body on success */ }
     return { ok: res.ok, status: res.status, body };
   } catch (e) {
-    return { ok: false, status: 0, body: null, error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message ? e.message : 'Could not reach the Tailscale API.') };
+    // Node's fetch reports a refused/DNS failure as a bare "fetch
+    // failed" — the credentials line must say what that means in
+    // plain words instead of showing the engine jargon. Any other
+    // specific message (e.g. a certificate problem) is kept as-is.
+    return { ok: false, status: 0, body: null, error: e && e.name === 'AbortError' ? 'Tailscale API did not answer in time.' : (e && e.message && e.message !== 'fetch failed' ? e.message : 'Could not reach the Tailscale API.') };
   } finally { clearTimeout(timer); }
 }
 
