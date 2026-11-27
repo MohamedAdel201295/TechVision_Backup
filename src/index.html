@@ -1115,17 +1115,15 @@
           <div class="field" id="restorePasswordField" style="display:none;">
             <label for="restorePassword">Backup password</label>
             <input type="password" id="restorePassword" placeholder="Password for this encrypted backup" autocomplete="off">
-            <div class="hint">This backup is encrypted (TechVision-only). Enter its backup password — the same one used when it was created. Without it, the files cannot be restored.</div>
+            <div class="hint">This backup is encrypted (TechVision-only). Enter its backup password to restore it.</div>
             <div class="field-error" id="restorePasswordError">Please enter the backup password.</div>
           </div>
           <button class="btn btn-ghost btn-sm" type="button" id="restoreAdvancedBtn" aria-expanded="false">Advanced Options ▸</button>
-          <div id="restoreAdvanced" style="display:none; margin-top:4px;">
+          <div id="restoreAdvanced" style="display:none; margin-top:2px;">
             <label class="check"><input type="checkbox" id="optOverwrite"> Overwrite existing files</label>
           </div>
-          <div class="note" style="margin-top:8px;">
-            <strong>Phase 2</strong><br>
-            Streaming restore with yauzl is implemented.<br>
-            VSS (Volume Shadow Copy) is NOT implemented. Locked files will be skipped during backup.
+          <div class="note" style="margin-top:4px;">
+            <strong>Phase 2</strong> — Streaming restore with yauzl is implemented. VSS (Volume Shadow Copy) is NOT implemented. Locked files will be skipped during backup.
           </div>
         </section>
       </div>
