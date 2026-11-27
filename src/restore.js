@@ -885,7 +885,31 @@ class RestoreEngine {
       const manifest = readManifest(zipPath);
       const dir = path.dirname(destPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const tmpPath = tempPathFor(destPath);
+      // Containment (same policy as the TVB single-file path and the
+      // bulk restore): the destination is the restore folder + the
+      // entry's path inside the backup, so the root is destPath with
+      // the entry's path segments removed. A pre-existing symlink
+      // (or Windows junction) in between must not redirect the write
+      // outside that root — resolve the REAL parent and write
+      // through it. (When the caller renames the file, the derived
+      // root is wider than the real folder — the check then passes,
+      // and the write still goes through the real parent.)
+      let realDest = destPath;
+      try {
+        const parts = rel.split('/').filter(function (p) { return p && p !== '.'; });
+        let root = destPath;
+        for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+        const realRoot = fs.realpathSync(root);
+        const realParent = fs.realpathSync(dir);
+        if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+          throw new Error('Skipped unsafe path: ' + entryName);
+        }
+        realDest = path.join(realParent, path.basename(destPath));
+      } catch (e) {
+        if (/Skipped unsafe path/.test(e.message)) throw e;
+        throw new Error('Failed to create folder for ' + entryName + ': ' + e.message);
+      }
+      const tmpPath = tempPathFor(realDest);
       const copied = await copyFileHashed(src, tmpPath);
       if (manifest) {
         const want = manifest.files[rel];
@@ -896,7 +920,7 @@ class RestoreEngine {
       }
       const skipped = skippedResult(tmpPath);
       if (skipped) return skipped;
-      fs.renameSync(tmpPath, destPath);
+      fs.renameSync(tmpPath, realDest);
       return { files: 1 };
     }
     // TechVision-only encrypted backup (.tvb): decrypt the entry
@@ -1006,12 +1030,36 @@ class RestoreEngine {
       }
       const dir = path.dirname(destPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const tmpPath = tempPathFor(destPath);
+      // Containment (same policy as the TVB single-file path and the
+      // bulk restore): the destination is the restore folder + the
+      // entry's path inside the backup, so the root is destPath with
+      // the entry's path segments removed. A pre-existing symlink
+      // (or Windows junction) in between must not redirect the write
+      // outside that root — resolve the REAL parent and write
+      // through it. (When the caller renames the file, the derived
+      // root is wider than the real folder — the check then passes,
+      // and the write still goes through the real parent.)
+      let realDest = destPath;
+      try {
+        const parts = wanted.split('/').filter(function (p) { return p && p !== '.'; });
+        let root = destPath;
+        for (let i = 0; i < parts.length; i++) root = path.dirname(root);
+        const realRoot = fs.realpathSync(root);
+        const realParent = fs.realpathSync(dir);
+        if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+          throw new Error('Skipped unsafe path: ' + entryName);
+        }
+        realDest = path.join(realParent, path.basename(destPath));
+      } catch (e) {
+        if (/Skipped unsafe path/.test(e.message)) throw e;
+        throw new Error('Failed to create folder for ' + entryName + ': ' + e.message);
+      }
+      const tmpPath = tempPathFor(realDest);
       try {
         await zipAes.decryptEntryToFile(zipPath, hit, password, tmpPath);
         const skipped = skippedResult(tmpPath);
         if (skipped) return skipped;
-        fs.renameSync(tmpPath, destPath);
+        fs.renameSync(tmpPath, realDest);
       } catch (e) {
         try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
         throw e;
