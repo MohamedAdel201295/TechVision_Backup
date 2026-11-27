@@ -686,7 +686,7 @@
       applyModuleUI('vpn');
       setBackTitle('VPN');
       setAppTitle('TechVision Tailscale VPN', 'Your private network — every device, anywhere, as if it were home.');
-      loadVpn();
+      loadVpn(true); // fresh open: credential fields reset (typed-but-unsaved input from last visit is dropped)
     }
     if (name === 'wireguard') {
       lastBackupView = name;
@@ -3038,7 +3038,26 @@
 
   function vpnMissing() { toast('VPN', 'The VPN bridge is not available in this build.', 'error'); }
 
-  async function loadVpn() {
+  // API credential fields: what is typed stays typed while the VPN
+  // page is open. A view refresh or a status poll used to blank the
+  // token/secret fields and overwrite the client ID with the saved
+  // value, wiping a credential mid-typing (2026-11-27). While the
+  // page is open, a field is only ever filled on a fresh open
+  // (reset=true: token/secret blank, client ID from settings) —
+  // a poll or a refresh never overwrites a value, though the
+  // placeholder still updates. Leaving the VPN page without Save
+  // still drops what was typed: showView('vpn') resets on open,
+  // and Save stays the only thing that persists anything.
+  function fillVpnCredFields(reset) {
+    var tok = $('vpnApiToken');
+    if (tok) { if (reset) tok.value = ''; tok.placeholder = (settings.vpn && settings.vpn.apiTokenInVault) ? 'Saved in the vault — leave blank to keep it' : 'tskey-api-…'; }
+    var ocid = $('vpnOauthClientId');
+    if (ocid && reset) ocid.value = (settings.vpn && settings.vpn.oauthClientId) || '';
+    var osec = $('vpnOauthClientSecret');
+    if (osec) { if (reset) osec.value = ''; osec.placeholder = (settings.vpn && settings.vpn.oauthClientSecretInVault) ? 'Saved in the vault — leave blank to keep it' : 'OAuth client secret'; }
+  }
+
+  async function loadVpn(resetCreds) {
     if (!api || typeof api.vpnGetStatus !== 'function') return vpnMissing();
     var st;
     try { st = await api.vpnGetStatus(); } catch (e) { st = { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
@@ -3118,14 +3137,31 @@
       // applies while advertising).
       if (dc) dc.style.display = '';
       var ket0 = $('vpnKeyExpiryToggle'); if (ket0) ket0.checked = vpnKeyExpiryWanted();
-      var tok0 = $('vpnApiToken'); if (tok0) { tok0.value = ''; tok0.placeholder = (settings.vpn && settings.vpn.apiTokenInVault) ? 'Saved in the vault — leave blank to keep it' : 'tskey-api-…'; }
-      var ocid0 = $('vpnOauthClientId'); if (ocid0) ocid0.value = (settings.vpn && settings.vpn.oauthClientId) || '';
-      var osec0 = $('vpnOauthClientSecret'); if (osec0) { osec0.value = ''; osec0.placeholder = (settings.vpn && settings.vpn.oauthClientSecretInVault) ? 'Saved in the vault — leave blank to keep it' : 'OAuth client secret'; }
+      fillVpnCredFields(!!resetCreds);
       refreshVpnRoutesState();
       refreshVpnKeyExpiryState();
       refreshVpnApiCredsStatus(false);
       renderVpnPeers([]);
       return;
+    }
+    // Stale advertisement, fixed on sight (2026-11-27): the router
+    // was advertising the 10.0.0.0/24 tunnel subnet instead of the
+    // home LAN. When it is ON and the advertised set no longer
+    // matches the freshly detected LAN, re-advertise the right
+    // subnet and reload the status. At most one attempt every 5
+    // minutes, so a failing daemon does not make every 15-second
+    // poll run `tailscale up`.
+    if (st.connected && (st.advertiseRoutes || []).length && st.lanSubnet && (st.advertiseRoutes || []).indexOf(st.lanSubnet) < 0
+      && api && typeof api.vpnReconcileSubnet === 'function' && Date.now() - vpnLastSubnetReconcile > 5 * 60 * 1000) {
+      vpnLastSubnetReconcile = Date.now();
+      try {
+        var rc = await api.vpnReconcileSubnet(vpnAuth(), st);
+        if (rc && rc.reconciled) {
+          st = await api.vpnGetStatus();
+          vpnStatusCache = st || {};
+          toast('VPN', 'Sharing your home network — the advertised route was corrected to ' + (rc.subnet || st.lanSubnet) + ' (it was ' + ((rc.previous || []).join(', ') || 'a stale route') + ').', 'success');
+        }
+      } catch (e) { /* next view load retries (throttled above) */ }
     }
     if (txt) txt.textContent = 'Connected';
     if (sub) sub.textContent = 'You are on your private network' + (st.tailnet ? (' — ' + st.tailnet) : '') + '.';
@@ -3144,9 +3180,7 @@
       ? ('Let devices on Tailscale reach your whole home network (' + st.lanSubnet + ' — printer, camera, router).')
       : 'Let devices on Tailscale reach your whole home network (printer, camera, router).';
     var ket = $('vpnKeyExpiryToggle'); if (ket) ket.checked = vpnKeyExpiryWanted();
-    var tok = $('vpnApiToken'); if (tok) { tok.value = ''; tok.placeholder = (settings.vpn && settings.vpn.apiTokenInVault) ? 'Saved in the vault — leave blank to keep it' : 'tskey-api-…'; }
-    var ocid = $('vpnOauthClientId'); if (ocid) ocid.value = (settings.vpn && settings.vpn.oauthClientId) || '';
-    var osec = $('vpnOauthClientSecret'); if (osec) { osec.value = ''; osec.placeholder = (settings.vpn && settings.vpn.oauthClientSecretInVault) ? 'Saved in the vault — leave blank to keep it' : 'OAuth client secret'; }
+    fillVpnCredFields(!!resetCreds);
     renderVpnPeers(st.peers || []);
     // First sign-in (or first view while connected): turn off the 180-day
     // key expiry automatically, so the device never asks to sign in again.
@@ -3357,6 +3391,7 @@
   // The console button only shows when the approval is missing and
   // the API cannot do it, and the note then carries the real reason.
   var vpnRoutesLastApproveTry = 0;
+  var vpnLastSubnetReconcile = 0; // throttle for the stale-route fix above
   var vpnRoutesApprovedHint = null; // {subnet, at} — a successful approve
   // call is trusted for a minute, so the note says "approved" at once
   // instead of waiting for the control plane to show it on a re-read.

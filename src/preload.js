@@ -143,6 +143,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   vpnGetStatus: () => ipcRenderer.invoke('vpn-get-status'),
   vpnSetConnected: (on) => ipcRenderer.invoke('vpn-set-connected', on),
   vpnSetRoutes: (on, auth) => ipcRenderer.invoke('vpn-set-routes', on, auth),
+  vpnReconcileSubnet: (auth, status) => ipcRenderer.invoke('vpn-reconcile-subnet', auth, status || null),
   vpnInstallConnect: (adminCreds) => ipcRenderer.invoke('vpn-install-connect', adminCreds || null),
   vpnDisableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-disable-key-expiry', auth),
   vpnEnableKeyExpiry: (auth) => ipcRenderer.invoke('vpn-enable-key-expiry', auth),

@@ -2948,7 +2948,7 @@ async function reconnectMapDrives() {
 // The module only shells out to the Tailscale CLI that is already
 // installed on the machine; it implements no VPN of its own.
 ipcMain.handle('vpn-get-status', async () => {
-  try { return await vpn.getStatus(); }
+  try { vpn.setTunnelAddress(getWgConfig().server.address); return await vpn.getStatus(); }
   catch (e) { return { installed: true, connected: false, error: e && e.message ? e.message : 'Could not read Tailscale status.' }; }
 });
 ipcMain.handle('vpn-set-connected', async (event, on) => {
@@ -2972,8 +2972,16 @@ ipcMain.handle('vpn-set-connected', async (event, on) => {
 ipcMain.handle('vpn-set-routes', async (event, on, auth) => {
   // Secrets come from the vault here, not the renderer: the renderer
   // only ever sends the OAuth client id.
-  try { return await vpn.setSubnetRouter(!!on, resolveVpnAuth(auth)); }
+  try { vpn.setTunnelAddress(getWgConfig().server.address); return await vpn.setSubnetRouter(!!on, resolveVpnAuth(auth)); }
   catch (e) { return { success: false, error: e && e.message ? e.message : 'Could not change the subnet router setting.' }; }
+});
+// Re-advertise the home LAN when the advertised route went stale
+// (2026-11-27: the router advertised the 10.0.0.0/24 tunnel subnet).
+// `status` is the renderer's already-fetched status, so no second
+// status read is needed; without it the module reads its own.
+ipcMain.handle('vpn-reconcile-subnet', async (event, auth, status) => {
+  try { vpn.setTunnelAddress(getWgConfig().server.address); return await vpn.reconcileSubnetRouter(resolveVpnAuth(auth), status || null); }
+  catch (e) { return { success: false, reconciled: false, error: e && e.message ? e.message : 'Could not check the subnet router.' }; }
 });
 ipcMain.handle('vpn-get-routes', async (event, auth) => {
   try { return await vpn.getDeviceRoutes(resolveVpnAuth(auth)); }
