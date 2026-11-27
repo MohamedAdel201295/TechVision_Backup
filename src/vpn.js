@@ -456,13 +456,18 @@ async function selfDeviceId() {
   return { id: st.deviceId, error: null };
 }
 
-/* One API call with the resolved credential; on a 401 with OAuth the
-   cached token is dropped and the call is retried once with a fresh one. */
+/* One API call with the resolved credential; on a 401 or 403 with OAuth
+   the cached token is dropped and the call is retried once with a fresh
+   one. The 403 matters as much as the 401: Tailscale answers a missing
+   scope with 403, so a token minted BEFORE a scope was granted in the
+   console would otherwise keep failing until it expired (~1h) or the
+   app restarted. All calls through here are idempotent, so one retry
+   is safe. */
 async function apiCallWithAuth(apiPath, auth, opts) {
   const first = await resolveApiAuth(auth);
   if (first.error) return { ok: false, status: 0, body: null, error: first.error, via: first.via || null };
   const r = await apiFetch(apiPath, first.header, opts);
-  if (r.status === 401 && first.via === 'oauth') {
+  if ((r.status === 401 || r.status === 403) && first.via === 'oauth') {
     oauthTokenCache = null;
     const second = await resolveApiAuth(auth);
     if (second.error) return { ok: false, status: 0, body: null, error: second.error, via: 'oauth' };
