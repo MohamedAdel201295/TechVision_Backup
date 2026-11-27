@@ -4436,9 +4436,14 @@
               vpnRoutesApprovedHint = { subnet: r.subnet, at: Date.now() };
               toast('VPN', 'Sharing your home network — the route was approved automatically.', 'success');
             } else {
+              // The console never opens by itself: the "Open admin
+              // console to approve the route" button below is the only
+              // manual path. The approval itself is still attempted
+              // automatically (and retried by the status poll).
               vpnRoutesApprovedHint = null;
-              if (typeof api.vpnOpenAdmin === 'function') await api.vpnOpenAdmin();
-              toast('VPN', 'Sharing your home network — approve the route in the Tailscale admin console (it just opened in your browser).' + (r.approveError ? ' The automatic approval failed: ' + r.approveError : ''), 'success');
+              toast('VPN', r.approveError
+                ? 'Sharing your home network — the route is advertising but still waiting for approval. The automatic approval failed: ' + r.approveError + ' — press "Open admin console to approve the route" below to approve it.'
+                : 'Sharing your home network — the route is advertising but still waiting for approval. Press "Open admin console to approve the route" below to approve it.', 'success');
             }
           } else {
             vpnRoutesApprovedHint = null;
