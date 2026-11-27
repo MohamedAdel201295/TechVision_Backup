@@ -336,6 +336,9 @@ select.filter {
    tier below re-measures the same budget (card starts ~64px down
    there). */
 #view-wizard .modal-wrap, #view-restore .modal-wrap { padding: 4px 8px 8px; }
+/* Batch 2 #7: the wizard card is the same size as the Restore card
+   (920px wide — heights already shared) — the wizard inner area grows. */
+#view-wizard .modal-wrap { max-width: 920px; }
 #view-wizard .modal-wrap .wizard-card, #view-restore .modal-wrap .wizard-card { max-height: calc(100vh - 96px); }
 #view-wizard .modal-wrap .wizard-card .modal-body, #view-restore .modal-wrap .wizard-card .modal-body { max-height: calc(100vh - 209px); }
 .modal-card, .wizard-card {
@@ -344,6 +347,11 @@ select.filter {
 }
 .modal-head { padding: 8px 22px 0; display: flex; align-items: flex-start; gap: 12px; }
 .modal-head h1, .modal-head h2 { font-size: 20px; margin: 0; }
+/* Batch 2 #6: Back button inline beside the wizard/restore title —
+   same row as the h1, compact so the header height does not grow. */
+.title-row { display: flex; align-items: center; gap: 10px; }
+.title-row h1 { margin: 0; }
+.title-back-btn { flex-shrink: 0; padding: 3px 10px; font-size: 13px; }
 .modal-head p { color: var(--muted); margin: 4px 0 0; font-size: 13px; }
 .modal-body { padding: 10px 22px 16px; }
 .field { margin-bottom: 11px; }

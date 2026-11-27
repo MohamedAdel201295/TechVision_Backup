@@ -252,7 +252,6 @@
         <h2 class="section-title" style="margin:0;">Logs</h2>
         <p style="color:var(--muted); margin:4px 0 0; font-size:13px;">Today's tasks, what finished, what failed or is still waiting for its drive — and the full log.</p>
       </div>
-      <button class="btn btn-ghost" type="button" id="logsRefreshBtn"><span class="refresh-glyph">⟳</span> Refresh</button>
     </div>
     <div class="log-tabs" id="logsTabs" role="tablist">
       <button class="log-tab active" type="button" data-logtab="today">Today</button>
@@ -883,7 +882,10 @@
     <div class="modal-head">
       <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
       <div>
-        <h1 id="wizardTitle">New Backup Job</h1>
+        <div class="title-row">
+          <button class="back-btn title-back-btn" type="button" id="wizardBackBtn">‹ Back</button>
+          <h1 id="wizardTitle">New Backup Job</h1>
+        </div>
         <p>Five quick steps — the wizard stays open while you pick folders.</p>
       </div>
     </div>
@@ -1061,7 +1063,10 @@
     <div class="modal-head">
       <img src="assets/TechVision_Logo.png" alt="" style="width:38px;height:38px;object-fit:contain;border-radius:9px;background:#fff;padding:2px;" onerror="this.style.display='none'">
       <div>
-        <h1>Restore Backup</h1>
+        <div class="title-row">
+          <button class="back-btn title-back-btn" type="button" id="restoreBackBtn">‹ Back</button>
+          <h1>Restore Backup</h1>
+        </div>
         <p>Pick a .zip backup file and a folder to restore it into.</p>
       </div>
     </div>

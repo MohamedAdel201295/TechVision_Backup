@@ -648,7 +648,9 @@
        origin view (the same destination as Back), so their back bar
        is redundant too — hiding it buys the wizard card the same
        ~30px, which is what finally lets the tallest steps fit with
-       no scroll at all (round 2 #5). */
+       no scroll at all (round 2 #5). Batch 2 #6 adds a Back button
+       INLINE beside the wizard/restore title instead — the top back
+       bar stays hidden on both views. */
     var bb = $('backBar'); if (bb) bb.style.display = (name === 'dashboard' || name === 'wizard' || name === 'restore') ? 'none' : '';
     /* The top-bar subtitle is redundant — every view carries its own
        heading and description in the page — so it stays hidden and
@@ -3995,7 +3997,11 @@
 
     $('navRestore').addEventListener('click', function () { openRestore(null); });
     var brb = $('backupTopRefreshBtn');
-    if (brb) brb.addEventListener('click', function () { playManualRefreshAnim(); refreshJobs(); });
+    /* Batch 2 #4: the labeled Logs Refresh button is gone — the topbar
+       icon is the only Logs refresh now, so it must re-render the Logs
+       list too when the Logs view is showing (refreshJobs only reloads
+       the job data). */
+    if (brb) brb.addEventListener('click', function () { playManualRefreshAnim(); refreshJobs().then(function () { if (currentView === 'logs') renderLogs(currentLogTab); }); });
     $('themeToggle').addEventListener('click', async function () {
       var next = document.body.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
       applyTheme(next);
@@ -4138,7 +4144,6 @@
         var nav = btn.getAttribute('data-nav');
         document.querySelectorAll('.nav-item').forEach(function (n) { n.classList.remove('active'); });
         btn.classList.add('active');
-        if (nav === 'logs') toast('Logs', 'Open the Log Viewer from the Logs window.', '');
         if (nav === 'jobs') showView('jobs');
         if (nav === 'dashboard') showView('dashboard');
         if (nav === 'logs') showView('logs');
@@ -4429,8 +4434,6 @@
     document.querySelectorAll('#logsTabs .log-tab').forEach(function (btn) {
       btn.addEventListener('click', function () { renderLogs(btn.getAttribute('data-logtab')); });
     });
-    var lrb = $('logsRefreshBtn');
-    if (lrb) lrb.addEventListener('click', function () { playManualRefreshAnim(); spinOnce(lrb.querySelector('.refresh-glyph')); loadJobs().then(function () { renderLogs(currentLogTab); }); });
     var llf = $('logsLevelFilter');
     if (llf) llf.addEventListener('change', renderFullLog);
     var ls = $('logsSearch');
@@ -4883,6 +4886,12 @@
   });
     var tbb = $('topBackBtn');
     if (tbb) tbb.addEventListener('click', goBack);
+    /* Batch 2 #6: Back buttons inline beside the wizard / restore
+       titles — same destination as Cancel (goBack). */
+    var wbb = $('wizardBackBtn');
+    if (wbb) wbb.addEventListener('click', goBack);
+    var rbb = $('restoreBackBtn');
+    if (rbb) rbb.addEventListener('click', goBack);
 
     loadSettings().then(function () { loadJobs(); checkVaultOnStartup(); refreshVaultStatus(); });
     showView('dashboard');
