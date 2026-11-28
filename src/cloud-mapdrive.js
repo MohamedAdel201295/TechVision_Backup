@@ -257,40 +257,84 @@ async function resolvePlayerCommand(ext) {
   return null;
 }
 
-// Substitute the URL for the %1 placeholder of a registered open
-// command (usually already quoted: "%1"); a command with no %1
-// gets the quoted URL appended.
-function buildPlayerCommandLine(command, url) {
-  const cmd = String(command || '');
-  const u = String(url || '');
-  if (/%1/i.test(cmd)) return cmd.replace(/%1/gi, u);
-  return cmd + ' "' + u + '"';
+// Split a Windows command template ("C:\Program Files\...\player.exe"
+// "%1" /play) into tokens the way the shell would: quoted parts stay
+// whole, "" inside quotes is a literal quote. No shell is ever run
+// on the result — the tokens go straight to spawn() as argv.
+function splitCommandLine(s) {
+  const out = [];
+  let cur = '';
+  let inQ = false;
+  let has = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '"') {
+      if (inQ && s[i + 1] === '"') { cur += '"'; i++; }
+      else inQ = !inQ;
+      has = true;
+    } else if (!inQ && (ch === ' ' || ch === '\t')) {
+      if (has) { out.push(cur); cur = ''; has = false; }
+    } else { cur += ch; has = true; }
+  }
+  if (has) out.push(cur);
+  return out;
+}
+
+// Build the argv for a registered player open command. The %1 (or
+// %L) placeholder is replaced with the media URL as ONE argument —
+// never re-parsed, never expanded — so a percent-encoded URL keeps
+// its %XX sequences intact (an Arabic filename becomes %D8%B3... and
+// must reach the player exactly like that). Only the EXE path gets
+// %VAR% expansion (Windows expands those in the template itself); a
+// command with no placeholder gets the URL appended. Returns null
+// when the template is empty.
+function buildPlayerArgv(command, url) {
+  const parts = splitCommandLine(String(command || ''));
+  if (!parts.length) return null;
+  // Windows expands %VAR% case-insensitively; match that so a
+  // template using %systemroot% still resolves.
+  const envLower = {};
+  for (const k of Object.keys(process.env)) envLower[k.toLowerCase()] = process.env[k];
+  const exe = parts[0].replace(/%([^%]+)%/g, (m, name) => (envLower[String(name).toLowerCase()] !== undefined ? envLower[String(name).toLowerCase()] : m));
+  const args = [];
+  let replaced = false;
+  for (const p of parts.slice(1)) {
+    if (/%1|%L/i.test(p)) { args.push(p.replace(/%1|%L/gi, url)); replaced = true; }
+    else args.push(p);
+  }
+  if (!replaced) args.push(url);
+  return { exe, args };
 }
 
 // Open a DAV media URL in the registered media player for its
-// extension. Returns { success: false, fallback: true } when there
-// is no association or the launch fails — the caller then falls
-// back to the browser, exactly as before.
+// extension. The player is launched DIRECTLY (spawn exe + argv) —
+// never through cmd.exe, which expands %...% as environment
+// variables and mangles a percent-encoded URL, so an Arabic filename
+// never reached the player intact. Returns { success: false,
+// playerFailed: true, error } when there is no association or the
+// launch fails — the caller shows the error in the app instead of
+// falling back to the browser.
 async function openMediaInPlayer(url, ext) {
-  if (!isWindows()) return { success: false, fallback: true, error: 'Windows only.' };
+  if (!isWindows()) return { success: false, playerFailed: true, error: 'Windows only.' };
   const resolved = await resolvePlayerCommand(ext);
-  if (!resolved || !resolved.command) return { success: false, fallback: true, error: 'No media player is registered for .' + String(ext || '').replace(/^\./, '') + ' files.' };
-  const cmdLine = buildPlayerCommandLine(resolved.command, url);
+  if (!resolved || !resolved.command) return { success: false, playerFailed: true, error: 'No media player is registered for .' + String(ext || '').replace(/^\./, '') + ' files.' };
+  const argv = buildPlayerArgv(resolved.command, url);
+  if (!argv) return { success: false, playerFailed: true, error: 'The registered media player command could not be read.' };
   return new Promise((resolve) => {
     let done = false;
     const finish = (r) => { if (!done) { done = true; resolve(r); } };
     let child;
     try {
-      child = spawn('cmd.exe', ['/c', cmdLine], { windowsHide: true, detached: true });
+      child = spawn(argv.exe, argv.args, { windowsHide: true, detached: true });
     } catch (e) {
-      return finish({ success: false, fallback: true, error: 'Could not start the media player: ' + (e && e.message ? e.message : String(e)) });
+      return finish({ success: false, playerFailed: true, error: 'Could not start the media player: ' + (e && e.message ? e.message : String(e)) });
     }
-    child.on('error', (e) => finish({ success: false, fallback: true, error: 'Could not start the media player: ' + (e && e.message ? e.message : String(e)) }));
+    child.on('error', (e) => finish({ success: false, playerFailed: true, error: 'Could not start the media player: ' + (e && e.message ? e.message : String(e)) }));
     // A player that exits at once with an error never took the URL;
     // one that stays up (or detaches) has it. 500 ms is enough to tell.
     const timer = setTimeout(() => { try { child.unref(); } catch (e) {} finish({ success: true, player: resolved.progId }); }, 500);
     child.on('exit', (code) => {
-      if (code !== 0 && code !== null) { clearTimeout(timer); finish({ success: false, fallback: true, error: 'The media player exited with an error (code ' + code + ').' }); }
+      if (code !== 0 && code !== null) { clearTimeout(timer); finish({ success: false, playerFailed: true, error: 'The media player exited with an error (code ' + code + ').' }); }
     });
   });
 }
@@ -565,7 +609,8 @@ module.exports = {
   officeUriFor,
   mediaUrlFor,
   openMediaInPlayer,
-  buildPlayerCommandLine,
+  buildPlayerArgv,
+  splitCommandLine,
   resolvePlayerCommand,
   seedCredentials,
   credentialTargetsFor,

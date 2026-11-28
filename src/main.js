@@ -212,6 +212,19 @@ const cloudSessions = new Map();
 // never a password.
 const openCredResolved = new Set();
 
+// "Prompt on next open" (2026-11-28): serverIds whose next direct
+// open must show the app credential window EVEN THOUGH a password is
+// saved. Set by "Forget password": the user asked to type the
+// credentials again, and the connect-time auto-save must not silently
+// satisfy the open gate. Cleared only when the credentials are
+// verified (cloud-open-verify-password success) — a Cancel never
+// clears it, so the window keeps appearing on every open attempt
+// until the credentials are entered once. In-memory only: a fresh
+// launch has no saved prompt to satisfy anyway (no saved password
+// survives a launch without the vault), and a disconnect / record
+// remove / vault lock / vault reset clears it like openCredResolved.
+const promptOnNextOpen = new Set();
+
 // ---------- TechVision Cloud — Map network drive ----------
 // State file: <userData>/.techvision/mapdrive.json —
 // { mappings: [{ serverId, letter, host, port, user, reconnect }] }.
@@ -2211,6 +2224,7 @@ ipcMain.handle('vault-reset', async (event, masterPassword) => {
     // The old vault is gone, so every saved password with it: direct
     // opens must prompt again (see the app-owned credential prompt).
     openCredResolved.clear();
+    promptOnNextOpen.clear();
     afterVaultUnlocked();
     return { success: true, replaced: hadVault };
   } catch (e) { return { success: false, error: e.message }; }
@@ -2250,6 +2264,7 @@ ipcMain.handle('vault-lock', async () => {
   // prompt again until the vault is unlocked (see the app-owned
   // credential prompt).
   openCredResolved.clear();
+  promptOnNextOpen.clear();
   // Also drop any leftover remember-me blob from the old build, so
   // the next launch asks for the master password again.
   try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
@@ -2523,11 +2538,34 @@ ipcMain.handle('cloud-client-forget-password', async (event, id) => {
   const cfg = getCloudConfig();
   const rec = (cfg.clients || []).find((c) => c.id === id);
   if (!rec) return { success: false, error: 'Server not found.' };
+  // (1) Forget means disconnected: drop the live session exactly the
+  // way cloud-client-disconnect does (server logout + session delete
+  // + stop save-back), so the user is actually signed out — the
+  // browser, the badge and the file list all go away with it.
+  const conn = cloudSessions.get(id);
+  if (conn) {
+    try { await cloudClient.logout(conn); } catch (e) { /* local drop is enough */ }
+  }
+  cloudSessions.delete(id);
+  try { cloudSaveback.stop(id); } catch (e) {}
+  // (3) The next direct open must show the app credential window
+  // again, even though the connect auto-saves the typed password:
+  // the flag forces the open gate to answer password-needed until
+  // the credentials are verified once. Cancel never clears it.
+  promptOnNextOpen.add(id);
   rec.password = null;
   rec.passwordInVault = false;
   openCredResolved.delete(id);
+  // (2) Trust reset: the fingerprint and pinned cert belong to the
+  // saved credentials. Forgetting them means the next connect starts
+  // from scratch — nothing Trust-related shows for this server until
+  // the user probes and trusts it again, which re-installs the cert
+  // on the next connect (Trust & connect).
+  rec.fingerprint = null;
+  rec.certPem = null;
   try { if (vaultKey) vault.removeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + id); } catch (e) {}
   saveCloudConfig();
+  appendAppLog('info', '[Cloud] Saved password forgotten for ' + (rec.name || rec.host) + ' — disconnected, trust cleared, next open will ask for the credentials again.');
   return { success: true };
 });
 
@@ -2536,6 +2574,7 @@ ipcMain.handle('cloud-client-remove', async (event, id) => {
   cfg.clients = cfg.clients.filter((c) => c.id !== id);
   cloudSessions.delete(id);
   openCredResolved.delete(id);
+  promptOnNextOpen.delete(id);
   saveCloudConfig();
   return { success: true };
 });
@@ -2652,6 +2691,12 @@ ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
   }
   cloudSessions.delete(serverId);
   openCredResolved.delete(serverId);
+  // NOTE: promptOnNextOpen is deliberately NOT cleared here. It
+  // means "the user asked to type the credentials again" (set by
+  // Forget), and a plain disconnect does not satisfy that request —
+  // only a verified credential entry does. Clearing it here would
+  // silently drop the Forget request the moment the renderer
+  // disconnects after forgetting (which it does).
   // No session, no save-back: a disconnected server's temp copies
   // stop being watched (their edits stay in the temp copy).
   try { cloudSaveback.stop(serverId); } catch (e) {}
@@ -3060,10 +3105,13 @@ async function seedCloudCredentialsForOpen(serverId, rec) {
 // password against the Cloud server WITHOUT creating a session and
 // WITHOUT opening anything. A DAV PROPFIND on /dav/ with HTTP Basic
 // auth exercises the exact credential path the players and Office
-// use, pinned to the record's certificate. The password travels only
-// in the Authorization header over pinned TLS — never in the URL,
-// never in a log line. 2xx = the credentials are right; 401 = wrong
-// user name or password; 429 = locked out after too many failures.
+// use, pinned to the record's certificate — or, when the record's
+// trust was cleared by Forget, to the live session's certificate
+// (the session was connected with that pin, so it is the same
+// server). The password travels only in the Authorization header
+// over pinned TLS — never in the URL, never in a log line. 2xx = the
+// credentials are right; 401 = wrong user name or password; 429 =
+// locked out after too many failures.
 function davProbeCredentials(host, port, certPem, user, password) {
   return new Promise((resolve) => {
     if (!certPem) return resolve({ error: 'No trusted certificate for this server.' });
@@ -3101,7 +3149,13 @@ ipcMain.handle('cloud-open-verify-password', async (event, serverId, user, passw
     const u = String(user || '').trim();
     const pw = String(password || '');
     if (!u || !pw) return { ok: false, code: 'missing', error: 'Enter the user name and password.' };
-    const probe = await davProbeCredentials(rec.host, rec.port, rec.certPem, u, pw);
+    // Pin to the record's certificate; when Forget cleared the
+    // record's trust, fall back to the live session's pin (the
+    // session was connected with it). Without either, the window
+    // could never verify — the probe refuses instead of guessing.
+    const liveConn = cloudSessions.get(serverId);
+    const pinPem = rec.certPem || (liveConn && liveConn.certPem) || null;
+    const probe = await davProbeCredentials(rec.host, rec.port, pinPem, u, pw);
     if (probe.status === 401) return { ok: false, code: 'wrong-password', error: 'Wrong user name or password. Try again.' };
     if (probe.status === 429) return { ok: false, code: 'locked', error: 'Too many failed logins. Try again later.' };
     if (probe.error) return { ok: false, code: 'unreachable', error: probe.error };
@@ -3112,6 +3166,10 @@ ipcMain.handle('cloud-open-verify-password', async (event, serverId, user, passw
       const conn = cloudSessions.get(serverId);
       if (conn) cloudSessions.set(serverId, Object.assign({}, conn, { user: u, password: pw }));
       openCredResolved.add(serverId);
+      // The credentials were entered and verified: the "prompt on
+      // next open" request from Forget is satisfied — never ask again
+      // for this server (until another Forget).
+      promptOnNextOpen.delete(serverId);
       try { await cloudMapDrive.seedCredentials(rec.host, rec.port, u, pw); } catch (e) {}
       return { ok: true };
     }
@@ -3132,8 +3190,11 @@ ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
     // no SAVED password must not reach the browser/Office prompt.
     // The renderer shows the app's own window instead; this handler
     // reports the need and opens nothing. Mapped-drive opens never
-    // call this handler, so they never prompt.
-    if (!getClientPassword(rec) && !openCredResolved.has(serverId)) {
+    // call this handler, so they never prompt. A "prompt on next
+    // open" flag (set by Forget) asks for the window even when a
+    // password IS saved — the connect-time auto-save must not
+    // silently satisfy the gate.
+    if ((!getClientPassword(rec) || promptOnNextOpen.has(serverId)) && !openCredResolved.has(serverId)) {
       return { success: false, code: 'password-needed', user: rec.user };
     }
     const uri = cloudMapDrive.officeUriFor(rec.host, rec.port, relPath);
@@ -3167,11 +3228,13 @@ ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
 // requests, so a video starts playing without downloading first.
 // Cert trust + credential seeding are identical to Office: the
 // player must trust the server cert, and must not be asked for a
-// login it cannot answer. Returns { success: false } on any failure
-// so the caller falls through to temp silently — only the temp path
-// shows an error. The built URL is returned even on failure (the
-// sandbox has no player, so the Windows-only cert step blocks the
-// open there — the caller/driver can still assert the exact URL).
+// login it cannot answer. A player failure returns code
+// 'player-failed' so the caller shows the real reason in the app
+// instead of falling through to temp or the browser; other failures
+// (not connected, cert declined) still fall through to temp. The
+// built URL is returned even on failure (the sandbox has no player,
+// so the Windows-only cert step blocks the open there — the
+// caller/driver can still assert the exact URL).
 ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
   try {
     const conn = cloudSessions.get(serverId);
@@ -3180,7 +3243,9 @@ ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
     const rec = (cfg.clients || []).find((c) => c.id === serverId);
     if (!rec) return { success: false, error: 'Server not found.' };
     // App-owned credential prompt (2026-11-28): see cloud-office-open.
-    if (!getClientPassword(rec) && !openCredResolved.has(serverId)) {
+    // A "prompt on next open" flag (set by Forget) forces the window
+    // even when a password is saved.
+    if ((!getClientPassword(rec) || promptOnNextOpen.has(serverId)) && !openCredResolved.has(serverId)) {
       return { success: false, code: 'password-needed', user: rec.user };
     }
     const url = cloudMapDrive.mediaUrlFor(rec.host, rec.port, relPath);
@@ -3201,20 +3266,23 @@ ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
     // (round 2 #14: same generic URL targets as Office — players
     // fetch over HTTPS the same way; result logged).
     await seedCloudCredentialsForOpen(serverId, rec);
-    // Open in the device's media player, not the browser:
-    // shell.openExternal('https://…') always hands an https URL to
-    // the default browser. The registered player for the extension
+    // Open in the device's media player, not the browser: handing
+    // an https URL to the shell always opens the default browser.
+    // The registered player for the extension
     // is launched with the DAV URL instead; it streams with Range
     // requests and consults the seeded Credential Manager login, so
-    // it plays without a prompt. No association, or a failed launch,
-    // falls back to the browser exactly as before.
+    // it plays without a prompt. Chrome must NEVER open for media
+    // (2026-11-28): when the player cannot open the file, the
+    // handler returns the real reason with code 'player-failed' and
+    // the renderer shows it in the app — no browser, no silent temp
+    // fallback. The failure is logged so the reason is visible in
+    // the Full log too.
     const ext = (relPath.split('.').pop() || '').toLowerCase();
     const played = await cloudMapDrive.openMediaInPlayer(url, ext);
     if (played.success) return { success: true, mode: 'direct', url, player: played.player };
-    if (played.error) console.log('[Cloud] Media player open failed, falling back to the browser: ' + played.error);
-    const err = await require('electron').shell.openExternal(url);
-    if (err) return { success: false, url, error: String(err) };
-    return { success: true, mode: 'direct', url, playerFallback: true };
+    const playerError = (played && played.error) || 'The media player could not open this file.';
+    appendAppLog('info', '[Cloud] Media player open failed for ' + relPath + ': ' + playerError);
+    return { success: false, code: 'player-failed', playerFailed: true, url, error: playerError };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }

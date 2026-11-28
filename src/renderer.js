@@ -1586,7 +1586,22 @@
         forget = document.createElement('button'); forget.className = 'btn btn-ghost btn-sm'; forget.type = 'button'; forget.textContent = '🔑 Forget password';
         forget.addEventListener('click', async function () {
           if (!api || typeof api.cloudClientForgetPassword !== 'function') return cloudMissing();
-          try { var r = await api.cloudClientForgetPassword(srv.id); if (r && r.success) { toast('Cloud', 'Saved password forgotten — you will type it next time.', 'success'); await loadCloud(); } else toast('Forget failed', (r && r.error) || 'Could not forget the password.', 'error'); }
+          try {
+            var r = await api.cloudClientForgetPassword(srv.id);
+            if (r && r.success) {
+              // Forget disconnects the server (main drops the session),
+              // so the renderer must drop its side too: no Connected
+              // badge, no file browser, no poller, no pending trust
+              // offer and no connect box for that server. The card
+              // re-renders from the reloaded config, which now has no
+              // fingerprint — so nothing Trust-related shows until the
+              // user trusts the server again on the next connect.
+              if (cloudConn && cloudConn.serverId === srv.id) await cloudDisconnect();
+              closeCloudConnect();
+              toast('Cloud', 'Saved password forgotten — disconnected. The next open will ask for the user name and password again.', 'success');
+              await loadCloud();
+            } else toast('Forget failed', (r && r.error) || 'Could not forget the password.', 'error');
+          }
           catch (e) { toast('Forget error', e && e.message ? e.message : 'Could not forget the password.', 'error'); }
         });
       }
@@ -2461,12 +2476,16 @@
       // (b2) Media (round 2 #11): play it straight from the server —
       // the player streams ranges over WebDAV, so a video starts
       // without downloading first. Falls through to temp when the
-      // direct open is unavailable (certificate declined, no player).
+      // direct open is unavailable (certificate declined, not
+      // connected). A PLAYER failure is different: Chrome must never
+      // open for media, and the file must not silently drop to temp
+      // either — the app shows the real reason and stops there.
       if (cloudIsMediaFile(entry.name) && api && typeof api.cloudMediaOpen === 'function') {
         try {
           var md = await cloudDirectOpenWithCredPrompt('media', cloudConn.serverId, entry.rel);
           if (md && md.cancelled) return; // credential prompt cancelled: do not open at all
           if (md && md.success) { cloudSetLastOpenMode('direct'); return; }
+          if (md && md.playerFailed) { toast('Could not open in the media player', (md && md.error) || 'The media player could not open this file.', 'error'); return; }
         } catch (e) {}
       }
     }
