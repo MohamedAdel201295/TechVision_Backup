@@ -2937,16 +2937,23 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
     // Certificate trust (once per server, admin): the saved record
     // holds certPem from the probe/trust flow. The fingerprint must
     // match the saved record before anything is installed — never
-    // install any other certificate.
+    // install any other certificate. Timings are kept for the Map
+    // trace: a failed Map logs the cert steps too (certutil -store
+    // Root can be slow), so the Full log shows the whole attempt.
+    const mapPreTrace = [];
     if (rec.certPem) {
       const fp = cloudServerMod.fingerprintOfCertPem(rec.certPem);
       if (rec.fingerprint && rec.fingerprint !== fp) {
         return { success: false, error: 'The saved certificate does not match this server. Remove the server in the Client tab and add it again.' };
       }
+      const tCert0 = Date.now();
       const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
+      mapPreTrace.push('cert check: ' + (trusted.success ? (trusted.trusted ? 'trusted' : 'not trusted yet') : 'FAILED — ' + (trusted.error || '')) + ' in ' + (Date.now() - tCert0) + 'ms');
       if (!trusted.success) return { success: false, error: trusted.error };
       if (!trusted.trusted) {
+        const tInst0 = Date.now();
         const inst = await cloudMapDrive.installCert(rec.certPem);
+        mapPreTrace.push('cert install: ' + (inst.success ? 'ok' : 'FAILED — ' + (inst.error || '')) + ' in ' + (Date.now() - tInst0) + 'ms');
         if (!inst.success) return { success: false, declined: !!inst.declined, error: inst.error };
       }
     } else {
@@ -2980,7 +2987,18 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
     // the same physical server, skipping any the cert does not cover.
     const altHosts = Array.isArray(rec.altHosts) ? rec.altHosts.filter((h) => h && String(h).toLowerCase() !== String(rec.host).toLowerCase()) : [];
     const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec), altHosts, coversHost: (h) => cloudServerMod.certCoversHost(rec.certPem, h) });
-    if (!mapped.success) return { success: false, error: mapped.error };
+    if (!mapped.success) {
+      // A failed Map MUST leave a trace in the app log: before this
+      // change the failure path logged nothing, so the Full log had
+      // no record of a Map that failed at all. The trace (cert
+      // steps, WebClient, net use exit code + output, verification
+      // attempts, timings) is what reveals the real cause on the
+      // device — the password is never in it (scrubbed in mapDrive).
+      appendAppLog('error', '[Cloud] Map failed: ' + rec.host + ':' + rec.port + ' as drive ' + l + ': ' + (mapped.error || ''));
+      for (const line of mapPreTrace) appendAppLog('error', '[Cloud] Map trace ' + l + ': ' + line);
+      if (Array.isArray(mapped.trace)) for (const line of mapped.trace) appendAppLog('error', '[Cloud] Map trace ' + l + ': ' + line);
+      return { success: false, error: mapped.error };
+    }
     // mapDrive verifies the drive exists in this session before
     // reporting success, so this record means a real, visible drive.
     state.mappings = state.mappings.filter((m) => m.serverId !== serverId && m.letter !== l);
@@ -3314,6 +3332,7 @@ async function reconnectMapDrives() {
       }
       const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
       appendAppLog(r.success ? 'info' : 'error', '[Cloud] Map drive ' + m.letter + ': reconnect ' + (r.success ? 'ok' : ('failed — ' + (r.error || ''))));
+      if (!r.success && Array.isArray(r.trace)) for (const line of r.trace) appendAppLog('error', '[Cloud] Map trace ' + m.letter + ': ' + line);
     }
   } catch (e) {}
 }

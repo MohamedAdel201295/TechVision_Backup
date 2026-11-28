@@ -404,6 +404,24 @@ function mapErrorText(r) {
   return raw ? 'Mapping failed: ' + raw.slice(0, 300) : 'Mapping failed (net use error ' + (r.code || '?') + ').';
 }
 
+// --- Map attempt trace (2026-11-28 diagnostics round) ---
+// A failed Map used to leave NO trace in the app log: `net use`
+// exits 0 while the drive never sticks, and the failure path logged
+// nothing at all — the Full log ended with old success lines. The
+// trace records every step (timings, net use exit code + output,
+// verification results) so a failed Map on the device explains
+// itself. Passwords never enter the trace: outputs are scrubbed of
+// the exact password string before they are recorded.
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// One line for the trace: single-line, whitespace collapsed, capped
+// so a chatty command cannot flood the app log.
+function traceText(s, maxLen) {
+  return String(s || '').replace(/\s+/g, ' ').trim().slice(0, maxLen || 400);
+}
+
 // Map https://host:port/dav as a drive letter, in the app's OWN
 // session (2026-11-28 correction: a normal-user run maps in the
 // user session, an elevated run maps in the admin session — the
@@ -432,35 +450,58 @@ async function mapDrive(opts) {
   if (!user || !password) return { success: false, error: 'password-needed' };
   const altHosts = Array.isArray(opts && opts.altHosts) ? opts.altHosts.map((h) => String(h || '').trim()).filter(Boolean) : [];
   const coversHost = opts && typeof opts.coversHost === 'function' ? opts.coversHost : null;
+  // The attempt trace: every step of this mapping, with timings and
+  // the raw output of the commands that ran. Returned on every
+  // result so the caller can write it to the app log on failure.
+  // The password is scrubbed out of any recorded output first.
+  const trace = [];
+  const scrub = (s) => {
+    const t = String(s || '');
+    return password ? t.split(password).join('[password]') : t;
+  };
+  const tWc0 = Date.now();
   const wc = await ensureWebClient();
-  if (!wc.success) return wc;
+  trace.push('webclient: ' + (wc.success ? 'running' : 'FAILED — ' + traceText(wc.error || '')) + ' in ' + (Date.now() - tWc0) + 'ms');
+  if (!wc.success) return Object.assign({}, wc, { trace });
   // A letter that is already mapped to THIS server is fine — reuse
   // it instead of failing with error 85. The remote is compared
   // with remoteMatchesDav, not string equality: Windows reports the
   // remote as \\host@SSL@port\dav, never as the https URL.
+  const tPre0 = Date.now();
   const cur = await getDriveStatus(letter);
-  if (cur.success && cur.mapped && remoteMatchesDav(cur.remote, host, port)) return { success: true, letter, host, alreadyMapped: true };
+  trace.push('precheck ' + letter + ': ' + (cur.success ? (cur.mapped ? 'mapped to "' + traceText(scrub(cur.remote || '')) + '"' : 'not mapped') : 'status error — ' + traceText(cur.error || '')) + ' in ' + (Date.now() - tPre0) + 'ms');
+  if (cur.success && cur.mapped && remoteMatchesDav(cur.remote, host, port)) return { success: true, letter, host, alreadyMapped: true, trace };
 
   const attempt = async (h) => {
+    const tNet0 = Date.now();
     const r = await runCmd('net.exe', ['use', letter + ':', davUrl(h, port), '/user:' + user, password, '/persistent:no'], 60000);
+    trace.push('net use ' + letter + ': ' + davUrl(h, port) + ' /user:' + user + ': exit=' + (r.code === undefined || r.code === null ? '?' : r.code) + ' in ' + (Date.now() - tNet0) + 'ms; stdout: "' + traceText(scrub(r.stdout)) + '"; stderr: "' + traceText(scrub(r.stderr)) + '"');
     if (!r.success) {
       const is1219 = /system error 1219/.test((r.stdout + ' ' + r.stderr).toLowerCase());
-      return { success: false, error: mapErrorText(r), code: is1219 ? '1219' : undefined };
+      return { success: false, error: mapErrorText(r), code: is1219 ? '1219' : undefined, trace };
     }
     // Post-map verification, in THIS session, before any success is
     // reported: the status must show this server's mapping AND the
     // drive root must open. A `net use` that exits 0 while the
-    // drive never sticks is a failure, not a mapped drive.
-    const st = await getDriveStatus(letter);
-    if (!st.success || !st.mapped || !remoteMatchesDav(st.remote, h, port)) {
-      return { success: false, error: 'Mapping reported success, but drive ' + letter + ': did not appear afterwards (verification failed) — the mapping did not stick. Try again, or disconnect any other mapping to this server first.' };
+    // drive never sticks is a failure, not a mapped drive. The
+    // redirector may need a moment to surface the drive, so
+    // re-check a few times with a short delay before giving up.
+    let sawStatus = false;
+    for (let v = 1; v <= 3; v++) {
+      const tV0 = Date.now();
+      const st = await getDriveStatus(letter);
+      let reachable = false;
+      try { reachable = fs.existsSync(letter + ':\\'); } catch (e) {}
+      const statusOk = !!(st.success && st.mapped && remoteMatchesDav(st.remote, h, port));
+      if (statusOk) sawStatus = true;
+      trace.push('verify attempt ' + v + '/3: mapped=' + (st.success && st.mapped ? 'yes' : 'no') + ' remote="' + traceText(scrub(st.remote || '')) + '" exists=' + reachable + ' in ' + (Date.now() - tV0) + 'ms; net use ' + letter + ': output: "' + traceText(scrub(st.raw || '')) + '"');
+      if (statusOk && reachable) return { success: true, letter, host: h, trace };
+      if (v < 3) await sleep(1000);
     }
-    let reachable = false;
-    try { reachable = fs.existsSync(letter + ':\\'); } catch (e) {}
-    if (!reachable) {
-      return { success: false, error: 'Mapping reported success, but drive ' + letter + ': cannot be opened afterwards (verification failed) — the mapping did not stick.' };
+    if (!sawStatus) {
+      return { success: false, error: 'Mapping reported success, but drive ' + letter + ': did not appear afterwards (verification failed) — the mapping did not stick. Try again, or disconnect any other mapping to this server first.', trace };
     }
-    return { success: true, letter, host: h };
+    return { success: false, error: 'Mapping reported success, but drive ' + letter + ': cannot be opened afterwards (verification failed) — the mapping did not stick.', trace };
   };
 
   const first = await attempt(host);
@@ -477,7 +518,7 @@ async function mapDrive(opts) {
     if (r.success) { r.viaAltHost = true; return r; }
     if (r.code !== '1219') return r; // a different failure: report it, don't keep guessing
   }
-  return { success: false, code: '1219', error: 'Windows already has a connection to this server with different credentials (System error 1219) — the other mapping to ' + host + ' must be disconnected first, or the second user must reach the server under a different address (its LAN address or hostname). The automatic retry under another address could not be used (no alternate address, or the server certificate does not cover it).' };
+  return { success: false, code: '1219', error: 'Windows already has a connection to this server with different credentials (System error 1219) — the other mapping to ' + host + ' must be disconnected first, or the second user must reach the server under a different address (its LAN address or hostname). The automatic retry under another address could not be used (no alternate address, or the server certificate does not cover it).', trace };
 }
 
 async function unmapDrive(letter) {
@@ -502,12 +543,14 @@ async function getDriveStatus(letter) {
   if (!/^[A-Z]$/.test(l)) return { success: false, error: 'Bad drive letter.' };
   const r = await runCmd('net.exe', ['use', l + ':'], 15000);
   const text = r.stdout || '';
-  if (!r.success || /there are no entries in the list/i.test(text)) return { success: true, mapped: false, letter: l };
+  // `raw` is the verbatim `net use X:` output, for the Map trace:
+  // on a failed Map it shows exactly what Windows reported.
+  if (!r.success || /there are no entries in the list/i.test(text)) return { success: true, mapped: false, letter: l, raw: text };
   const m = /Remote name\s+(\S+)/i.exec(text);
   const remote = m ? m[1].trim() : '';
   let exists = false;
   try { exists = fs.existsSync(l + ':\\'); } catch (e) {}
-  return { success: true, mapped: !!remote, letter: l, remote, reachable: exists };
+  return { success: true, mapped: !!remote, letter: l, remote, reachable: exists, raw: text };
 }
 
 // Letters Windows already uses (local drives + mapped drives), so
