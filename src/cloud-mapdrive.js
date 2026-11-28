@@ -160,9 +160,14 @@ async function isElevated() {
 // on every press. Accept every form Windows can report for the
 // same DAV root: the UNC form (with or without @SSL@), the URL
 // form, and the \DavWWWRoot form the redirector sometimes shows.
+// Real Windows reports the remote with TWO segments —
+// \\host@SSL@port\DavWWWRoot\dav — and that is the form the
+// redirector actually uses on the device (2026-11-28, drive M:);
+// a one-segment-only match rejected a drive that was really
+// mapped and declared "verification failed".
 function normalizeDavRemote(remote) {
   const s = String(remote || '').trim();
-  let m = /^\\\\([^@\\]+)(?:@SSL@|@)(\d+)\\(?:dav|DavWWWRoot)\\?$/i.exec(s);
+  let m = /^\\\\([^@\\]+)(?:@SSL@|@)(\d+)\\(?:DavWWWRoot(?:\\dav)?|dav)\\?$/i.exec(s);
   if (m) return { host: m[1].toLowerCase(), port: parseInt(m[2], 10), ssl: /@SSL@/i.test(s) };
   m = /^(https?):\/\/([^/:]+):(\d+)\/dav\/?$/i.exec(s);
   if (m) return { host: m[2].toLowerCase(), port: parseInt(m[3], 10), ssl: m[1].toLowerCase() === 'https' };
@@ -498,6 +503,21 @@ async function mapDrive(opts) {
       if (statusOk && reachable) return { success: true, letter, host: h, trace };
       if (v < 3) await sleep(1000);
     }
+    // A failed Map must leave nothing behind: `net use` exited 0
+    // above, so this attempt may have created a mapping that never
+    // verified — every failed Map on the device left one behind
+    // (seven stale mappings to the same server, 2026-11-28).
+    // Best-effort unmap of the letter this attempt just created.
+    // The precheck already returned early for a letter mapped to
+    // this server, and a failed `net use` never reaches here, so
+    // this only ever removes what this attempt made. An unmap
+    // failure must not change the reported error.
+    let cleanup = '';
+    try {
+      const u = await unmapDrive(letter);
+      cleanup = u.success ? 'removed' : 'FAILED — ' + traceText(u.error || '');
+    } catch (e) { cleanup = 'FAILED — ' + traceText(e && e.message ? e.message : String(e)); }
+    trace.push('cleanup ' + letter + ': ' + cleanup);
     if (!sawStatus) {
       return { success: false, error: 'Mapping reported success, but drive ' + letter + ': did not appear afterwards (verification failed) — the mapping did not stick. Try again, or disconnect any other mapping to this server first.', trace };
     }
