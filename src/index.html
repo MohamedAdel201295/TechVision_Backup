@@ -1251,6 +1251,24 @@
     <button class="btn btn-ghost" type="button" id="cloudPromptCancel">Cancel</button>
   </div>
 </div>
+<div class="backdrop" id="cloudCredBackdrop"></div>
+<div class="confirm-modal" id="cloudCredModal" role="dialog" aria-labelledby="cloudCredTitle" style="display:none;">
+  <h3 id="cloudCredTitle">Sign in to open this file</h3>
+  <p id="cloudCredSub">This server needs a user name and password before the file can open. They are saved on this device, so you only enter them once.</p>
+  <div class="field">
+    <label for="cloudCredUser">User name</label>
+    <input type="text" id="cloudCredUser" autocomplete="username">
+  </div>
+  <div class="field">
+    <label for="cloudCredPass">Password</label>
+    <input type="password" id="cloudCredPass" placeholder="Password of this user" autocomplete="current-password">
+  </div>
+  <p class="field-error" id="cloudCredError" style="display:none;"></p>
+  <div class="confirm-actions">
+    <button class="btn btn-primary" type="button" id="cloudCredOpen">Open</button>
+    <button class="btn btn-ghost" type="button" id="cloudCredCancel">Cancel</button>
+  </div>
+</div>
 <div class="backdrop" id="vaultBackdrop"></div>
 <div class="confirm-modal" id="vaultModal" role="alertdialog" aria-labelledby="vaultModalTitle" style="display:none;">
   <h3 id="vaultModalTitle">🔒 Unlock the vault</h3>

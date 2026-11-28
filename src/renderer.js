@@ -2453,7 +2453,8 @@
       // Word/Excel/PowerPoint — no temp copy, saves go back.
       if (cloudIsOfficeDoc(entry.name) && api && typeof api.cloudOfficeOpen === 'function') {
         try {
-          var o = await api.cloudOfficeOpen(cloudConn.serverId, entry.rel);
+          var o = await cloudDirectOpenWithCredPrompt('office', cloudConn.serverId, entry.rel);
+          if (o && o.cancelled) return; // credential prompt cancelled: do not open at all
           if (o && o.success) { cloudSetLastOpenMode('direct'); return; }
         } catch (e) {}
       }
@@ -2463,7 +2464,8 @@
       // direct open is unavailable (certificate declined, no player).
       if (cloudIsMediaFile(entry.name) && api && typeof api.cloudMediaOpen === 'function') {
         try {
-          var md = await api.cloudMediaOpen(cloudConn.serverId, entry.rel);
+          var md = await cloudDirectOpenWithCredPrompt('media', cloudConn.serverId, entry.rel);
+          if (md && md.cancelled) return; // credential prompt cancelled: do not open at all
           if (md && md.success) { cloudSetLastOpenMode('direct'); return; }
         } catch (e) {}
       }
@@ -2669,6 +2671,174 @@
     if (modal) modal.style.display = 'none';
     if (back) back.classList.remove('show');
     cloudPromptCallback = null;
+  }
+
+  /* ---------- App-owned credential prompt (2026-11-28) ----------
+     A direct Cloud open (Office doc or media) with no SAVED password
+     asks here, in the app's own window — never the browser's auth
+     popup, never Windows Security, never credentials in the URL.
+     Submit: the typed password is verified against the server first
+     (DAV PROPFIND, no session is created); only a verified password
+     is saved to the vault and seeded, and only then does the file
+     open. Cancel: nothing opens, nothing is saved, and the next open
+     asks again — the cancel is never remembered. A wrong password
+     shows a retry message inside this same modal. Mapped-drive opens
+     never reach this code (cloudTryMappedOpen runs first), so they
+     never prompt. */
+  var cloudCredResolve = null;
+  var cloudCredServerId = null;
+  function cloudCredShowError(msg) {
+    var e = $('cloudCredError');
+    if (!e) return;
+    if (msg) { e.textContent = msg; e.style.display = ''; } else { e.textContent = ''; e.style.display = 'none'; }
+  }
+  function cloudCloseCredModal() {
+    var modal = $('cloudCredModal'); var back = $('cloudCredBackdrop');
+    if (modal) modal.style.display = 'none';
+    if (back) back.classList.remove('show');
+    var p = $('cloudCredPass'); if (p) p.value = '';
+    cloudCredShowError(null);
+    cloudCredResolve = null;
+    cloudCredServerId = null;
+  }
+  // Cancel: the file does NOT open and nothing is saved. The cancel
+  // is never remembered — the next open asks again.
+  function cloudCredCancel() {
+    var resolve = cloudCredResolve;
+    cloudCloseCredModal();
+    if (resolve) resolve({ ok: false });
+  }
+  // Asks for the user name + password for one server. Resolves
+  // { ok: true, user, password } on Open (after a verified save
+  // attempt) or { ok: false } on Cancel. The password field is
+  // cleared the moment the modal closes, so the typed value never
+  // stays in the DOM.
+  function cloudAskOpenCredentials(serverId, userHint) {
+    return new Promise(function (resolve) {
+      var modal = $('cloudCredModal'); var back = $('cloudCredBackdrop');
+      if (!modal) return resolve({ ok: false });
+      var u = $('cloudCredUser'); if (u) u.value = userHint || '';
+      var p = $('cloudCredPass'); if (p) p.value = '';
+      cloudCredShowError(null);
+      modal.style.display = 'block';
+      if (back) back.classList.add('show');
+      cloudCredResolve = resolve;
+      cloudCredServerId = serverId;
+      setTimeout(function () { if (p) p.focus(); else if (u) u.focus(); }, 30);
+    });
+  }
+  function cloudCredSubmit() {
+    if (!cloudCredResolve) return;
+    var resolve = cloudCredResolve;
+    var serverId = cloudCredServerId;
+    var user = (($('cloudCredUser') || {}).value || '').trim();
+    var password = (($('cloudCredPass') || {}).value || '');
+    if (!user || !password) { cloudCredShowError('Enter the user name and password.'); return; }
+    var btn = $('cloudCredOpen'); if (btn) btn.disabled = true;
+    cloudCredShowError(null);
+    (async function () {
+      try {
+        if (!api || typeof api.cloudOpenVerifyPassword !== 'function') { cloudCredShowError('Could not check the password. Try again.'); return; }
+        var v = await api.cloudOpenVerifyPassword(serverId, user, password);
+        if (!v || !v.ok) {
+          if (v && v.code === 'wrong-password') cloudCredShowError('Wrong user name or password. Try again.');
+          else if (v && v.code === 'locked') cloudCredShowError('Too many failed logins. Try again later.');
+          else cloudCredShowError((v && v.error) || 'Could not reach the server. Try again.');
+          return; // stays open for a retry; nothing was saved or seeded
+        }
+        // Verified: save it to the vault (unlock/create-key flows
+        // included), then close and open the file. A skipped unlock
+        // still opens this session — the password was verified — but
+        // nothing was saved, so the next launch asks again.
+        await cloudSaveOpenPasswordFlow(serverId, user, password);
+        cloudCloseCredModal();
+        resolve({ ok: true, user: user, password: password });
+      } catch (e) {
+        cloudCredShowError('Could not check the password. Try again.');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    })();
+  }
+  // Wait until the vault modal (unlock or create-key) closes, then
+  // report whether the save retry ran. The unlock retry fires
+  // fire-and-forget after the modal hides, so the waiter re-checks
+  // the saved state instead of trusting the modal alone.
+  function cloudWaitVaultSaveDone(getDone) {
+    return new Promise(function (resolve) {
+      var deadline = Date.now() + 8000;
+      var timer = setInterval(function () {
+        if (getDone()) { clearInterval(timer); resolve(true); return; }
+        if (Date.now() > deadline) { clearInterval(timer); resolve(getDone()); return; }
+        var m = $('vaultModal');
+        var closed = !m || m.style.display === 'none';
+        if (closed) {
+          api.vaultStatus().then(function (st) {
+            if (st && st.locked) { clearInterval(timer); resolve(false); }
+          }).catch(function () {});
+        }
+      }, 200);
+    });
+  }
+  // Save a verified Cloud password for the direct open. Returns true
+  // when it is in the vault. False (skipped unlock / no vault yet)
+  // still lets the open proceed this session — the password was
+  // already verified — but the next launch prompts again.
+  async function cloudSaveOpenPasswordFlow(serverId, user, password) {
+    if (!api || typeof api.cloudClientSave !== 'function' || typeof api.vaultStatus !== 'function') return false;
+    var rec = null;
+    try { rec = ((cloudCfg && cloudCfg.clients) || []).find(function (c) { return c.id === serverId; }); } catch (e) {}
+    if (!rec) return false;
+    var saveOnce = async function () {
+      try {
+        var r = await api.cloudClientSave({ id: rec.id, name: rec.name, host: rec.host, port: rec.port, user: user, accessMode: rec.accessMode, password: password, fingerprint: rec.fingerprint, certPem: rec.certPem });
+        if (r && r.success && !r.passwordNotSaved) { try { await loadCloud(); } catch (e) {} return true; }
+        return r;
+      } catch (e) { return { success: false }; }
+    };
+    var first = await saveOnce();
+    if (first === true) return true;
+    if (first && first.passwordNotSaved && first.needsMasterKey) {
+      // The create-key retry fires fire-and-forget after the vault
+      // is set up — resolve the wait FROM the retry itself. Waiting
+      // only for Skip hangs forever after a successful create (the
+      // modal never closes and the open never retries).
+      var done = false, skipped = false;
+      await new Promise(function (resolve) {
+        var retry = function () { saveOnce().then(function (ok) { done = ok === true; resolve(); }); };
+        askCreateMasterKey('the Cloud server password', retry, function () { skipped = true; resolve(); });
+      });
+      if (!done && skipped) {
+        done = await cloudWaitVaultSaveDone(function () { return done; });
+        if (!done) { var again = await saveOnce(); return again === true; }
+      }
+      return done;
+    }
+    if (first && first.passwordNotSaved && first.needsUnlock) {
+      var unlocked = false;
+      var retry2 = function () { saveOnce().then(function (ok) { unlocked = ok === true; }); };
+      showVaultUnlockModal(retry2, 'Unlock the vault to save the Cloud server password for next time.');
+      if (!unlocked) unlocked = await cloudWaitVaultSaveDone(function () { return unlocked; });
+      if (!unlocked) { var again2 = await saveOnce(); return again2 === true; }
+      return unlocked;
+    }
+    return false;
+  }
+  // Direct open (Office or media) with the credential prompt in front
+  // of it. Returns the handler result, or { cancelled: true } when
+  // the user cancelled the prompt — the caller must NOT fall through
+  // to temp then. The open is retried exactly ONCE after a successful
+  // prompt; a second password-needed result is treated as a cancel.
+  async function cloudDirectOpenWithCredPrompt(kind, serverId, rel) {
+    var call = kind === 'office' ? api.cloudOfficeOpen : api.cloudMediaOpen;
+    var r = await call(serverId, rel);
+    if (r && r.code === 'password-needed') {
+      var ans = await cloudAskOpenCredentials(serverId, r.user || '');
+      if (!ans || !ans.ok) return { cancelled: true };
+      r = await call(serverId, rel);
+      if (r && r.code === 'password-needed') return { cancelled: true };
+    }
+    return r;
   }
 
   /* ---------- schedule display ---------- */
@@ -4879,6 +5049,25 @@
     if (cpi) cpi.addEventListener('keydown', function (ev) {
       if (ev.key === 'Enter') { var cb = cloudPromptCallback; var v = cpi.value || ''; closeCloudPrompt(); if (cb) cb(v); }
       if (ev.key === 'Escape') closeCloudPrompt();
+    });
+    // App-owned credential prompt (2026-11-28): Cancel (button,
+    // backdrop or Escape) means the file does not open — the cancel
+    // is never remembered, so the next open asks again.
+    var cco = $('cloudCredOpen');
+    if (cco) cco.addEventListener('click', function () { cloudCredSubmit(); });
+    var ccc = $('cloudCredCancel');
+    if (ccc) ccc.addEventListener('click', function () { cloudCredCancel(); });
+    var ccb = $('cloudCredBackdrop');
+    if (ccb) ccb.addEventListener('click', function () { cloudCredCancel(); });
+    var ccu = $('cloudCredUser');
+    if (ccu) ccu.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { var p = $('cloudCredPass'); if (p) p.focus(); }
+      if (ev.key === 'Escape') cloudCredCancel();
+    });
+    var ccp = $('cloudCredPass');
+    if (ccp) ccp.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') cloudCredSubmit();
+      if (ev.key === 'Escape') cloudCredCancel();
     });
     if (api && typeof api.onCloudProgress === 'function') {
       api.onCloudProgress(function (p) {

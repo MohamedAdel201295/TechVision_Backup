@@ -7,6 +7,7 @@ const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 const { BackupEngine, JobConfig, BackupResult } = require('./techvision-core.js');
 const { RestoreEngine } = require('./restore.js');
 const mailer = require('./mailer.js');
@@ -203,6 +204,13 @@ function getCloudServer() {
 // Client sessions live in main only (tokens never reach the renderer):
 // serverId -> { host, port, certPem, token, user, root, canWrite }
 const cloudSessions = new Map();
+
+// App-owned credential prompt (2026-11-28): serverIds whose direct-open
+// credentials were verified this session. A verified server never
+// prompts again until the next launch (or a disconnect / forget /
+// vault reset, which all clear the entry). The SET holds ids only —
+// never a password.
+const openCredResolved = new Set();
 
 // ---------- TechVision Cloud — Map network drive ----------
 // State file: <userData>/.techvision/mapdrive.json —
@@ -2200,6 +2208,9 @@ ipcMain.handle('vault-reset', async (event, masterPassword) => {
     const hadVault = vault.vaultExists(app.getPath('userData'));
     vaultKey = vault.resetVault(app.getPath('userData'), masterPassword);
     if (hadVault) clearVaultSecretFlags();
+    // The old vault is gone, so every saved password with it: direct
+    // opens must prompt again (see the app-owned credential prompt).
+    openCredResolved.clear();
     afterVaultUnlocked();
     return { success: true, replaced: hadVault };
   } catch (e) { return { success: false, error: e.message }; }
@@ -2235,6 +2246,10 @@ ipcMain.handle('vault-unlock', async (event, masterPassword) => {
 ipcMain.handle('vault-lock', async () => {
   if (vaultKey) vault.lockVault(vaultKey);
   vaultKey = null;
+  // A locked vault cannot read saved passwords: direct opens must
+  // prompt again until the vault is unlocked (see the app-owned
+  // credential prompt).
+  openCredResolved.clear();
   // Also drop any leftover remember-me blob from the old build, so
   // the next launch asks for the master password again.
   try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
@@ -2510,6 +2525,7 @@ ipcMain.handle('cloud-client-forget-password', async (event, id) => {
   if (!rec) return { success: false, error: 'Server not found.' };
   rec.password = null;
   rec.passwordInVault = false;
+  openCredResolved.delete(id);
   try { if (vaultKey) vault.removeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + id); } catch (e) {}
   saveCloudConfig();
   return { success: true };
@@ -2519,6 +2535,7 @@ ipcMain.handle('cloud-client-remove', async (event, id) => {
   const cfg = getCloudConfig();
   cfg.clients = cfg.clients.filter((c) => c.id !== id);
   cloudSessions.delete(id);
+  openCredResolved.delete(id);
   saveCloudConfig();
   return { success: true };
 });
@@ -2634,6 +2651,7 @@ ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
     try { await cloudClient.logout(conn); } catch (e) { /* local drop is enough */ }
   }
   cloudSessions.delete(serverId);
+  openCredResolved.delete(serverId);
   // No session, no save-back: a disconnected server's temp copies
   // stop being watched (their edits stay in the temp copy).
   try { cloudSaveback.stop(serverId); } catch (e) {}
@@ -3038,6 +3056,71 @@ async function seedCloudCredentialsForOpen(serverId, rec) {
   }
 }
 
+// App-owned credential prompt (2026-11-28): check a typed user name +
+// password against the Cloud server WITHOUT creating a session and
+// WITHOUT opening anything. A DAV PROPFIND on /dav/ with HTTP Basic
+// auth exercises the exact credential path the players and Office
+// use, pinned to the record's certificate. The password travels only
+// in the Authorization header over pinned TLS — never in the URL,
+// never in a log line. 2xx = the credentials are right; 401 = wrong
+// user name or password; 429 = locked out after too many failures.
+function davProbeCredentials(host, port, certPem, user, password) {
+  return new Promise((resolve) => {
+    if (!certPem) return resolve({ error: 'No trusted certificate for this server.' });
+    let req;
+    try {
+      req = https.request({
+        host, port, path: '/dav/', method: 'PROPFIND',
+        ca: [certPem], checkServerIdentity: () => undefined,
+        headers: {
+          Authorization: 'Basic ' + Buffer.from(String(user) + ':' + String(password)).toString('base64'),
+          Depth: '0',
+        },
+        timeout: 15000,
+      }, (res) => {
+        res.resume();
+        resolve({ status: res.statusCode });
+      });
+    } catch (e) { return resolve({ error: e && e.message ? e.message : String(e) }); }
+    req.on('timeout', () => { try { req.destroy(); } catch (e) {} resolve({ error: 'The server did not answer in time.' }); });
+    req.on('error', (e) => {
+      const msg = e && e.message ? e.message : String(e);
+      if (e && e.code === 'ECONNREFUSED') return resolve({ error: 'Cannot reach the server at ' + host + ':' + port + '.' });
+      if (/certificate/i.test(msg)) return resolve({ error: 'The server certificate could not be verified.' });
+      resolve({ error: msg });
+    });
+    req.end();
+  });
+}
+
+ipcMain.handle('cloud-open-verify-password', async (event, serverId, user, password) => {
+  try {
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === serverId);
+    if (!rec) return { ok: false, code: 'no-server', error: 'Server not found.' };
+    const u = String(user || '').trim();
+    const pw = String(password || '');
+    if (!u || !pw) return { ok: false, code: 'missing', error: 'Enter the user name and password.' };
+    const probe = await davProbeCredentials(rec.host, rec.port, rec.certPem, u, pw);
+    if (probe.status === 401) return { ok: false, code: 'wrong-password', error: 'Wrong user name or password. Try again.' };
+    if (probe.status === 429) return { ok: false, code: 'locked', error: 'Too many failed logins. Try again later.' };
+    if (probe.error) return { ok: false, code: 'unreachable', error: probe.error };
+    if (probe.status >= 200 && probe.status < 300) {
+      // Verified: the live session now uses these credentials, the
+      // server stops prompting for this server this session, and
+      // players get the login seeded so they open without asking.
+      const conn = cloudSessions.get(serverId);
+      if (conn) cloudSessions.set(serverId, Object.assign({}, conn, { user: u, password: pw }));
+      openCredResolved.add(serverId);
+      try { await cloudMapDrive.seedCredentials(rec.host, rec.port, u, pw); } catch (e) {}
+      return { ok: true };
+    }
+    return { ok: false, code: 'unreachable', error: 'Server error ' + probe.status + '.' };
+  } catch (e) {
+    return { ok: false, code: 'unreachable', error: e && e.message ? e.message : String(e) };
+  }
+});
+
 ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
   try {
     const conn = cloudSessions.get(serverId);
@@ -3045,6 +3128,14 @@ ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
     const cfg = getCloudConfig();
     const rec = (cfg.clients || []).find((c) => c.id === serverId);
     if (!rec) return { success: false, error: 'Server not found.' };
+    // App-owned credential prompt (2026-11-28): a direct open with
+    // no SAVED password must not reach the browser/Office prompt.
+    // The renderer shows the app's own window instead; this handler
+    // reports the need and opens nothing. Mapped-drive opens never
+    // call this handler, so they never prompt.
+    if (!getClientPassword(rec) && !openCredResolved.has(serverId)) {
+      return { success: false, code: 'password-needed', user: rec.user };
+    }
     const uri = cloudMapDrive.officeUriFor(rec.host, rec.port, relPath);
     if (!uri) return { success: false, error: 'not-office' };
     if (rec.certPem) {
@@ -3088,6 +3179,10 @@ ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
     const cfg = getCloudConfig();
     const rec = (cfg.clients || []).find((c) => c.id === serverId);
     if (!rec) return { success: false, error: 'Server not found.' };
+    // App-owned credential prompt (2026-11-28): see cloud-office-open.
+    if (!getClientPassword(rec) && !openCredResolved.has(serverId)) {
+      return { success: false, code: 'password-needed', user: rec.user };
+    }
     const url = cloudMapDrive.mediaUrlFor(rec.host, rec.port, relPath);
     if (!url) return { success: false, error: 'not-media' };
     if (rec.certPem) {

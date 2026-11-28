@@ -114,6 +114,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cloudSetOpenMode: (mode) => ipcRenderer.invoke('cloud-set-open-mode', mode),
   cloudOfficeOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-office-open', serverId, relPath),
   cloudMediaOpen: (serverId, relPath) => ipcRenderer.invoke('cloud-media-open', serverId, relPath),
+  cloudOpenVerifyPassword: (serverId, user, password) => ipcRenderer.invoke('cloud-open-verify-password', serverId, user, password),
   cloudClipboardFiles: () => ipcRenderer.invoke('cloud-clipboard-files'),
   cloudClientMkdir: (serverId, relPath) => ipcRenderer.invoke('cloud-client-mkdir', serverId, relPath),
   cloudClientDelete: (serverId, relPath) => ipcRenderer.invoke('cloud-client-delete', serverId, relPath),
