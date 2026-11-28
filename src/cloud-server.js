@@ -949,7 +949,17 @@ class CloudServer {
       await verifyPassword(password, DUMMY_CREDENTIALS.salt, DUMMY_CREDENTIALS.hash);
     }
     if (!ok) {
-      this._noteLoginFail(ip);
+      // A request with no Authorization header at all is a discovery
+      // probe — the WebDAV redirector/WinHTTP sends one before
+      // retrying with the saved login — not a failed login, so it
+      // must not count toward the lockout: 5 probes alone used to
+      // lock the client IP for 10 minutes (the fast auth cache made
+      // the race reachable where slow scrypt masked it). Only a
+      // credential that was actually presented and wrong counts; the
+      // 5-wrong-passwords lockout itself is unchanged. The dummy
+      // scrypt above still runs on this path, so timing reveals
+      // nothing about whether the user exists.
+      if (m) this._noteLoginFail(ip);
       this._audit(ip, name, 'dav login failed', '');
       res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="TechVision Cloud"', 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Wrong user name or password.' }));

@@ -172,11 +172,31 @@ function createMediaProxy(resolveCredentials, opts) {
           // byte so the socket returns to the keep-alive pool; for
           // anything else (a full 200 stream) drop the socket
           // instead, so the file is not downloaded for a probe.
-          if (headProbe && upRes.headers['content-range']) {
-            const cm = /^bytes \d+-\d+\/(\d+)$/.exec(String(upRes.headers['content-range']));
-            if (cm) out['content-length'] = cm[1];
+          let status = upRes.statusCode;
+          if (headProbe) {
+            // The probe fetched one byte upstream (Range: bytes=0-0),
+            // so the answer must NOT look like a range answer: a 206
+            // whose Content-Length is the whole file and whose
+            // Content-Range covers one byte is self-contradictory,
+            // and players (PotPlayer) reject it as "file not found"
+            // without ever issuing a GET. Synthesize the 200 a plain
+            // GET would have carried: full length, no Content-Range.
+            // The 1-byte upstream fetch stays (the speed win stays).
+            const cr = String(upRes.headers['content-range'] || '');
+            if (upRes.statusCode === 206) {
+              const cm = /^bytes \d+-\d+\/(\d+)$/.exec(cr);
+              if (cm) { status = 200; out['content-length'] = cm[1]; delete out['content-range']; }
+            } else if (upRes.statusCode === 416) {
+              // Empty file: the 1-byte probe is out of range upstream
+              // (Content-Range: bytes */N). Answer 200 with the
+              // total length, as the old proxy did.
+              const cm = /^bytes \*\/(\d+)$/.exec(cr);
+              if (cm) { status = 200; out['content-length'] = cm[1]; delete out['content-range']; }
+            }
+            // 404 passes through untouched (file really missing /
+            // wrong user); 200 passes through as today.
           }
-          try { res.writeHead(upRes.statusCode, out); res.end(); } catch (e) {}
+          try { res.writeHead(status, out); res.end(); } catch (e) {}
           if (upRes.statusCode === 206) { upFinished = true; try { upRes.resume(); } catch (e) {} }
           else { try { upReq.destroy(); } catch (e) {} }
           return;
