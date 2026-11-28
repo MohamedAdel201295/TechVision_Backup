@@ -1592,7 +1592,9 @@
     servers.forEach(function (srv) {
       var o = document.createElement('option');
       o.value = srv.id;
-      o.textContent = srv.name + ' — ' + srv.host + ':' + srv.port + ' (' + (srv.accessMode === 'tailscale' ? 'Tailscale' : srv.accessMode === 'wireguard' ? 'WireGuard' : 'Normal') + ')';
+      // The user name is part of the option: two records for the
+      // same server (Mohamed / Mohamed 2) used to look identical.
+      o.textContent = srv.name + ' — user ' + (srv.user || '—') + ' — ' + srv.host + ':' + srv.port + ' (' + (srv.accessMode === 'tailscale' ? 'Tailscale' : srv.accessMode === 'wireguard' ? 'WireGuard' : 'Normal') + ')';
       sel.appendChild(o);
     });
     if (prevServer) { for (var i = 0; i < sel.options.length; i++) if (sel.options[i].value === prevServer) { sel.value = prevServer; break; } }
@@ -1605,7 +1607,6 @@
       statusEl.textContent = 'No servers yet — add one in the Client tab first.';
       return;
     }
-    if (mapBtn) mapBtn.disabled = false;
     var status = null;
     try {
       if (api && typeof api.cloudMapdriveStatus === 'function') status = await api.cloudMapdriveStatus();
@@ -1665,6 +1666,26 @@
     var connectedHere = !!(cloudConn && cloudConn.serverId === serverId);
     if (srvHint) srvHint.textContent = (hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.')
       + (connectedHere ? '' : ' Not connected — connect in the Client tab before mapping.');
+    // The Map button stays disabled until this server is connected:
+    // pressing it while not connected used to flash a small toast
+    // and yank the user to the Client tab. The hint above says why.
+    if (mapBtn) mapBtn.disabled = !connectedHere;
+    // The not-connected error lives INLINE in the status line (under
+    // the button) and stays there across re-renders — it is the same
+    // message the refused Map press shows, not a toast that vanishes.
+    if (!connectedHere && (!mapping || mapping.status === 'not-mapped')) {
+      statusEl.textContent = 'Not connected — connect in the Client tab first, then map the drive.';
+    }
+    // Which session this drive belongs to: the mapping is created
+    // in the session the app runs in, never the other one — an
+    // elevated run maps in the admin session, a normal run in the
+    // user session.
+    var elevEl = $('cloudMapElevated');
+    if (elevEl) {
+      if (status && status.elevated === true) elevEl.textContent = 'Running as administrator — this mapping belongs to the admin session. It shows in an administrator Explorer / command prompt, not in a normal one.';
+      else if (status && status.elevated === false) elevEl.textContent = 'Running as a normal user — this mapping belongs to your user session.';
+      else elevEl.textContent = '';
+    }
   }
 
   async function cloudMapDriveAction() {
@@ -1675,23 +1696,29 @@
     if (!serverId) { toast('No server', 'Add a server in the Client tab first.', 'error'); return; }
     if (!api || typeof api.cloudMapdriveMap !== 'function') return cloudMissing();
     var statusEl = $('cloudMapStatus');
+    // Not connected to this server: say so INLINE in the Map panel
+    // status line and STAY here — no small toast, no jump to the
+    // Client tab. The button is disabled in this state already; this
+    // is the backstop for a race between render and press.
+    var connectedHere = !!(cloudConn && cloudConn.serverId === serverId);
+    if (!connectedHere) {
+      if (statusEl) statusEl.textContent = 'Not connected — connect in the Client tab first, then map the drive.';
+      return;
+    }
     if (statusEl) statusEl.textContent = 'Mapping… (Windows may ask for administrator permission once, to trust the server certificate.)';
     try {
       var r = await api.cloudMapdriveMap(serverId, letterSel ? letterSel.value : 'Z', !!(recBox && recBox.checked));
       if (r && r.success) {
-        toast('Drive mapped', 'The server is now drive ' + r.letter + ': — open files straight from it.', 'success');
+        toast('Drive mapped', 'The server is now drive ' + r.letter + ':' + (r.viaAltHost ? ' — reached under its alternate address (' + (r.host || '') + '), because Windows allows only one login per server name.' : ' — open files straight from it.'), 'success');
         cloudMapInvalidateCache();
       } else if (r && r.error === 'password-needed') {
         toast('Password needed', 'Save the server password in the Client tab first — connect once with the password, and it is saved on this device.', 'error');
       } else if (r && r.error === 'not-connected') {
-        // Client-connection guard: never attempt the mapping when
-        // the Client is not connected to this server. Say so, then
-        // jump to the Client tab with this server selected, so
-        // Connect is one click away — then he maps from here.
-        toast('Not connected', 'You are not connected to this server in the Client tab. Connect first, then map the drive.', 'error');
-        var srv = (cloudCfg && cloudCfg.clients || []).find(function (c) { return c.id === serverId; });
-        if (srv) selectCloudServer(srv);
-        showCloudPanel('client');
+        // Backstop for the same guard in the main process (the
+        // connection dropped between the check above and the call):
+        // inline and stay, exactly like the local check.
+        if (statusEl) statusEl.textContent = 'Not connected — connect in the Client tab first, then map the drive.';
+        return;
       } else {
         toast('Mapping failed', (r && r.error) || 'Could not map the drive.', 'error');
       }

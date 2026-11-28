@@ -2521,6 +2521,20 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     // one — e.g. after "Forget password" while still connected — and
     // Office/media opens need a password to seed or they prompt.
     cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite, password }));
+    // Alternate addresses of this server (LAN addresses + DDNS from
+    // /api/info): a second user mapping the same host hits Windows
+    // error 1219, and the Map tab retries under one of these.
+    if (rec && Array.isArray(info.addrs) && info.addrs.length) {
+      const host = String(rec.host || '').toLowerCase();
+      rec.altHosts = info.addrs.map((a) => String(a || '').trim()).filter((a) => a && a.toLowerCase() !== host);
+      saveCloudConfig();
+    }
+    // Seed the login into Windows Credential Manager NOW, at connect
+    // time, automatically and without asking: the first direct open
+    // (Office, media player) must not prompt — seeding only at open
+    // time used to be too late for a player that had already asked.
+    // Best-effort: a failure never blocks the connect.
+    if (rec) { try { await seedCloudCredentialsForOpen(opts.serverId, rec); } catch (e) {} }
     // A typed password that just authenticated is remembered for next
     // time — in the vault when it is unlocked. When there is no
     // master password yet it is NOT written to cloud.json in plain
@@ -2727,6 +2741,10 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
     const state = getMapdriveState();
     const cfg = getCloudConfig();
     const free = await cloudMapDrive.listFreeLetters();
+    // Whether the app itself runs elevated: the mapping belongs to
+    // the session the app runs in, so the panel says which one.
+    let elevated = null;
+    try { const el = await cloudMapDrive.isElevated(); if (el && el.success) elevated = !!el.elevated; } catch (e) {}
     const out = [];
     for (const m of state.mappings) {
       const rec = cfg.clients.find((c) => c.id === m.serverId);
@@ -2738,7 +2756,10 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
       else {
         const st = await cloudMapDrive.getDriveStatus(m.letter);
         if (st.success && st.mapped) {
-          status = (st.remote === cloudMapDrive.davUrl(m.host, m.port)) ? 'mapped' : 'not-mapped';
+          // Windows reports the remote as \\host@SSL@port\dav, never
+          // as the https URL — compare with remoteMatchesDav, or the
+          // app keeps saying "Not mapped" about its own mapping.
+          status = cloudMapDrive.remoteMatchesDav(st.remote, m.host, m.port) ? 'mapped' : 'not-mapped';
           remote = st.remote || null;
         } else if (!st.success) { status = 'error'; error = st.error; }
       }
@@ -2748,7 +2769,7 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
         name: rec ? rec.name : m.serverId, hasPassword: !!(rec && getClientPassword(rec)),
       });
     }
-    return { success: true, mappings: out, freeLetters: free.success ? free.letters : [] };
+    return { success: true, mappings: out, freeLetters: free.success ? free.letters : [], elevated };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -2821,13 +2842,27 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
     if (covers === false) {
       return { success: false, error: 'The server certificate does not cover this address (' + rec.host + '). It was issued before this address existed on the server — restart the Cloud server on the server machine so it issues a new certificate covering it, then connect again in the Client tab (Trust & connect) and map the drive.' };
     }
-    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
+    // Alternate addresses for the same server (saved at connect time
+    // from /api/info): when a second user maps the same host, Windows
+    // refuses with error 1219 — one credential set per server NAME
+    // per logon session. mapDrive retries under another address for
+    // the same physical server, skipping any the cert does not cover.
+    const altHosts = Array.isArray(rec.altHosts) ? rec.altHosts.filter((h) => h && String(h).toLowerCase() !== String(rec.host).toLowerCase()) : [];
+    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec), altHosts, coversHost: (h) => cloudServerMod.certCoversHost(rec.certPem, h) });
     if (!mapped.success) return { success: false, error: mapped.error };
+    // mapDrive verifies the drive exists in this session before
+    // reporting success, so this record means a real, visible drive.
     state.mappings = state.mappings.filter((m) => m.serverId !== serverId && m.letter !== l);
-    state.mappings.push({ serverId, letter: l, host: rec.host, port: rec.port, user: rec.user, reconnect: !!reconnect });
+    state.mappings.push({ serverId, letter: l, host: mapped.host || rec.host, port: rec.port, user: rec.user, reconnect: !!reconnect });
     saveMapdriveState(state);
-    appendAppLog('info', '[Cloud] Mapped ' + rec.host + ':' + rec.port + ' as drive ' + l + ':');
-    return { success: true, letter: l };
+    appendAppLog('info', '[Cloud] Mapped ' + (mapped.host || rec.host) + ':' + rec.port + ' as drive ' + l + ':' + (mapped.viaAltHost ? ' (via alternate address ' + mapped.host + ')' : ''));
+    // Seed the credentials now, automatically and without asking:
+    // a mapped drive never prompts (the redirector uses the `net
+    // use` login), and a direct open of the same server afterwards
+    // finds the login already stored. Best-effort — a failure never
+    // blocks the mapping.
+    try { await seedCloudCredentialsForOpen(serverId, rec); } catch (e) {}
+    return { success: true, letter: l, host: mapped.host || rec.host, viaAltHost: !!mapped.viaAltHost };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }
@@ -2868,7 +2903,7 @@ ipcMain.handle('cloud-mapdrive-open-mapped', async (event, serverId, relPath) =>
     if (!joined.success) return { success: false, error: joined.error };
     const st = await cloudMapDrive.getDriveStatus(m.letter);
     if (!st.success || !st.mapped) return { success: false, error: 'not-mapped' };
-    if (st.remote && st.remote !== cloudMapDrive.davUrl(m.host, m.port)) return { success: false, error: 'not-mapped' };
+    if (st.remote && !cloudMapDrive.remoteMatchesDav(st.remote, m.host, m.port)) return { success: false, error: 'not-mapped' };
     let exists = false;
     try { exists = fs.existsSync(joined.path); } catch (e) {}
     if (!exists) return { success: false, error: 'File not found on the mapped drive.' };
@@ -3003,9 +3038,20 @@ ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
     // (round 2 #14: same generic URL targets as Office — players
     // fetch over HTTPS the same way; result logged).
     await seedCloudCredentialsForOpen(serverId, rec);
+    // Open in the device's media player, not the browser:
+    // shell.openExternal('https://…') always hands an https URL to
+    // the default browser. The registered player for the extension
+    // is launched with the DAV URL instead; it streams with Range
+    // requests and consults the seeded Credential Manager login, so
+    // it plays without a prompt. No association, or a failed launch,
+    // falls back to the browser exactly as before.
+    const ext = (relPath.split('.').pop() || '').toLowerCase();
+    const played = await cloudMapDrive.openMediaInPlayer(url, ext);
+    if (played.success) return { success: true, mode: 'direct', url, player: played.player };
+    if (played.error) console.log('[Cloud] Media player open failed, falling back to the browser: ' + played.error);
     const err = await require('electron').shell.openExternal(url);
     if (err) return { success: false, url, error: String(err) };
-    return { success: true, mode: 'direct', url };
+    return { success: true, mode: 'direct', url, playerFallback: true };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }

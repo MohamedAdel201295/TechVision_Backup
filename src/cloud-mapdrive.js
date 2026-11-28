@@ -6,8 +6,12 @@
  * (Local Machine Trusted Root store — the WebClient service runs as
  * SYSTEM and validates against the machine store, NOT the user
  * store), then maps https://<host>:<port>/dav as a drive letter with
- * `net use` in the user's own session (an elevated mapping is
- * invisible to Explorer, so the mapping itself is NEVER elevated).
+ * `net use` in the app's OWN session (2026-11-28 correction: the
+ * mapping belongs to the session the app runs in — a normal-user run
+ * maps in the user session, an elevated run maps in the admin
+ * session — and is NEVER duplicated into the other session; an
+ * elevated mapping is invisible to a normal Explorer, so the panel
+ * says which session the drive belongs to).
  *
  * Every function returns { success, ... } / { success: false, error }
  * instead of throwing, and on non-Windows returns a clear error
@@ -18,7 +22,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 
 function isWindows() {
   return process.platform === 'win32';
@@ -138,6 +142,45 @@ function davUrl(host, port) {
   return 'https://' + host + ':' + port + '/dav';
 }
 
+// Is the app itself running elevated (as administrator)? `net
+// session` succeeds only for an elevated process (error 5
+// otherwise). The mapping lives in the session the app runs in —
+// normal-user run: user session; elevated run: admin session —
+// so the Map panel can say which one this drive belongs to.
+async function isElevated() {
+  if (!isWindows()) return { success: false, error: 'Windows only.' };
+  const r = await runCmd('net.exe', ['session'], 15000);
+  return { success: true, elevated: !!r.success };
+}
+
+// Windows reports a WebDAV mapping's remote as a UNC path
+// (\\host@SSL@port\dav), not the https URL the app mapped —
+// comparing the two strings can never match, so the app kept
+// saying "Not mapped" about its own mapping and re-ran `net use`
+// on every press. Accept every form Windows can report for the
+// same DAV root: the UNC form (with or without @SSL@), the URL
+// form, and the \DavWWWRoot form the redirector sometimes shows.
+function normalizeDavRemote(remote) {
+  const s = String(remote || '').trim();
+  let m = /^\\\\([^@\\]+)(?:@SSL@|@)(\d+)\\(?:dav|DavWWWRoot)\\?$/i.exec(s);
+  if (m) return { host: m[1].toLowerCase(), port: parseInt(m[2], 10), ssl: /@SSL@/i.test(s) };
+  m = /^(https?):\/\/([^/:]+):(\d+)\/dav\/?$/i.exec(s);
+  if (m) return { host: m[2].toLowerCase(), port: parseInt(m[3], 10), ssl: m[1].toLowerCase() === 'https' };
+  m = /^\\\\DavWWWRoot\\(?:dav|DavWWWRoot)\\?$/i.exec(s);
+  if (m) return { host: null, port: null, ssl: null, davWwwRoot: true };
+  return null;
+}
+
+function remoteMatchesDav(remote, host, port) {
+  const n = normalizeDavRemote(remote);
+  if (!n) return false;
+  // The host-less \DavWWWRoot form carries no address to compare:
+  // it can only be a WebDAV mapping, and this app only ever maps
+  // its own DAV root, so it counts as ours.
+  if (n.davWwwRoot) return true;
+  return n.host === String(host).toLowerCase() && n.port === parseInt(port, 10);
+}
+
 // Office documents open straight from a WebDAV URL with the Office
 // URI scheme (ms-word:ofe|u|… = open for edit). No download; saves
 // go back to the server through WebDAV. Returns null for anything
@@ -168,6 +211,88 @@ function mediaUrlFor(host, port, rel) {
   const segs = String(rel || '').split('/').filter((s) => s !== '');
   if (!segs.length) return null;
   return davUrl(host, port) + '/' + segs.map((s) => encodeURIComponent(s)).join('/');
+}
+
+// --- default media player (Part D) ---
+// shell.openExternal('https://…') always opens the DEFAULT BROWSER
+// for an https URL — that is why videos opened in Chrome instead of
+// the media player. A player is found the way Windows finds one:
+// the per-extension UserChoice ProgId, then that ProgId's
+// shell\open\command. WinINET-based players also consult the
+// Credential Manager generic credentials seeded at connect time,
+// so the player does not prompt for the Cloud login.
+function parseRegValue(output, name) {
+  const lines = String(output || '').split(/\r?\n/);
+  for (const line of lines) {
+    const m = /^\s*(.*?)\s+REG_\w+\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const n = m[1].trim();
+    if (name === '(Default)' ? (n === '(Default)' || n === '') : n === name) return m[2].trim();
+  }
+  return null;
+}
+
+async function regQueryValue(key, valueName) {
+  const args = ['query', key];
+  if (valueName === '(Default)') args.push('/ve');
+  else args.push('/v', valueName);
+  const r = await runCmd('reg.exe', args, 15000);
+  if (!r.success) return null;
+  return parseRegValue(r.stdout, valueName);
+}
+
+async function resolvePlayerCommand(ext) {
+  const e = String(ext || '').replace(/^\./, '').toLowerCase();
+  if (!e) return null;
+  const progId = await regQueryValue('HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.' + e + '\\UserChoice', 'ProgId');
+  if (!progId) return null;
+  const keys = [
+    'HKCU\\Software\\Classes\\' + progId + '\\shell\\open\\command',
+    'HKCR\\' + progId + '\\shell\\open\\command',
+  ];
+  for (const k of keys) {
+    const cmd = await regQueryValue(k, '(Default)');
+    if (cmd) return { progId, command: cmd };
+  }
+  return null;
+}
+
+// Substitute the URL for the %1 placeholder of a registered open
+// command (usually already quoted: "%1"); a command with no %1
+// gets the quoted URL appended.
+function buildPlayerCommandLine(command, url) {
+  const cmd = String(command || '');
+  const u = String(url || '');
+  if (/%1/i.test(cmd)) return cmd.replace(/%1/gi, u);
+  return cmd + ' "' + u + '"';
+}
+
+// Open a DAV media URL in the registered media player for its
+// extension. Returns { success: false, fallback: true } when there
+// is no association or the launch fails — the caller then falls
+// back to the browser, exactly as before.
+async function openMediaInPlayer(url, ext) {
+  if (!isWindows()) return { success: false, fallback: true, error: 'Windows only.' };
+  const resolved = await resolvePlayerCommand(ext);
+  if (!resolved || !resolved.command) return { success: false, fallback: true, error: 'No media player is registered for .' + String(ext || '').replace(/^\./, '') + ' files.' };
+  const cmdLine = buildPlayerCommandLine(resolved.command, url);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; resolve(r); } };
+    let child;
+    try {
+      child = spawn('cmd.exe', ['/c', cmdLine], { windowsHide: true, detached: true });
+    } catch (e) {
+      return finish({ success: false, fallback: true, error: 'Could not start the media player: ' + (e && e.message ? e.message : String(e)) });
+    }
+    child.on('error', (e) => finish({ success: false, fallback: true, error: 'Could not start the media player: ' + (e && e.message ? e.message : String(e)) }));
+    // A player that exits at once with an error never took the URL;
+    // one that stays up (or detaches) has it. 500 ms is enough to tell.
+    const timer = setTimeout(() => { try { child.unref(); } catch (e) {} finish({ success: true, player: resolved.progId }); }, 500);
+    child.on('exit', (code) => {
+      if (code !== 0 && code !== null) { clearTimeout(timer); finish({ success: false, fallback: true, error: 'The media player exited with an error (code ' + code + ').' }); }
+    });
+  });
 }
 
 // The Credential Manager targets a Cloud login is seeded under.
@@ -220,7 +345,7 @@ async function seedCredentials(host, port, user, password) {
 function mapErrorText(r) {
   const text = (r.stdout + ' ' + r.stderr).toLowerCase();
   if (/system error 86/.test(text)) return 'Wrong user name or password for this Cloud server.';
-  if (/system error 1219/.test(text)) return 'Windows already has a connection to this server with different credentials — disconnect the other mapping first (or sign out and back in).';
+  if (/system error 1219/.test(text)) return 'Windows already has a connection to this server with different credentials (System error 1219) — disconnect the other mapping to this server first, or map the second user under a different address for the same server (its LAN address or hostname).';
   if (/system error 85/.test(text)) return 'That drive letter is already in use — pick a different letter.';
   if (/system error 67/.test(text)) return 'The server could not be reached at that address, or Windows does not trust its certificate yet.';
   if (/system error 53/.test(text)) return 'The network path was not found — check the server address and port.';
@@ -235,10 +360,22 @@ function mapErrorText(r) {
   return raw ? 'Mapping failed: ' + raw.slice(0, 300) : 'Mapping failed (net use error ' + (r.code || '?') + ').';
 }
 
-// Map https://host:port/dav as a drive letter, in the user's own
-// session (UN-elevated — an elevated mapping is invisible to
-// Explorer). Assumes the certificate is already trusted; call
-// isCertTrusted/installCert first.
+// Map https://host:port/dav as a drive letter, in the app's OWN
+// session (2026-11-28 correction: a normal-user run maps in the
+// user session, an elevated run maps in the admin session — the
+// mapping is NEVER duplicated into the other session). Assumes the
+// certificate is already trusted; call isCertTrusted/installCert
+// first. Verifies afterwards that the drive really exists in this
+// session before reporting success: `net use` exiting 0 used to be
+// reported as "Drive mapped" even when the drive never appeared.
+// On Windows error 1219 (one credential set per server NAME per
+// logon session) retries the same physical server under each
+// alternate host in opts.altHosts (e.g. LAN address instead of the
+// Tailscale IP), skipping any the certificate does not cover
+// (opts.coversHost, may be async; false = skip, true/null = try).
+// Returns { success, letter, host } — host is the address the
+// mapping actually ended up under (viaAltHost: true when it took
+// an alternate), or { success: false, error, code: '1219' }.
 async function mapDrive(opts) {
   if (!isWindows()) return winOnlyError();
   const letter = String((opts && opts.letter) || '').toUpperCase();
@@ -249,16 +386,54 @@ async function mapDrive(opts) {
   if (!/^[A-Z]$/.test(letter)) return { success: false, error: 'Pick a drive letter (A–Z).' };
   if (!host || !port || port < 1 || port > 65535) return { success: false, error: 'Bad server address or port.' };
   if (!user || !password) return { success: false, error: 'password-needed' };
+  const altHosts = Array.isArray(opts && opts.altHosts) ? opts.altHosts.map((h) => String(h || '').trim()).filter(Boolean) : [];
+  const coversHost = opts && typeof opts.coversHost === 'function' ? opts.coversHost : null;
   const wc = await ensureWebClient();
   if (!wc.success) return wc;
-  const url = davUrl(host, port);
   // A letter that is already mapped to THIS server is fine — reuse
-  // it instead of failing with error 85.
+  // it instead of failing with error 85. The remote is compared
+  // with remoteMatchesDav, not string equality: Windows reports the
+  // remote as \\host@SSL@port\dav, never as the https URL.
   const cur = await getDriveStatus(letter);
-  if (cur.success && cur.mapped && cur.remote === url) return { success: true, letter, alreadyMapped: true };
-  const r = await runCmd('net.exe', ['use', letter + ':', url, '/user:' + user, password, '/persistent:no'], 60000);
-  if (!r.success) return { success: false, error: mapErrorText(r) };
-  return { success: true, letter };
+  if (cur.success && cur.mapped && remoteMatchesDav(cur.remote, host, port)) return { success: true, letter, host, alreadyMapped: true };
+
+  const attempt = async (h) => {
+    const r = await runCmd('net.exe', ['use', letter + ':', davUrl(h, port), '/user:' + user, password, '/persistent:no'], 60000);
+    if (!r.success) {
+      const is1219 = /system error 1219/.test((r.stdout + ' ' + r.stderr).toLowerCase());
+      return { success: false, error: mapErrorText(r), code: is1219 ? '1219' : undefined };
+    }
+    // Post-map verification, in THIS session, before any success is
+    // reported: the status must show this server's mapping AND the
+    // drive root must open. A `net use` that exits 0 while the
+    // drive never sticks is a failure, not a mapped drive.
+    const st = await getDriveStatus(letter);
+    if (!st.success || !st.mapped || !remoteMatchesDav(st.remote, h, port)) {
+      return { success: false, error: 'Mapping reported success, but drive ' + letter + ': did not appear afterwards (verification failed) — the mapping did not stick. Try again, or disconnect any other mapping to this server first.' };
+    }
+    let reachable = false;
+    try { reachable = fs.existsSync(letter + ':\\'); } catch (e) {}
+    if (!reachable) {
+      return { success: false, error: 'Mapping reported success, but drive ' + letter + ': cannot be opened afterwards (verification failed) — the mapping did not stick.' };
+    }
+    return { success: true, letter, host: h };
+  };
+
+  const first = await attempt(host);
+  if (first.success) return first;
+  if (first.code !== '1219' || !altHosts.length) return first;
+  for (const alt of altHosts) {
+    if (!alt || alt.toLowerCase() === host.toLowerCase()) continue;
+    if (coversHost) {
+      let ok = null;
+      try { ok = await coversHost(alt); } catch (e) { ok = false; }
+      if (ok === false) continue;
+    }
+    const r = await attempt(alt);
+    if (r.success) { r.viaAltHost = true; return r; }
+    if (r.code !== '1219') return r; // a different failure: report it, don't keep guessing
+  }
+  return { success: false, code: '1219', error: 'Windows already has a connection to this server with different credentials (System error 1219) — the other mapping to ' + host + ' must be disconnected first, or the second user must reach the server under a different address (its LAN address or hostname). The automatic retry under another address could not be used (no alternate address, or the server certificate does not cover it).' };
 }
 
 async function unmapDrive(letter) {
@@ -274,8 +449,9 @@ async function unmapDrive(letter) {
   return { success: true, letter: l };
 }
 
-// `net use X:` — the remote path must match our dav URL exactly, so
-// a letter mapped to something else never counts as ours.
+// `net use X:` — the remote is what Windows reports (usually the
+// UNC form \\host@SSL@port\dav). Callers compare it with
+// remoteMatchesDav, never with the https URL.
 async function getDriveStatus(letter) {
   if (!isWindows()) return { success: false, error: 'Windows only.' };
   const l = String(letter || '').toUpperCase();
@@ -370,12 +546,15 @@ function saveState(filePath, state) {
 
 module.exports = {
   isWindows,
+  isElevated,
   thumbprintsOfCertPem,
   isCertTrusted,
   installCert,
   ensureWebClient,
   mapDrive,
   mapErrorText,
+  remoteMatchesDav,
+  normalizeDavRemote,
   unmapDrive,
   getDriveStatus,
   listFreeLetters,
@@ -385,6 +564,9 @@ module.exports = {
   officeSchemeFor,
   officeUriFor,
   mediaUrlFor,
+  openMediaInPlayer,
+  buildPlayerCommandLine,
+  resolvePlayerCommand,
   seedCredentials,
   credentialTargetsFor,
   loadState,

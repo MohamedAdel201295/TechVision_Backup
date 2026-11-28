@@ -498,7 +498,14 @@ class CloudServer {
     if (!session) { this._sendJson(res, 401, { error: 'Not signed in.' }); return; }
 
     if (req.method === 'GET' && pathname === '/api/info') {
-      this._sendJson(res, 200, { name: 'TechVision Cloud', version: 1, user: session.user, root: session.root, canWrite: session.canWrite });
+      // addrs: the server's other addresses (LAN IPs + DDNS). A
+      // client that maps the same server as a second user hits
+      // Windows error 1219 on the first address; the Map tab retries
+      // under one of these — same physical server, different name.
+      const addrs = lanIPs();
+      const ddns = this._serverCfg().ddnsHostname;
+      if (ddns) addrs.push(ddns);
+      this._sendJson(res, 200, { name: 'TechVision Cloud', version: 1, user: session.user, root: session.root, canWrite: session.canWrite, addrs });
       return;
     }
 
