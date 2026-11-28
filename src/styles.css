@@ -826,12 +826,6 @@ body[data-theme="light"] .log-box { background: #0f1e2e; }
 .restore-step-head h3 { margin: 0; font-size: 14px; }
 .restore-valid { font-size: 13px; font-weight: 600; color: var(--success); margin-top: 3px; }
 .restore-valid.bad { color: var(--danger); }
-.restore-mode-card {
-  border: 1px solid var(--accent); background: var(--accent-bg);
-  border-radius: var(--radius-lg); padding: 6px 14px;
-}
-.restore-mode-title { font-weight: 700; }
-.restore-mode-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
 .restore-side { display: flex; flex-direction: column; gap: 8px; position: sticky; top: 0; }
 .restore-side .card { margin-bottom: 0; }
 .restore-side h3 { margin: 0 0 10px; font-size: 14px; }
