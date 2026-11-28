@@ -518,7 +518,7 @@
       </div>
       <div class="card cloud-section cloud-server-users">
       <h3 style="margin:0 0 4px;font-size:14px;">Users</h3>
-      <p class="cloud-muted" style="margin:0 0 8px;">Each user sees only their own folder. Give a user the whole drive (D:\) or one folder (D:\HR). Passwords are stored hashed, never in plain text.</p>
+      <p class="cloud-muted" style="margin:0 0 8px;">Each user sees only their own folders — give a user the whole drive (D:\) or one folder (D:\HR), or several folders at once. Passwords are stored hashed, never in plain text.</p>
       <div id="cloudUsersList" class="job-list"></div>
       <div class="cloud-form-grid">
       <div class="field">
@@ -542,6 +542,34 @@
       </div>
       </div>
       <button class="btn" type="button" id="cloudUserAddBtn">＋ Add user</button>
+      <div id="cloudUserEditForm" style="display:none; margin-top:12px; border-top:1px solid var(--border); padding-top:12px;">
+        <h3 style="margin:0 0 8px;font-size:14px;">Edit user — <span id="cloudEditTitle"></span></h3>
+        <div class="cloud-form-grid">
+          <div class="field">
+            <label for="cloudEditName">User name</label>
+            <input type="text" id="cloudEditName" autocomplete="off">
+          </div>
+          <div class="field">
+            <label for="cloudEditPass">New password (blank keeps the old one)</label>
+            <input type="password" id="cloudEditPass" placeholder="Leave blank to keep" autocomplete="new-password">
+            <div class="hint">At least 12 characters when you set a new one.</div>
+          </div>
+        </div>
+        <div class="field">
+          <label>Folders this user can see</label>
+          <div id="cloudEditRoots"></div>
+          <button class="btn" type="button" id="cloudEditAddRootBtn" style="margin-top:6px;">＋ Add folder</button>
+          <div class="hint">Each folder appears as its own folder at the top of the user's Cloud. A user needs at least one folder.</div>
+        </div>
+        <div class="toggle-row">
+          <div><div class="t-label">Can write</div><div class="t-sub">Upload, delete, rename.</div></div>
+          <label class="switch"><input type="checkbox" id="cloudEditCanWrite" checked><span class="slider"></span></label>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          <button class="btn btn-primary" type="button" id="cloudEditSaveBtn">Save changes</button>
+          <button class="btn" type="button" id="cloudEditCancelBtn">Cancel</button>
+        </div>
+      </div>
       </div>
     </div>
     <div id="cloudClientPanel" style="display:none;">

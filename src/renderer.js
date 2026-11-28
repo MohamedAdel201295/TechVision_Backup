@@ -1110,6 +1110,8 @@
 
   /* ---------- TechVision Cloud ---------- */
   var cloudCfg = null;           // last cloud-get-config result
+  var cloudSelectedUser = null;  // server user whose card is selected (shows Delete + Edit)
+  var cloudEditingUser = null;   // server user open in the Edit form, if any
   var cloudPanel = 'home';       // 'home' | 'server' | 'client' | 'mapdrive'
   var wgPanel = 'server';        // 'server' | 'nat' — WireGuard tabs
   var cloudSelected = null;      // saved server record being connected to
@@ -1441,30 +1443,93 @@
       }
       users.forEach(function (u) {
         var card = document.createElement('div');
-        card.className = 'job-card';
+        card.className = 'job-card' + (cloudSelectedUser === u.name ? ' selected' : '');
+        // Click a row to select it — Delete and Edit appear beside
+        // it, like the Jobs details-on-click pattern. Nothing is
+        // deleted or edited by the click itself.
+        card.addEventListener('click', function () {
+          cloudSelectedUser = (cloudSelectedUser === u.name) ? null : u.name;
+          if (cloudSelectedUser !== u.name) closeCloudUserEdit();
+          renderCloudServer();
+        });
         var body = document.createElement('div'); body.className = 'job-body';
         var h = document.createElement('h3'); h.className = 'job-name'; h.textContent = u.name;
         var meta = document.createElement('div'); meta.className = 'job-meta';
-        meta.textContent = (u.canWrite ? 'Read + write' : 'Read-only') + ' — ' + u.root;
-        meta.title = u.root;
+        var roots = (u.roots && u.roots.length) ? u.roots : [u.root];
+        meta.textContent = (u.canWrite ? 'Read + write' : 'Read-only') + ' — ' + roots.join(' · ');
+        meta.title = roots.join('\n');
         var acts = document.createElement('div'); acts.className = 'drawer-actions';
-        var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete user';
-        del.addEventListener('click', function () {
-          askConfirm('Delete user "' + u.name + '"? They will no longer be able to connect.', async function () {
-            if (!api || typeof api.cloudUserRemove !== 'function') return cloudMissing();
-            try {
-              var r = await api.cloudUserRemove(u.name);
-              if (r && r.success) { toast('User deleted', u.name + ' was removed.', 'success'); await loadCloud(); }
-              else toast('Delete failed', (r && r.error) || 'Could not delete user.', 'error');
-            } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete user.', 'error'); }
+        if (cloudSelectedUser === u.name) {
+          var edit = document.createElement('button'); edit.className = 'btn btn-sm'; edit.type = 'button'; edit.textContent = '✎ Edit user';
+          edit.addEventListener('click', function (ev) { ev.stopPropagation(); openCloudUserEdit(u); });
+          acts.appendChild(edit);
+          var del = document.createElement('button'); del.className = 'btn btn-danger btn-sm'; del.type = 'button'; del.textContent = '🗑 Delete user';
+          del.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            askConfirm('Delete user "' + u.name + '"? They will no longer be able to connect.', async function () {
+              if (!api || typeof api.cloudUserRemove !== 'function') return cloudMissing();
+              try {
+                var r = await api.cloudUserRemove(u.name);
+                if (r && r.success) { cloudSelectedUser = null; closeCloudUserEdit(); toast('User deleted', u.name + ' was removed.', 'success'); await loadCloud(); }
+                else toast('Delete failed', (r && r.error) || 'Could not delete user.', 'error');
+              } catch (e) { toast('Delete error', e && e.message ? e.message : 'Could not delete user.', 'error'); }
+            });
           });
-        });
-        acts.appendChild(del);
+          acts.appendChild(del);
+        }
         body.appendChild(h); body.appendChild(meta);
         card.appendChild(body); card.appendChild(acts);
         list.appendChild(card);
       });
     }
+    // The edited user vanished (deleted from another view): close
+    // the form instead of editing a ghost.
+    if (cloudEditingUser && !(users || []).some(function (x) { return x.name === cloudEditingUser; })) closeCloudUserEdit();
+  }
+
+  // --- Edit user form (Server tab) ---
+  function cloudEditRootRow(value) {
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:8px; margin-bottom:6px;';
+    var input = document.createElement('input');
+    input.type = 'text'; input.className = 'cloud-edit-root'; input.autocomplete = 'off';
+    input.placeholder = 'D:\\ or D:\\HR'; input.style.flex = '1'; input.value = value || '';
+    var browse = document.createElement('button');
+    browse.className = 'btn'; browse.type = 'button'; browse.textContent = 'Browse…';
+    browse.addEventListener('click', async function () {
+      if (!api || typeof api.showOpenDialog !== 'function') return cloudMissing();
+      try {
+        var pick = await api.showOpenDialog({ properties: ['openDirectory'] });
+        if (pick && !pick.canceled && pick.filePaths && pick.filePaths.length) input.value = pick.filePaths[0];
+      } catch (e) { toast('Browse error', e && e.message ? e.message : 'Could not open the folder picker.', 'error'); }
+    });
+    var remove = document.createElement('button');
+    remove.className = 'btn'; remove.type = 'button'; remove.textContent = '✕'; remove.title = 'Remove this folder';
+    remove.addEventListener('click', function () {
+      var rows = document.querySelectorAll('#cloudEditRoots .cloud-edit-root');
+      if (rows.length <= 1) { toast('One folder is required', 'A user needs at least one folder.', 'warning'); return; }
+      row.remove();
+    });
+    row.appendChild(input); row.appendChild(browse); row.appendChild(remove);
+    return row;
+  }
+  function openCloudUserEdit(u) {
+    cloudEditingUser = u.name;
+    var t = $('cloudEditTitle'); if (t) t.textContent = u.name;
+    var n = $('cloudEditName'); if (n) n.value = u.name;
+    var p = $('cloudEditPass'); if (p) p.value = '';
+    var w = $('cloudEditCanWrite'); if (w) w.checked = !!u.canWrite;
+    var box = $('cloudEditRoots');
+    if (box) {
+      box.innerHTML = '';
+      var roots = (u.roots && u.roots.length) ? u.roots : [u.root];
+      roots.forEach(function (r) { box.appendChild(cloudEditRootRow(r)); });
+    }
+    var f = $('cloudUserEditForm'); if (f) { f.style.display = ''; f.scrollIntoView({ block: 'nearest' }); }
+  }
+  function closeCloudUserEdit() {
+    cloudEditingUser = null;
+    var f = $('cloudUserEditForm'); if (f) f.style.display = 'none';
   }
 
   function renderCloudClientList() {
@@ -4618,6 +4683,43 @@
         }
       } catch (e) {}
       doAdd();
+    });
+    // Edit user form: add another folder row, save, cancel.
+    var cea = $('cloudEditAddRootBtn');
+    if (cea) cea.addEventListener('click', function () {
+      var box = $('cloudEditRoots'); if (box) box.appendChild(cloudEditRootRow(''));
+    });
+    var cec = $('cloudEditCancelBtn');
+    if (cec) cec.addEventListener('click', function () { closeCloudUserEdit(); });
+    var ces = $('cloudEditSaveBtn');
+    if (ces) ces.addEventListener('click', async function () {
+      if (!api || typeof api.cloudUserEdit !== 'function') return cloudMissing();
+      if (!cloudEditingUser) return;
+      var roots = [];
+      document.querySelectorAll('#cloudEditRoots .cloud-edit-root').forEach(function (el) {
+        var v = (el.value || '').trim();
+        if (v) roots.push(v);
+      });
+      try {
+        var r = await api.cloudUserEdit(cloudEditingUser, {
+          name: ($('cloudEditName') || {}).value || '',
+          password: ($('cloudEditPass') || {}).value || '',
+          roots: roots,
+          canWrite: $('cloudEditCanWrite') ? $('cloudEditCanWrite').checked : false,
+        });
+        if (r && r.success) {
+          var msg = 'User saved.';
+          if (r.user && r.user.renamed) {
+            msg += (r.updatedRecords > 0)
+              ? ' ' + r.updatedRecords + ' saved server record' + (r.updatedRecords === 1 ? '' : 's') + ' now log in as ' + r.user.name + '.'
+              : ' No saved server record pointed at this server — reconnect it by hand if you saved one.';
+          }
+          closeCloudUserEdit();
+          cloudSelectedUser = null;
+          toast('User saved', msg, 'success');
+          await loadCloud();
+        } else toast('Save failed', (r && r.error) || 'Could not save user.', 'error');
+      } catch (e) { toast('Save error', e && e.message ? e.message : 'Could not save user.', 'error'); }
     });
     var cca = $('cloudClientAddBtn');
     if (cca) cca.addEventListener('click', async function () {

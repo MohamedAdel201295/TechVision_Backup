@@ -2371,6 +2371,67 @@ ipcMain.handle('cloud-user-set-password', async (event, name, password) => {
   }
 });
 
+// Edit a user (rename / new password / roots list / read-write).
+// A rename follows saved client records that point at THIS server:
+// they log in as the new name, or they would keep logging in as a
+// user that no longer exists. This server is local, so a record
+// matches when its host is one of this machine's own addresses
+// (LAN, Tailscale, DDNS, localhost) on the same port. Records
+// pointing at other servers are left alone, and a rename with no
+// matching record reports updatedRecords: 0 — the user then has to
+// reconnect that record by hand. A changed password is written into
+// the vault for the matched records too (same secret key the
+// connect flow reads), so saved logins keep working silently.
+function localServerHosts(cfg) {
+  const hosts = new Set(['localhost', '127.0.0.1']);
+  try { for (const a of cloudServerMod.lanIPs()) hosts.add(String(a).toLowerCase()); } catch (e) {}
+  try {
+    const ddns = String((cfg.server && cfg.server.ddnsHostname) || '').trim().toLowerCase();
+    if (ddns) hosts.add(ddns);
+  } catch (e) {}
+  return hosts;
+}
+
+ipcMain.handle('cloud-user-edit', async (event, name, updates) => {
+  try {
+    const result = getCloudServer().editUser(name, updates);
+    let updatedRecords = 0;
+    let passwordUpdatedRecords = 0;
+    if (result.renamed || result.passwordChanged) {
+      const cfg = getCloudConfig();
+      const localHosts = localServerHosts(cfg);
+      const serverPort = cfg.server.port || 8443;
+      for (const rec of (cfg.clients || [])) {
+        if (rec.user !== name) continue;
+        if (rec.port !== serverPort) continue;
+        if (!localHosts.has(String(rec.host || '').toLowerCase())) continue;
+        if (result.renamed) rec.user = result.name;
+        updatedRecords++;
+        if (result.passwordChanged && vaultKey && updates && updates.password) {
+          try {
+            vault.storeSecret(app.getPath('userData'), vaultKey, 'cloud-client:' + rec.id, String(updates.password));
+            rec.passwordInVault = true;
+            delete rec.password;
+            passwordUpdatedRecords++;
+          } catch (e) {}
+        }
+      }
+      if (updatedRecords > 0) saveCloudConfig();
+      // A live session keeps the old user name in main's session
+      // map — drop it so the next request re-logs in with the new
+      // name (the vault password above makes that silent).
+      if (result.renamed) {
+        for (const [id, s] of cloudSessions) {
+          if (s && s.user === name) cloudSessions.delete(id);
+        }
+      }
+    }
+    return { success: true, user: result, updatedRecords, passwordUpdatedRecords };
+  } catch (e) {
+    return { success: false, error: e && e.message ? e.message : String(e) };
+  }
+});
+
 // Saved servers (client side). The password for a server is stored
 // in the master-password vault (secret 'cloud-client:<id>') when the
 // vault is unlocked — never in plain text in cloud.json. The record
@@ -2527,7 +2588,7 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     // (memory only, never written to disk): the record may not have
     // one — e.g. after "Forget password" while still connected — and
     // Office/media opens need a password to seed or they prompt.
-    cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, canWrite: info.canWrite, password }));
+    cloudSessions.set(opts.serverId, Object.assign({}, conn, { user: info.user, root: info.root, roots: info.roots || [info.root], canWrite: info.canWrite, password }));
     // Alternate addresses of this server (LAN addresses + DDNS from
     // /api/info): a second user mapping the same host hits Windows
     // error 1219, and the Map tab retries under one of these.

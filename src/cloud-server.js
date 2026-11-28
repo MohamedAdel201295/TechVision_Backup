@@ -250,10 +250,87 @@ class CloudServer {
   }
 
   // --- users (passwords are never stored or returned in the clear) ---
+  // Multi-root users: a user has a LIST of roots (folders) instead
+  // of one root. Old single-root users migrate on first read:
+  // root -> [root]. The `root` field is kept as roots[0] so old
+  // callers keep working. One read/write flag per user (not per
+  // root) — per-folder permissions are still out of scope.
+  _userRoots(u) {
+    if (Array.isArray(u.roots) && u.roots.length) return u.roots.map((r) => path.normalize(String(r)));
+    return u.root ? [path.normalize(String(u.root))] : [];
+  }
+  _migrateUsers() {
+    const users = this._serverCfg().users || [];
+    let changed = false;
+    for (const u of users) {
+      if (!Array.isArray(u.roots) || !u.roots.length) {
+        if (u.root) { u.roots = [path.normalize(String(u.root))]; changed = true; }
+      }
+      if (u.roots && u.roots.length && u.root !== u.roots[0]) { u.root = u.roots[0]; changed = true; }
+    }
+    if (changed) this.onConfigChange();
+  }
+  // Display name of one root folder inside the user's virtual root:
+  // the folder's own name (a drive root 'D:\' shows as 'D'). Two
+  // roots with the same name get a number suffix so the virtual root
+  // listing never has two identical folders.
+  _rootDisplayName(root) {
+    const base = String(root || '').replace(/[\\/]+$/, '');
+    const m = /([^\\/]+)$/.exec(base);
+    if (m) return m[1];
+    const drive = /^([A-Za-z]):$/.exec(base);
+    if (drive) return drive[1];
+    return 'Cloud';
+  }
+  _rootDisplayNames(roots) {
+    const names = [];
+    for (const r of roots || []) {
+      let name = this._rootDisplayName(r);
+      if (names.indexOf(name) >= 0) {
+        let n = 2;
+        while (names.indexOf(name + ' (' + n + ')') >= 0) n++;
+        name = name + ' (' + n + ')';
+      }
+      names.push(name);
+    }
+    return names;
+  }
+  // Resolve a client-relative path against a user's roots. With ONE
+  // root the path resolves directly under it, exactly as before
+  // (rel == '' is the root itself) — a single-root user sees no
+  // extra folder level, in the browser, the DAV layer or the mapped
+  // drive. With TWO OR MORE roots the first segment names the root
+  // (its display name); the rest is jailed inside that root, and
+  // rel == '' is the virtual root itself (no single target).
+  // Returns { target, root, displayName, isVirtualRoot, isRoot } or
+  // null when it escapes / names no root.
+  _resolveUserPath(roots, rel) {
+    const clean = String(rel || '').replace(/^[/\\]+/, '').split(/[\\/]+/).filter((p) => p && p !== '.');
+    const names = this._rootDisplayNames(roots);
+    if (roots.length === 1) {
+      const root = roots[0];
+      const target = this._jail(root, clean.join('/'));
+      if (target === null) return null;
+      const realRoot = this._realRoot(root);
+      return { target, root, displayName: names[0], isVirtualRoot: false, isRoot: realRoot !== null && target === realRoot };
+    }
+    if (!clean.length) return { target: null, root: null, displayName: '', isVirtualRoot: true, isRoot: false };
+    const idx = names.indexOf(clean[0]);
+    if (idx < 0) return null;
+    const root = roots[idx];
+    const target = this._jail(root, clean.slice(1).join('/'));
+    if (target === null) return null;
+    const realRoot = this._realRoot(root);
+    return { target, root, displayName: names[idx], isVirtualRoot: false, isRoot: realRoot !== null && target === realRoot };
+  }
   listUsers() {
-    return (this._serverCfg().users || []).map((u) => ({
-      name: u.name, root: u.root, canWrite: !!u.canWrite,
-    }));
+    this._migrateUsers();
+    return (this._serverCfg().users || []).map((u) => {
+      const roots = this._userRoots(u);
+      return {
+        name: u.name, root: roots[0] || u.root, roots, canWrite: !!u.canWrite,
+      };
+    });
   }
 
   addUser(name, password, root, canWrite) {
@@ -269,9 +346,58 @@ class CloudServer {
     const users = this._serverCfg().users || (this._serverCfg().users = []);
     if (users.some((u) => u.name === clean)) throw new Error('A user with this name already exists.');
     const { salt, hash } = hashPassword(password);
-    users.push({ name: clean, passHash: hash, salt, root: path.normalize(root), canWrite: !!canWrite });
+    const normRoot = path.normalize(root);
+    users.push({ name: clean, passHash: hash, salt, root: normRoot, roots: [normRoot], canWrite: !!canWrite });
     this.onConfigChange();
-    return { name: clean, root: path.normalize(root), canWrite: !!canWrite };
+    return { name: clean, root: normRoot, roots: [normRoot], canWrite: !!canWrite };
+  }
+
+  // Edit a user: rename, rotate the password, replace the roots
+  // list, flip read/write — everything the Edit form changes.
+  // password ''/missing = keep the old one; roots missing = keep
+  // the old list. A rename updates the user in place; the caller
+  // (main.js) updates saved client records that point at this
+  // server. Any change drops the user's sessions at once: the
+  // login-time snapshot (name, roots) must never outlive the edit.
+  editUser(name, updates) {
+    const users = this._serverCfg().users || [];
+    const u = users.find((x) => x.name === name);
+    if (!u) throw new Error('User not found.');
+    const clean = (updates && updates.name !== undefined) ? String(updates.name || '').trim() : u.name;
+    if (!clean) throw new Error('User name is required.');
+    if (clean !== name && users.some((x) => x.name === clean)) throw new Error('A user with this name already exists.');
+    let roots = this._userRoots(u);
+    if (updates && updates.roots !== undefined) {
+      if (!Array.isArray(updates.roots) || !updates.roots.length) throw new Error('At least one folder is required.');
+      const seen = new Set();
+      roots = updates.roots.map((r) => {
+        if (!r || !path.isAbsolute(String(r))) throw new Error('Each folder must be an absolute path.');
+        const norm = path.normalize(String(r));
+        let st = null;
+        try { st = fs.statSync(norm); } catch (e) { st = null; }
+        if (!st || !st.isDirectory()) throw new Error('Folder does not exist or is not a folder: ' + norm);
+        if (seen.has(norm.toLowerCase())) throw new Error('The same folder is listed twice: ' + norm);
+        seen.add(norm.toLowerCase());
+        return norm;
+      });
+    }
+    let passwordChanged = false;
+    if (updates && updates.password !== undefined && updates.password !== null && updates.password !== '') {
+      if (typeof updates.password !== 'string' || updates.password.length < 12) throw new Error('Password must be at least 12 characters.');
+      const { salt, hash } = hashPassword(updates.password);
+      u.passHash = hash;
+      u.salt = salt;
+      passwordChanged = true;
+    }
+    const renamed = clean !== name;
+    u.name = clean;
+    u.roots = roots;
+    u.root = roots[0];
+    if (updates && updates.canWrite !== undefined) u.canWrite = !!updates.canWrite;
+    this._revokeSessionsFor(name);
+    if (renamed) this._revokeSessionsFor(clean);
+    this.onConfigChange();
+    return { name: clean, root: roots[0], roots: roots.slice(), canWrite: !!u.canWrite, renamed, passwordChanged };
   }
 
   removeUser(name) {
@@ -469,7 +595,8 @@ class CloudServer {
       }
       this.loginFails.delete(ip);
       const token = crypto.randomBytes(32).toString('hex');
-      this.sessions.set(token, { user: user.name, root: user.root, canWrite: !!user.canWrite, expiresAt: Date.now() + TOKEN_TTL_MS });
+      const roots = this._userRoots(user);
+      this.sessions.set(token, { user: user.name, root: roots[0], roots, canWrite: !!user.canWrite, expiresAt: Date.now() + TOKEN_TTL_MS });
       this._audit(ip, user.name, 'login ok', '');
       this._sendJson(res, 200, { token });
       return;
@@ -505,13 +632,30 @@ class CloudServer {
       const addrs = lanIPs();
       const ddns = this._serverCfg().ddnsHostname;
       if (ddns) addrs.push(ddns);
-      this._sendJson(res, 200, { name: 'TechVision Cloud', version: 1, user: session.user, root: session.root, canWrite: session.canWrite, addrs });
+      this._sendJson(res, 200, { name: 'TechVision Cloud', version: 1, user: session.user, root: session.root, roots: session.roots || [session.root], canWrite: session.canWrite, addrs });
       return;
     }
 
     if (req.method === 'GET' && pathname === '/api/list') {
-      const target = this._jail(session.root, u.searchParams.get('path') || '');
-      if (target === null || !fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
+      const rel = u.searchParams.get('path') || '';
+      const resolved = this._resolveUserPath(session.roots || [session.root], rel);
+      if (resolved === null) {
+        this._sendJson(res, 404, { error: 'Folder not found.' });
+        return;
+      }
+      // The virtual root: one folder per root the user has.
+      if (resolved.isVirtualRoot) {
+        const names = this._rootDisplayNames(session.roots || [session.root]);
+        const entries = (session.roots || [session.root]).map((r, i) => {
+          let mtime = 0;
+          try { mtime = fs.statSync(r).mtimeMs; } catch (_) {}
+          return { name: names[i], isDir: true, size: 0, mtime };
+        });
+        this._sendJson(res, 200, { path: rel, entries });
+        return;
+      }
+      const target = resolved.target;
+      if (!fs.existsSync(target) || !fs.statSync(target).isDirectory()) {
         this._sendJson(res, 404, { error: 'Folder not found.' });
         return;
       }
@@ -533,7 +677,9 @@ class CloudServer {
     }
 
     if (req.method === 'GET' && pathname === '/api/download') {
-      const target = this._jail(session.root, u.searchParams.get('path') || '');
+      const rel = u.searchParams.get('path') || '';
+      const resolved = this._resolveUserPath(session.roots || [session.root], rel);
+      const target = resolved && !resolved.isVirtualRoot ? resolved.target : null;
       if (target === null || !fs.existsSync(target) || !fs.statSync(target).isFile()) {
         this._sendJson(res, 404, { error: 'File not found.' });
         return;
@@ -544,7 +690,7 @@ class CloudServer {
         'Content-Length': size,
         'Content-Disposition': 'attachment; filename="' + path.basename(target).replace(/["\r\n]/g, '') + '"',
       });
-      this._audit(ip, session.user, 'download', path.relative(session.root, target) || path.basename(target));
+      this._audit(ip, session.user, 'download', rel || path.basename(target));
       // A read stream with no error listener throws as an uncaught
       // exception if the file vanishes mid-download — and that kills
       // the whole app (scheduler, tray and server included).
@@ -556,7 +702,9 @@ class CloudServer {
 
     if (req.method === 'POST' && pathname === '/api/upload') {
       if (!session.canWrite) { this._sendJson(res, 403, { error: 'This user is read-only.' }); return; }
-      const dir = this._jail(session.root, u.searchParams.get('path') || '');
+      const rel = u.searchParams.get('path') || '';
+      const resolved = this._resolveUserPath(session.roots || [session.root], rel);
+      const dir = resolved && !resolved.isVirtualRoot ? resolved.target : null;
       const fileName = String(req.headers['x-filename'] || '').split(/[\\/]/).pop();
       if (dir === null || !fileName || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
         this._sendJson(res, 400, { error: 'Bad upload destination.' });
@@ -598,7 +746,7 @@ class CloudServer {
         this._sendJson(res, 500, { error: 'Could not save the uploaded file.' });
         return;
       }
-      this._audit(ip, session.user, 'upload', path.relative(session.root, dest));
+      this._audit(ip, session.user, 'upload', (rel ? rel + '/' : '') + fileName);
       this._sendJson(res, 200, { ok: true, name: fileName });
       return;
     }
@@ -609,54 +757,63 @@ class CloudServer {
       try { body = await this._readJsonBody(req); }
       catch (e) { this._sendJson(res, 400, { error: e.message }); return; }
       if (!body || typeof body !== 'object') { this._sendJson(res, 400, { error: 'Invalid request.' }); return; }
+      // Multi-root: every path resolves through the user's roots
+      // (first segment = the root's display name). resolve() returns
+      // null for the virtual root itself and for paths that escape.
+      const roots = session.roots || [session.root];
+      const resolve = (p) => {
+        const r = this._resolveUserPath(roots, p || '');
+        return r && !r.isVirtualRoot ? r : null;
+      };
       try {
         if (pathname === '/api/mkdir') {
-          const target = this._jail(session.root, body.path || '');
-          if (target === null) throw new Error('Bad path.');
-          fs.mkdirSync(target, { recursive: true });
+          const r = resolve(body.path || '');
+          if (r === null) throw new Error('Bad path.');
+          fs.mkdirSync(r.target, { recursive: true });
           this._audit(ip, session.user, 'mkdir', body.path || '');
           this._sendJson(res, 200, { ok: true });
           return;
         }
-        // The shared folder itself can never be deleted, moved or
+        // A shared folder itself can never be deleted, moved or
         // copied: deleting it would brick the user until an admin
-        // fixes it.
-        const realRoot = this._realRoot(session.root);
+        // fixes it. Each root guards itself (r.isRoot).
         // copy (duplicate): file or folder, to a path that must not
         // exist yet — the client picks a free "name - copy" name.
         // Never the shared folder itself, never a folder into itself.
         if (pathname === '/api/copy') {
-          const from = this._jail(session.root, body.from || '');
-          const to = this._jail(session.root, body.to || '');
-          if (from === null || to === null || !fs.existsSync(from)) throw new Error('Bad path.');
-          if (realRoot !== null && from === realRoot) throw new Error('Cannot copy the shared folder itself.');
-          if (to === from || to.startsWith(from + path.sep)) throw new Error('Cannot copy a folder into itself.');
-          if (fs.existsSync(to)) throw new Error('A file or folder with that name already exists.');
-          fs.mkdirSync(path.dirname(to), { recursive: true });
-          fs.cpSync(from, to, { recursive: true, force: false, errorOnExist: true });
+          const from = resolve(body.from || '');
+          if (!from || !fs.existsSync(from.target)) throw new Error('Bad path.');
+          if (from.isRoot) throw new Error('Cannot copy the shared folder itself.');
+          const to = resolve(body.to || '');
+          if (!to) throw new Error('Bad path.');
+          if (to.target === from.target || to.target.startsWith(from.target + path.sep)) throw new Error('Cannot copy a folder into itself.');
+          if (fs.existsSync(to.target)) throw new Error('A file or folder with that name already exists.');
+          fs.mkdirSync(path.dirname(to.target), { recursive: true });
+          fs.cpSync(from.target, to.target, { recursive: true, force: false, errorOnExist: true });
           this._audit(ip, session.user, 'copy', (body.from || '') + ' -> ' + (body.to || ''));
           this._sendJson(res, 200, { ok: true });
           return;
         }
         // delete
         if (pathname === '/api/delete') {
-          const target = this._jail(session.root, body.path || '');
-          if (target === null || !fs.existsSync(target)) throw new Error('Not found.');
-          if (realRoot !== null && target === realRoot) throw new Error('Cannot delete the shared folder itself.');
-          const st = fs.statSync(target);
-          if (st.isDirectory()) fs.rmSync(target, { recursive: true, force: true });
-          else fs.unlinkSync(target);
+          const r = resolve(body.path || '');
+          if (r === null || !fs.existsSync(r.target)) throw new Error('Not found.');
+          if (r.isRoot) throw new Error('Cannot delete the shared folder itself.');
+          const st = fs.statSync(r.target);
+          if (st.isDirectory()) fs.rmSync(r.target, { recursive: true, force: true });
+          else fs.unlinkSync(r.target);
           this._audit(ip, session.user, 'delete', body.path || '');
           this._sendJson(res, 200, { ok: true });
           return;
         }
         // rename
-        const from = this._jail(session.root, body.from || '');
-        const to = this._jail(session.root, body.to || '');
-        if (from === null || to === null || !fs.existsSync(from)) throw new Error('Bad path.');
-        if (realRoot !== null && from === realRoot) throw new Error('Cannot move the shared folder itself.');
-        fs.mkdirSync(path.dirname(to), { recursive: true });
-        fs.renameSync(from, to);
+        const from = resolve(body.from || '');
+        if (!from || !fs.existsSync(from.target)) throw new Error('Bad path.');
+        if (from.isRoot) throw new Error('Cannot move the shared folder itself.');
+        const to = resolve(body.to || '');
+        if (!to) throw new Error('Bad path.');
+        fs.mkdirSync(path.dirname(to.target), { recursive: true });
+        fs.renameSync(from.target, to.target);
         this._audit(ip, session.user, 'rename', (body.from || '') + ' -> ' + (body.to || ''));
         this._sendJson(res, 200, { ok: true });
         return;
@@ -758,7 +915,8 @@ class CloudServer {
       return null;
     }
     this.loginFails.delete(ip);
-    return { name: user.name, root: user.root, canWrite: !!user.canWrite };
+    const roots = this._userRoots(user);
+    return { name: user.name, root: roots[0], roots, canWrite: !!user.canWrite };
   }
 
   // Relative path inside the user's root for a /dav request.
@@ -853,14 +1011,34 @@ class CloudServer {
     if (!user) return;
     const rel = this._davRel(pathname);
     if (rel === null) { this._sendJson(res, 400, { error: 'Bad path.' }); return; }
-    const target = this._jail(user.root, rel);
-    if (target === null) { this._sendJson(res, 404, { error: 'Not found.' }); return; }
-    const isRoot = target === this._realRoot(user.root);
+    // Multi-root: the first segment names the root; '' is the
+    // virtual root (one folder per root). It has no single target —
+    // PROPFIND lists it, anything else gets a 404.
+    const resolved = this._resolveUserPath(user.roots, rel);
+    if (resolved === null) { this._sendJson(res, 404, { error: 'Not found.' }); return; }
+    const target = resolved.target;
+    const isRoot = resolved.isRoot;
     const writeMethod = ['PUT', 'MKCOL', 'DELETE', 'MOVE', 'COPY', 'LOCK', 'UNLOCK'].indexOf(req.method) >= 0;
     if (writeMethod && !user.canWrite) { this._sendJson(res, 403, { error: 'This user is read-only.' }); return; }
 
     if (req.method === 'PROPFIND') {
       try { await this._readTextBody(req, 64 * 1024); } catch (e) { this._sendJson(res, 400, { error: e.message }); return; }
+      if (resolved.isVirtualRoot) {
+        const depth = String(req.headers.depth || '1').toLowerCase();
+        const names = this._rootDisplayNames(user.roots);
+        let xml = '<?xml version="1.0" encoding="utf-8" ?>\n<D:multistatus xmlns:D="DAV:">\n';
+        xml += '<D:response><D:href>/dav/</D:href><D:propstat><D:prop><D:displayname>Cloud</D:displayname><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>\n';
+        if (depth !== '0') {
+          for (let i = 0; i < user.roots.length; i++) {
+            xml += this._davPropXml(user.roots[i], names[i], true) + '\n';
+          }
+        }
+        xml += '</D:multistatus>';
+        const body = Buffer.from(xml, 'utf8');
+        res.writeHead(207, { 'Content-Type': 'application/xml; charset="utf-8"', 'Content-Length': body.length });
+        res.end(body);
+        return;
+      }
       if (!fs.existsSync(target)) { this._sendJson(res, 404, { error: 'Not found.' }); return; }
       const depth = String(req.headers.depth || '1').toLowerCase();
       const deep = depth !== '0';
@@ -885,6 +1063,10 @@ class CloudServer {
       res.end(body);
       return;
     }
+
+    // The virtual root is a listing only: no file to GET, no folder
+    // to create, delete or move.
+    if (resolved.isVirtualRoot) { this._sendJson(res, 404, { error: 'Not found.' }); return; }
 
     if (req.method === 'GET') {
       if (!fs.existsSync(target) || !fs.statSync(target).isFile()) { this._sendJson(res, 404, { error: 'File not found.' }); return; }
@@ -988,9 +1170,14 @@ class CloudServer {
     if (req.method === 'MOVE' || req.method === 'COPY') {
       const destRel = this._davDestRel(req);
       if (destRel === null) { this._sendJson(res, 400, { error: 'Destination header is missing or invalid.' }); return; }
-      const dest = this._jail(user.root, destRel);
-      if (dest === null) { this._sendJson(res, 404, { error: 'Destination not found.' }); return; }
+      // The source root itself can never be moved: check it before
+      // the destination (a new top-level name has no root to resolve
+      // against, and must still get the shared-folder error).
       if (isRoot) { this._sendJson(res, 403, { error: 'Cannot move the shared folder itself.' }); return; }
+      const destResolved = this._resolveUserPath(user.roots, destRel);
+      if (destResolved === null || destResolved.isVirtualRoot) { this._sendJson(res, 404, { error: 'Destination not found.' }); return; }
+      if (destResolved.isRoot) { this._sendJson(res, 403, { error: 'Cannot replace a shared folder.' }); return; }
+      const dest = destResolved.target;
       if (!fs.existsSync(target)) { this._sendJson(res, 404, { error: 'Not found.' }); return; }
       if (req.method === 'MOVE' && !this._davLockCheck(target, req)) { this._sendJson(res, 423, { error: 'File is locked.' }); return; }
       if (dest === target) { this._sendJson(res, 403, { error: 'Source and destination are the same.' }); return; }

@@ -97,6 +97,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cloudUserAdd: (u) => ipcRenderer.invoke('cloud-user-add', u),
   cloudUserRemove: (name) => ipcRenderer.invoke('cloud-user-remove', name),
   cloudUserSetPassword: (name, password) => ipcRenderer.invoke('cloud-user-set-password', name, password),
+  cloudUserEdit: (name, updates) => ipcRenderer.invoke('cloud-user-edit', name, updates),
   // TechVision Cloud — client (passwords are never stored)
   cloudClientSave: (s) => ipcRenderer.invoke('cloud-client-save', s),
   cloudClientRemove: (id) => ipcRenderer.invoke('cloud-client-remove', id),
