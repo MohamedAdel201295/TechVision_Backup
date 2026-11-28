@@ -27,6 +27,19 @@ const SCRYPT_OPTS = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
 const MAX_LOGIN_FAILS = 5;
 const LOCKOUT_MS = 10 * 60 * 1000;
+// DAV auth cache: a correct Basic credential is re-verified with a
+// full scrypt (~50 ms) on EVERY DAV request, and a player open/play
+// is dozens of requests — so seconds accumulate. The cache remembers
+// a verified credential for 5 minutes (sliding), so repeat requests
+// skip scrypt. A wrong password never hits the cache (different key
+// -> miss -> full scrypt -> 401 + lockout counting, exactly as
+// before); a password change / user delete takes effect at once
+// because every hit re-checks the live passHash, and
+// _revokeSessionsFor purges the user's entries too. In-memory only:
+// a server restart clears it. The key is a SHA-256 of the presented
+// base64 token — the password itself is never stored or logged.
+const DAV_AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
+const DAV_AUTH_CACHE_MAX = 128;
 const MAX_JSON_BYTES = 1024 * 1024;
 // Largest single upload the server accepts. A client streaming past
 // this gets a 413 and the partial file is deleted.
@@ -219,6 +232,7 @@ class CloudServer {
     this.port = 0;
     this.sessions = new Map(); // token -> { user, root, canWrite, expiresAt }
     this.loginFails = new Map(); // ip -> { fails, lockedUntil, lastFailAt }
+    this._davAuthCache = new Map(); // SHA-256 of Basic token -> { name, passHash, expiresAt } (in-memory only)
     this._davLocks = new Map(); // absolute path -> { token, expiresAt, owner } (WebDAV LOCK, in-memory only)
     this._uploadsInFlight = new Set(); // dest paths with an upload running
     this.maxUploadBytes = (opts && opts.maxUploadBytes) || MAX_UPLOAD_BYTES;
@@ -428,6 +442,15 @@ class CloudServer {
     for (const [t, s] of this.sessions) {
       if (s.user === name) this.sessions.delete(t);
     }
+    // The DAV auth cache is keyed by credential, not by user — drop
+    // this user's entries too, so a removed / re-passworded user loses
+    // DAV access at once. (The passHash check on a cache hit already
+    // makes stale entries unusable; this is belt-and-braces.)
+    if (this._davAuthCache) {
+      for (const [k, v] of this._davAuthCache) {
+        if (v.name === name) this._davAuthCache.delete(k);
+      }
+    }
   }
 
   // --- lifecycle ---
@@ -458,6 +481,7 @@ class CloudServer {
     this.httpsServer = null;
     this.port = 0;
     this.sessions.clear();
+    this._davAuthCache.clear();
     this._davLocks.clear();
     // close() alone waits for open connections forever; destroy them
     // so Stop never hangs on a client holding a connection open.
@@ -899,6 +923,23 @@ class CloudServer {
     }
     const users = this._serverCfg().users || [];
     const user = users.find((x) => x.name === name);
+    // Fast path: this exact credential verified recently, and the
+    // user + password hash are unchanged since then — skip scrypt.
+    // A wrong password can never hit here (different credential ->
+    // different key -> miss -> full scrypt below), and a lockout
+    // above already 429s before this point, exactly as before.
+    if (m && user && name) {
+      const key = crypto.createHash('sha256').update(m[1]).digest('hex');
+      const hit = this._davAuthCache.get(key);
+      if (hit && hit.name === name && hit.passHash === user.passHash && hit.expiresAt > Date.now()) {
+        // Sliding expiry: active playback keeps the entry alive.
+        hit.expiresAt = Date.now() + DAV_AUTH_CACHE_TTL_MS;
+        this.loginFails.delete(ip);
+        const roots = this._userRoots(user);
+        return { name: user.name, root: roots[0], roots, canWrite: !!user.canWrite };
+      }
+      if (hit) this._davAuthCache.delete(key);
+    }
     let ok = false;
     if (user && name) {
       ok = await verifyPassword(password, user.salt, user.passHash);
@@ -913,6 +954,18 @@ class CloudServer {
       res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="TechVision Cloud"', 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Wrong user name or password.' }));
       return null;
+    }
+    // Remember this verified credential so repeat requests skip
+    // scrypt. The key is a hash of the presented token, never the
+    // password; the live passHash is re-checked on every hit.
+    if (m) {
+      const key = crypto.createHash('sha256').update(m[1]).digest('hex');
+      if (this._davAuthCache.size >= DAV_AUTH_CACHE_MAX) {
+        let oldest = null; let oldestAt = Infinity;
+        for (const [k, v] of this._davAuthCache) { if (v.expiresAt < oldestAt) { oldestAt = v.expiresAt; oldest = k; } }
+        if (oldest) this._davAuthCache.delete(oldest);
+      }
+      this._davAuthCache.set(key, { name: user.name, passHash: user.passHash, expiresAt: Date.now() + DAV_AUTH_CACHE_TTL_MS });
     }
     this.loginFails.delete(ip);
     const roots = this._userRoots(user);

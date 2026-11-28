@@ -61,6 +61,19 @@ function createMediaProxy(resolveCredentials, opts) {
   opts = opts || {};
   const tokenTtlMs = opts.tokenTtlMs || DEFAULT_TOKEN_TTL_MS;
   const tokens = new Map(); // token -> { serverId, relPath, ext, createdAt, expiresAt }
+  // One shared upstream agent: without it, every proxied player
+  // request opens a fresh TLS connection to the DAV server (the
+  // default https.request has keep-alive off) — a handshake per
+  // chunk on top of the per-request scrypt the DAV cache now skips.
+  // NOTE: checkServerIdentity MUST live on the agent, not on each
+  // request — a fresh arrow function per request makes the agent
+  // treat every request as a different pool (measured: 48 TLS
+  // connections for 48 chunks) and reuse never happens. The check
+  // itself is unchanged (hostname verification off; the pinned
+  // cert in `ca` is the trust anchor, exactly as before) — only
+  // where the option sits moved. `ca` stays per-request because it
+  // varies per server record, and that does not break reuse.
+  const upstreamAgent = new https.Agent({ keepAlive: true, maxSockets: 8, checkServerIdentity: () => undefined });
   let server = null;
   let address = null;
   let sweepTimer = null;
@@ -117,12 +130,24 @@ function createMediaProxy(resolveCredentials, opts) {
       Authorization: 'Basic ' + Buffer.from(String(creds.user) + ':' + String(creds.password)).toString('base64'),
     };
     if (req.headers.range) headers.Range = req.headers.range;
+    // A HEAD is a probe: the player wants headers, not bytes. Ask
+    // upstream for one byte only instead of opening a full stream
+    // that gets destroyed — but only when the player did not ask for
+    // a range itself (its range is forwarded as-is).
+    const headProbe = req.method === 'HEAD' && !req.headers.range;
+    if (headProbe) headers.Range = 'bytes=0-0';
     let upReq;
+    // True once the upstream response has finished normally. The
+    // player's close handler below must only destroy the upstream
+    // request on a PREMATURE close — destroying it after a normal
+    // finish would kill the keep-alive socket and lose reuse.
+    let upFinished = false;
     try {
       upReq = https.request({
         host: String(creds.host), port: parseInt(creds.port, 10),
         path: davPathFor(rec.relPath), method: 'GET',
-        ca: [creds.certPem], checkServerIdentity: () => undefined,
+        ca: [creds.certPem],
+        agent: upstreamAgent,
         headers,
       }, (upRes) => {
         // Never let an auth challenge reach the player: a 401 here
@@ -143,12 +168,21 @@ function createMediaProxy(resolveCredentials, opts) {
         }
         if (req.method === 'HEAD') {
           // Headers only: the player is probing. Do not stream the
-          // file — end the response and drop the upstream socket.
+          // file — end the response. For a 1-byte probe, drain that
+          // byte so the socket returns to the keep-alive pool; for
+          // anything else (a full 200 stream) drop the socket
+          // instead, so the file is not downloaded for a probe.
+          if (headProbe && upRes.headers['content-range']) {
+            const cm = /^bytes \d+-\d+\/(\d+)$/.exec(String(upRes.headers['content-range']));
+            if (cm) out['content-length'] = cm[1];
+          }
           try { res.writeHead(upRes.statusCode, out); res.end(); } catch (e) {}
-          try { upReq.destroy(); } catch (e) {}
+          if (upRes.statusCode === 206) { upFinished = true; try { upRes.resume(); } catch (e) {} }
+          else { try { upReq.destroy(); } catch (e) {} }
           return;
         }
         try { res.writeHead(upRes.statusCode, out); } catch (e) { try { upReq.destroy(); } catch (e2) {} return; }
+        upRes.on('end', () => { upFinished = true; try { upReq.setTimeout(0); } catch (e) {} });
         upRes.on('error', () => { try { res.destroy(); } catch (e) {} });
         upRes.pipe(res);
       });
@@ -157,7 +191,9 @@ function createMediaProxy(resolveCredentials, opts) {
     upReq.on('timeout', () => { try { upReq.destroy(new Error('upstream timeout')); } catch (e) {} });
     upReq.on('error', () => send502(res));
     // The player gave up mid-stream: stop fetching upstream too.
-    res.on('close', () => { try { upReq.destroy(); } catch (e) {} });
+    // (After a normal finish the socket belongs to the keep-alive
+    // pool — destroying the request then would lose reuse.)
+    res.on('close', () => { if (!upFinished) { try { upReq.destroy(); } catch (e) {} } });
     upReq.end();
   }
 
@@ -178,6 +214,7 @@ function createMediaProxy(resolveCredentials, opts) {
   function stop() {
     return new Promise((resolve) => {
       tokens.clear();
+      try { upstreamAgent.destroy(); } catch (e) {}
       if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }
       if (!server) { address = null; return resolve(); }
       const s = server; server = null; address = null;
