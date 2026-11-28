@@ -6,7 +6,6 @@
 (function () {
   'use strict';
   var api = window.electronAPI || null;
-  var timer = null;
   function $(id) { return document.getElementById(id); }
   function toast(title, message, kind) {
     var box = $('toasts'); if (!box) return;
@@ -36,8 +35,9 @@
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
   }
   /* The job this restore was opened from (Restore... on a job), if any:
-     its source is the "Original Location", its type/compression fill
-     the Backup Information card. Standalone opens have none of it. */
+     its type/compression/timestamp fill the Backup Information card.
+     Standalone opens have none of it. The destination is always
+     picked by hand — there is no "Original Location" any more. */
   var jobInfo = null;
   function fillRestoreInfo(zipPath, info) {
     var empty = $('restoreInfoEmpty'), list = $('restoreInfoList');
@@ -145,31 +145,22 @@
             if (pwHint) pwHint.textContent = 'This backup is encrypted (TechVision-only). Enter its backup password to restore it.';
           }
           $('restorePasswordField').style.display = 'block';
+          // Layered backup (encryption password AND ZIP password):
+          // show BOTH fields up front, so one Start Restore submit
+          // restores it. The ZIP field used to appear only after a
+          // failed first attempt (ZIP_PASSWORD_REQUIRED) — that path
+          // stays as a safety net for a layered file whose flag
+          // could not be read here.
+          if (info.layered) {
+            var zf = $('restoreZipPasswordField');
+            if (zf) zf.style.display = 'block';
+          }
         }
       } else {
         showValid(zipPath, false);
         fillRestoreInfo(zipPath, null);
       }
     } catch (e) { showValid(zipPath, false); fillRestoreInfo(zipPath, null); /* unknown: restore will report the real error */ }
-  }
-  /* Restore To: Original Location restores into the job's source
-     folder (only when opened from a job); Custom Location uses the
-     Browse field. The field stays disabled while Original is picked. */
-  function setupRestoreDest() {
-    var orig = $('restoreDestOriginal'), cust = $('restoreDestCustom'), hint = $('restoreOriginalHint');
-    if (!orig || !cust) return;
-    var hasSource = !!(jobInfo && jobInfo.source);
-    orig.disabled = !hasSource;
-    if (hint) hint.style.display = hasSource ? 'none' : '';
-    var apply = function () {
-      var useOrig = orig.checked && hasSource;
-      $('restoreTo').disabled = useOrig;
-      $('restoreBrowseDest').disabled = useOrig;
-      if (useOrig) { $('restoreTo').value = jobInfo.source; $('restoreDestError').classList.remove('show'); }
-    };
-    orig.addEventListener('change', apply);
-    cust.addEventListener('change', apply);
-    apply();
   }
   async function pickFolder() {
     if (!api || typeof api.showOpenDialog !== 'function') { toast('Browse unavailable', 'Folder picker API is not available.', 'error'); return; }
@@ -194,8 +185,9 @@
     var pw = $('restorePassword').value;
     if (isEncryptedBackup && !pw) { $('restorePasswordError').classList.add('show'); ok = false; }
     else $('restorePasswordError').classList.remove('show');
-    // A layered backup's second password: the field is only shown
-    // after a ZIP_PASSWORD_REQUIRED result, and is then required.
+    // A layered backup's second password: the field is shown up
+    // front for a layered backup (and after a ZIP_PASSWORD_REQUIRED
+    // result as a safety net), and is then required.
     var zipField = $('restoreZipPasswordField');
     var zipFieldVisible = !!(zipField && zipField.style.display !== 'none');
     var zipPw = $('restoreZipPassword') ? $('restoreZipPassword').value : '';
@@ -210,9 +202,36 @@
     var le0 = $('restoreLogEmpty'); if (le0) le0.style.display = '';
     $('restoreProgressCard').classList.add('show');
     var pe = $('restoreProgressEmpty'); if (pe) pe.style.display = 'none';
-    setProgress(0, 0, '');
-    var pct = 0;
-    timer = setInterval(function () { pct = Math.min(92, pct + Math.random() * 9 + 3); setProgress(pct); }, 350);
+    // Real progress only: until the first progress event arrives the
+    // bar shows "Running…" with no percentage — never a random
+    // number (the old timer added Math.random()*9+3 every 350 ms).
+    // Each event is a file the engine really wrote (or skipped):
+    // pct = files done / files total, capped at 99% until the run
+    // itself reports completion, and never decreasing (a chain
+    // restore learns a new artifact's total only when it starts it).
+    var pctEl = $('restoreProgressPct'); if (pctEl) pctEl.textContent = 'Running…';
+    $('restoreProgressFill').style.width = '0%';
+    $('restoreProgressCount').textContent = '0 files';
+    $('restoreProgressFile').textContent = '';
+    var maxPct = 0;
+    var unsubProgress = null;
+    if (api && typeof api.onRestoreProgress === 'function') {
+      unsubProgress = api.onRestoreProgress(function (p) {
+        if (!p) return;
+        var done = Number(p.filesDone) || 0;
+        var total = Number(p.filesTotal) || 0;
+        if (total > 0) {
+          var pct = Math.min(99, Math.floor(100 * done / total));
+          if (pct > maxPct) maxPct = pct;
+          setProgress(maxPct, done, p.currentFile || '');
+        } else {
+          // Total unknown (a layered archive's inner file count is
+          // only known once it is opened): count files, no fake %.
+          $('restoreProgressCount').textContent = done + ' files';
+          if (p.currentFile) $('restoreProgressFile').textContent = p.currentFile;
+        }
+      });
+    }
     try {
       // Overwrite is OFF unless the checkbox is ticked: existing
       // files are then skipped, never replaced. Verification always
@@ -221,7 +240,6 @@
       // The first password opens the .tvb (or a plain encrypted
       // ZIP); the second opens the ZIP inside a layered .tvb.
       var result = await api.restoreAll(zipPath, dest, isEncryptedBackup ? $('restorePassword').value : null, { overwrite: !!(ow && ow.checked), zipPassword: zipPw || null });
-      clearInterval(timer);
       var files = result ? Number(result.files ?? result.restoredFiles ?? result.fileCount ?? 0) : 0;
       var skipped = result ? Number(result.files_skipped ?? result.filesSkipped ?? result.skipped ?? 0) : 0;
       setProgress(100, files, '');
@@ -257,11 +275,11 @@
       }
       if (typeof api.refreshJobs === 'function') { try { await api.refreshJobs(); } catch (e) {} }
     } catch (e) {
-      clearInterval(timer);
       var msg = e && e.message ? e.message : 'The restore did not complete.';
       showResult(false, 'Restore failed', msg);
       toast('Restore failed', msg, 'error');
     } finally {
+      if (unsubProgress) { try { unsubProgress(); } catch (e) {} unsubProgress = null; }
       $('startBtn').disabled = false;
       $('startBtn').textContent = 'Start Restore';
       $('restoreCancelBtn').disabled = false;
@@ -286,23 +304,20 @@
       api.getJobConfig(null).then(function (cfg) {
         if (cfg) {
           jobInfo = {
-            source: cfg.source || (cfg.job && cfg.job.source) || null,
             type: cfg.type || (cfg.job && cfg.job.type) || null,
             compression: cfg.compression || (cfg.job && cfg.job.compression) || null,
             timestamp: cfg.timestamp || (cfg.job && cfg.job.timestamp) || null
           };
-          setupRestoreDest();
         }
         if (cfg && cfg.result && cfg.result.backup_path) { $('backupFile').value = cfg.result.backup_path; checkEncrypted(cfg.result.backup_path); }
       }).catch(function () {});
-    } else setupRestoreDest();
+    }
   }
   /* Reset the restore view to a blank state. Called every time the
      restore view opens — the old separate window reloaded its page on
      every open, so this is the in-place equivalent of that fresh
      start. Exposed for renderer.js. */
   function resetRestore() {
-    if (timer) { clearInterval(timer); timer = null; }
     jobInfo = null; isEncryptedBackup = false;
     $('backupFile').value = '';
     $('restoreTo').value = '';
@@ -317,18 +332,13 @@
     var pe = $('restoreProgressEmpty'); if (pe) pe.style.display = '';
     var rb = $('resultBox'); if (rb) { rb.style.display = 'none'; rb.innerHTML = ''; }
     var le = $('restoreLogEmpty'); if (le) le.style.display = '';
-    var orig = $('restoreDestOriginal'), cust = $('restoreDestCustom');
-    if (orig) orig.checked = false;
-    if (cust) cust.checked = true;
     var ow = $('optOverwrite'); if (ow) ow.checked = false;
-    var hint = $('restoreOriginalHint'); if (hint) hint.style.display = '';
     var adv = $('restoreAdvanced'); if (adv) adv.style.display = 'none';
     var abtn = $('restoreAdvancedBtn');
     if (abtn) { abtn.setAttribute('aria-expanded', 'false'); abtn.textContent = 'Advanced Options ▸'; }
     var sb = $('startBtn'); if (sb) { sb.disabled = false; sb.textContent = 'Start Restore'; }
     var cb = $('restoreCancelBtn'); if (cb) cb.disabled = false;
     setProgress(0, 0, '');
-    setupRestoreDest();
     loadPendingRestore();
   }
   // Wire immediately like the job wizard: this script sits at the end of

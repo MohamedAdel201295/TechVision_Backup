@@ -1676,7 +1676,14 @@ ipcMain.handle('backup-run-incremental', async (event, jobConfig) => {
 ipcMain.handle('restore-all', async (event, zipPath, restoreDir, password, options) => {
   try {
     const restoreEngine = new RestoreEngine();
-    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null, options || {});
+    // Live progress: the engine reports every file it settles
+    // (restored, skipped or failed) through onProgress, forwarded
+    // to the calling window as 'restore-progress' — the wizard bar
+    // shows files done / files total, never a timer.
+    const sender = event.sender;
+    const result = await restoreEngine.restore_all(zipPath, restoreDir, password || null, Object.assign({}, options || {}, {
+      onProgress: (p) => { try { if (sender && !sender.isDestroyed()) sender.send('restore-progress', p); } catch (e) {} },
+    }));
     // restore_all reports failures in its result object instead of
     // throwing (wrong password, hash mismatch) — honour it, or a
     // failed restore would be reported as success. Its counters are

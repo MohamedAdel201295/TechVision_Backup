@@ -85,10 +85,40 @@ function restoreOptions(options) {
   // zipPassword is the ZIP-layer password (a layered .tvb's inner
   // ZIP, or a plain password-protected ZIP) — a non-string or empty
   // value is treated as "no ZIP password given".
+  // onProgress / progress: the live progress channel (point 13B).
+  // onProgress is the main-process callback that forwards each
+  // settled file to the renderer; progress is the shared mutable
+  // state { done, total, onProgress } created once per restore_all
+  // so chain artifacts and the layered recursion accumulate into
+  // one count instead of each reporting its own.
   return {
     overwrite: !!(options && options.overwrite),
     chainWritten: (options && options.chainWritten) || null,
-    zipPassword: (options && typeof options.zipPassword === 'string' && options.zipPassword) ? options.zipPassword : null
+    zipPassword: (options && typeof options.zipPassword === 'string' && options.zipPassword) ? options.zipPassword : null,
+    onProgress: (options && typeof options.onProgress === 'function') ? options.onProgress : null,
+    progress: (options && options.progress && typeof options.progress === 'object') ? options.progress : null
+  };
+}
+
+// The shared progress state for one restore_all call. Each artifact
+// adds its file count when it starts (addTotal) and reports every
+// file it settles (bump) — restored, skipped or failed — so the
+// percentage the wizard shows is files really processed, never a
+// timer. When a total is not known yet (a layered archive's inner
+// count is only known once it is opened) total stays short and the
+// wizard shows the count with no percentage.
+function progressFor(opts) {
+  const prog = (opts && opts.progress) || { done: 0, total: 0, onProgress: (opts && opts.onProgress) || null };
+  if (!prog.onProgress && opts && opts.onProgress) prog.onProgress = opts.onProgress;
+  return {
+    addTotal: function (n) { if (typeof n === 'number' && n > 0) prog.total += n; },
+    bump: function (name) {
+      prog.done++;
+      if (typeof prog.onProgress === 'function') {
+        try { prog.onProgress({ filesDone: prog.done, filesTotal: prog.total, currentFile: name || '' }); } catch (e) {}
+      }
+    },
+    state: prog
   };
 }
 
@@ -268,9 +298,13 @@ class RestoreEngine {
    */
   async restore_all(zipPath, restoreDir, password, options) {
     const opts = restoreOptions(options);
+    // One shared progress state for the whole restore (single
+    // artifact, chain, or layered recursion) — see progressFor.
+    const progress = opts.progress || { done: 0, total: 0, onProgress: opts.onProgress || null };
+    const optsWithProgress = Object.assign({}, opts, { progress });
     const chain = findBackupChain(zipPath);
     if (!chain || (chain.chain.length === 1 && !chain.baseMissing)) {
-      return this._restoreSingle(zipPath, restoreDir, password, opts);
+      return this._restoreSingle(zipPath, restoreDir, password, optsWithProgress);
     }
     const result = new RestoreResult();
     const startTime = Date.now();
@@ -282,7 +316,7 @@ class RestoreEngine {
     // OFF. Without this set the incremental's changed files were
     // skipped as "already exist" and the restore came back stale.
     const chainWritten = new Set();
-    const chainOpts = Object.assign({}, opts, { chainWritten: chainWritten });
+    const chainOpts = Object.assign({}, optsWithProgress, { chainWritten: chainWritten });
     for (const artifact of chain.chain) {
       const one = await this._restoreSingle(artifact, restoreDir, password, chainOpts);
       result.files_restored += one.files_restored;
@@ -316,6 +350,7 @@ class RestoreEngine {
    */
   async _restoreSingle(zipPath, restoreDir, password, options) {
     const opts = restoreOptions(options);
+    const prog = progressFor(opts);
     const result = new RestoreResult();
     const startTime = Date.now();
     // Overwrite OFF (default): an existing destination file is
@@ -354,6 +389,10 @@ class RestoreEngine {
         // the entry name alone — a per-file .tvb that happens to
         // hold one file called 'archive.zip' is not layered.
         const layeredInfo = tvb.inspectTvb(zipPath, password);
+        // Progress total: every entry of a per-file .tvb. A layered
+        // .tvb adds nothing here — its one entry is a whole ZIP,
+        // and the inner restore (recursion below) adds its own count.
+        if (!layeredInfo.layered) prog.addTotal(layeredInfo.entries.filter(function (e) { return !String(e.name || '').endsWith('/'); }).length);
         if (layeredInfo.layered) {
           if (layeredInfo.entries.length !== 1 || layeredInfo.entries[0].name !== tvb.TVB_LAYERED_ENTRY) {
             throw new Error('This backup is damaged: a layered backup must hold exactly one archive entry.');
@@ -388,10 +427,15 @@ class RestoreEngine {
             // Verified already (GCM tag + SHA-256 inside the reader):
             // rename over the destination — unless it already exists
             // and overwrite is OFF, in which case the good file
-            // there is left alone.
-            if (skipIfExists(tmp, dest, rel)) return false;
+            // there is left alone. Every entry settles here
+            // (restored or skipped) — that is the progress tick.
+            // A layered .tvb's single entry is a whole ZIP, not a
+            // file: it does NOT bump — the inner restore (recursion
+            // below) bumps each real file it restores.
+            if (skipIfExists(tmp, dest, rel)) { if (!layeredInfo.layered) prog.bump(rel); return false; }
             fs.renameSync(tmp, dest);
             if (opts.chainWritten) opts.chainWritten.add(path.resolve(dest));
+            if (!layeredInfo.layered) prog.bump(rel);
             return true;
           }
         });
@@ -431,7 +475,7 @@ class RestoreEngine {
             const dest = path.join(restoreDir, rel);
             try {
               if (entry.isDirectory()) { fs.mkdirSync(dest, { recursive: true }); await walk(src); }
-              else if (entry.isSymbolicLink()) { result.errors.push('Skipped symbolic link: ' + rel); }
+              else if (entry.isSymbolicLink()) { result.errors.push('Skipped symbolic link: ' + rel); prog.bump(rel); }
               else if (rel === MANIFEST_NAME) {
                 // The integrity manifest is metadata, not user data —
                 // never restored as a file.
@@ -471,6 +515,7 @@ class RestoreEngine {
                     result.files_restored++; result.total_bytes += copied.size;
                   }
                 }
+                prog.bump(rel);
               }
             } catch (e) {
               result.errors.push('Failed to restore ' + rel + ': ' + e.message);
@@ -478,6 +523,19 @@ class RestoreEngine {
           }
         };
         const manifest = readManifest(zipPath);
+        // Progress total: every file under the backup folder
+        // (manifest excluded, symlinks counted — they settle as
+        // errors, not as restored files).
+        const countFolderFiles = (dir) => {
+          let n = 0;
+          for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, e.name);
+            if (e.isDirectory()) n += countFolderFiles(full);
+            else if (path.relative(zipPath, full) !== MANIFEST_NAME) n++;
+          }
+          return n;
+        };
+        try { prog.addTotal(countFolderFiles(zipPath)); } catch (e) {}
         await walk(zipPath);
         if (!manifest) {
           result.warnings.push('This backup has no integrity manifest (created before verification was added) — files were copied without hash verification.');
@@ -514,12 +572,18 @@ class RestoreEngine {
           throw new Error(ZIP_PASSWORD_REQUIRED + ': This backup is password-protected. Enter its ZIP password and try again.');
         }
         if (!fs.existsSync(restoreDir)) fs.mkdirSync(restoreDir, { recursive: true });
+        // Progress total: every non-directory entry. Each entry
+        // settles via options.onSettled (restored, skipped or
+        // failed) — the onFile callback below only fires for files
+        // actually written, so it cannot drive progress alone.
+        prog.addTotal(encryptedInfo.entries.filter(function (e) { return !e.isDir; }).length);
         const extracted = await zipAes.extractEncrypted(zipPath, restoreDir, password, (rel, size) => {
           result.files_restored++;
           result.total_bytes += size;
         }, {
           overwrite: opts.overwrite,
-          chainWritten: opts.chainWritten
+          chainWritten: opts.chainWritten,
+          onSettled: function (rel) { prog.bump(rel); }
         });
         result.files_skipped = extracted.skipped;
         result.skipped_files = extracted.skipped_files;
@@ -594,6 +658,10 @@ class RestoreEngine {
           return resolve(result);
         }
         zipfileRef = zipfile;
+        // Progress total: every entry in the central directory
+        // (files and folders alike — folders settle instantly below,
+        // so done reaches total exactly when the restore ends).
+        prog.addTotal(zipfile.entryCount || 0);
         zipfile.on('error', failZip);
         zipfile.on('end', () => { ended = true; maybeFinish(); });
 
@@ -609,6 +677,7 @@ class RestoreEngine {
           // and `subdir/a.txt` then failed with ENOTDIR. A trailing
           // slash is the reliable test (same as the TVB reader).
           if (entry.fileName.endsWith('/') || (entry.externalAttributes & 0x10) !== 0) {
+            prog.bump(entry.fileName);
             return;
           }
 
@@ -617,6 +686,7 @@ class RestoreEngine {
           // were counted as restored.
           if (seenNames.has(entry.fileName)) {
             result.errors.push(`Duplicate entry skipped: ${entry.fileName}`);
+            prog.bump(entry.fileName);
             return;
           }
           seenNames.add(entry.fileName);
@@ -627,6 +697,7 @@ class RestoreEngine {
           const entryPath = path.resolve(restoreBase, entry.fileName.replace(/\//g, path.sep));
           if (entryPath !== restoreBase && !entryPath.startsWith(restoreBase + path.sep)) {
             result.errors.push(`Skipped unsafe path: ${entry.fileName}`);
+            prog.bump(entry.fileName);
             return;
           }
 
@@ -640,6 +711,7 @@ class RestoreEngine {
           } catch (e) {
             result.errors.push(`Failed to create folder for ${entry.fileName}: ${e.message}`);
             pendingEntries--;
+            prog.bump(entry.fileName);
             maybeFinish();
             return;
           }
@@ -653,6 +725,7 @@ class RestoreEngine {
             if (realParent !== realBase && !realParent.startsWith(realBase + path.sep)) {
               result.errors.push(`Skipped unsafe path: ${entry.fileName}`);
               pendingEntries--;
+              prog.bump(entry.fileName);
               maybeFinish();
               return;
             }
@@ -660,6 +733,7 @@ class RestoreEngine {
           } catch (e) {
             result.errors.push(`Failed to create folder for ${entry.fileName}: ${e.message}`);
             pendingEntries--;
+            prog.bump(entry.fileName);
             maybeFinish();
             return;
           }
@@ -675,6 +749,7 @@ class RestoreEngine {
             if (err) {
               result.errors.push(`Failed to open ${entry.fileName}: ${err.message}`);
               pendingEntries--;
+              prog.bump(entry.fileName);
               maybeFinish();
               return;
             }
@@ -696,6 +771,7 @@ class RestoreEngine {
               try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
               result.errors.push(msg);
               pendingEntries--;
+              prog.bump(entry.fileName);
               maybeFinish();
             };
             // CRC through a Transform so backpressure is honoured
@@ -726,6 +802,7 @@ class RestoreEngine {
                 // which case the good file there is left alone.
                 if (skipIfExists(tmpPath, writePath, entry.fileName)) {
                   pendingEntries--;
+                  prog.bump(entry.fileName);
                   maybeFinish();
                   return;
                 }
@@ -733,6 +810,7 @@ class RestoreEngine {
                   try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
                   result.errors.push(`Failed to write ${entry.fileName}: ${e.message}`);
                   pendingEntries--;
+                  prog.bump(entry.fileName);
                   maybeFinish();
                   return;
                 }
@@ -742,6 +820,7 @@ class RestoreEngine {
                 result.total_bytes += bytes;
               }
               pendingEntries--;
+              prog.bump(entry.fileName);
               maybeFinish();
             });
             ReadStream.pipe(crcStream).pipe(ws);

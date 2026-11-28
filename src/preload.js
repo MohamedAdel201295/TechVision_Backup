@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Restore operations
   restoreAll: (zipPath, restoreDir, password, options) => ipcRenderer.invoke('restore-all', zipPath, restoreDir, password, options),
   restoreSingle: (zipPath, entryName, destPath, password, options) => ipcRenderer.invoke('restore-single', zipPath, entryName, destPath, password, options),
+  // onRestoreProgress returns an unsubscribe function so a run can stop
+  // listening when it finishes (same shape as onBackupProgress).
+  onRestoreProgress: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('restore-progress', h); return () => ipcRenderer.removeListener('restore-progress', h); },
 
   // File system operations
     readDir: (dirPath) => ipcRenderer.invoke('fs-readdir', dirPath),

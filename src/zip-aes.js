@@ -601,6 +601,11 @@ async function extractEncrypted(zipPath, destDir, password, onFile, options) {
   // artifact must overwrite files this chain wrote, while files that
   // existed before the restore are still skipped.
   const chainWritten = (options && options.chainWritten) || null;
+  // Progress hook (point 13B): options.onSettled fires once per
+  // non-directory entry, whatever its outcome (restored, skipped,
+  // failed) — the restore progress bar counts settled files.
+  const onSettled = (options && typeof options.onSettled === 'function') ? options.onSettled : null;
+  const settled = (name) => { if (onSettled) { try { onSettled(name); } catch (e) {} } };
   const entries = readEntries(zipPath);
   const base = path.resolve(destDir);
   if (!fs.existsSync(base)) fs.mkdirSync(base, { recursive: true });
@@ -615,6 +620,7 @@ async function extractEncrypted(zipPath, destDir, password, onFile, options) {
     const dest = path.join(base, entry.name.split('/').join(path.sep));
     if (dest !== base && !dest.startsWith(base + path.sep)) {
       errors.push('Skipped unsafe path: ' + entry.name);
+      settled(entry.name);
       continue;
     }
     try {
@@ -622,6 +628,7 @@ async function extractEncrypted(zipPath, destDir, password, onFile, options) {
       const realParent = fs.realpathSync(path.dirname(dest));
       if (realParent !== realBase && !realParent.startsWith(realBase + path.sep)) {
         errors.push('Skipped unsafe path: ' + entry.name);
+        settled(entry.name);
         continue;
       }
       const realDest = path.join(realParent, path.basename(dest));
@@ -642,6 +649,7 @@ async function extractEncrypted(zipPath, destDir, password, onFile, options) {
       if (!ok) {
         try { fs.unlinkSync(tmpDest); } catch (e) {}
         errors.push(entry.name + ': written file failed verification');
+        settled(entry.name);
         continue;
       }
       // Only an existing regular FILE is skipped — a directory at the
@@ -657,14 +665,17 @@ async function extractEncrypted(zipPath, destDir, password, onFile, options) {
         try { fs.unlinkSync(tmpDest); } catch (e) {}
         skipped++;
         skipped_files.push(entry.name);
+        settled(entry.name);
         continue;
       }
       fs.renameSync(tmpDest, realDest);
       if (chainWritten) chainWritten.add(path.resolve(realDest));
       files++; bytes += out.bytes;
       if (typeof onFile === 'function') onFile(entry.name, out.bytes);
+      settled(entry.name);
     } catch (e) {
       errors.push(entry.name + ': ' + e.message);
+      settled(entry.name);
       if (e.message.indexOf('Wrong password') === 0) throw e; // one wrong password fails the whole restore
     }
   }
