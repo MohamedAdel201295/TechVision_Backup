@@ -368,6 +368,10 @@ function credentialTargetsFor(host, port) {
   return [
     { kind: 'generic', name: base },
     { kind: 'generic', name: base + '/dav' },
+    // The UNC form the redirector reports (\\host@SSL@port\DavWWWRoot\dav):
+    // Office/a redirector re-auth can look the login up under this
+    // target instead of the URL one, so seed it too (2026-11-28).
+    { kind: 'generic', name: '\\\\' + h + '@SSL@' + p + '\\DavWWWRoot\\dav' },
     { kind: 'generic', name: h },
     { kind: 'generic', name: h + ':' + p },
     { kind: 'add', name: h },
@@ -394,6 +398,215 @@ async function seedCredentials(host, port, user, password) {
   }
   if (!ok) return { success: false, error: 'Could not store the Cloud credentials in Windows Credential Manager: ' + failed.join('; ') };
   return { success: true, seeded: ok, failed: failed.length ? failed : undefined };
+}
+
+// --- Local Intranet zone + WebDAV AuthForwardServerList (2026-11-28) ---
+// Why a prompt survives a saved password: Windows only auto-uses a
+// stored Credential Manager login for sites in the Local Intranet
+// zone (default policy "Automatic logon only in Intranet zone").
+// The Cloud server sits on a Tailscale CGNAT address
+// (100.109.240.86), not on the user's LAN, so WinINET classifies
+// it as an Internet site and Office prompts on every open even
+// though the login IS saved (the user name comes pre-filled — the
+// credential was found, the zone policy blocks its silent use).
+// Office opens its OWN connection to the DAV server, so it hits
+// this gate on every file, from the Map and from inside the Cloud
+// page alike. Registering the server's addresses in the Intranet
+// zone lets WinINET use the already-seeded login silently. The
+// redirector itself uses WinHTTP and needs the server in
+// AuthForwardServerList (KB 941050) before it forwards a stored
+// credential for non-Office files. Zone entries hold no passwords
+// — only an address + a zone number — and the server's 401 +
+// scrypt + lockout are untouched.
+const ZONE_MAP_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\ZoneMap';
+const ZONE_MAP_RANGES_KEY = ZONE_MAP_KEY + '\\Ranges';
+const ZONE_MAP_DOMAINS_KEY = ZONE_MAP_KEY + '\\Domains';
+const WEBCLIENT_PARAMS_KEY = 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\WebClient\\Parameters';
+
+function isIpAddress(host) {
+  const h = String(host || '').trim();
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true; // IPv4
+  if (h.indexOf(':') >= 0 && /^[0-9a-fA-F:]+$/.test(h)) return true; // IPv6 literal
+  return false;
+}
+
+// The addresses to register for a client record: the server address
+// itself plus every alternate address learned at connect time (LAN
+// addresses + DDNS hostname from /api/info). Deduped,
+// case-insensitive — a hostname used as the record host is already
+// the first entry, and an alt host equal to it adds nothing.
+function zoneHostsFor(rec) {
+  const out = [];
+  const seen = new Set();
+  const add = (h) => {
+    const s = String(h || '').trim();
+    if (!s) return;
+    const k = s.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(s);
+  };
+  if (rec) {
+    add(rec.host);
+    if (Array.isArray(rec.altHosts)) for (const h of rec.altHosts) add(h);
+  }
+  return out;
+}
+
+// Parse `reg query` output (plain, /v, or /s) into sections:
+// [{ key, values: { name: { type, data } } }]. A section starts at
+// a line naming a registry key; value lines are `name REG_TYPE
+// data`. REG_MULTI_SZ values may continue on following indented
+// lines (one more string each) — those are folded into the same
+// value, separated by '\n'.
+function parseRegQueryOutput(output) {
+  const sections = [];
+  let cur = null;
+  const lines = String(output || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) continue;
+    const keyMatch = /^(HKEY_[A-Z_]+\\.*)$/i.exec(line.trim());
+    if (keyMatch) { cur = { key: keyMatch[1], values: {} }; sections.push(cur); continue; }
+    if (!cur) continue;
+    const vm = /^\s*(.*?)\s+(REG_SZ|REG_DWORD|REG_MULTI_SZ|REG_EXPAND_SZ|REG_BINARY|REG_QWORD)\s+(.*)$/.exec(line);
+    if (vm) {
+      cur.values[vm[1].trim()] = { type: vm[2], data: vm[3] };
+      cur._lastMulti = vm[2] === 'REG_MULTI_SZ' ? vm[1].trim() : null;
+      continue;
+    }
+    // Continuation line of a REG_MULTI_SZ value: one more string.
+    if (cur._lastMulti && /^\s+\S/.test(line)) {
+      cur.values[cur._lastMulti].data += '\n' + line.trim();
+      continue;
+    }
+    cur._lastMulti = null;
+  }
+  for (const s of sections) delete s._lastMulti;
+  return sections;
+}
+
+function regDwordIsOne(data) {
+  if (data === null || data === undefined) return false;
+  const s = String(data).trim().toLowerCase();
+  return s === '0x1' || s === '1';
+}
+
+async function regQuerySections(key, recursive) {
+  const args = ['query', key];
+  if (recursive) args.push('/s');
+  const r = await runCmd('reg.exe', args, 15000);
+  if (!r.success) return null; // key absent (or unreadable): caller treats as empty
+  return parseRegQueryOutput(r.stdout);
+}
+
+async function regQueryValueRaw(key, valueName) {
+  const args = ['query', key];
+  if (valueName === '(Default)') args.push('/ve');
+  else args.push('/v', valueName);
+  const r = await runCmd('reg.exe', args, 15000);
+  if (!r.success) return null;
+  const sections = parseRegQueryOutput(r.stdout);
+  if (!sections.length) return null;
+  const v = sections[0].values[valueName];
+  return v ? v.data : null;
+}
+
+async function regQueryMultiSz(key, valueName) {
+  const raw = await regQueryValueRaw(key, valueName);
+  if (raw === null || raw === undefined) return [];
+  return String(raw).split(/\\0|\n/).map((s) => s.trim()).filter(Boolean);
+}
+
+async function regAddValue(key, valueName, type, data) {
+  const r = await runCmd('reg.exe', ['add', key, '/v', valueName, '/t', type, '/d', String(data), '/f'], 15000);
+  return { success: !!r.success, error: r.success ? '' : (r.error || 'reg add failed') };
+}
+
+// Register ONE address in the Local Intranet zone. IPs go to
+// ZoneMap\Ranges\Range<N> (:Range = the IP, https = 1); hostnames go
+// to ZoneMap\Domains\<hostname> (https = 1). Idempotent: an address
+// already covered is left alone; a Range for the IP with https unset
+// is fixed in place instead of duplicating the Range. Best-effort
+// per address — a failure is reported, never thrown.
+async function ensureIntranetZoneForAddress(addr) {
+  if (!isWindows()) return { success: false, address: addr, error: 'Windows only.' };
+  const a = String(addr || '').trim();
+  if (!a) return { success: false, address: addr, error: 'Empty address.' };
+  if (isIpAddress(a)) {
+    const sections = (await regQuerySections(ZONE_MAP_RANGES_KEY, true)) || [];
+    let maxN = -1;
+    let existing = null;
+    for (const s of sections) {
+      const last = String(s.key || '').split('\\').pop() || '';
+      const m = /^Range(\d+)$/i.exec(last);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (n > maxN) maxN = n;
+        const rangeVal = s.values[':Range'];
+        if (rangeVal && String(rangeVal.data || '').trim().toLowerCase() === a.toLowerCase()) {
+          existing = { key: s.key, https: s.values['https'] ? s.values['https'].data : null };
+        }
+      }
+    }
+    if (existing) {
+      if (regDwordIsOne(existing.https)) return { success: true, address: a, alreadyCovered: true };
+      const w = await regAddValue(existing.key, 'https', 'REG_DWORD', '1');
+      return w.success ? { success: true, address: a, updated: true } : { success: false, address: a, error: w.error };
+    }
+    const key = ZONE_MAP_RANGES_KEY + '\\Range' + (maxN + 1);
+    const w1 = await regAddValue(key, ':Range', 'REG_SZ', a);
+    if (!w1.success) return { success: false, address: a, error: w1.error };
+    const w2 = await regAddValue(key, 'https', 'REG_DWORD', '1');
+    if (!w2.success) return { success: false, address: a, error: w2.error };
+    return { success: true, address: a, added: true, range: 'Range' + (maxN + 1) };
+  }
+  const key = ZONE_MAP_DOMAINS_KEY + '\\' + a;
+  const cur = await regQueryValueRaw(key, 'https');
+  if (regDwordIsOne(cur)) return { success: true, address: a, alreadyCovered: true };
+  const w = await regAddValue(key, 'https', 'REG_DWORD', '1');
+  return w.success ? { success: true, address: a, added: true } : { success: false, address: a, error: w.error };
+}
+
+async function ensureIntranetZone(hosts) {
+  if (!isWindows()) return { success: false, error: 'Windows only.' };
+  const list = Array.isArray(hosts) ? hosts : [hosts];
+  const results = [];
+  for (const h of list) {
+    try { results.push(await ensureIntranetZoneForAddress(h)); }
+    catch (e) { results.push({ success: false, address: h, error: e && e.message ? e.message : String(e) }); }
+  }
+  const failed = results.filter((r) => !r.success);
+  return { success: failed.length === 0, results, failed: failed.length ? failed : undefined };
+}
+
+// Add the server's addresses to the WebDAV redirector's
+// AuthForwardServerList (KB 941050): without an entry, WinHTTP
+// never forwards a stored credential for that server, so
+// non-Office files opened from the mapped drive prompt. Entries
+// are `https://<host>` — no port, no share. HKLM, so one UAC
+// prompt, and only when an entry is actually missing; the WebClient
+// service is restarted once in the same elevated call so the list
+// takes effect. Best-effort — a failure never blocks the connect;
+// the Intranet-zone fix above still covers Office.
+async function ensureAuthForwardServerList(hosts) {
+  if (!isWindows()) return { success: false, error: 'Windows only.' };
+  const list = (Array.isArray(hosts) ? hosts : [hosts]).map((h) => String(h || '').trim()).filter(Boolean);
+  if (!list.length) return { success: false, error: 'No server address.' };
+  const current = await regQueryMultiSz(WEBCLIENT_PARAMS_KEY, 'AuthForwardServerList');
+  const lower = new Set(current.map((c) => String(c).trim().toLowerCase()));
+  const missing = list.filter((h) => !lower.has(('https://' + h).toLowerCase()));
+  if (!missing.length) return { success: true, alreadyPresent: true, entries: current };
+  const next = current.concat(missing.map((h) => 'https://' + h));
+  // One elevation for the whole step: write the list, then restart
+  // the WebClient service so it picks the list up. A restart
+  // briefly drops WebDAV connections — this runs at connect time,
+  // before any mapping exists, so nothing live is dropped.
+  const dataArg = next.join('\\0');
+  const script = '$ErrorActionPreference = "Stop"; reg.exe add "' + WEBCLIENT_PARAMS_KEY + '" /v AuthForwardServerList /t REG_MULTI_SZ /d "' + dataArg + '" /f; if ($LASTEXITCODE -ne 0) { exit 1 }; Restart-Service -Name WebClient -Force';
+  const r = await runElevatedCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
+  if (!r.success) return { success: false, declined: !!r.declined, error: r.error || 'Could not update the WebDAV server list.' };
+  return { success: true, added: missing, entries: next, restarted: true };
 }
 
 function mapErrorText(r) {
@@ -682,6 +895,12 @@ module.exports = {
   resolvePlayerCommand,
   seedCredentials,
   credentialTargetsFor,
+  zoneHostsFor,
+  isIpAddress,
+  parseRegQueryOutput,
+  ensureIntranetZone,
+  ensureIntranetZoneForAddress,
+  ensureAuthForwardServerList,
   loadState,
   saveState,
 };

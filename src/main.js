@@ -2694,6 +2694,21 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
     // time used to be too late for a player that had already asked.
     // Best-effort: a failure never blocks the connect.
     if (rec) { try { await seedCloudCredentialsForOpen(opts.serverId, rec); } catch (e) {} }
+    // WebDAV AuthForwardServerList (2026-11-28): the redirector
+    // (WinHTTP) only forwards a stored credential for servers on
+    // this list — without it, non-Office files opened from the
+    // mapped drive prompt. One UAC prompt, only when an entry is
+    // actually missing, and the WebClient restart happens here at
+    // connect time, before any mapping exists. Best-effort: a
+    // failure never blocks the connect — the Intranet-zone fix
+    // (in seedCloudCredentialsForOpen) still covers Office.
+    if (rec) {
+      try {
+        const a = await cloudMapDrive.ensureAuthForwardServerList(cloudMapDrive.zoneHostsFor(rec));
+        if (a.success && a.added) console.log(`[Cloud] WebDAV server list updated for ${rec.host} (WebClient restarted).`);
+        else if (!a.success) appendAppLog('warn', `[Cloud] Could not add ${rec.host} to the WebDAV server list (${a.error || 'unknown error'}) — non-Office files from the mapped drive may still ask for the Cloud login.`);
+      } catch (e) {}
+    }
     // A typed password that just authenticated is remembered for next
     // time — in the vault when it is unlocked. When there is no
     // master password yet it is NOT written to cloud.json in plain
@@ -3150,6 +3165,17 @@ async function seedCloudCredentialsForOpen(serverId, rec) {
       console.log(`[Cloud] Credential seeding failed for ${rec.host}:${rec.port}: ${r.error}`);
       appendAppLog('warn', `[Cloud] Could not store the login for ${rec.host} in Windows Credential Manager (${r.error || 'unknown error'}) — Office may ask for the Cloud user and password.`);
     }
+    // Local Intranet zone (2026-11-28): a saved login is only used
+    // silently for Intranet-zone sites, and this server's address
+    // (a Tailscale IP, not on the LAN) is an Internet site by
+    // default — register the server's addresses so Office stops
+    // prompting on every open. HKCU, no elevation, idempotent;
+    // a failure never blocks the open.
+    try {
+      const z = await cloudMapDrive.ensureIntranetZone(cloudMapDrive.zoneHostsFor(rec));
+      if (z.success) console.log(`[Cloud] Intranet zone ensured for ${rec.host}.`);
+      else appendAppLog('warn', `[Cloud] Could not register ${rec.host} in the Local Intranet zone — Office may still ask for the Cloud login.`);
+    } catch (e) {}
     return r;
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
@@ -3226,6 +3252,9 @@ ipcMain.handle('cloud-open-verify-password', async (event, serverId, user, passw
       // for this server (until another Forget).
       promptOnNextOpen.delete(serverId);
       try { await cloudMapDrive.seedCredentials(rec.host, rec.port, u, pw); } catch (e) {}
+      // Same seeding moment as a connect: register the server in
+      // the Local Intranet zone so Office stops prompting.
+      try { await cloudMapDrive.ensureIntranetZone(cloudMapDrive.zoneHostsFor(rec)); } catch (e) {}
       return { ok: true };
     }
     return { ok: false, code: 'unreachable', error: 'Server error ' + probe.status + '.' };
@@ -3378,6 +3407,12 @@ async function reconnectMapDrives() {
       const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
       appendAppLog(r.success ? 'info' : 'error', '[Cloud] Map drive ' + m.letter + ': reconnect ' + (r.success ? 'ok' : ('failed — ' + (r.error || ''))));
       if (!r.success && Array.isArray(r.trace)) for (const line of r.trace) appendAppLog('error', '[Cloud] Map trace ' + m.letter + ': ' + line);
+      // A re-mapped drive must be seeded like a hand-made Map
+      // (2026-11-28): without it, the login is never stored in this
+      // session and Office prompts on the first open — and the
+      // Intranet-zone entries (in seedCloudCredentialsForOpen) never
+      // get written either.
+      if (r.success) { try { await seedCloudCredentialsForOpen(m.serverId, rec); } catch (e) {} }
     }
   } catch (e) {}
 }
