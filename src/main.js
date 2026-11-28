@@ -16,6 +16,7 @@ const driveResolver = require('./drive-resolver.js');
 const cloudServerMod = require('./cloud-server.js');
 const cloudClient = require('./cloud-client.js');
 const cloudMapDrive = require('./cloud-mapdrive.js');
+const { createMediaProxy } = require('./cloud-media-proxy.js');
 const cloudSavebackMod = require('./cloud-saveback.js');
 const vpn = require('./vpn.js');
 const wireguard = require('./wireguard.js');
@@ -77,6 +78,31 @@ function getClientPassword(rec) {
   } catch (e) {}
   return rec.password || null;
 }
+
+// Local loopback media proxy (2026-11-28): a non-WinINET player
+// (PotPlayer, VLC) cannot use the seeded Credential Manager login,
+// so it gets 401 from DAV and exits code 1. The proxy serves the
+// file to ANY player over plain HTTP on 127.0.0.1 with a one-time
+// token URL, fetching upstream from DAV with the app's own
+// credentials (Basic auth over pinned TLS). The resolver runs per
+// fetch, so it always uses the LIVE session first (the password
+// that just authenticated) and the saved record second — a token
+// minted before a disconnect finds no credentials and serves
+// nothing. Tokens carry no password and no DAV URL.
+function resolveMediaProxyCredentials(serverId) {
+  try {
+    const conn = cloudSessions.get(serverId);
+    const cfg = getCloudConfig();
+    const rec = (cfg.clients || []).find((c) => c.id === serverId);
+    if (!rec) return null;
+    const certPem = (conn && conn.certPem) || rec.certPem || null;
+    const user = (conn && conn.user) || rec.user;
+    const password = (conn && conn.password) || getClientPassword(rec);
+    if (!rec.host || !rec.port || !certPem || !user || !password) return null;
+    return { host: rec.host, port: rec.port, certPem, user, password };
+  } catch (e) { return null; }
+}
+const mediaProxy = createMediaProxy(resolveMediaProxyCredentials);
 
 function readSettingsFile() {
   try {
@@ -2225,6 +2251,9 @@ ipcMain.handle('vault-reset', async (event, masterPassword) => {
     // opens must prompt again (see the app-owned credential prompt).
     openCredResolved.clear();
     promptOnNextOpen.clear();
+    // And every media-proxy token with them: the credentials they
+    // would fetch with no longer exist.
+    try { mediaProxy.revokeAll(); } catch (e) {}
     afterVaultUnlocked();
     return { success: true, replaced: hadVault };
   } catch (e) { return { success: false, error: e.message }; }
@@ -2265,6 +2294,8 @@ ipcMain.handle('vault-lock', async () => {
   // credential prompt).
   openCredResolved.clear();
   promptOnNextOpen.clear();
+  // Same for media-proxy tokens: no credentials, no fetch.
+  try { mediaProxy.revokeAll(); } catch (e) {}
   // Also drop any leftover remember-me blob from the old build, so
   // the next launch asks for the master password again.
   try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
@@ -2548,6 +2579,9 @@ ipcMain.handle('cloud-client-forget-password', async (event, id) => {
   }
   cloudSessions.delete(id);
   try { cloudSaveback.stop(id); } catch (e) {}
+  // The session is gone, so its media-proxy tokens are too: a token
+  // minted before the Forget must not keep serving the file.
+  try { mediaProxy.revokeServer(id); } catch (e) {}
   // (3) The next direct open must show the app credential window
   // again, even though the connect auto-saves the typed password:
   // the flag forces the open gate to answer password-needed until
@@ -2573,6 +2607,7 @@ ipcMain.handle('cloud-client-remove', async (event, id) => {
   const cfg = getCloudConfig();
   cfg.clients = cfg.clients.filter((c) => c.id !== id);
   cloudSessions.delete(id);
+  try { mediaProxy.revokeServer(id); } catch (e) {}
   openCredResolved.delete(id);
   promptOnNextOpen.delete(id);
   saveCloudConfig();
@@ -2691,6 +2726,8 @@ ipcMain.handle('cloud-client-disconnect', async (event, serverId) => {
   }
   cloudSessions.delete(serverId);
   openCredResolved.delete(serverId);
+  // The session is gone, so its media-proxy tokens are too.
+  try { mediaProxy.revokeServer(serverId); } catch (e) {}
   // NOTE: promptOnNextOpen is deliberately NOT cleared here. It
   // means "the user asked to type the credentials again" (set by
   // Forget), and a plain disconnect does not satisfy that request —
@@ -3286,21 +3323,29 @@ ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
     await seedCloudCredentialsForOpen(serverId, rec);
     // Open in the device's media player, not the browser: handing
     // an https URL to the shell always opens the default browser.
-    // The registered player for the extension
-    // is launched with the DAV URL instead; it streams with Range
-    // requests and consults the seeded Credential Manager login, so
-    // it plays without a prompt. Chrome must NEVER open for media
-    // (2026-11-28): when the player cannot open the file, the
-    // handler returns the real reason with code 'player-failed' and
-    // the renderer shows it in the app — no browser, no silent temp
-    // fallback. The failure is logged so the reason is visible in
-    // the Full log too.
+    // The player is launched with a LOCAL proxy URL instead of the
+    // DAV URL (2026-11-28): a non-WinINET player (PotPlayer, VLC)
+    // cannot use the seeded Credential Manager login, so DAV
+    // answers 401 and the player exits code 1. The proxy serves the
+    // file over plain HTTP on 127.0.0.1 with a one-time token — no
+    // auth, no credentials in the URL — so ANY registered player
+    // plays it, and Range requests still stream/seek. If the proxy
+    // itself cannot start, fall back to the DAV URL (the old path:
+    // WinINET players still play it) and say so in the log.
+    // Chrome must NEVER open for media (2026-11-28): when the
+    // player cannot open the file, the handler returns the real
+    // reason with code 'player-failed' and the renderer shows it in
+    // the app — no browser, no silent temp fallback. The failure is
+    // logged so the reason is visible in the Full log too.
     const ext = (relPath.split('.').pop() || '').toLowerCase();
-    const played = await cloudMapDrive.openMediaInPlayer(url, ext);
-    if (played.success) return { success: true, mode: 'direct', url, player: played.player };
+    const proxyUrl = await mediaProxy.mint(serverId, relPath);
+    const playUrl = proxyUrl || url;
+    if (!proxyUrl) appendAppLog('warn', '[Cloud] Media proxy unavailable — opening the DAV URL directly in the player.');
+    const played = await cloudMapDrive.openMediaInPlayer(playUrl, ext);
+    if (played.success) return { success: true, mode: 'direct', url: playUrl, player: played.player };
     const playerError = (played && played.error) || 'The media player could not open this file.';
     appendAppLog('info', '[Cloud] Media player open failed for ' + relPath + ': ' + playerError);
-    return { success: false, code: 'player-failed', playerFailed: true, url, error: playerError };
+    return { success: false, code: 'player-failed', playerFailed: true, url: playUrl, error: playerError };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
   }

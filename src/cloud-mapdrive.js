@@ -204,10 +204,13 @@ function officeUriFor(host, port, rel) {
   return scheme + ':ofe|u|' + davUrl(host, port) + '/' + segs.map((s) => encodeURIComponent(s)).join('/');
 }
 
-// Media (video/audio) opens straight from the WebDAV URL in the
-// default player — the player pulls ranges over HTTPS, so a big video
-// starts playing without downloading first. Returns null for anything
-// that is not media.
+// Media (video/audio) URL for a file — used only to build the DAV
+// address the app itself fetches from. The PLAYER never sees this
+// URL any more: it gets a plain local proxy URL instead (see
+// cloud-media-proxy.js), because a non-WinINET player cannot answer
+// the DAV login and exits with an error. The proxy still streams
+// ranges, so a big video starts playing without downloading first.
+// Returns null for anything that is not media.
 const MEDIA_EXTS = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma'];
 function mediaUrlFor(host, port, rel) {
   const i = String(rel || '').lastIndexOf('.');
@@ -311,9 +314,11 @@ function buildPlayerArgv(command, url) {
   return { exe, args };
 }
 
-// Open a DAV media URL in the registered media player for its
-// extension. The player is launched DIRECTLY (spawn exe + argv) —
-// never through cmd.exe, which expands %...% as environment
+// Open a media URL in the registered media player for its
+// extension. The URL is normally the local proxy URL minted by
+// cloud-media-proxy.js — plain HTTP on 127.0.0.1, no login — so ANY
+// player plays it. The player is launched DIRECTLY (spawn exe +
+// argv) — never through cmd.exe, which expands %...% as environment
 // variables and mangles a percent-encoded URL, so an Arabic filename
 // never reached the player intact. Returns { success: false,
 // playerFailed: true, error } when there is no association or the
