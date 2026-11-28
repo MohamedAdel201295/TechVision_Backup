@@ -1116,7 +1116,13 @@
   var wgPanel = 'server';        // 'server' | 'nat' — WireGuard tabs
   var cloudSelected = null;      // saved server record being connected to
   var cloudPendingProbe = null;  // { fingerprint, certPem, changed } awaiting trust
-  var cloudConn = null;          // { serverId, info } while connected
+  var cloudConn = null;          // { serverId, info } of the VIEWED connection
+  // Every live connection, keyed by server record id: two records
+  // for the same server (Mohamed / Mohamed 2) stay connected at the
+  // same time — connecting one must never flip the other one to
+  // "not connected". cloudConn above is the one the file browser is
+  // showing; badges, the Map panel and the poller read this map.
+  var cloudConns = {};
   var cloudPath = '';            // current remote path, '' = root, '/' separators
   var cloudTransferTimer = null;
 
@@ -1191,11 +1197,12 @@
     var sp = $('cloudServerModePort'); if (sp) sp.textContent = String(s.port || 8443);
     var su = $('cloudServerModeUsers'); if (su) su.textContent = String((s.users || []).length);
     var cb = $('cloudClientModeBadge');
+    var _liveCount = Object.keys(cloudConns).length;
     if (cb) {
-      cb.textContent = cloudConn ? 'Connected' : 'Not connected';
-      cb.className = 'pill ' + (cloudConn ? 'pill-completed' : 'pill-pending');
+      cb.textContent = _liveCount ? 'Connected' + (_liveCount > 1 ? ' (' + _liveCount + ')' : '') : 'Not connected';
+      cb.className = 'pill ' + (_liveCount ? 'pill-completed' : 'pill-pending');
     }
-    var ca = $('cloudClientModeAddr'); if (ca) ca.textContent = cloudConn ? (cloudConn.name || '—') : '—';
+    var ca = $('cloudClientModeAddr'); if (ca) ca.textContent = cloudConn ? ((cloudConn.name || '—') + ' — user ' + (cloudConn.info && cloudConn.info.user ? cloudConn.info.user : '—')) : '—';
     var cc = $('cloudClientModeCount'); if (cc) cc.textContent = String(((cloudCfg.clients) || []).length);
   }
 
@@ -1564,11 +1571,11 @@
       // Connect again — Disconnect lives here on the card too (round
       // 2 #8), next to the badge, so Connect / Disconnect / Forget
       // are all together on the card.
-      if (cloudConn && cloudConn.serverId === srv.id) {
+      if (cloudConns[srv.id]) {
         var badge = document.createElement('span'); badge.className = 'cloud-connected-badge'; badge.textContent = '● Connected';
         acts.appendChild(badge);
         var disc = document.createElement('button'); disc.className = 'btn btn-ghost btn-sm'; disc.type = 'button'; disc.textContent = 'Disconnect';
-        disc.addEventListener('click', function () { cloudDisconnect(); });
+        disc.addEventListener('click', function () { cloudDisconnect(srv.id); });
         acts.appendChild(disc);
       } else {
         // One click when the password is saved on this device: connect
@@ -1596,7 +1603,7 @@
               // re-renders from the reloaded config, which now has no
               // fingerprint — so nothing Trust-related shows until the
               // user trusts the server again on the next connect.
-              if (cloudConn && cloudConn.serverId === srv.id) await cloudDisconnect();
+              if (cloudConns[srv.id]) await cloudDisconnect(srv.id);
               closeCloudConnect();
               toast('Cloud', 'Saved password forgotten — disconnected. The next open will ask for the user name and password again.', 'success');
               await loadCloud();
@@ -1610,7 +1617,7 @@
         askConfirm('Remove server "' + srv.name + '" from the list?', async function () {
           if (!api || typeof api.cloudClientRemove !== 'function') return cloudMissing();
           try {
-            if (cloudConn && cloudConn.serverId === srv.id) await cloudDisconnect();
+            if (cloudConns[srv.id]) await cloudDisconnect(srv.id);
             await api.cloudClientRemove(srv.id); await loadCloud();
           }
           catch (e) { toast('Remove error', e && e.message ? e.message : 'Could not remove server.', 'error'); }
@@ -1716,7 +1723,8 @@
       cloudMapCurrentLetter = mapping.letter;
       if (disBtn) disBtn.style.display = '';
       if (expBtn) expBtn.style.display = '';
-      statusEl.textContent = 'Mapped: ' + mapping.letter + ': → ' + (mapping.name || mapping.host) + ' (' + mapping.host + ':' + mapping.port + ')';
+      statusEl.textContent = 'Mapped: ' + mapping.letter + ': → ' + (mapping.name || mapping.host) + ' (' + mapping.host + ':' + mapping.port + ')'
+        + (mapping.connected === false ? ' — disconnected. The drive is still there — connect in the Client tab to use it again.' : '');
     } else if (mapping && mapping.status === 'password-needed') {
       cloudMapCurrentLetter = null;
       if (disBtn) disBtn.style.display = 'none';
@@ -1743,7 +1751,7 @@
     // Say the connection state here too, before the user presses Map:
     // mapping needs a live Client connection to this server (the
     // guard in cloudMapDriveAction), not just a saved record.
-    var connectedHere = !!(cloudConn && cloudConn.serverId === serverId);
+    var connectedHere = !!cloudConns[serverId];
     if (srvHint) srvHint.textContent = (hasPassword ? 'Pick a saved server from the Client tab.' : 'This server has no saved password — connect once in the Client tab first.')
       + (connectedHere ? '' : ' Not connected — connect in the Client tab before mapping.');
     // The Map button stays disabled until this server is connected:
@@ -1780,7 +1788,7 @@
     // status line and STAY here — no small toast, no jump to the
     // Client tab. The button is disabled in this state already; this
     // is the backstop for a race between render and press.
-    var connectedHere = !!(cloudConn && cloudConn.serverId === serverId);
+    var connectedHere = !!cloudConns[serverId];
     if (!connectedHere) {
       if (statusEl) statusEl.textContent = 'Not connected — connect in the Client tab first, then map the drive.';
       return;
@@ -2000,7 +2008,9 @@
       }
       // `selected` is a local copy, so closeCloudConnect() clearing
       // cloudSelected below cannot lose the server name.
-      cloudConn = { serverId: selected.id, info: r.info, name: selected.name };
+      var _conn = { serverId: selected.id, info: r.info, name: selected.name };
+      cloudConns[selected.id] = _conn;
+      cloudConn = _conn;
       cloudMapInvalidateCache();
       closeCloudConnect();
       cloudPath = '';
@@ -2038,25 +2048,48 @@
     }
   }
 
-  async function cloudDisconnect() {
+  // Disconnect ONE server (serverId, default = the viewed one).
+  // The other live connections are never touched: their sessions
+  // stay, their cards keep the Connected badge, and if the
+  // disconnected one was the viewed one the browser switches to
+  // another still-connected server instead of hiding.
+  async function cloudDisconnect(serverId) {
     cloudHideContextMenu();
-    if (cloudConn && api && typeof api.cloudClientDisconnect === 'function') {
-      try { await api.cloudClientDisconnect(cloudConn.serverId); } catch (e) {}
+    var targetId = serverId || (cloudConn && cloudConn.serverId);
+    if (targetId && api && typeof api.cloudClientDisconnect === 'function') {
+      try { await api.cloudClientDisconnect(targetId); } catch (e) {}
     }
-    cloudStopPoller();
-    cloudLinkDown = false;
-    cloudReloginTried = false;
-    cloudSetConnBanner(false);
-    cloudConn = null;
-    cloudMapInvalidateCache();
-    cloudPath = '';
-    cloudSelectedEntry = null;
-    cloudClipboard = null;
-    var browser = $('cloudBrowser'); if (browser) browser.style.display = 'none';
+    if (targetId) delete cloudConns[targetId];
+    var wasViewed = !!(cloudConn && cloudConn.serverId === targetId);
+    if (wasViewed) {
+      cloudStopPoller();
+      cloudLinkDown = false;
+      cloudReloginTried = false;
+      cloudSetConnBanner(false);
+      cloudConn = null;
+      cloudMapInvalidateCache();
+      cloudPath = '';
+      cloudSelectedEntry = null;
+      cloudClipboard = null;
+      var remaining = Object.keys(cloudConns);
+      if (remaining.length) {
+        cloudConn = cloudConns[remaining[0]];
+        renderCloudHome();
+        // The server card must go back to Connect/Open instead of keeping
+        // its "Connected" badge.
+        renderCloudClientList();
+        if (cloudPanel === 'mapdrive') renderMapdrivePanel();
+        await cloudBrowse('');
+        cloudStartPoller();
+        return;
+      }
+      var browser = $('cloudBrowser'); if (browser) browser.style.display = 'none';
+    }
     renderCloudHome();
     // The server card must go back to Connect/Open instead of keeping
     // its "Connected" badge.
     renderCloudClientList();
+    if (cloudPanel === 'mapdrive') renderMapdrivePanel();
   }
 
   /* ---------- Cloud client auto-refresh ----------
@@ -2151,7 +2184,9 @@
         certPem: certPem, user: srv.user, password: null,
       });
       if (r && r.success) {
-        cloudConn = { serverId: srv.id, info: r.info, name: srv.name };
+        var _reConn = { serverId: srv.id, info: r.info, name: srv.name };
+        cloudConns[srv.id] = _reConn;
+        cloudConn = _reConn;
         cloudMapInvalidateCache();
         cloudLinkDown = false;
         cloudSetConnBanner(false);
@@ -2564,7 +2599,7 @@
     if (crumbs) {
       crumbs.innerHTML = '';
       var rootBtn = document.createElement('button');
-      rootBtn.className = 'cloud-crumb'; rootBtn.type = 'button'; rootBtn.textContent = (cloudConn && cloudConn.name ? cloudConn.name : 'Server') + ' /';
+      rootBtn.className = 'cloud-crumb'; rootBtn.type = 'button'; rootBtn.textContent = (cloudConn && cloudConn.name ? cloudConn.name : 'Server') + ' — user ' + (cloudConn && cloudConn.info && cloudConn.info.user ? cloudConn.info.user : '—') + ' /';
       rootBtn.addEventListener('click', function () { cloudBrowse(''); });
       crumbs.appendChild(rootBtn);
       var parts = cloudPath ? cloudPath.split('/') : [];
@@ -2617,6 +2652,38 @@
       if (prevSel && e.name === prevSel) { cloudSelectedEntry = entry; row.classList.add('selected'); }
     });
     cloudUpdateToolbar();
+    cloudUpdateServerSwitch();
+  }
+
+  // Server switcher in the file browser head: shown only while two
+  // or more servers are connected — picking one switches the file
+  // browser to that user's files (each user is read with their own
+  // permissions and roots).
+  function cloudUpdateServerSwitch() {
+    var sel = $('cloudServerSwitch');
+    if (!sel) return;
+    var ids = Object.keys(cloudConns);
+    sel.innerHTML = '';
+    if (ids.length < 2) { sel.style.display = 'none'; return; }
+    sel.style.display = '';
+    ids.forEach(function (id) {
+      var c = cloudConns[id];
+      var o = document.createElement('option');
+      o.value = id;
+      o.textContent = (c.name || 'Server') + ' — user ' + (c.info && c.info.user ? c.info.user : '—');
+      sel.appendChild(o);
+    });
+    if (cloudConn) sel.value = cloudConn.serverId;
+  }
+  async function cloudSwitchServer(serverId) {
+    if (!cloudConns[serverId]) return;
+    cloudConn = cloudConns[serverId];
+    cloudPath = '';
+    cloudSelectedEntry = null;
+    cloudClipboard = null;
+    renderCloudHome();
+    cloudUpdateServerSwitch();
+    await cloudBrowse('');
   }
 
   async function cloudDownload(relPath) {
@@ -3298,6 +3365,31 @@
         });
       }
     } catch (e) { /* vault stays locked; encrypted runs will ask instead */ }
+  }
+  // Tray Master Password (2026-11-28): the window was hidden to the
+  // tray, which locked the vault — showing it again asks for the
+  // master password, the same unlock modal as at startup. The
+  // "I forgot it" reset button stays hidden (showVaultUnlockModal
+  // hides it): the key is locked, not lost. "Skip for now" still
+  // works — the app keeps running with a locked vault, exactly
+  // like skipping the startup prompt.
+  async function showVaultModalOnTrayRestore() {
+    if (!api || typeof api.vaultStatus !== 'function') return;
+    try {
+      var st = await api.vaultStatus();
+      if (st.exists && st.locked) {
+        var _t = $('vaultModalText'); if (_t && vaultUnlockDefaultText) _t.textContent = vaultUnlockDefaultText;
+        showVaultUnlockModal(null, null);
+      }
+    } catch (e) { /* vault stays locked; encrypted runs will ask instead */ }
+  }
+  if (api && typeof api.onVaultShowUnlock === 'function') {
+    api.onVaultShowUnlock(function () { showVaultModalOnTrayRestore(); });
+  }
+  // After a connect's auto-remap finishes, a dropped mapping may
+  // have come back: re-render the Map panel if it is open.
+  if (api && typeof api.onCloudMapdriveChanged === 'function') {
+    api.onCloudMapdriveChanged(function () { if (cloudPanel === 'mapdrive') renderMapdrivePanel(); });
   }
   function hideVaultModal() {
     $('vaultModal').style.display = 'none';
@@ -4388,8 +4480,9 @@
       refreshVaultStatus();
     });
     // No Lock button any more (Settings → Security keeps only
-    // create / change): the vault locks itself when the app closes,
-    // and the next launch asks for the master password again.
+    // create / change): the vault locks itself when the window
+    // hides to the tray and when the app closes, and the next
+    // show / launch asks for the master password again.
     // (The vault-lock IPC stays for tests; no UI calls it.)
     var vub = $('vaultUnlockBtn');
     if (vub) vub.addEventListener('click', async function () {
@@ -4978,6 +5071,8 @@
     if (ccp) ccp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') cloudConnectFlow(); });
     var cdb = $('cloudDisconnectBtn');
     if (cdb) cdb.addEventListener('click', function () { cloudDisconnect(); });
+    var cssw = $('cloudServerSwitch');
+    if (cssw) cssw.addEventListener('change', function () { cloudSwitchServer(cssw.value); });
     var cmb2 = $('cloudMapBtn');
     if (cmb2) cmb2.addEventListener('click', function () { cloudMapDriveAction(); });
     var cmd = $('cloudMapDisconnectBtn');

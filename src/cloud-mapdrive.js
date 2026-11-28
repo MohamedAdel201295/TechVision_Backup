@@ -693,7 +693,47 @@ async function mapDrive(opts) {
   const tPre0 = Date.now();
   const cur = await getDriveStatus(letter);
   trace.push('precheck ' + letter + ': ' + (cur.success ? (cur.mapped ? 'mapped to "' + traceText(scrub(cur.remote || '')) + '"' : 'not mapped') : 'status error — ' + traceText(cur.error || '')) + ' in ' + (Date.now() - tPre0) + 'ms');
-  if (cur.success && cur.mapped && remoteMatchesDav(cur.remote, host, port)) return { success: true, letter, host, alreadyMapped: true, trace };
+  if (cur.success && cur.mapped && remoteMatchesDav(cur.remote, host, port)) {
+    // Stale-credential check (2026-11-28): the letter is already
+    // mapped to this server, but the mapping may hold an OLD
+    // password (mapped when the password was different) — every
+    // player open with the old login counts as a failed login and
+    // 3 opens lock the IP for 10 minutes, while the player reports
+    // 401/404/429 alike as "file not found". When the caller
+    // supplies verifyCredentials, check the CURRENT saved password
+    // against the server first: 2xx = the saved login is good and
+    // the mapping was made with it — reuse it; 401 = the saved
+    // login is wrong, so the mapping is dead weight that only
+    // generates lockout fails — drop it and map fresh below (the
+    // fresh attempt surfaces the real error); 429 = already locked
+    // out — fail plainly without touching the mapping; anything
+    // else (unreachable, cert error) = keep the old behaviour and
+    // reuse the mapping. No verifier supplied = old behaviour.
+    if (typeof opts.verifyCredentials === 'function') {
+      let probe;
+      try { probe = await opts.verifyCredentials(); } catch (e) { probe = { error: e && e.message ? e.message : String(e) }; }
+      const pStatus = probe && probe.status;
+      if (pStatus === 401) {
+        trace.push('stale-credential check: saved password rejected (401) — dropping the old mapping and mapping fresh');
+        const drop = await unmapDrive(letter);
+        trace.push('drop stale mapping ' + letter + ': ' + (drop.success ? 'removed' : 'FAILED — ' + traceText(drop.error || '')));
+        // Fall through to attempt(host) below — the mapping is gone,
+        // so this maps fresh with the current password. Do NOT
+        // return alreadyMapped here.
+      } else if (pStatus === 429) {
+        trace.push('stale-credential check: server locked out (429) — failing without touching the mapping');
+        return { success: false, error: 'Too many failed logins — the server locked this address for 10 minutes. Wait, then try again.', trace };
+      } else if (pStatus >= 200 && pStatus < 300) {
+        trace.push('stale-credential check: saved password accepted (' + pStatus + ') — reusing the existing mapping');
+        return { success: true, letter, host, alreadyMapped: true, trace };
+      } else {
+        trace.push('stale-credential check: inconclusive (' + (probe && probe.error ? traceText(probe.error) : ('status ' + pStatus)) + ') — reusing the existing mapping');
+        return { success: true, letter, host, alreadyMapped: true, trace };
+      }
+    } else {
+      return { success: true, letter, host, alreadyMapped: true, trace };
+    }
+  }
 
   const attempt = async (h) => {
     const tNet0 = Date.now();
@@ -904,3 +944,4 @@ module.exports = {
   loadState,
   saveState,
 };
+

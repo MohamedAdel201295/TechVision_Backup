@@ -487,6 +487,7 @@ const APP_ICON = path.join(ASSETS_PATH, 'TechVision_Logo.png');
 // Closing the main window only hides it to the tray.
 let tray = null;
 let isQuitting = false;
+let vaultLockedByTrayHide = false; // set when a tray hide locks the vault; cleared when the window shows again
 
 // Main window — the only window. The job wizard, restore wizard, log
 // viewer and settings used to be separate BrowserWindows; they are
@@ -1098,6 +1099,33 @@ function createMainWindow() {
     }
   });
 
+  // Tray Master Password (2026-11-28): hiding the window to the
+  // tray locks the vault, so showing it again asks for the master
+  // password — exactly like a fresh launch. The 'hide' event fires
+  // for BOTH hide paths (the X close above and the tray click),
+  // and for no other reason, so both go through the same lock.
+  // The flag records that this hide locked the vault: a window
+  // shown without it (first launch, a fresh window) shows the
+  // startup prompt on its own and must not get a second modal.
+  // Skip when already locked (startup prompt skipped) or when no
+  // vault exists — there is nothing to lock, and no modal to show.
+  mainWindow.on('hide', () => {
+    if (isQuitting) return;
+    if (vaultKey) {
+      vaultLockedByTrayHide = true;
+      lockVault();
+    }
+  });
+  mainWindow.on('show', () => {
+    if (!vaultLockedByTrayHide) return;
+    vaultLockedByTrayHide = false;
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('vault-show-unlock');
+      }
+    } catch (e) {}
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -1157,7 +1185,50 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => { isQuitting = true; });
+// Unmap every mapped drive the app owns (2026-11-28: a full Exit
+// from the tray must disconnect the Map network drives). The state
+// records are KEPT — the next launch's startup auto-reconnect
+// re-maps them — only the live Windows mapping is removed. X to the
+// tray does NOT call this: the app is still running.
+let quittingAfterUnmap = false;
+async function unmapAllMappedDrives() {
+  const state = getMapdriveState();
+  const letters = (state.mappings || []).map((m) => m.letter).filter(Boolean);
+  const results = [];
+  for (const letter of letters) {
+    try {
+      const r = await cloudMapDrive.unmapDrive(letter);
+      results.push(r);
+      if (!r.success && !r.alreadyGone) appendAppLog('warn', '[Cloud] Exit unmap of drive ' + letter + ': ' + (r.error || 'failed'));
+    } catch (e) {
+      results.push({ success: false, letter, error: e && e.message ? e.message : String(e) });
+      appendAppLog('warn', '[Cloud] Exit unmap of drive ' + letter + ': ' + (e && e.message ? e.message : String(e)));
+    }
+  }
+  return results;
+}
+
+app.on('before-quit', async (event) => {
+  isQuitting = true;
+  // A second process (no single-instance lock) must never unmap the
+  // running instance's drives: mappings live in the logon session,
+  // so a `net use /delete` from any process in the session removes
+  // them.
+  if (!gotSingleInstanceLock) return;
+  if (quittingAfterUnmap) return;
+  let state = null;
+  try { state = getMapdriveState(); } catch (e) {}
+  if (!state || !state.mappings || !state.mappings.length) return;
+  event.preventDefault();
+  quittingAfterUnmap = true;
+  try {
+    await Promise.race([
+      unmapAllMappedDrives(),
+      new Promise((resolve) => setTimeout(resolve, 15000)),
+    ]);
+  } catch (e) {}
+  app.quit();
+});
 
 // ---------- Scheduler ----------
 // The schedule a job is created with was saved but never executed:
@@ -2286,7 +2357,11 @@ ipcMain.handle('vault-unlock', async (event, masterPassword) => {
     return { success: true };
   } catch (e) { return { success: false, error: e.message }; }
 });
-ipcMain.handle('vault-lock', async () => {
+/* Lock the vault and drop everything derived from the key. Shared by
+   the vault-lock IPC (tests / Settings) and the tray-hide lock below:
+   one place, one behavior — the key, the resolved-open flags and the
+   media-proxy tokens all go away together. */
+function lockVault() {
   if (vaultKey) vault.lockVault(vaultKey);
   vaultKey = null;
   // A locked vault cannot read saved passwords: direct opens must
@@ -2299,8 +2374,8 @@ ipcMain.handle('vault-lock', async () => {
   // Also drop any leftover remember-me blob from the old build, so
   // the next launch asks for the master password again.
   try { vault.clearUnlockBlob(app.getPath('userData')); } catch (e) {}
-  return { success: true };
-});
+}
+ipcMain.handle('vault-lock', async () => { lockVault(); return { success: true }; });
 
 // ---------- TechVision Cloud ----------
 // Config + server status. Passwords and the server private key never
@@ -2533,6 +2608,11 @@ ipcMain.handle('cloud-client-save', async (event, s) => {
     // plaintext password, when no new password was sent.
     if (existing && existing.passwordInVault) rec.passwordInVault = true;
     if (existing && existing.password) rec.password = existing.password;
+    // Keep the alternate addresses learned at connect time (from
+    // /api/info): a re-save after a connect must not wipe them, or
+    // the Map tab loses the addresses it retries under when Windows
+    // refuses a second user with error 1219.
+    if (existing && Array.isArray(existing.altHosts)) rec.altHosts = existing.altHosts.slice();
     let passwordNotSaved = false;
     let needsMasterKey = false;
     let needsUnlock = false;
@@ -2728,6 +2808,16 @@ ipcMain.handle('cloud-client-connect', async (event, opts) => {
         if (!vault.vaultExists(app.getPath('userData'))) needsMasterKey = true;
       }
     }
+    // A connect re-establishes any mapping that dropped while the
+    // Client was disconnected (2026-11-28: auto-remap). Fire and
+    // forget: a down server's probe can take seconds and must never
+    // slow the connect, and a failed re-map never changes the
+    // connect result. The Map panel re-renders when it finishes.
+    try {
+      reconnectMapDrives().then(function () {
+        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('cloud-mapdrive-changed'); } catch (e) {}
+      }).catch(function () {});
+    } catch (e) {}
     return { success: true, info, passwordNotSaved, needsMasterKey };
   } catch (e) {
     return { success: false, error: e && e.message ? e.message : String(e) };
@@ -2950,6 +3040,11 @@ ipcMain.handle('cloud-mapdrive-status', async () => {
         serverId: m.serverId, letter: m.letter, host: m.host, port: m.port, user: m.user,
         reconnect: !!m.reconnect, status, error, remote,
         name: rec ? rec.name : m.serverId, hasPassword: !!(rec && getClientPassword(rec)),
+        // Whether the Client tab is connected to this server RIGHT
+        // NOW: the Map panel shows a mapped-but-disconnected drive
+        // as "still there, connect again to use it" instead of
+        // flipping to "Not mapped" when the session drops.
+        connected: cloudSessions.has(m.serverId),
       });
     }
     return { success: true, mappings: out, freeLetters: free.success ? free.letters : [], elevated };
@@ -3032,13 +3127,34 @@ ipcMain.handle('cloud-mapdrive-map', async (event, serverId, letter, reconnect) 
     if (covers === false) {
       return { success: false, error: 'The server certificate does not cover this address (' + rec.host + '). It was issued before this address existed on the server — restart the Cloud server on the server machine so it issues a new certificate covering it, then connect again in the Client tab (Trust & connect) and map the drive.' };
     }
+    // Refresh the alternate addresses from the LIVE session before
+    // mapping (2026-11-28: the saved list can be empty or stale — a
+    // record re-saved after its connect lost it, or the server's
+    // addresses changed since). The session is the source of truth;
+    // a failed refresh keeps the saved list.
+    try {
+      const live = cloudSessions.get(serverId);
+      if (live) {
+        const liveInfo = await cloudClient.info(live);
+        if (liveInfo && Array.isArray(liveInfo.addrs) && liveInfo.addrs.length) {
+          const hostLower = String(rec.host || '').toLowerCase();
+          rec.altHosts = liveInfo.addrs.map((a) => String(a || '').trim()).filter((a) => a && a.toLowerCase() !== hostLower);
+          saveCloudConfig();
+        }
+      }
+    } catch (e) { /* saved altHosts stand */ }
     // Alternate addresses for the same server (saved at connect time
     // from /api/info): when a second user maps the same host, Windows
     // refuses with error 1219 — one credential set per server NAME
     // per logon session. mapDrive retries under another address for
     // the same physical server, skipping any the cert does not cover.
     const altHosts = Array.isArray(rec.altHosts) ? rec.altHosts.filter((h) => h && String(h).toLowerCase() !== String(rec.host).toLowerCase()) : [];
-    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec), altHosts, coversHost: (h) => cloudServerMod.certCoversHost(rec.certPem, h) });
+    // Stale-credential check (2026-11-28): when the letter is already
+    // mapped to this server, mapDrive verifies the mapping with the
+    // CURRENT saved password (a DAV PROPFIND — the exact credential
+    // path the redirector uses) and drops + re-creates it on 401
+    // instead of silently reusing a dead mapping that locks the IP.
+    const mapped = await cloudMapDrive.mapDrive({ letter: l, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec), altHosts, coversHost: (h) => cloudServerMod.certCoversHost(rec.certPem, h), verifyCredentials: () => davProbeCredentials(rec.host, rec.port, rec.certPem, rec.user, getClientPassword(rec)) });
     if (!mapped.success) {
       // A failed Map MUST leave a trace in the app log: before this
       // change the failure path logged nothing, so the Full log had
@@ -3319,6 +3435,89 @@ ipcMain.handle('cloud-office-open', async (event, serverId, relPath) => {
 // built URL is returned even on failure (the sandbox has no player,
 // so the Windows-only cert step blocks the open there — the
 // caller/driver can still assert the exact URL).
+// --- Cloud playlist (.m3u) ---
+// Opening one file from the Cloud page used to hand the player a
+// single proxy URL, so the player showed one file and no playlist —
+// unlike a mapped drive, where the player sees the whole folder.
+// Now the app builds a .m3u for the file + its media siblings in the
+// same folder (the same /api/list the Cloud page itself uses), each
+// entry a proxy URL with its real name, and opens the .m3u instead.
+// A player starts a playlist at its FIRST entry, so the opened file
+// goes first and the remaining siblings follow in listing order —
+// that matches the mapped drive, where double-clicking a file starts
+// that file. Any failure (no siblings, listing failed, a mint
+// failed) falls back to the single URL, exactly as before.
+// The playlist is capped by the proxy's token table (MAX_TOKENS =
+// 64 in cloud-media-proxy.js — this number must stay in sync): a
+// playlist that minted more tokens than the table holds would evict
+// its own early entries, and the clicked file itself would 404. The
+// cap counts the table's live tokens, so a busy table shrinks the
+// playlist instead of breaking it.
+const PLAYLIST_MAX_ENTRIES = 64;
+const PLAYLIST_TMP_PREFIX = 'techvision-playlist-';
+
+function playlistTmpPath() {
+  const rand = require('crypto').randomBytes(6).toString('hex');
+  return path.join(os.tmpdir(), PLAYLIST_TMP_PREFIX + Date.now().toString(36) + '-' + rand + '.m3u');
+}
+
+// Best-effort removal of playlist files from earlier opens (never the
+// one just written). A failure here must never block the open.
+function cleanupStalePlaylists(keepPath) {
+  try {
+    const dir = os.tmpdir();
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(PLAYLIST_TMP_PREFIX) || !name.endsWith('.m3u')) continue;
+      const p = path.join(dir, name);
+      if (keepPath && p === keepPath) continue;
+      try { fs.unlinkSync(p); } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+// Build the .m3u for a Cloud media open. Returns the .m3u path, or
+// null when no playlist applies (the caller then opens the single
+// proxy URL). The file carries only proxy URLs — one-time tokens, no
+// passwords — and #EXTINF titles with the real filenames.
+async function buildCloudPlaylist(serverId, conn, rec, relPath) {
+  try {
+    const dir = String(relPath || '').split('/').slice(0, -1).join('/');
+    const r = await cloudClient.list(conn, dir);
+    const entries = (r && r.entries) || [];
+    const rels = [];
+    for (const e of entries) {
+      if (!e || e.isDir || !e.name) continue;
+      const rel = (dir ? dir + '/' : '') + e.name;
+      if (!cloudMapDrive.mediaUrlFor(rec.host, rec.port, rel)) continue;
+      rels.push(rel);
+    }
+    const at = rels.indexOf(relPath);
+    if (rels.length < 2 || at < 0) return null;
+    // Room in the token table for this playlist (the single URL for
+    // the opened file already holds one slot). Fewer than 2 slots
+    // means no playlist — the single URL plays instead.
+    let room = PLAYLIST_MAX_ENTRIES;
+    try { if (mediaProxy && typeof mediaProxy.tokenCount === 'function') room = PLAYLIST_MAX_ENTRIES - mediaProxy.tokenCount(); } catch (e) {}
+    if (room < 2) return null;
+    // Opened file first, then the following siblings in listing
+    // order, wrapping to the top of the folder when the cap is hit.
+    const ordered = [];
+    for (let i = 0; i < rels.length && ordered.length < room; i++) ordered.push(rels[(at + i) % rels.length]);
+    const lines = ['#EXTM3U'];
+    for (const rel of ordered) {
+      const u = await mediaProxy.mint(serverId, rel);
+      if (!u) return null;
+      lines.push('#EXTINF:-1,' + rel.split('/').pop().replace(/[\r\n]/g, ' '), u);
+    }
+    const p = playlistTmpPath();
+    // UTF-8 BOM + CRLF: Windows players (PotPlayer) read Arabic
+    // titles correctly only from a BOM-marked .m3u.
+    fs.writeFileSync(p, '\uFEFF' + lines.join('\r\n') + '\r\n', 'utf8');
+    cleanupStalePlaylists(p);
+    return p;
+  } catch (e) { return null; }
+}
+
 ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
   try {
     const conn = cloudSessions.get(serverId);
@@ -3370,8 +3569,17 @@ ipcMain.handle('cloud-media-open', async (event, serverId, relPath) => {
     const proxyUrl = await mediaProxy.mint(serverId, relPath);
     const playUrl = proxyUrl || url;
     if (!proxyUrl) appendAppLog('warn', '[Cloud] Media proxy unavailable — opening the DAV URL directly in the player.');
-    const played = await cloudMapDrive.openMediaInPlayer(playUrl, ext);
-    if (played.success) return { success: true, mode: 'direct', url: playUrl, player: played.player };
+    // Playlist: when the proxy is up, open the folder's media as an
+    // .m3u so the player shows the real names AND the playlist (like
+    // a mapped drive does). Any failure here falls back to the single
+    // URL, exactly as before.
+    let playlistPath = null;
+    if (proxyUrl) {
+      try { playlistPath = await buildCloudPlaylist(serverId, conn, rec, relPath); } catch (e) { playlistPath = null; }
+    }
+    const openTarget = playlistPath || playUrl;
+    const played = await cloudMapDrive.openMediaInPlayer(openTarget, ext);
+    if (played.success) return { success: true, mode: playlistPath ? 'playlist' : 'direct', url: openTarget, player: played.player };
     const playerError = (played && played.error) || 'The media player could not open this file.';
     appendAppLog('info', '[Cloud] Media player open failed for ' + relPath + ': ' + playerError);
     return { success: false, code: 'player-failed', playerFailed: true, url: playUrl, error: playerError };
@@ -3395,7 +3603,17 @@ async function reconnectMapDrives() {
       const rec = cfg.clients.find((c) => c.id === m.serverId);
       if (!rec || !getClientPassword(rec)) continue;
       const st = await cloudMapDrive.getDriveStatus(m.letter);
-      if (st.success && st.mapped) continue;
+      if (st.success && st.mapped) {
+        // Already mapped — but the mapping may hold an OLD password
+        // (mapped when the password was different): the redirector
+        // re-authenticates from the stored login, so seed the
+        // CURRENT saved password now instead of skipping seeding
+        // entirely (2026-11-28: a stale mapping locks the IP after
+        // 3 player opens while the player reports "file not found").
+        // The re-map itself is still skipped, as before.
+        try { await seedCloudCredentialsForOpen(m.serverId, rec); } catch (e) {}
+        continue;
+      }
       let probeOk = true;
       try { await cloudClient.probeServer(String(rec.host), parseInt(rec.port, 10)); }
       catch (e) { probeOk = false; }
@@ -3404,7 +3622,12 @@ async function reconnectMapDrives() {
         const trusted = await cloudMapDrive.isCertTrusted(rec.certPem);
         if (trusted.success && !trusted.trusted) { appendAppLog('info', '[Cloud] Map drive ' + m.letter + ': certificate is not trusted yet, skipping reconnect.'); continue; }
       }
-      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec) });
+      // A second user's mapping hits Windows error 1219 when the
+      // first user's login is already held for this server name:
+      // retry under an alternate address (LAN / DDNS) from the
+      // record, skipping any the certificate does not cover.
+      const altHosts = Array.isArray(rec.altHosts) ? rec.altHosts.filter((h) => h && String(h).toLowerCase() !== String(rec.host).toLowerCase()) : [];
+      const r = await cloudMapDrive.mapDrive({ letter: m.letter, host: rec.host, port: rec.port, user: rec.user, password: getClientPassword(rec), altHosts, coversHost: rec.certPem ? (h) => cloudServerMod.certCoversHost(rec.certPem, h) : null });
       appendAppLog(r.success ? 'info' : 'error', '[Cloud] Map drive ' + m.letter + ': reconnect ' + (r.success ? 'ok' : ('failed — ' + (r.error || ''))));
       if (!r.success && Array.isArray(r.trace)) for (const line of r.trace) appendAppLog('error', '[Cloud] Map trace ' + m.letter + ': ' + line);
       // A re-mapped drive must be seeded like a hand-made Map
@@ -4546,3 +4769,4 @@ function promptRestoreDir() {
   // Return a default restore directory
   return path.join(app.getPath('documents'), 'TechVision Restores');
 }
+

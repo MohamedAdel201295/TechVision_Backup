@@ -62,6 +62,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     vaultStoreJobPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-password', jobId, jobPassword),
     vaultHasJobZipPassword: (jobId) => ipcRenderer.invoke('vault-has-job-zip-password', jobId),
     vaultStoreJobZipPassword: (jobId, jobPassword) => ipcRenderer.invoke('vault-store-job-zip-password', jobId, jobPassword),
+    // Tray Master Password: main asks the renderer to show the unlock
+    // modal again when the window comes back from the tray.
+    onVaultShowUnlock: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('vault-show-unlock', h); return () => ipcRenderer.removeListener('vault-show-unlock', h); },
+    // Fired after a connect's auto-remap finishes, so the Map panel
+    // can re-render (a dropped mapping may have come back).
+    onCloudMapdriveChanged: (callback) => { const h = (event, ...args) => callback(...args); ipcRenderer.on('cloud-mapdrive-changed', h); return () => ipcRenderer.removeListener('cloud-mapdrive-changed', h); },
 
   // Job detail actions
   openEditJob: (jobId) => ipcRenderer.invoke('job-open-edit', jobId),

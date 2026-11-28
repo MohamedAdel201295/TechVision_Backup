@@ -9,20 +9,24 @@
 // became visible instead.
 //
 // How: the app serves the file to the player itself over plain HTTP
-// on 127.0.0.1 with a one-time token URL — no auth, no credentials,
-// no filename in the URL — and fetches upstream from DAV with the
-// app's own credentials (HTTP Basic over pinned TLS, the same path
-// the credential-verify probe uses). Range requests are forwarded
-// so seeking/scrubbing works. The URL works for ANY registered
-// player, because from the player's side it is a plain local HTTP
-// stream with no login.
+// on 127.0.0.1 with a one-time token URL — no auth, no credentials —
+// and fetches upstream from DAV with the app's own credentials (HTTP
+// Basic over pinned TLS, the same path the credential-verify probe
+// uses). Range requests are forwarded so seeking/scrubbing works.
+// The URL carries the token + the real (percent-encoded) filename,
+// so the player shows the real title instead of a random token; a
+// Content-Disposition header names it too (Arabic names via RFC 5987).
+// The URL works for ANY registered player, because from the player's
+// side it is a plain local HTTP stream with no login.
 //
 // Security:
 // - Binds 127.0.0.1 ONLY (never 0.0.0.0); ephemeral port.
 // - Tokens are random 192-bit base64url, bound to one server record
-//   + one file; the file identity lives server-side, never in the
-//   URL (the URL carries only the token + the file extension, so
-//   players that sniff the extension still pick the right demuxer).
+//   + one file; the file identity lives server-side in the token
+//   record — the filename suffix in the URL is display-only and is
+//   NEVER used for lookup (a forged suffix still serves the token's
+//   own file, or 404s with a forged token). The extension in the
+//   suffix still lets players that sniff it pick the right demuxer.
 // - Tokens slide-expire 15 minutes after the last fetch (absolute
 //   cap 4 hours) and are revoked on disconnect / Forget / record
 //   remove / vault lock / vault reset. Wrong or expired token -> 404.
@@ -55,6 +59,26 @@ function extOf(relPath) {
   const i = base.lastIndexOf('.');
   if (i <= 0) return '';
   return base.slice(i + 1).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 8);
+}
+
+// Content-Disposition naming the real file: players use the URL's
+// last segment or this header as the title. Arabic names go in the
+// RFC 5987 filename* (UTF-8, percent-encoded); filename= carries an
+// ASCII-only fallback — a pure-Arabic name collapses to just its
+// extension there, so it falls back to "file" + ext instead.
+function contentDispositionFor(relPath) {
+  const base = String(relPath || '').split('/').pop() || 'file';
+  let ascii = base.replace(/[^\x20-\x7E]/g, '').replace(/["\\]/g, '').trim();
+  // If the name's stem has no ASCII letters/digits left (a pure
+  // Arabic name collapses to just ".mp3"), fall back to "file" + ext.
+  const dot = ascii.lastIndexOf('.');
+  const stem = dot >= 0 ? ascii.slice(0, dot) : ascii;
+  if (!/[A-Za-z0-9]/.test(stem)) {
+    const ext = extOf(relPath);
+    ascii = 'file' + (ext ? '.' + ext : '');
+  }
+  const encoded = encodeURIComponent(base).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  return 'inline; filename="' + ascii + '"; filename*=UTF-8\'\'' + encoded;
 }
 
 function createMediaProxy(resolveCredentials, opts) {
@@ -117,8 +141,12 @@ function createMediaProxy(resolveCredentials, opts) {
     }
     let pathname = '';
     try { pathname = decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname); } catch (e) { return send404(res); }
-    const m = /^\/([A-Za-z0-9_-]{16,})(\.[A-Za-z0-9]{1,8})?$/.exec(pathname);
+    const m = /^\/([A-Za-z0-9_-]{16,})(?:\.[A-Za-z0-9]{1,8})?(?:\/.*)?$/.exec(pathname);
     if (!m) return send404(res);
+    // The token is the FIRST path segment only. A trailing "/name"
+    // suffix (the minted filename) — or the old ".ext" form — is
+    // display-only and never used for lookup: the file always comes
+    // from the token record's relPath.
     const rec = lookupToken(m[1]);
     if (!rec) return send404(res);
 
@@ -166,6 +194,10 @@ function createMediaProxy(resolveCredentials, opts) {
         for (const h of FORWARDED_HEADERS) {
           if (upRes.headers[h] !== undefined) out[h] = upRes.headers[h];
         }
+        // Name the real file for the player (GET and HEAD alike):
+        // without this the player titles the stream with the random
+        // token from the URL instead of the filename.
+        out['content-disposition'] = contentDispositionFor(rec.relPath);
         if (req.method === 'HEAD') {
           // Headers only: the player is probing. Do not stream the
           // file — end the response. For a 1-byte probe, drain that
@@ -257,9 +289,14 @@ function createMediaProxy(resolveCredentials, opts) {
     }
     const token = crypto.randomBytes(24).toString('base64url');
     const ext = extOf(relPath);
+    const base = String(relPath).split('/').pop() || '';
     const now = Date.now();
     tokens.set(token, { serverId, relPath: String(relPath), ext, createdAt: now, expiresAt: now + tokenTtlMs });
-    return 'http://127.0.0.1:' + addr.port + '/' + token + (ext ? '.' + ext : '');
+    // The URL carries the real filename (percent-encoded) after the
+    // token, so the player shows the real title. The extension rides
+    // in the basename, so extension-sniffing players still pick the
+    // right demuxer; the old "/token.ext" form still resolves.
+    return 'http://127.0.0.1:' + addr.port + '/' + token + (base ? '/' + encodeURIComponent(base) : '');
   }
 
   function revokeServer(serverId) {
